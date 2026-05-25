@@ -1,10 +1,13 @@
 <view class="page">
+  <view wx:if="{{error}}" class="error">{{error}}</view>
+  <view wx:if="{{loading}}" class="hint">加载中...</view>
   <view class="card">
     <text class="title">{{product.name}}</text>
     <text class="price">¥{{product.salePrice}}</text>
     <text class="desc">{{product.rightsDesc}}</text>
     <text class="rule">发放方式：{{product.fulfillmentType}}</text>
     <text class="rule">售后规则：{{product.afterSaleRule}}</text>
+    <text class="rule">商品状态：{{product.status}}</text>
     <button bindtap="createOrder">立即购买</button>
   </view>
 </view>

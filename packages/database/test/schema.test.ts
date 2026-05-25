@@ -6,8 +6,12 @@ import { describe, expect, it } from "vitest";
 const testDir = fileURLToPath(new URL(".", import.meta.url));
 const schemaPath = resolve(testDir, "../prisma/schema.prisma");
 const schema = readFileSync(schemaPath, "utf8");
-const migrationSql = readFileSync(
-  resolve(testDir, "../prisma/migrations/000001_constraints/migration.sql"),
+const initMigrationSql = readFileSync(
+  resolve(testDir, "../prisma/migrations/000001_init/migration.sql"),
+  "utf8"
+);
+const constraintsMigrationSql = readFileSync(
+  resolve(testDir, "../prisma/migrations/000002_constraints/migration.sql"),
   "utf8"
 );
 
@@ -135,16 +139,53 @@ describe("Prisma database contract", () => {
   });
 
   it("adds PostgreSQL constraints for cross-field financial invariants", () => {
-    expect(migrationSql).toContain("agent_products_type_reference_check");
-    expect(migrationSql).toContain("risk_freezes_active_target_unique");
-    expect(migrationSql).toContain("manual_payouts_paid_settlement_unique");
-    expect(migrationSql).toContain("ledger_entries_no_update");
-    expect(migrationSql).toContain("ledger_entries_no_delete");
+    expect(initMigrationSql).toContain('CREATE TABLE "orders"');
+    expect(initMigrationSql).toContain('CREATE TABLE "ledger_entries"');
+    expect(constraintsMigrationSql).toContain("agent_products_type_reference_check");
+    expect(constraintsMigrationSql).toContain("agent_products_business_rules_check");
+    expect(constraintsMigrationSql).toContain("order_amount_snapshots_totals_check");
+    expect(constraintsMigrationSql).toContain("order_items_totals_check");
+    expect(constraintsMigrationSql).toContain("risk_freezes_active_target_unique");
+    expect(constraintsMigrationSql).toContain("manual_payouts_paid_settlement_unique");
+    expect(constraintsMigrationSql).toContain("ledger_entries_no_update");
+    expect(constraintsMigrationSql).toContain("ledger_entries_no_delete");
   });
 
   it("uses a generic product snapshot for platform and agent-owned products", () => {
     const snapshot = modelBlock("OrderAmountSnapshot");
     expect(snapshot).toMatch(/productSnapshotJson\s+Json\s+@map\("product_snapshot_json"\)/);
     expect(snapshot).not.toContain("platformProductSnapshotJson");
+  });
+
+  it("adds non-negative money checks for V1 financial tables", () => {
+    for (const constraint of [
+      "platform_products_amounts_check",
+      "order_items_amounts_check",
+      "order_amount_snapshots_amounts_check",
+      "after_sales_amounts_check",
+      "settlement_items_amounts_check",
+      "deposit_accounts_amounts_check",
+      "ledger_entries_amounts_check"
+    ]) {
+      expect(constraintsMigrationSql).toContain(constraint);
+    }
+  });
+
+  it("adds ownership and refund-total triggers that Prisma cannot express", () => {
+    for (const trigger of [
+      "agent_products_owner_check",
+      "agent_products_business_rules_check",
+      "order_amount_snapshots_totals_check",
+      "order_items_owner_check",
+      "after_sales_owner_check",
+      "refunds_link_check",
+      "refunds_total_check",
+      "settlement_items_owner_check",
+      "manual_payouts_owner_check",
+      "deposit_transactions_owner_check"
+    ]) {
+      expect(constraintsMigrationSql).toContain(trigger);
+    }
+    expect(constraintsMigrationSql).toContain("refund total cannot exceed order paid amount");
   });
 });

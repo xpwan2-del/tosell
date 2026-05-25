@@ -1,14 +1,22 @@
 <view class="page">
   <view class="shop-head">
     <text class="shop-name">{{shop.name}}</text>
-    <text class="shop-desc">{{shop.announcement}}</text>
-    <button bindtap="copyServiceWechat">复制客服微信</button>
+    <text class="shop-desc">{{shop.announcement || '本店虚拟权益购买后按商品规则发放'}}</text>
+    <text class="status">店铺状态：{{shop.status}}</text>
+    <view class="actions">
+      <button bindtap="copyServiceWechat">复制客服微信</button>
+    </view>
   </view>
+
+  <view wx:if="{{error}}" class="error">{{error}}</view>
+  <view wx:if="{{loading}}" class="hint">加载中...</view>
+
   <view class="product-list">
     <block wx:for="{{products}}" wx:key="id">
       <view class="product" bindtap="openProduct" data-id="{{item.id}}">
-        <text class="title">{{item.name}}</text>
-        <text class="price">¥{{item.salePrice}}</text>
+        <text class="title">{{item.displayName}}</text>
+        <text class="price">¥{{item.displayPrice}}</text>
+        <text class="meta">履约：{{item.product.fulfillmentRule.mode || '按规则发放'}}</text>
       </view>
     </block>
   </view>

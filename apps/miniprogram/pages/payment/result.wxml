@@ -1,0 +1,17 @@
+<view class="page">
+  <view wx:if="{{error}}" class="error">{{error}}</view>
+  <view wx:if="{{loading}}" class="hint">加载中...</view>
+  <view class="card">
+    <text class="title">支付结果</text>
+    <text>订单号：{{order.orderNo}}</text>
+    <text>支付状态：{{order.paymentStatus}}</text>
+    <text>履约状态：{{order.fulfillmentStatus}}</text>
+    <text>实付金额：¥{{paidAmount}}</text>
+    <text>处理结果：{{paymentResult}}</text>
+    <view class="actions">
+      <button bindtap="simulatePayment">模拟支付成功</button>
+      <button bindtap="openOrder">查看订单详情</button>
+      <button bindtap="openOrders">我的订单</button>
+    </view>
+  </view>
+</view>

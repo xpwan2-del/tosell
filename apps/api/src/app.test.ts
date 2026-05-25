@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildApp } from "./app.js";
+import { buildApp } from "./app.ts";
 
 describe("api", () => {
   it("quotes platform product amounts on backend", async () => {
@@ -17,10 +17,10 @@ describe("api", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
       paidAmountCents: "15000",
-      supplyAmountCents: "10000",
-      serviceFeeCents: "75",
-      agentExpectedIncomeCents: "4925"
+      salePriceCents: "15000",
+      quantity: 1
     });
+    expect(JSON.stringify(response.json())).not.toMatch(/supplyAmountCents|serviceFeeCents|agentExpectedIncomeCents/);
   });
 
   it("rejects quote requests that cannot be resolved from backend product data", async () => {
@@ -59,6 +59,30 @@ describe("api", () => {
 
     expect(first.json().status).toBe("processed");
     expect(second.json().status).toBe("duplicate");
+  });
+
+  it("rejects payment callbacks with mismatched amount", async () => {
+    const app = buildApp();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-1" },
+      payload: { shopId: "shop-1", agentProductId: "ap-1" }
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: {
+        channel: "mock",
+        channelTradeNo: "trade-mismatch-1",
+        orderNo: created.json().orderNo,
+        amountCents: "14999"
+      }
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe("PAYMENT_CALLBACK_REJECTED");
   });
 
   it("rejects payment callbacks for unknown orders", async () => {
@@ -203,7 +227,12 @@ describe("api", () => {
     });
 
     expect(created.statusCode).toBe(200);
-    expect(created.json().snapshot.amountSnapshot.agentExpectedIncomeCents).toBe("4925");
+    expect(created.json()).toMatchObject({
+      paidAmountCents: "15000",
+      salePriceCents: "15000",
+      productName: "测试虚拟权益"
+    });
+    expect(JSON.stringify(created.json())).not.toMatch(/supplyAmountCents|serviceFeeCents|agentExpectedIncomeCents|settlementStatus/);
 
     const agentTwoOrders = await app.inject({
       method: "GET",
@@ -213,7 +242,134 @@ describe("api", () => {
     expect(agentTwoOrders.json()).toEqual([]);
   });
 
-  it("runs payment, fulfillment, and settlement generation without duplicate settlement items", async () => {
+  it("lists only the current user's orders without internal finance fields", async () => {
+    const app = buildApp();
+    await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-1" },
+      payload: { shopId: "shop-1", agentProductId: "ap-1" }
+    });
+    await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-2" },
+      payload: { shopId: "shop-1", agentProductId: "ap-1" }
+    });
+
+    const orders = await app.inject({
+      method: "GET",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-1" }
+    });
+
+    expect(orders.statusCode).toBe(200);
+    expect(orders.json()).toHaveLength(1);
+    expect(orders.json()[0]).toMatchObject({ userId: "user-1", paidAmountCents: "15000" });
+    expect(JSON.stringify(orders.json())).not.toMatch(/supplyAmountCents|serviceFeeCents|agentExpectedIncomeCents|settlementStatus/);
+  });
+
+  it("reviews agent onboarding and opens the shop after deposit confirmation", async () => {
+    const app = buildApp();
+    const application = await app.inject({
+      method: "POST",
+      url: "/api/agent/applications",
+      headers: { "x-agent-id": "agent-new", "x-shop-id": "shop-new" },
+      payload: { contactPhone: "13700000000", customerServiceWechat: "new_agent_service" }
+    });
+    expect(application.statusCode).toBe(200);
+    expect(application.json().status).toBe("pending_review");
+
+    const reviewed = await app.inject({
+      method: "POST",
+      url: "/api/admin/agents/agent-new/review",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: { approved: true }
+    });
+    expect(reviewed.json().status).toBe("pending_deposit");
+
+    const deposit = await app.inject({
+      method: "POST",
+      url: "/api/admin/deposits/agent-new/confirm",
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" },
+      payload: { amountCents: "50000", voucherUrl: "https://example.test/deposit.png" }
+    });
+    expect(deposit.statusCode).toBe(200);
+    expect(deposit.json().account.status).toBe("paid");
+
+    const shop = await app.inject({
+      method: "GET",
+      url: "/api/agent/shop",
+      headers: { "x-agent-id": "agent-new", "x-shop-id": "shop-new" }
+    });
+    expect(shop.json().status).toBe("open");
+  });
+
+  it("does not expose internal product finance fields on user product APIs", async () => {
+    const app = buildApp();
+    const list = await app.inject({
+      method: "GET",
+      url: "/api/user/shops/shop-1/products"
+    });
+    const detail = await app.inject({
+      method: "GET",
+      url: "/api/user/products/ap-1"
+    });
+
+    expect(list.statusCode).toBe(200);
+    expect(detail.statusCode).toBe(200);
+    expect(JSON.stringify(list.json())).not.toMatch(/supplyPriceCents|minSalePriceCents|suggestedSalePriceCents/);
+    expect(JSON.stringify(detail.json())).not.toMatch(/supplyPriceCents|minSalePriceCents|suggestedSalePriceCents/);
+  });
+
+  it("enforces platform minimum sale price on agent pricing APIs", async () => {
+    const app = buildApp();
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/agent/products/ap-1/price",
+      headers: { "x-agent-id": "agent-1", "x-shop-id": "shop-1" },
+      payload: { salePriceCents: "11999" }
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe("PRICE_RULE_FAILED");
+  });
+
+  it("rejects after-sale requests before payment or above remaining paid amount", async () => {
+    const app = buildApp();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-1" },
+      payload: { shopId: "shop-1", agentProductId: "ap-1" }
+    });
+    const orderNo = created.json().orderNo;
+
+    const unpaidAfterSale = await app.inject({
+      method: "POST",
+      url: "/api/user/after-sales",
+      headers: { "x-user-id": "user-1" },
+      payload: { orderNo, reasonCode: "not_needed", requestedRefundCents: "15000" }
+    });
+    expect(unpaidAfterSale.statusCode).toBe(400);
+    expect(unpaidAfterSale.json().code).toBe("AFTER_SALE_NOT_ALLOWED");
+
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: { channel: "mock", channelTradeNo: "trade-after-sale-1", orderNo, amountCents: "15000" }
+    });
+    const excessiveAfterSale = await app.inject({
+      method: "POST",
+      url: "/api/user/after-sales",
+      headers: { "x-user-id": "user-1" },
+      payload: { orderNo, reasonCode: "not_needed", requestedRefundCents: "15001" }
+    });
+    expect(excessiveAfterSale.statusCode).toBe(400);
+    expect(excessiveAfterSale.json().code).toBe("REFUND_AMOUNT_INVALID");
+  });
+
+  it("runs payment, fulfillment, settlement generation, and manual payout without duplicate settlement items", async () => {
     const app = buildApp();
     const created = await app.inject({
       method: "POST",
@@ -254,6 +410,232 @@ describe("api", () => {
     expect(firstSettlement.statusCode).toBe(200);
     expect(firstSettlement.json().items).toHaveLength(1);
     expect(secondSettlement.json().items).toHaveLength(0);
+
+    const payout = await app.inject({
+      method: "POST",
+      url: `/api/admin/settlements/${firstSettlement.json().settlementNo}/payouts`,
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" },
+      payload: { payoutMethod: "manual_bank_transfer", voucherUrl: "https://example.test/voucher.png" }
+    });
+
+    expect(payout.statusCode).toBe(200);
+    expect(payout.json().payout.status).toBe("paid");
+
+    const payoutDuplicate = await app.inject({
+      method: "POST",
+      url: `/api/admin/settlements/${firstSettlement.json().settlementNo}/payouts`,
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" },
+      payload: { payoutMethod: "manual_bank_transfer" }
+    });
+    expect(payoutDuplicate.json().status).toBe("duplicate");
+  });
+
+  it("submits and approves an agent-owned product before it can be sold", async () => {
+    const app = buildApp();
+    const submitted = await app.inject({
+      method: "POST",
+      url: "/api/agent/products/own",
+      headers: { "x-agent-id": "agent-1", "x-shop-id": "shop-1" },
+      payload: {
+        name: "代理自有课程权益",
+        salePriceCents: "19900",
+        minSalePriceCents: "9900",
+        fulfillmentMode: "manual"
+      }
+    });
+    expect(submitted.statusCode).toBe(200);
+    expect(submitted.json().reviewStatus).toBe("pending_review");
+
+    const reviewed = await app.inject({
+      method: "POST",
+      url: `/api/admin/agent-products/reviews/${submitted.json().id}/review`,
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: { approved: true, reason: "符合虚拟商品规则" }
+    });
+    expect(reviewed.statusCode).toBe(200);
+    expect(reviewed.json().agentProduct.productType).toBe("agent_owned");
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-1" },
+      payload: {
+        shopId: "shop-1",
+        agentProductId: reviewed.json().agentProduct.id,
+        clientPaidAmountCents: "19900"
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    expect(created.json().snapshot.productType).toBe("agent_owned");
+  });
+
+  it("creates clawback from agent responsibility refund after payout", async () => {
+    const app = buildApp();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-1" },
+      payload: { shopId: "shop-1", agentProductId: "ap-1" }
+    });
+    const orderNo = created.json().orderNo;
+
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: { channel: "mock", channelTradeNo: "trade-refund-1", orderNo, amountCents: "15000" }
+    });
+    await app.inject({
+      method: "POST",
+      url: `/api/admin/fulfillment/${orderNo}`,
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: { status: "success", attemptNo: 1 }
+    });
+    const settlement = await app.inject({
+      method: "POST",
+      url: "/api/admin/settlements/generate",
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" },
+      payload: { agentId: "agent-1", now: "2030-01-01T00:00:00.000Z" }
+    });
+    await app.inject({
+      method: "POST",
+      url: `/api/admin/settlements/${settlement.json().settlementNo}/payouts`,
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" },
+      payload: { payoutMethod: "manual_bank_transfer" }
+    });
+
+    const afterSale = await app.inject({
+      method: "POST",
+      url: "/api/user/after-sales",
+      headers: { "x-user-id": "user-1" },
+      payload: { orderNo, reasonCode: "agent_service_issue", requestedRefundCents: "5000" }
+    });
+    const refund = await app.inject({
+      method: "POST",
+      url: `/api/admin/after-sales/${afterSale.json().afterSaleNo}/refunds`,
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: { refundAmountCents: "5000", responsibility: "agent" }
+    });
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/refunds/mock",
+      payload: { channel: "mock", channelRefundNo: "refund-cb-1", refundNo: refund.json().refund.refundNo }
+    });
+    const clawbacks = await app.inject({
+      method: "GET",
+      url: "/api/agent/clawbacks",
+      headers: { "x-agent-id": "agent-1", "x-shop-id": "shop-1" }
+    });
+
+    expect(clawbacks.json()).toHaveLength(1);
+    expect(clawbacks.json()[0].requestedAmountCents).toBe("5025");
+  });
+
+  it("deducts post-settlement refunds from pending manual payout before deposit", async () => {
+    const app = buildApp();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-1" },
+      payload: { shopId: "shop-1", agentProductId: "ap-1" }
+    });
+    const orderNo = created.json().orderNo;
+
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: { channel: "mock", channelTradeNo: "trade-payable-refund-1", orderNo, amountCents: "15000" }
+    });
+    await app.inject({
+      method: "POST",
+      url: `/api/admin/fulfillment/${orderNo}`,
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: { status: "success", attemptNo: 1 }
+    });
+    const settlement = await app.inject({
+      method: "POST",
+      url: "/api/admin/settlements/generate",
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" },
+      payload: { agentId: "agent-1", now: "2030-01-01T00:00:00.000Z", batchNo: "payable-refund" }
+    });
+
+    const afterSale = await app.inject({
+      method: "POST",
+      url: "/api/user/after-sales",
+      headers: { "x-user-id": "user-1" },
+      payload: { orderNo, reasonCode: "agent_service_issue", requestedRefundCents: "5000" }
+    });
+    const refund = await app.inject({
+      method: "POST",
+      url: `/api/admin/after-sales/${afterSale.json().afterSaleNo}/refunds`,
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: { refundAmountCents: "5000", responsibility: "agent" }
+    });
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/refunds/mock",
+      payload: { channel: "mock", channelRefundNo: "refund-cb-payable-1", refundNo: refund.json().refund.refundNo }
+    });
+
+    const clawbacks = await app.inject({
+      method: "GET",
+      url: "/api/agent/clawbacks",
+      headers: { "x-agent-id": "agent-1", "x-shop-id": "shop-1" }
+    });
+    expect(clawbacks.json()[0].deductions).toEqual([
+      { from: "payable_income", amountCents: "4925" },
+      { from: "deposit", amountCents: "100" }
+    ]);
+
+    const payout = await app.inject({
+      method: "POST",
+      url: `/api/admin/settlements/${settlement.json().settlementNo}/payouts`,
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" },
+      payload: { payoutMethod: "manual_bank_transfer" }
+    });
+    expect(payout.json().payout.amountCents).toBe("0");
+  });
+
+  it("excludes risk-frozen fulfilled orders from settlement", async () => {
+    const app = buildApp();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-1" },
+      payload: { shopId: "shop-1", agentProductId: "ap-1" }
+    });
+    const orderNo = created.json().orderNo;
+
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: { channel: "mock", channelTradeNo: "trade-risk-settle-1", orderNo, amountCents: "15000" }
+    });
+    await app.inject({
+      method: "POST",
+      url: `/api/admin/fulfillment/${orderNo}`,
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: { status: "success", attemptNo: 1 }
+    });
+    await app.inject({
+      method: "POST",
+      url: "/api/admin/risk-freezes",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: {
+        targetType: "order",
+        targetId: orderNo,
+        freezeType: "order_frozen",
+        reasonCode: "manual_risk"
+      }
+    });
+    const settlement = await app.inject({
+      method: "POST",
+      url: "/api/admin/settlements/generate",
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" },
+      payload: { agentId: "agent-1", now: "2030-01-01T00:00:00.000Z", batchNo: "risk-freeze" }
+    });
+
+    expect(settlement.statusCode).toBe(200);
+    expect(settlement.json().items).toHaveLength(0);
   });
 
   it("rejects cumulative refund allocation above paid amount", async () => {

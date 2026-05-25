@@ -22,8 +22,8 @@ export type SettlementOrderAmount = SettlementCandidate & {
 
 export type SettlementItemDraft = {
   orderId: string;
-  agentId?: string;
-  shopId?: string;
+  agentId: string;
+  shopId: string;
   paidAmountCents: bigint;
   supplyAmountCents: bigint;
   serviceFeeCents: bigint;

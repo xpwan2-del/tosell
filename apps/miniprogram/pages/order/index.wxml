@@ -1,0 +1,15 @@
+<view class="page">
+  <view wx:if="{{error}}" class="error">{{error}}</view>
+  <view wx:if="{{loading}}" class="hint">加载中...</view>
+
+  <view class="card">
+    <text class="title">我的订单</text>
+    <block wx:for="{{orders}}" wx:key="orderNo">
+      <view class="row" data-order-no="{{item.orderNo}}" bindtap="openOrder">
+        <text>{{item.orderNo}} / {{item.productName}}</text>
+        <text>{{item.status}} / {{item.paymentStatus}} / ¥{{item.paidAmount}}</text>
+      </view>
+    </block>
+    <text wx:if="{{orders.length === 0}}">暂无订单</text>
+  </view>
+</view>

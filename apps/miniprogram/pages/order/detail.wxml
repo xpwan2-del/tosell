@@ -1,10 +1,17 @@
 <view class="page">
+  <view wx:if="{{error}}" class="error">{{error}}</view>
+  <view wx:if="{{loading}}" class="hint">加载中...</view>
   <view class="card">
     <text>订单号：{{order.orderNo}}</text>
-    <text>状态：{{order.status}}</text>
-    <text>履约：{{order.fulfillmentStatus}}</text>
-    <text>售后：{{order.refundStatus}}</text>
+    <text>订单状态：{{order.status}}</text>
+    <text>支付状态：{{order.paymentStatus}}</text>
+    <text>履约状态：{{order.fulfillmentStatus}}</text>
+    <text>售后状态：{{order.refundStatus}}</text>
+    <text>实付金额：¥{{paidAmount}}</text>
     <text>权益：{{order.entitlement}}</text>
+    <input placeholder="退款金额，单位分" value="{{refundCents}}" bindinput="onRefundCentsInput" />
+    <input placeholder="售后原因代码" value="{{refundReasonCode}}" bindinput="onRefundReasonInput" />
+    <input placeholder="售后说明" value="{{refundDescription}}" bindinput="onRefundDescriptionInput" />
     <button bindtap="requestRefund">申请售后</button>
   </view>
 </view>

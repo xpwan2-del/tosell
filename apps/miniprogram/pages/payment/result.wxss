@@ -2,23 +2,19 @@
   padding: 24rpx;
 }
 .card {
+  display: grid;
+  gap: 16rpx;
   background: #fff;
   border-radius: 12rpx;
   padding: 28rpx;
 }
-.title,
-.price,
-.desc,
-.rule {
-  display: block;
-  margin-bottom: 16rpx;
-}
 .title {
-  font-size: 36rpx;
+  font-size: 34rpx;
   font-weight: 700;
 }
-.price {
-  color: #0a6b5f;
+.actions {
+  display: flex;
+  gap: 12rpx;
 }
 .hint {
   color: #65737d;

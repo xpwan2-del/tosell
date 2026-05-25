@@ -16,6 +16,11 @@ export class IdempotencyRegistry {
   runOnce<T>(key: string, action: () => T): T | undefined {
     if (this.seen.has(key)) return undefined;
     this.seen.add(key);
-    return action();
+    try {
+      return action();
+    } catch (error) {
+      this.seen.delete(key);
+      throw error;
+    }
   }
 }

@@ -1,15 +1,58 @@
+import { api, cents, text } from "../../utils/api.js";
+
 Page({
   data: {
+    shopId: "shop-1",
+    productId: "",
+    loading: false,
+    error: "",
+    quote: {} as Record<string, unknown>,
     product: {
-      id: "p1",
-      name: "示例虚拟权益",
-      salePrice: "150.00",
-      rightsDesc: "购买后发放虚拟权益凭证",
-      fulfillmentType: "自动或人工发放",
-      afterSaleRule: "未履约可退款，已使用按规则仲裁"
+      id: "",
+      name: "",
+      salePrice: "",
+      rightsDesc: "",
+      fulfillmentType: "",
+      afterSaleRule: "",
+      status: ""
     }
   },
-  createOrder() {
-    wx.navigateTo({ url: "/pages/order/detail?orderNo=mock-order" });
+  onLoad(this: any, query: Record<string, string | undefined>) {
+    this.setData({ productId: query.id ?? "ap-1", shopId: query.shopId ?? "shop-1" });
+    void this.loadProduct();
+  },
+  async loadProduct(this: any) {
+    this.setData({ loading: true, error: "" });
+    try {
+      const [agentProduct, quote] = await Promise.all([
+        api.product(this.data.productId),
+        api.quote(this.data.shopId, this.data.productId)
+      ]);
+      const product = agentProduct.product as Record<string, unknown> | undefined;
+      this.setData({
+        quote,
+        product: {
+          id: text(agentProduct.id),
+          name: text(product?.name),
+          salePrice: cents(agentProduct.salePriceCents),
+          rightsDesc: "购买后可在订单中查看权益凭证",
+          fulfillmentType: text((product?.fulfillmentRule as Record<string, unknown> | undefined)?.mode, "manual"),
+          afterSaleRule: "未履约可申请售后，已使用按规则处理",
+          status: text(agentProduct.status)
+        }
+      });
+    } catch (error) {
+      this.setData({ error: error instanceof Error ? error.message : "加载失败" });
+    } finally {
+      this.setData({ loading: false });
+    }
+  },
+  async createOrder(this: any) {
+    try {
+      const order = await api.createOrder(this.data.shopId, this.data.productId, text(this.data.quote.paidAmountCents));
+      wx.navigateTo({ url: `/pages/payment/result?orderNo=${order.orderNo}` });
+    } catch (error) {
+      wx.showToast({ title: error instanceof Error ? error.message : "下单失败", icon: "none" });
+    }
   }
 });

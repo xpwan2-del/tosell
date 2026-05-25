@@ -1,103 +1,395 @@
-import React from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { api, cents, text, type JsonRecord } from "./api.js";
 import "./styles.css";
 
-type ModuleCard = {
-  title: string;
-  owner: string;
-  status: string;
-  checks: string[];
+type LoadState = {
+  shop?: JsonRecord;
+  publicProducts: JsonRecord[];
+  agentProducts: JsonRecord[];
+  platformProducts: JsonRecord[];
+  ownProducts: JsonRecord[];
+  agentOrders: JsonRecord[];
+  adminOrders: JsonRecord[];
+  settlements: JsonRecord[];
+  clawbacks: JsonRecord[];
+  auditLogs: JsonRecord[];
+  reconciliation?: JsonRecord;
 };
 
-const modules: ModuleCard[] = [
-  {
-    title: "代理审核",
-    owner: "运营",
-    status: "待审核 / 待缴保证金 / 已开通 / 冻结",
-    checks: ["审核通过后进入保证金环节", "拒绝必须填写原因", "冻结/禁用必须审计"]
-  },
-  {
-    title: "保证金",
-    owner: "财务",
-    status: "待缴 / 已缴 / 扣减 / 不足 / 退还观察期",
-    checks: ["每次变化写流水", "余额不足限制结算或销售", "退还前检查未完结风险"]
-  },
-  {
-    title: "商品与定价",
-    owner: "运营",
-    status: "平台商品 / 代理自有商品审核 / 风险下架",
-    checks: ["售价不得低于最低限价", "自有商品审核后售卖", "改价不影响订单快照"]
-  },
-  {
-    title: "订单与履约",
-    owner: "运营",
-    status: "待支付 / 已支付 / 履约中 / 已履约 / 履约失败",
-    checks: ["订单归属固化", "履约失败不得结算", "补发和撤销必须留痕"]
-  },
-  {
-    title: "售后退款",
-    owner: "运营 + 财务",
-    status: "售后中 / 平台介入 / 退款中 / 已退款 / 驳回",
-    checks: ["责任归属必填", "退款中冻结结算", "已结算退款生成追扣"]
-  },
-  {
-    title: "结算与人工打款",
-    owner: "财务",
-    status: "待结算 / 冻结 / 可结算 / 结算中 / 已结算",
-    checks: ["T+1 默认从履约成功起算", "同一订单不可重复结算", "V1 不做代理自助提现"]
-  },
-  {
-    title: "风控与审计",
-    owner: "管理员",
-    status: "订单冻结 / 店铺冻结 / 限制结算 / 商品下架",
-    checks: ["冻结期间不可结算", "解冻后重新判断", "敏感操作写审计日志"]
-  }
+const initialState: LoadState = {
+  publicProducts: [],
+  agentProducts: [],
+  platformProducts: [],
+  ownProducts: [],
+  agentOrders: [],
+  adminOrders: [],
+  settlements: [],
+  clawbacks: [],
+  auditLogs: []
+};
+
+const adminNav = [
+  "基础看板",
+  "代理审核",
+  "保证金",
+  "店铺管理",
+  "商品管理",
+  "代理商品审核",
+  "订单管理",
+  "履约管理",
+  "售后退款",
+  "结算管理",
+  "风控冻结",
+  "审计日志"
+];
+
+const agentNav = [
+  "入驻与店铺",
+  "选品与定价",
+  "订单收益",
+  "结算记录",
+  "追扣记录"
 ];
 
 function App() {
+  const [data, setData] = useState<LoadState>(initialState);
+  const [message, setMessage] = useState("正在连接 API...");
+  const [loading, setLoading] = useState(false);
+  const [priceCents, setPriceCents] = useState("15000");
+  const [refundCents, setRefundCents] = useState("3000");
+  const [attemptNo, setAttemptNo] = useState(1);
+  const [currentOrder, setCurrentOrder] = useState<JsonRecord | undefined>();
+  const [currentAfterSale, setCurrentAfterSale] = useState<JsonRecord | undefined>();
+  const [currentRefund, setCurrentRefund] = useState<JsonRecord | undefined>();
+  const [currentAllocation, setCurrentAllocation] = useState<JsonRecord | undefined>();
+
+  const selectedPublicProduct = data.publicProducts[0];
+  const selectedAgentProduct = data.agentProducts[0];
+  const selectedOrder = currentOrder ?? data.adminOrders[0] ?? data.agentOrders[0];
+  const selectedSettlement = data.settlements.find((sheet) => text(sheet.status) !== "paid") ?? data.settlements[0];
+  const selectedOwnProduct = data.ownProducts.find((item) => text(item.reviewStatus) === "pending_review") ?? data.ownProducts[0];
+  const selectedOrderNo = text(selectedOrder?.orderNo, "");
+  const selectedOrderAmount = amountOf(selectedOrder);
+
+  async function loadAll(status = "数据已刷新") {
+    setLoading(true);
+    try {
+      const [
+        shop,
+        publicProducts,
+        agentProducts,
+        platformProducts,
+        ownProducts,
+        agentOrders,
+        settlements,
+        clawbacks,
+        adminOrders,
+        auditLogs,
+        reconciliation
+      ] = await Promise.all([
+        api.shop(),
+        api.shopProducts(),
+        api.agentProducts(),
+        api.platformProducts(),
+        api.ownProducts(),
+        api.agentOrders(),
+        api.agentSettlements(),
+        api.agentClawbacks(),
+        api.adminOrders(),
+        api.auditLogs(),
+        api.reconciliationSummary()
+      ]);
+      setData({ shop, publicProducts, agentProducts, platformProducts, ownProducts, agentOrders, settlements, clawbacks, adminOrders, auditLogs, reconciliation });
+      setCurrentOrder((order: JsonRecord | undefined) => order ?? adminOrders[0] ?? agentOrders[0]);
+      setMessage(status);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "加载失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadAll();
+  }, []);
+
+  async function runAction(label: string, action: () => Promise<unknown>, refresh = true) {
+    setLoading(true);
+    try {
+      const result = await action();
+      if (isRecord(result) && result.orderNo) setCurrentOrder(result);
+      if (isRecord(result) && result.afterSaleNo) setCurrentAfterSale(result);
+      if (isRecord(result) && isRecord(result.refund)) setCurrentRefund(result.refund as JsonRecord);
+      if (isRecord(result) && isRecord(result.allocation)) setCurrentAllocation(result.allocation as JsonRecord);
+      if (isRecord(result) && result.refundNo) setCurrentRefund(result);
+      setMessage(`${label}成功`);
+      if (refresh) await loadAll(`${label}成功，数据已刷新`);
+    } catch (error) {
+      setMessage(`${label}失败：${error instanceof Error ? error.message : "未知错误"}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const metrics = useMemo(() => {
+    const reconciliation = data.reconciliation ?? {};
+    return [
+      { label: "GMV", value: cents(reconciliation.totalPaidCents) },
+      { label: "退款金额", value: cents(reconciliation.totalRefundedCents) },
+      { label: "服务费", value: cents(reconciliation.totalServiceFeeCents) },
+      { label: "保证金余额", value: cents(reconciliation.depositAvailableCents) }
+    ];
+  }, [data.reconciliation]);
+
   return (
     <main className="shell">
       <aside className="sidebar">
         <div className="brand">ToSell</div>
-        <nav>
-          {modules.map((item) => (
-            <a key={item.title} href={`#${item.title}`}>{item.title}</a>
-          ))}
-        </nav>
+        <small>平台后台</small>
+        <nav>{adminNav.map((item) => <a key={item} href={`#${item}`}>{item}</a>)}</nav>
+        <small>代理中心</small>
+        <nav>{agentNav.map((item) => <a key={item} href={`#${item}`}>{item}</a>)}</nav>
       </aside>
+
       <section className="content">
         <header className="topbar">
           <div>
-            <h1>虚拟商品微商小店后台</h1>
-            <p>B2B2C 供货、审核、履约、结算和风控工作台</p>
+            <h1>虚拟商品小店运营台</h1>
+            <p>API：{api.baseUrl}；后台使用 mock header，代理和用户视图使用固定 demo 身份。</p>
           </div>
-          <div className="pill">V1 结算单 + 人工打款</div>
+          <button onClick={() => void loadAll()} disabled={loading}>刷新</button>
         </header>
 
-        <section className="metrics" aria-label="核心指标">
-          <div><span>GMV</span><strong>¥0.00</strong></div>
-          <div><span>待审核代理</span><strong>0</strong></div>
-          <div><span>退款中订单</span><strong>0</strong></div>
-          <div><span>可结算金额</span><strong>¥0.00</strong></div>
+        <div className={loading ? "notice loading" : "notice"}>{message}</div>
+
+        <section className="metrics" id="基础看板" aria-label="基础看板">
+          {metrics.map((item) => (
+            <div key={item.label}><span>{item.label}</span><strong>{item.value}</strong></div>
+          ))}
         </section>
 
-        <section className="grid">
-          {modules.map((module) => (
-            <article className="panel" key={module.title} id={module.title}>
-              <div className="panel-head">
-                <h2>{module.title}</h2>
-                <span>{module.owner}</span>
-              </div>
-              <p className="status">{module.status}</p>
-              <ul>
-                {module.checks.map((check) => <li key={check}>{check}</li>)}
-              </ul>
-            </article>
-          ))}
+        <section className="two-col">
+          <Panel title="代理审核" owner="运营" id="代理审核">
+            <KeyValue label="示例代理" value="agent-1 / 测试代理 A" />
+            <KeyValue label="审核状态" value="active，可演示重新置为待缴保证金" />
+            <div className="actions">
+              <button onClick={() => void runAction("代理审核通过", () => api.reviewAgent("agent-1", true, "资料通过"))}>审核通过</button>
+              <button onClick={() => void runAction("代理审核拒绝", () => api.reviewAgent("agent-1", false, "资料需补充"))}>审核拒绝</button>
+            </div>
+            <KeyValue label="新代理" value="agent-new，可演示完整入驻审核" />
+            <button onClick={() => void runAction("新代理审核通过", () => api.reviewAgent("agent-new", true, "资料通过"))}>通过新代理</button>
+          </Panel>
+
+          <Panel title="保证金" owner="财务" id="保证金">
+            <KeyValue label="应缴/可用" value="¥500.00 / 以后端账户为准" />
+            <KeyValue label="操作约束" value="扣减写交易和审计；余额不足触发限制" />
+            <div className="actions">
+              <button onClick={() => void runAction("新代理保证金确认", () => api.confirmDeposit())}>确认新代理保证金</button>
+              <button onClick={() => void runAction("保证金扣减", api.deductDeposit)}>扣减 ¥10.00</button>
+            </div>
+          </Panel>
+
+          <Panel title="店铺管理" owner="运营" id="店铺管理">
+            <KeyValue label="店铺" value={`${text(data.shop?.name)} (${text(data.shop?.status)})`} />
+            <KeyValue label="客服微信" value={text(data.shop?.customerServiceWechat)} />
+            <button onClick={() => void runAction("店铺资料保存", () => api.saveAgentShop("测试代理 A 小店", "购买后按商品规则发放权益"))}>保存店铺资料</button>
+          </Panel>
+
+          <Panel title="商品管理" owner="运营" id="商品管理">
+            <KeyValue label="平台商品数" value={String(data.platformProducts.length)} />
+            <KeyValue label="店铺商品数" value={String(data.agentProducts.length)} />
+            <Table rows={data.platformProducts} columns={["id", "name", "supplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents", "status"]} moneyColumns={["supplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents"]} />
+            <div className="inline-form">
+              <label>代理售价(分)<input value={priceCents} onChange={(event) => setPriceCents(event.target.value)} /></label>
+              <button onClick={() => void runAction("代理改价", () => api.updateAgentProductPrice(text(selectedAgentProduct?.id, "ap-1"), priceCents))}>保存售价</button>
+            </div>
+            <button onClick={() => void runAction("创建平台商品", api.createPlatformProduct)}>新增平台商品</button>
+          </Panel>
+
+          <Panel title="代理商品审核" owner="运营" id="代理商品审核">
+            <KeyValue label="待审/历史" value={String(data.ownProducts.length)} />
+            <KeyValue label="当前自有商品" value={text(selectedOwnProduct?.name, "暂无，先提交")} />
+            <Table rows={data.ownProducts} columns={["id", "name", "salePriceCents", "minSalePriceCents", "reviewStatus", "status"]} moneyColumns={["salePriceCents", "minSalePriceCents"]} />
+            <div className="actions">
+              <button onClick={() => void runAction("代理提交自有商品", api.submitOwnProduct)}>提交自有商品</button>
+              <button disabled={!selectedOwnProduct?.id} onClick={() => void runAction("自有商品审核通过", () => api.reviewOwnProduct(text(selectedOwnProduct?.id, "")))}>审核通过</button>
+              <button disabled={!selectedOwnProduct?.id} onClick={() => void runAction("自有商品审核拒绝", () => api.reviewOwnProduct(text(selectedOwnProduct?.id, ""), false))}>审核拒绝</button>
+            </div>
+          </Panel>
+
+          <Panel title="订单管理" owner="运营" id="订单管理">
+            <KeyValue label="后台订单数" value={String(data.adminOrders.length)} />
+            <KeyValue label="当前订单" value={selectedOrderNo || "暂无，先创建订单"} />
+            <div className="actions">
+              <button onClick={() => void runAction("订单报价", () => api.quoteOrder("shop-1", text(selectedPublicProduct?.id, "ap-1")), false)}>报价</button>
+              <button onClick={() => void runAction("创建订单", async () => {
+                const quote = await api.quoteOrder("shop-1", text(selectedPublicProduct?.id, "ap-1"));
+                return api.createOrder("shop-1", text(selectedPublicProduct?.id, "ap-1"), text(quote.paidAmountCents));
+              })}>创建订单</button>
+              <button disabled={!selectedOrderNo} onClick={() => void runAction("模拟支付", () => api.mockPayment(selectedOrderNo, selectedOrderAmount))}>模拟支付</button>
+            </div>
+          </Panel>
+
+          <Panel title="履约管理" owner="运营" id="履约管理">
+            <KeyValue label="履约状态" value={text(selectedOrder?.fulfillmentStatus)} />
+            <div className="inline-form">
+              <label>尝试次数<input value={String(attemptNo)} onChange={(event) => setAttemptNo(Number(event.target.value) || 1)} /></label>
+              <button disabled={!selectedOrderNo} onClick={() => void runAction("人工履约", () => api.fulfillOrder(selectedOrderNo, attemptNo))}>发放权益</button>
+            </div>
+          </Panel>
+
+          <Panel title="售后退款" owner="运营" id="售后退款">
+            <KeyValue label="退款状态" value={text(selectedOrder?.refundStatus)} />
+            <KeyValue label="售后单" value={text(currentAfterSale?.afterSaleNo, "暂无，先提交售后")} />
+            <KeyValue label="退款单" value={text(currentRefund?.refundNo, "暂无，先审批退款")} />
+            <KeyValue label="最近拆账" value={currentAllocation ? `平台 ${cents(currentAllocation.platformBearCents)} / 代理 ${cents(currentAllocation.agentBearCents)}` : "暂无"} />
+            <div className="inline-form">
+              <label>申请/拆账金额(分)<input value={refundCents} onChange={(event) => setRefundCents(event.target.value)} /></label>
+            </div>
+            <div className="actions">
+              <button disabled={!selectedOrderNo} onClick={() => void runAction("用户售后申请", () => api.createAfterSale(selectedOrderNo, refundCents))}>提交售后</button>
+              <button disabled={!selectedOrderNo} onClick={() => void runAction("退款拆账", () => api.allocateRefund(selectedOrder ?? {}, refundCents, "mixed"), false)}>混合责任拆账</button>
+              <button disabled={!currentAfterSale?.afterSaleNo} onClick={() => void runAction("退款审批建单", () => api.createRefund(text(currentAfterSale?.afterSaleNo, ""), selectedOrder ?? {}, refundCents, "mixed"))}>审批退款</button>
+              <button disabled={!currentRefund?.refundNo} onClick={() => void runAction("退款回调", () => api.mockRefund(text(currentRefund?.refundNo, "")))}>mock 退款成功</button>
+            </div>
+          </Panel>
+
+          <Panel title="结算管理" owner="财务" id="结算管理">
+            <KeyValue label="结算单数" value={String(data.settlements.length)} />
+            <KeyValue label="当前订单结算状态" value={text(selectedOrder?.settlementStatus)} />
+            <KeyValue label="待打款结算单" value={text(selectedSettlement?.settlementNo, "暂无，先生成")} />
+            <div className="actions">
+              <button onClick={() => void runAction("生成结算单", api.generateSettlement)}>生成 T+1 结算单</button>
+              <button disabled={!selectedSettlement?.settlementNo} onClick={() => void runAction("人工打款确认", () => api.confirmPayout(text(selectedSettlement?.settlementNo, "")))}>确认人工打款</button>
+            </div>
+          </Panel>
+
+          <Panel title="风控冻结" owner="运营/管理员" id="风控冻结">
+            <KeyValue label="当前订单风控" value={text(selectedOrder?.riskStatus)} />
+            <div className="actions">
+              <button disabled={!selectedOrderNo} onClick={() => void runAction("订单风控冻结", () => api.riskFreeze("order", selectedOrderNo))}>冻结订单</button>
+              <button onClick={() => void runAction("店铺风控冻结", () => api.riskFreeze("shop", "shop-2"))}>冻结测试店铺 B</button>
+            </div>
+          </Panel>
+
+          <Panel title="审计日志" owner="管理员" id="审计日志">
+            <KeyValue label="审计记录数" value={String(data.auditLogs.length)} />
+            <Table rows={data.auditLogs.slice(-5)} columns={["action", "targetType", "targetId", "actor"]} />
+          </Panel>
+        </section>
+
+        <section className="section">
+          <h2>代理经营视图</h2>
+          <div className="two-col">
+            <Panel title="入驻与店铺" owner="代理" id="入驻与店铺">
+              <KeyValue label="店铺" value={text(data.shop?.name)} />
+              <KeyValue label="营业状态" value={text(data.shop?.status)} />
+              <button onClick={() => void runAction("入驻申请提交", api.submitAgentApplication)}>提交入驻资料</button>
+            </Panel>
+
+            <Panel title="选品与定价" owner="代理" id="选品与定价">
+              <Table rows={agentProductRows(data.agentProducts)} columns={["id", "productName", "salePriceCents", "supplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents", "status"]} moneyColumns={["salePriceCents", "supplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents"]} />
+              <p className="hint">平台商品的供货价、最低价、建议价和预估收益只在代理中心展示，最终金额以后端返回为准。</p>
+            </Panel>
+
+            <Panel title="订单收益" owner="代理" id="订单收益">
+              <Table rows={orderIncomeRows(data.agentOrders)} columns={["orderNo", "status", "paymentStatus", "paidAmountCents", "agentExpectedIncomeCents", "settlementStatus"]} moneyColumns={["paidAmountCents", "agentExpectedIncomeCents"]} />
+            </Panel>
+
+            <Panel title="结算记录" owner="代理" id="结算记录">
+              <Table rows={data.settlements} columns={["settlementNo", "status", "totalOrderCount", "totalAgentIncomeCents"]} moneyColumns={["totalAgentIncomeCents"]} />
+            </Panel>
+
+            <Panel title="追扣记录" owner="代理" id="追扣记录">
+              <Table rows={data.clawbacks} columns={["clawbackNo", "orderNo", "status", "remainingAmountCents"]} moneyColumns={["remainingAmountCents"]} />
+            </Panel>
+          </div>
         </section>
       </section>
     </main>
   );
+}
+
+function Panel(props: { title: string; owner: string; id: string; children: React.ReactNode }) {
+  return (
+    <article className="panel" id={props.id}>
+      <div className="panel-head">
+        <h2>{props.title}</h2>
+        <span>{props.owner}</span>
+      </div>
+      {props.children}
+    </article>
+  );
+}
+
+function KeyValue(props: { label: string; value: string }) {
+  return (
+    <div className="kv">
+      <span>{props.label}</span>
+      <strong>{props.value}</strong>
+    </div>
+  );
+}
+
+function Table(props: { rows: JsonRecord[]; columns: string[]; moneyColumns?: string[] }) {
+  const moneyColumns = new Set(props.moneyColumns ?? []);
+  if (props.rows.length === 0) return <p className="empty">暂无记录</p>;
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead><tr>{props.columns.map((column) => <th key={column}>{column}</th>)}</tr></thead>
+        <tbody>
+          {props.rows.map((row, index) => (
+            <tr key={`${props.columns.map((column) => text(row[column])).join("-")}-${index}`}>
+              {props.columns.map((column) => <td key={column}>{moneyColumns.has(column) ? cents(row[column]) : text(row[column])}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function amountOf(order?: JsonRecord): string {
+  if (order?.paidAmountCents) return text(order.paidAmountCents, "15000");
+  const snapshot = order?.snapshot as JsonRecord | undefined;
+  const amount = snapshot?.amountSnapshot as JsonRecord | undefined;
+  return text(amount?.paidAmountCents, "15000");
+}
+
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function agentProductRows(rows: JsonRecord[]): JsonRecord[] {
+  return rows.map((row) => {
+    const product = row.product as JsonRecord | undefined;
+    return {
+      id: row.id,
+      productName: product?.name,
+      salePriceCents: row.salePriceCents,
+      supplyPriceCents: product?.supplyPriceCents,
+      minSalePriceCents: product?.minSalePriceCents,
+      suggestedSalePriceCents: product?.suggestedSalePriceCents,
+      status: row.status
+    };
+  });
+}
+
+function orderIncomeRows(rows: JsonRecord[]): JsonRecord[] {
+  return rows.map((row) => {
+    const snapshot = row.snapshot as JsonRecord | undefined;
+    const amount = snapshot?.amountSnapshot as JsonRecord | undefined;
+    return {
+      orderNo: row.orderNo,
+      status: row.status,
+      paymentStatus: row.paymentStatus,
+      paidAmountCents: amount?.paidAmountCents,
+      agentExpectedIncomeCents: amount?.agentExpectedIncomeCents,
+      settlementStatus: row.settlementStatus
+    };
+  });
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

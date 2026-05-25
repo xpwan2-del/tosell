@@ -7,8 +7,42 @@
   background: #fff;
   border-radius: 12rpx;
   padding: 28rpx;
+  margin-bottom: 20rpx;
 }
 .title {
   font-size: 34rpx;
   font-weight: 700;
+}
+.row {
+  display: grid;
+  gap: 8rpx;
+  border-top: 1rpx solid #e8edf0;
+  padding-top: 14rpx;
+}
+.actions,
+.price-row {
+  display: flex;
+  gap: 12rpx;
+  align-items: center;
+  flex-wrap: wrap;
+}
+input,
+.price-row input {
+  border: 1rpx solid #ccd6dc;
+  border-radius: 8rpx;
+  padding: 8rpx 12rpx;
+  min-width: 220rpx;
+  height: 56rpx;
+  box-sizing: border-box;
+}
+.hint {
+  color: #65737d;
+  margin-bottom: 16rpx;
+}
+.error {
+  color: #a32626;
+  background: #fff0f0;
+  border-radius: 12rpx;
+  padding: 20rpx;
+  margin-bottom: 20rpx;
 }
