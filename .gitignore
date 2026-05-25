@@ -13,3 +13,10 @@
 .ccb/agents/*/runtime.json
 .ccb/agents/*/provider-runtime/
 .ccb/agents/*/provider-state/
+
+node_modules/
+dist/
+coverage/
+.env
+.env.local
+*.log

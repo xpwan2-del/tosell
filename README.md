@@ -13,6 +13,10 @@
 - [功能卡片与开发计划](docs/03-development-cards.md)
 - [测试验收与上线清单](docs/04-testing-and-release.md)
 - [待确认问题](docs/05-open-questions.md)
+- [系统架构](docs/06-system-architecture.md)
+- [后台、后端与数据库计划](docs/07-admin-backend-database-plan.md)
+- [状态机与权限](docs/08-state-machines-and-permissions.md)
+- [API、测试与发布计划](docs/09-api-testing-release-plan.md)
 
 ## 第一版核心闭环
 
@@ -30,4 +34,43 @@
 
 ## 当前阶段
 
-当前处于开发前需求确认和计划沉淀阶段。仓库内暂不包含业务代码。
+当前已进入 V1 MVP 实现阶段。仓库包含：
+
+- `packages/database`：Prisma 数据模型、种子数据入口。
+- `packages/core`：金额计算、退款拆账、结算筛选、权限隔离、幂等工具和单元测试。
+- `apps/api`：Fastify API 骨架，含店铺/商品、订单创建、mock 支付/退款回调、履约、退款拆账、结算、保证金、风控、审计和权限检查示例。
+- `apps/admin`：平台后台/运营财务工作台骨架。
+- `apps/miniprogram`：微信小程序用户端、商品、订单、代理中心页面结构。
+
+## 本地命令
+
+```bash
+npm install
+npm test
+npm run typecheck
+npm run db:validate
+npm run api:dev
+npm run admin:dev
+```
+
+`db:validate` 默认使用示例 `DATABASE_URL` 校验 Prisma schema。真实环境需要按 `.env.example` 配置 PostgreSQL、微信小程序和支付参数。
+
+## API 本地联调
+
+```bash
+npm run api:dev
+```
+
+开发期 API 使用内存 demo store，不依赖真实 PostgreSQL；正式环境必须替换为 Prisma/PostgreSQL 事务服务、真实登录态和微信支付验签。mock 认证头：
+
+- 用户端：`x-user-id`
+- 代理端：`x-agent-id`、`x-shop-id`
+- 后台：`x-admin-id`、`x-admin-role: operator | finance | admin`
+
+主要 MVP 分组：
+
+- `/api/user/*`：店铺、商品、订单报价/创建、订单详情、售后申请。
+- `/api/agent/*`：入驻、店铺、商品定价、订单收益、结算记录、追扣记录。
+- `/api/admin/*`：代理审核、商品、订单、履约、退款拆账、结算、保证金、风控、审计。
+- `/api/callbacks/*`：mock 支付回调、mock 退款回调，按幂等键去重。
+- `/api/exports/*`：基础对账摘要。

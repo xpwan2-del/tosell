@@ -1,0 +1,15 @@
+<view class="page">
+  <view class="shop-head">
+    <text class="shop-name">{{shop.name}}</text>
+    <text class="shop-desc">{{shop.announcement}}</text>
+    <button bindtap="copyServiceWechat">复制客服微信</button>
+  </view>
+  <view class="product-list">
+    <block wx:for="{{products}}" wx:key="id">
+      <view class="product" bindtap="openProduct" data-id="{{item.id}}">
+        <text class="title">{{item.name}}</text>
+        <text class="price">¥{{item.salePrice}}</text>
+      </view>
+    </block>
+  </view>
+</view>

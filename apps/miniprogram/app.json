@@ -1,0 +1,13 @@
+{
+  "pages": [
+    "pages/shop/index",
+    "pages/product/detail",
+    "pages/order/detail",
+    "pages/agent/index"
+  ],
+  "window": {
+    "navigationBarTitleText": "微商小店",
+    "navigationBarBackgroundColor": "#11181c",
+    "navigationBarTextStyle": "white"
+  }
+}

@@ -1,0 +1,9 @@
+<view class="page">
+  <view class="card">
+    <text class="title">代理中心</text>
+    <text>审核状态：{{agent.reviewStatus}}</text>
+    <text>保证金：{{agent.depositStatus}}</text>
+    <text>待结算：¥{{agent.pendingAmount}}</text>
+    <text>冻结金额：¥{{agent.frozenAmount}}</text>
+  </view>
+</view>

@@ -1,0 +1,10 @@
+<view class="page">
+  <view class="card">
+    <text class="title">{{product.name}}</text>
+    <text class="price">¥{{product.salePrice}}</text>
+    <text class="desc">{{product.rightsDesc}}</text>
+    <text class="rule">发放方式：{{product.fulfillmentType}}</text>
+    <text class="rule">售后规则：{{product.afterSaleRule}}</text>
+    <button bindtap="createOrder">立即购买</button>
+  </view>
+</view>

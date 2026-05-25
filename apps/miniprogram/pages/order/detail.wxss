@@ -1,0 +1,10 @@
+.page {
+  padding: 24rpx;
+}
+.card {
+  display: grid;
+  gap: 16rpx;
+  background: #fff;
+  border-radius: 12rpx;
+  padding: 28rpx;
+}

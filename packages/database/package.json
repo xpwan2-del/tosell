@@ -1,0 +1,15 @@
+{
+  "name": "@tosell/database",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "prisma:validate": "DATABASE_URL=postgresql://tosell:tosell@localhost:5432/tosell prisma validate --schema prisma/schema.prisma",
+    "prisma:generate": "DATABASE_URL=postgresql://tosell:tosell@localhost:5432/tosell prisma generate --schema prisma/schema.prisma",
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.19.0"
+  }
+}

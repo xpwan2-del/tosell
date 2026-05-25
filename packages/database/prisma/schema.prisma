@@ -1,0 +1,1015 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserStatus {
+  active
+  disabled
+}
+
+enum AgentStatus {
+  draft
+  pending_review
+  rejected
+  pending_deposit
+  active
+  frozen
+  disabled
+  exit_observation
+  exited
+}
+
+enum DepositStatus {
+  pending_payment
+  paid
+  partially_deducted
+  frozen
+  refund_reviewing
+  refunded
+  insufficient
+}
+
+enum ShopStatus {
+  not_opened
+  configuring
+  open
+  frozen
+  disabled
+}
+
+enum ReviewStatus {
+  draft
+  pending_review
+  rejected
+  approved
+}
+
+enum ProductStatus {
+  draft
+  active
+  inactive
+  risk_removed
+}
+
+enum AgentProductStatus {
+  draft
+  pending_review
+  rejected
+  approved
+  listed
+  delisted
+  risk_removed
+}
+
+enum ProductType {
+  platform
+  agent_owned
+}
+
+enum FulfillmentType {
+  manual
+  automatic
+  external
+}
+
+enum OrderStatus {
+  pending_payment
+  paid
+  fulfilling
+  fulfilled
+  fulfillment_failed
+  after_sale_pending
+  refunding
+  refunded
+  closed
+}
+
+enum PaymentStatus {
+  unpaid
+  paying
+  paid
+  failed
+  cancelled
+  expired
+}
+
+enum FulfillmentStatus {
+  not_started
+  processing
+  success
+  failed
+  resent
+  revoked
+}
+
+enum RefundStatus {
+  none
+  pending
+  refunding
+  refunded
+  rejected
+  cancelled
+}
+
+enum SettlementStatus {
+  pending
+  frozen
+  settleable
+  settling
+  settled
+  clawback_pending
+  clawed_back
+}
+
+enum RiskStatus {
+  normal
+  order_frozen
+  shop_frozen
+  settlement_restricted
+  product_removed
+  disabled
+}
+
+enum CallbackProcessStatus {
+  received
+  processed
+  ignored_duplicate
+  failed
+}
+
+enum AfterSaleStatus {
+  pending
+  agent_processing
+  platform_intervening
+  refund_approved
+  refunding
+  refunded
+  rejected
+  cancelled
+}
+
+enum Responsibility {
+  platform
+  agent
+  user
+  mixed
+  undecided
+}
+
+enum ServiceFeeBearer {
+  platform
+  agent
+  user
+  mixed
+  none
+}
+
+enum SettlementSheetStatus {
+  draft
+  confirmed
+  payout_pending
+  paid
+  cancelled
+}
+
+enum ManualPayoutStatus {
+  pending
+  paid
+  failed
+  cancelled
+}
+
+enum DepositTransactionType {
+  pay
+  freeze
+  unfreeze
+  deduct
+  refund
+  adjustment
+}
+
+enum ClawbackStatus {
+  pending
+  deducting
+  completed
+  insufficient
+  cancelled
+}
+
+enum ClawbackDeductFrom {
+  pending_income
+  payable_income
+  deposit
+  mixed
+}
+
+enum LedgerDirection {
+  debit
+  credit
+}
+
+enum LedgerSubjectType {
+  agent
+  platform
+  user
+}
+
+enum LedgerAccountType {
+  agent_pending_income
+  agent_frozen_income
+  agent_payable_income
+  agent_paid_income
+  agent_clawback_receivable
+  agent_deposit_available
+  agent_deposit_frozen
+  platform_service_fee_income
+  platform_refund_cost
+}
+
+enum LedgerEntryType {
+  ORDER_AGENT_INCOME_PENDING
+  ORDER_SERVICE_FEE_ACCRUAL
+  REFUND_AGENT_BEAR
+  REFUND_PLATFORM_BEAR
+  SERVICE_FEE_REFUND
+  SETTLEMENT_LOCK
+  SETTLEMENT_PAYOUT
+  CLAWBACK_CREATE
+  CLAWBACK_DEDUCT_PENDING
+  CLAWBACK_DEDUCT_PAYOUT
+  CLAWBACK_DEDUCT_DEPOSIT
+  DEPOSIT_PAY
+  DEPOSIT_DEDUCT
+  DEPOSIT_REFUND
+  RISK_FREEZE
+  RISK_UNFREEZE
+  MANUAL_ADJUST
+}
+
+enum RiskFreezeStatus {
+  active
+  released
+  cancelled
+}
+
+enum ComplaintStatus {
+  pending
+  processing
+  resolved
+  rejected
+  cancelled
+}
+
+enum ActorType {
+  user
+  agent
+  admin
+  system
+}
+
+model User {
+  id          String     @id @default(cuid())
+  openid     String     @unique
+  unionid    String?    @unique
+  phone      String?
+  status     UserStatus @default(active)
+  createdAt  DateTime   @default(now()) @map("created_at")
+  updatedAt  DateTime   @updatedAt @map("updated_at")
+
+  agent        Agent?
+  applications AgentApplication[]
+  orders       Order[]
+  entitlements Entitlement[]
+
+  @@map("users")
+}
+
+model Agent {
+  id            String        @id @default(cuid())
+  userId        String        @unique @map("user_id")
+  agentNo       String        @unique @map("agent_no")
+  name          String
+  contactPhone  String?       @map("contact_phone")
+  status        AgentStatus   @default(draft)
+  riskStatus    RiskStatus    @default(normal) @map("risk_status")
+  depositStatus DepositStatus @default(pending_payment) @map("deposit_status")
+  approvedAt    DateTime?     @map("approved_at")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  user                User                 @relation(fields: [userId], references: [id])
+  applications        AgentApplication[]
+  shop                Shop?
+  agentProducts       AgentProduct[]
+  productReviews      AgentProductReview[]
+  depositAccount      DepositAccount?
+  depositTransactions DepositTransaction[]
+  orders              Order[]
+  afterSales          AfterSale[]
+  settlementSheets    SettlementSheet[]
+  ledgerEntries       LedgerEntry[]
+
+  @@index([status])
+  @@index([riskStatus])
+  @@map("agents")
+}
+
+model AgentApplication {
+  id                    String       @id @default(cuid())
+  agentId               String?      @map("agent_id")
+  userId                String       @map("user_id")
+  identityInfoJson      Json         @map("identity_info_json")
+  contactInfoJson       Json         @map("contact_info_json")
+  customerServiceWechat String       @map("customer_service_wechat")
+  status                ReviewStatus @default(pending_review)
+  rejectReason          String?      @map("reject_reason")
+  reviewedById          String?      @map("reviewed_by")
+  reviewedAt            DateTime?    @map("reviewed_at")
+  createdAt             DateTime     @default(now()) @map("created_at")
+  updatedAt             DateTime     @updatedAt @map("updated_at")
+
+  agent Agent? @relation(fields: [agentId], references: [id])
+  user  User   @relation(fields: [userId], references: [id])
+
+  @@index([status, createdAt])
+  @@index([agentId])
+  @@map("agent_applications")
+}
+
+model Shop {
+  id           String     @id @default(cuid())
+  agentId      String     @unique @map("agent_id")
+  shopNo       String     @unique @map("shop_no")
+  name         String
+  logoUrl      String?    @map("logo_url")
+  announcement String?
+  sharePath    String     @unique @map("share_path")
+  status       ShopStatus @default(not_opened)
+  riskStatus   RiskStatus @default(normal) @map("risk_status")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+
+  agent             Agent                        @relation(fields: [agentId], references: [id])
+  customerServices  ShopCustomerServiceBinding[]
+  agentProducts     AgentProduct[]
+  productReviews    AgentProductReview[]
+  orders            Order[]
+  afterSales        AfterSale[]
+  settlementItems   SettlementItem[]
+  ledgerEntries     LedgerEntry[]
+
+  @@index([status])
+  @@map("shops")
+}
+
+model ShopCustomerServiceBinding {
+  id           String       @id @default(cuid())
+  shopId       String       @map("shop_id")
+  wechatId     String       @map("wechat_id")
+  qrCodeUrl    String?      @map("qr_code_url")
+  status       UserStatus   @default(active)
+  reviewStatus ReviewStatus @default(pending_review) @map("review_status")
+  reviewedById String?      @map("reviewed_by")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+
+  shop Shop @relation(fields: [shopId], references: [id])
+
+  @@index([shopId, status])
+  @@map("shop_customer_service_bindings")
+}
+
+model PlatformProduct {
+  id                      String          @id @default(cuid())
+  productNo               String          @unique @map("product_no")
+  name                    String
+  categoryId              String?         @map("category_id")
+  detail                  String
+  rightsDesc              String          @map("rights_desc")
+  supplyPriceCents        BigInt          @map("supply_price_cents")
+  minSalePriceCents       BigInt          @map("min_sale_price_cents")
+  suggestedSalePriceCents BigInt          @map("suggested_sale_price_cents")
+  fulfillmentType         FulfillmentType @default(manual) @map("fulfillment_type")
+  fulfillmentRuleJson     Json            @map("fulfillment_rule_json")
+  afterSaleRuleJson       Json            @map("after_sale_rule_json")
+  status                  ProductStatus   @default(draft)
+  createdAt               DateTime        @default(now()) @map("created_at")
+  updatedAt               DateTime        @updatedAt @map("updated_at")
+
+  agentProducts AgentProduct[]
+
+  @@index([status])
+  @@map("platform_products")
+}
+
+model AgentProduct {
+  id                 String             @id @default(cuid())
+  agentId            String             @map("agent_id")
+  shopId             String             @map("shop_id")
+  productType        ProductType        @map("product_type")
+  platformProductId  String?            @map("platform_product_id")
+  ownProductReviewId String?            @unique @map("own_product_review_id")
+  salePriceCents     BigInt             @map("sale_price_cents")
+  status             AgentProductStatus @default(draft)
+  listedAt           DateTime?          @map("listed_at")
+  delistedAt         DateTime?          @map("delisted_at")
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
+
+  agent           Agent               @relation(fields: [agentId], references: [id])
+  shop            Shop                @relation(fields: [shopId], references: [id])
+  platformProduct PlatformProduct?    @relation(fields: [platformProductId], references: [id])
+  ownReview       AgentProductReview? @relation(fields: [ownProductReviewId], references: [id])
+  orderItems      OrderItem[]
+
+  @@unique([shopId, productType, platformProductId])
+  @@index([agentId, status])
+  @@index([shopId, status])
+  @@map("agent_products")
+}
+
+model AgentProductReview {
+  id                  String       @id @default(cuid())
+  agentId             String       @map("agent_id")
+  shopId              String       @map("shop_id")
+  name                String
+  detailJson          Json         @map("detail_json")
+  salePriceCents      BigInt       @map("sale_price_cents")
+  afterSaleRuleJson   Json         @map("after_sale_rule_json")
+  fulfillmentRuleJson Json         @map("fulfillment_rule_json")
+  status              ReviewStatus @default(pending_review)
+  rejectReason        String?      @map("reject_reason")
+  riskReason          String?      @map("risk_reason")
+  reviewedById        String?      @map("reviewed_by")
+  reviewedAt          DateTime?    @map("reviewed_at")
+  createdAt           DateTime     @default(now()) @map("created_at")
+  updatedAt           DateTime     @updatedAt @map("updated_at")
+
+  agent        Agent         @relation(fields: [agentId], references: [id])
+  shop         Shop          @relation(fields: [shopId], references: [id])
+  agentProduct AgentProduct?
+
+  @@index([agentId, status])
+  @@index([shopId, status])
+  @@map("agent_product_reviews")
+}
+
+model Order {
+  id                String            @id @default(cuid())
+  orderNo           String            @unique @map("order_no")
+  userId            String            @map("user_id")
+  agentId           String            @map("agent_id")
+  shopId            String            @map("shop_id")
+  status            OrderStatus       @default(pending_payment)
+  paymentStatus     PaymentStatus     @default(unpaid) @map("payment_status")
+  fulfillmentStatus FulfillmentStatus @default(not_started) @map("fulfillment_status")
+  refundStatus      RefundStatus      @default(none) @map("refund_status")
+  settlementStatus  SettlementStatus  @default(pending) @map("settlement_status")
+  riskStatus        RiskStatus        @default(normal) @map("risk_status")
+  paidAmountCents   BigInt            @default(0) @map("paid_amount_cents")
+  paidAt            DateTime?         @map("paid_at")
+  fulfilledAt       DateTime?         @map("fulfilled_at")
+  closedAt          DateTime?         @map("closed_at")
+  createdAt         DateTime          @default(now()) @map("created_at")
+  updatedAt         DateTime          @updatedAt @map("updated_at")
+
+  user               User                 @relation(fields: [userId], references: [id])
+  agent              Agent                @relation(fields: [agentId], references: [id])
+  shop               Shop                 @relation(fields: [shopId], references: [id])
+  items              OrderItem[]
+  amountSnapshot     OrderAmountSnapshot?
+  payments           Payment[]
+  fulfillmentRecords FulfillmentRecord[]
+  entitlements       Entitlement[]
+  afterSales         AfterSale[]
+  refunds            Refund[]
+  settlementItem     SettlementItem?
+  ledgerEntries      LedgerEntry[]
+
+  @@index([agentId, createdAt])
+  @@index([shopId, status])
+  @@index([userId, createdAt])
+  @@index([fulfilledAt])
+  @@index([settlementStatus, riskStatus])
+  @@map("orders")
+}
+
+model OrderItem {
+  id                  String      @id @default(cuid())
+  orderId             String      @map("order_id")
+  agentProductId      String      @map("agent_product_id")
+  productType         ProductType @map("product_type")
+  productIdSnapshot   String      @map("product_id_snapshot")
+  productNameSnapshot String      @map("product_name_snapshot")
+  salePriceCents      BigInt      @map("sale_price_cents")
+  quantity            Int         @default(1)
+  supplyPriceCents    BigInt      @map("supply_price_cents")
+  serviceFeeCents     BigInt      @map("service_fee_cents")
+  agentIncomeCents    BigInt      @map("agent_income_cents")
+  createdAt           DateTime    @default(now()) @map("created_at")
+
+  order               Order               @relation(fields: [orderId], references: [id])
+  agentProduct        AgentProduct        @relation(fields: [agentProductId], references: [id])
+  fulfillmentRecords  FulfillmentRecord[]
+  entitlements        Entitlement[]
+
+  @@index([orderId])
+  @@index([agentProductId])
+  @@map("order_items")
+}
+
+model OrderAmountSnapshot {
+  id                         String   @id @default(cuid())
+  orderId                    String   @unique @map("order_id")
+  serviceFeeBps              Int      @default(50) @map("service_fee_bps")
+  paidAmountCents            BigInt   @map("paid_amount_cents")
+  supplyAmountCents          BigInt   @map("supply_amount_cents")
+  serviceFeeCents            BigInt   @map("service_fee_cents")
+  agentExpectedIncomeCents   BigInt   @map("agent_expected_income_cents")
+  productSnapshotJson         Json    @map("product_snapshot_json")
+  shopSnapshotJson           Json     @map("shop_snapshot_json")
+  pricingSnapshotJson        Json     @map("pricing_snapshot_json")
+  fulfillmentRuleSnapshotJson Json    @map("fulfillment_rule_snapshot_json")
+  afterSaleRuleSnapshotJson  Json     @map("after_sale_rule_snapshot_json")
+  createdAt                  DateTime @default(now()) @map("created_at")
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@map("order_amount_snapshots")
+}
+
+model Payment {
+  id             String        @id @default(cuid())
+  paymentNo      String        @unique @map("payment_no")
+  orderId        String        @map("order_id")
+  userId         String        @map("user_id")
+  channel        String
+  channelTradeNo String?       @unique @map("channel_trade_no")
+  amountCents    BigInt        @map("amount_cents")
+  status         PaymentStatus @default(paying)
+  idempotencyKey String        @unique @map("idempotency_key")
+  paidAt         DateTime?     @map("paid_at")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+
+  order     Order             @relation(fields: [orderId], references: [id])
+  callbacks PaymentCallback[]
+  refunds   Refund[]
+
+  @@index([orderId])
+  @@map("payments")
+}
+
+model PaymentCallback {
+  id                String                @id @default(cuid())
+  paymentId         String?               @map("payment_id")
+  channel           String
+  channelEventId    String                @unique @map("channel_event_id")
+  rawPayloadJson    Json                  @map("raw_payload_json")
+  processedStatus   CallbackProcessStatus @default(received) @map("processed_status")
+  idempotencyKey    String                @unique @map("idempotency_key")
+  createdAt         DateTime              @default(now()) @map("created_at")
+  processedAt       DateTime?             @map("processed_at")
+
+  payment Payment? @relation(fields: [paymentId], references: [id])
+
+  @@index([paymentId])
+  @@map("payment_callbacks")
+}
+
+model FulfillmentRecord {
+  id              String            @id @default(cuid())
+  orderId         String            @map("order_id")
+  orderItemId     String            @map("order_item_id")
+  agentId         String            @map("agent_id")
+  fulfillmentType FulfillmentType   @map("fulfillment_type")
+  status          FulfillmentStatus @default(not_started)
+  successAt       DateTime?         @map("success_at")
+  failReason      String?           @map("fail_reason")
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+
+  order     Order                @relation(fields: [orderId], references: [id])
+  orderItem OrderItem            @relation(fields: [orderItemId], references: [id])
+  attempts  FulfillmentAttempt[]
+
+  @@index([agentId, status])
+  @@index([orderId])
+  @@map("fulfillment_records")
+}
+
+model FulfillmentAttempt {
+  id              String            @id @default(cuid())
+  fulfillmentId   String            @map("fulfillment_id")
+  attemptNo       Int               @map("attempt_no")
+  idempotencyKey  String            @unique @map("idempotency_key")
+  operatorId      String?           @map("operator_id")
+  requestJson     Json              @map("request_json")
+  resultJson      Json?             @map("result_json")
+  status          FulfillmentStatus @default(processing)
+  createdAt       DateTime          @default(now()) @map("created_at")
+
+  fulfillment FulfillmentRecord @relation(fields: [fulfillmentId], references: [id])
+
+  @@unique([fulfillmentId, attemptNo])
+  @@map("fulfillment_attempts")
+}
+
+model Entitlement {
+  id               String            @id @default(cuid())
+  orderId          String            @map("order_id")
+  orderItemId      String            @map("order_item_id")
+  userId           String            @map("user_id")
+  rightsCode       String            @map("rights_code")
+  rightsPayloadJson Json             @map("rights_payload_json")
+  status           FulfillmentStatus @default(success)
+  idempotencyKey   String            @unique @map("idempotency_key")
+  issuedAt         DateTime?         @map("issued_at")
+  revokedAt        DateTime?         @map("revoked_at")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+
+  order     Order     @relation(fields: [orderId], references: [id])
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id])
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@unique([orderItemId, rightsCode])
+  @@index([userId, createdAt])
+  @@map("entitlements")
+}
+
+model AfterSale {
+  id                    String           @id @default(cuid())
+  afterSaleNo           String           @unique @map("after_sale_no")
+  orderId               String           @map("order_id")
+  userId                String           @map("user_id")
+  agentId               String           @map("agent_id")
+  shopId                String           @map("shop_id")
+  status                AfterSaleStatus  @default(pending)
+  reasonCode            String           @map("reason_code")
+  responsibility        Responsibility   @default(undecided)
+  requestedRefundCents  BigInt           @map("requested_refund_cents")
+  approvedRefundCents   BigInt           @default(0) @map("approved_refund_cents")
+  platformBearCents     BigInt           @default(0) @map("platform_bear_cents")
+  agentBearCents        BigInt           @default(0) @map("agent_bear_cents")
+  serviceFeeRefundCents BigInt           @default(0) @map("service_fee_refund_cents")
+  serviceFeeBearer      ServiceFeeBearer @default(none) @map("service_fee_bearer")
+  evidenceJson          Json?            @map("evidence_json")
+  createdAt             DateTime         @default(now()) @map("created_at")
+  updatedAt             DateTime         @updatedAt @map("updated_at")
+
+  order   Order    @relation(fields: [orderId], references: [id])
+  agent   Agent    @relation(fields: [agentId], references: [id])
+  shop    Shop     @relation(fields: [shopId], references: [id])
+  refunds Refund[]
+
+  @@index([agentId, status])
+  @@index([shopId, status])
+  @@index([orderId])
+  @@map("after_sales")
+}
+
+model Refund {
+  id              String       @id @default(cuid())
+  refundNo        String       @unique @map("refund_no")
+  afterSaleId     String       @map("after_sale_id")
+  orderId         String       @map("order_id")
+  paymentId       String       @map("payment_id")
+  amountCents     BigInt       @map("amount_cents")
+  status          RefundStatus @default(refunding)
+  channelRefundNo String?      @unique @map("channel_refund_no")
+  idempotencyKey  String       @unique @map("idempotency_key")
+  createdAt       DateTime     @default(now()) @map("created_at")
+  updatedAt       DateTime     @updatedAt @map("updated_at")
+
+  afterSale AfterSale        @relation(fields: [afterSaleId], references: [id])
+  order     Order            @relation(fields: [orderId], references: [id])
+  payment   Payment          @relation(fields: [paymentId], references: [id])
+  callbacks RefundCallback[]
+  ledgers   LedgerEntry[]
+
+  @@index([orderId])
+  @@map("refunds")
+}
+
+model RefundCallback {
+  id              String                @id @default(cuid())
+  refundId        String?               @map("refund_id")
+  channel         String
+  channelEventId  String                @unique @map("channel_event_id")
+  rawPayloadJson  Json                  @map("raw_payload_json")
+  processedStatus CallbackProcessStatus @default(received) @map("processed_status")
+  idempotencyKey  String                @unique @map("idempotency_key")
+  createdAt       DateTime              @default(now()) @map("created_at")
+  processedAt     DateTime?             @map("processed_at")
+
+  refund Refund? @relation(fields: [refundId], references: [id])
+
+  @@index([refundId])
+  @@map("refund_callbacks")
+}
+
+model SettlementSheet {
+  id                    String                @id @default(cuid())
+  settlementNo          String                @unique @map("settlement_no")
+  agentId               String                @map("agent_id")
+  periodStart           DateTime              @map("period_start")
+  periodEnd             DateTime              @map("period_end")
+  status                SettlementSheetStatus @default(draft)
+  totalOrderCount       Int                   @default(0) @map("total_order_count")
+  totalPaidCents        BigInt                @default(0) @map("total_paid_cents")
+  totalServiceFeeCents  BigInt                @default(0) @map("total_service_fee_cents")
+  totalAgentIncomeCents BigInt                @default(0) @map("total_agent_income_cents")
+  idempotencyKey        String                @unique @map("idempotency_key")
+  createdById           String?               @map("created_by")
+  confirmedById         String?               @map("confirmed_by")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  agent    Agent            @relation(fields: [agentId], references: [id])
+  items    SettlementItem[]
+  payouts  ManualPayout[]
+  ledgers  LedgerEntry[]
+
+  @@unique([agentId, periodStart, periodEnd, idempotencyKey])
+  @@index([agentId, status])
+  @@map("settlement_sheets")
+}
+
+model SettlementItem {
+  id                 String   @id @default(cuid())
+  settlementId       String   @map("settlement_id")
+  orderId            String   @unique @map("order_id")
+  agentId            String   @map("agent_id")
+  shopId             String   @map("shop_id")
+  paidAmountCents    BigInt   @map("paid_amount_cents")
+  supplyAmountCents  BigInt   @map("supply_amount_cents")
+  serviceFeeCents    BigInt   @map("service_fee_cents")
+  agentIncomeCents   BigInt   @map("agent_income_cents")
+  deductedCents      BigInt   @default(0) @map("deducted_cents")
+  settleAmountCents  BigInt   @map("settle_amount_cents")
+  fulfilledAt        DateTime @map("fulfilled_at")
+  settleableAt       DateTime @map("settleable_at")
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  settlement SettlementSheet @relation(fields: [settlementId], references: [id])
+  order      Order           @relation(fields: [orderId], references: [id])
+  shop       Shop            @relation(fields: [shopId], references: [id])
+
+  @@index([settlementId])
+  @@index([agentId, createdAt])
+  @@map("settlement_items")
+}
+
+model ManualPayout {
+  id                    String             @id @default(cuid())
+  settlementId          String             @map("settlement_id")
+  agentId               String             @map("agent_id")
+  amountCents           BigInt             @map("amount_cents")
+  payeeInfoSnapshotJson Json               @map("payee_info_snapshot_json")
+  payoutMethod          String             @map("payout_method")
+  payoutVoucherUrl      String?            @map("payout_voucher_url")
+  status                ManualPayoutStatus @default(pending)
+  idempotencyKey        String             @unique @map("idempotency_key")
+  paidById              String?            @map("paid_by")
+  paidAt                DateTime?          @map("paid_at")
+  createdAt             DateTime           @default(now()) @map("created_at")
+  updatedAt             DateTime           @updatedAt @map("updated_at")
+
+  settlement SettlementSheet @relation(fields: [settlementId], references: [id])
+
+  @@index([agentId, status])
+  @@map("manual_payouts")
+}
+
+model DepositAccount {
+  id                  String        @id @default(cuid())
+  agentId             String        @unique @map("agent_id")
+  requiredAmountCents BigInt        @map("required_amount_cents")
+  availableAmountCents BigInt       @default(0) @map("available_amount_cents")
+  frozenAmountCents   BigInt        @default(0) @map("frozen_amount_cents")
+  deductedAmountCents BigInt        @default(0) @map("deducted_amount_cents")
+  status              DepositStatus @default(pending_payment)
+  createdAt           DateTime      @default(now()) @map("created_at")
+  updatedAt           DateTime      @updatedAt @map("updated_at")
+
+  agent        Agent                @relation(fields: [agentId], references: [id])
+  transactions DepositTransaction[]
+
+  @@map("deposit_accounts")
+}
+
+model DepositTransaction {
+  id                 String                 @id @default(cuid())
+  agentId            String                 @map("agent_id")
+  accountId          String                 @map("account_id")
+  type               DepositTransactionType
+  amountCents        BigInt                 @map("amount_cents")
+  balanceBeforeCents BigInt                 @map("balance_before_cents")
+  balanceAfterCents  BigInt                 @map("balance_after_cents")
+  reasonCode         String                 @map("reason_code")
+  relatedType        String?                @map("related_type")
+  relatedId          String?                @map("related_id")
+  voucherUrl         String?                @map("voucher_url")
+  idempotencyKey     String                 @unique @map("idempotency_key")
+  operatorId         String?                @map("operator_id")
+  createdAt          DateTime               @default(now()) @map("created_at")
+
+  agent   Agent          @relation(fields: [agentId], references: [id])
+  account DepositAccount @relation(fields: [accountId], references: [id])
+  ledgers LedgerEntry[]
+
+  @@index([agentId, createdAt])
+  @@index([relatedType, relatedId])
+  @@map("deposit_transactions")
+}
+
+model Clawback {
+  id             String              @id @default(cuid())
+  clawbackNo     String              @unique @map("clawback_no")
+  agentId        String              @map("agent_id")
+  sourceType     String              @map("source_type")
+  sourceId       String              @map("source_id")
+  orderId        String?             @map("order_id")
+  amountCents    BigInt              @map("amount_cents")
+  status         ClawbackStatus      @default(pending)
+  deductFrom     ClawbackDeductFrom? @map("deduct_from")
+  reasonCode     String              @map("reason_code")
+  idempotencyKey String              @unique @map("idempotency_key")
+  createdAt      DateTime            @default(now()) @map("created_at")
+  updatedAt      DateTime            @updatedAt @map("updated_at")
+
+  ledgers LedgerEntry[]
+
+  @@index([agentId, status])
+  @@index([sourceType, sourceId])
+  @@map("clawbacks")
+}
+
+model LedgerEntry {
+  id                   String             @id @default(cuid())
+  ledgerNo             String             @unique @map("ledger_no")
+  agentId              String?            @map("agent_id")
+  shopId               String?            @map("shop_id")
+  subjectType          LedgerSubjectType  @map("subject_type")
+  subjectId            String             @map("subject_id")
+  accountType          LedgerAccountType  @map("account_type")
+  entryType            LedgerEntryType    @map("entry_type")
+  direction            LedgerDirection
+  amountCents          BigInt             @map("amount_cents")
+  currency             String             @default("CNY")
+  sourceType           String             @map("source_type")
+  sourceId             String             @map("source_id")
+  orderId              String?            @map("order_id")
+  settlementId         String?            @map("settlement_id")
+  refundId             String?            @map("refund_id")
+  clawbackId           String?            @map("clawback_id")
+  depositTransactionId String?            @map("deposit_transaction_id")
+  idempotencyKey       String             @unique @map("idempotency_key")
+  balanceBeforeCents   BigInt?            @map("balance_before_cents")
+  balanceAfterCents    BigInt?            @map("balance_after_cents")
+  reversalOfLedgerId   String?            @map("reversal_of_ledger_id")
+  createdAt            DateTime           @default(now()) @map("created_at")
+
+  agent              Agent?               @relation(fields: [agentId], references: [id])
+  shop               Shop?                @relation(fields: [shopId], references: [id])
+  order              Order?               @relation(fields: [orderId], references: [id])
+  settlement         SettlementSheet?      @relation(fields: [settlementId], references: [id])
+  refund             Refund?              @relation(fields: [refundId], references: [id])
+  clawback           Clawback?            @relation(fields: [clawbackId], references: [id])
+  depositTransaction DepositTransaction?  @relation(fields: [depositTransactionId], references: [id])
+
+  @@index([agentId, createdAt])
+  @@index([sourceType, sourceId])
+  @@index([orderId])
+  @@map("ledger_entries")
+}
+
+model RiskFreeze {
+  id              String           @id @default(cuid())
+  targetType      String           @map("target_type")
+  targetId        String           @map("target_id")
+  agentId         String?          @map("agent_id")
+  freezeType      String           @map("freeze_type")
+  status          RiskFreezeStatus @default(active)
+  reasonCode      String           @map("reason_code")
+  reasonText      String           @map("reason_text")
+  activeUniqueKey String?          @unique @map("active_unique_key")
+  createdById     String?          @map("created_by")
+  releasedById    String?          @map("released_by")
+  releasedAt      DateTime?        @map("released_at")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  @@index([agentId, status])
+  @@index([targetType, targetId, freezeType, status])
+  @@map("risk_freezes")
+}
+
+model Complaint {
+  id             String          @id @default(cuid())
+  orderId        String          @map("order_id")
+  agentId        String          @map("agent_id")
+  userId         String          @map("user_id")
+  status         ComplaintStatus @default(pending)
+  complaintType  String          @map("complaint_type")
+  responsibility Responsibility  @default(undecided)
+  resolutionJson Json?           @map("resolution_json")
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+
+  @@index([agentId, status])
+  @@index([orderId])
+  @@map("complaints")
+}
+
+model AuditLog {
+  id             String    @id @default(cuid())
+  actorType      ActorType @map("actor_type")
+  actorId        String    @map("actor_id")
+  action         String
+  targetType     String    @map("target_type")
+  targetId       String    @map("target_id")
+  beforeJson     Json?     @map("before_json")
+  afterJson      Json?     @map("after_json")
+  reason         String?
+  idempotencyKey String    @unique @map("idempotency_key")
+  requestId      String    @map("request_id")
+  ip             String?
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  @@index([actorType, actorId, createdAt])
+  @@index([targetType, targetId, createdAt])
+  @@index([requestId])
+  @@map("audit_logs")
+}
+
+model AdminUser {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  displayName  String   @map("display_name")
+  passwordHash String   @map("password_hash")
+  status       UserStatus @default(active)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  roles AdminUserRole[]
+
+  @@map("admin_users")
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  code        String   @unique
+  name        String
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  users       AdminUserRole[]
+  permissions RolePermission[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  code        String   @unique
+  name        String
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model AdminUserRole {
+  adminUserId String   @map("admin_user_id")
+  roleId      String   @map("role_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  adminUser AdminUser @relation(fields: [adminUserId], references: [id])
+  role      Role      @relation(fields: [roleId], references: [id])
+
+  @@id([adminUserId, roleId])
+  @@map("admin_user_roles")
+}
+
+model RolePermission {
+  roleId       String   @map("role_id")
+  permissionId String   @map("permission_id")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  role       Role       @relation(fields: [roleId], references: [id])
+  permission Permission @relation(fields: [permissionId], references: [id])
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}

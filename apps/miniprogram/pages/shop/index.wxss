@@ -1,0 +1,25 @@
+.page {
+  padding: 24rpx;
+}
+.shop-head,
+.product {
+  background: #fff;
+  border-radius: 12rpx;
+  padding: 24rpx;
+  margin-bottom: 20rpx;
+}
+.shop-name,
+.title {
+  display: block;
+  font-weight: 600;
+}
+.shop-desc {
+  display: block;
+  color: #65737d;
+  margin: 12rpx 0;
+}
+.price {
+  display: block;
+  color: #0a6b5f;
+  margin-top: 8rpx;
+}
