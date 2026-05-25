@@ -107,6 +107,12 @@ enum FulfillmentStatus {
   revoked
 }
 
+enum RightsCodeStatus {
+  available
+  issued
+  voided
+}
+
 enum RefundStatus {
   none
   pending
@@ -313,6 +319,7 @@ model Agent {
   afterSales          AfterSale[]
   settlementSheets    SettlementSheet[]
   ledgerEntries       LedgerEntry[]
+  notifications       AgentNotification[]
 
   @@index([status])
   @@index([riskStatus])
@@ -348,6 +355,9 @@ model Shop {
   name         String
   logoUrl      String?    @map("logo_url")
   announcement String?
+  themeColor   String?    @map("theme_color")
+  bannerUrl    String?    @map("banner_url")
+  shareTitle   String?    @map("share_title")
   sharePath    String     @unique @map("share_path")
   status       ShopStatus @default(not_opened)
   riskStatus   RiskStatus @default(normal) @map("risk_status")
@@ -356,6 +366,7 @@ model Shop {
 
   agent             Agent                        @relation(fields: [agentId], references: [id])
   customerServices  ShopCustomerServiceBinding[]
+  productGroups     ShopProductGroup[]
   agentProducts     AgentProduct[]
   productReviews    AgentProductReview[]
   orders            Order[]
@@ -365,6 +376,21 @@ model Shop {
 
   @@index([status])
   @@map("shops")
+}
+
+model ShopProductGroup {
+  id             String   @id @default(cuid())
+  shopId         String   @map("shop_id")
+  name           String
+  sortOrder      Int      @default(0) @map("sort_order")
+  agentProductIds Json    @map("agent_product_ids")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  shop Shop @relation(fields: [shopId], references: [id])
+
+  @@index([shopId, sortOrder])
+  @@map("shop_product_groups")
 }
 
 model ShopCustomerServiceBinding {
@@ -389,6 +415,8 @@ model PlatformProduct {
   productNo               String          @unique @map("product_no")
   name                    String
   categoryId              String?         @map("category_id")
+  categoryName            String?         @map("category_name")
+  tagsJson                Json?           @map("tags_json")
   detail                  String
   rightsDesc              String          @map("rights_desc")
   supplyPriceCents        BigInt          @map("supply_price_cents")
@@ -402,9 +430,32 @@ model PlatformProduct {
   updatedAt               DateTime        @updatedAt @map("updated_at")
 
   agentProducts AgentProduct[]
+  rightsCodes   RightsCode[]
 
   @@index([status])
   @@map("platform_products")
+}
+
+model RightsCode {
+  id             String            @id @default(cuid())
+  productId      String            @map("product_id")
+  codeCiphertext String            @map("code_ciphertext")
+  batchNo        String            @map("batch_no")
+  status         RightsCodeStatus  @default(available)
+  orderId        String?           @map("order_id")
+  issueKey       String?           @unique @map("issue_key")
+  importedById   String?           @map("imported_by")
+  issuedAt       DateTime?         @map("issued_at")
+  createdAt      DateTime          @default(now()) @map("created_at")
+  updatedAt      DateTime          @updatedAt @map("updated_at")
+
+  product PlatformProduct @relation(fields: [productId], references: [id])
+  order   Order?          @relation(fields: [orderId], references: [id])
+
+  @@unique([productId, codeCiphertext])
+  @@index([productId, status])
+  @@index([batchNo])
+  @@map("rights_codes")
 }
 
 model AgentProduct {
@@ -490,6 +541,7 @@ model Order {
   refunds            Refund[]
   settlementItem     SettlementItem?
   ledgerEntries      LedgerEntry[]
+  rightsCodes        RightsCode[]
 
   @@index([agentId, createdAt])
   @@index([shopId, status])
@@ -497,6 +549,21 @@ model Order {
   @@index([fulfilledAt])
   @@index([settlementStatus, riskStatus])
   @@map("orders")
+}
+
+model AgentNotification {
+  id        String    @id @default(cuid())
+  agentId   String    @map("agent_id")
+  type      String
+  title     String
+  content   String
+  readAt    DateTime? @map("read_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  agent Agent @relation(fields: [agentId], references: [id])
+
+  @@index([agentId, readAt, createdAt])
+  @@map("agent_notifications")
 }
 
 model OrderItem {

@@ -17,6 +17,8 @@
 - [后台、后端与数据库计划](docs/07-admin-backend-database-plan.md)
 - [状态机与权限](docs/08-state-machines-and-permissions.md)
 - [API、测试与发布计划](docs/09-api-testing-release-plan.md)
+- [V2 支付开通与对接流程](docs/10-v2-payment-onboarding.md)
+- [V2 非支付经营增强交付说明](docs/11-v2-non-payment-release.md)
 
 ## 第一版核心闭环
 
@@ -41,6 +43,8 @@
 - `apps/api`：Fastify API 骨架，含店铺/商品、订单创建、mock 支付/退款回调、履约、退款拆账、结算、保证金、风控、审计和权限检查示例。
 - `apps/admin`：平台后台/运营财务工作台骨架。
 - `apps/miniprogram`：微信小程序用户端、商品、订单、代理中心页面结构。
+
+V2 已在本地能力层加入经营增强：店铺装修、代理经营看板、批量选品、权益码池、模拟自动履约、消息通知、风险看板和支付开通指引。真实支付仍需等待微信支付商户号、证书和回调域名开通后接入。
 
 ## 本地命令
 

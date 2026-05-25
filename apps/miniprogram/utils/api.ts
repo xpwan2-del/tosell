@@ -106,10 +106,21 @@ export const api = {
     body: { orderNo, reasonCode, requestedRefundCents, description }
   }),
   agentShop: () => request<Record<string, unknown>>("/api/agent/shop", { mode: "agent" }),
+  agentDashboard: () => request<Record<string, unknown>>("/api/agent/dashboard", { mode: "agent" }),
   saveAgentShop: (name: string, announcement: string, customerServiceWechat?: string) => request<Record<string, unknown>>("/api/agent/shop", {
     method: "PATCH",
     mode: "agent",
     body: { name, announcement, customerServiceWechat }
+  }),
+  saveShopDecor: (themeColor: string, shareTitle: string, bannerUrl: string) => request<Record<string, unknown>>("/api/agent/shop/decor", {
+    method: "PATCH",
+    mode: "agent",
+    body: {
+      themeColor,
+      shareTitle,
+      bannerUrl,
+      productGroups: [{ name: "推荐权益", agentProductIds: ["ap-1", "ap-code"] }]
+    }
   }),
   submitApplication: (contactPhone = "13800000000", customerServiceWechat = "agent_a_service") => request<Record<string, unknown>>("/api/agent/applications", {
     method: "POST",
@@ -118,6 +129,16 @@ export const api = {
   }),
   platformProducts: () => request<Array<Record<string, unknown>>>("/api/agent/products/platform", { mode: "agent" }),
   agentProducts: () => request<Array<Record<string, unknown>>>("/api/agent/products", { mode: "agent" }),
+  batchSelectPlatformProducts: () => request<Record<string, unknown>>("/api/agent/products/platform/batch", {
+    method: "POST",
+    mode: "agent",
+    body: {
+      items: [
+        { platformProductId: "prod-1", salePriceCents: "15000" },
+        { platformProductId: "prod-code", salePriceCents: "4900" }
+      ]
+    }
+  }),
   selectPlatformProduct: (platformProductId: string, salePriceCents: string) => request<Record<string, unknown>>("/api/agent/products/platform", {
     method: "POST",
     mode: "agent",
@@ -135,5 +156,6 @@ export const api = {
   }),
   agentOrders: () => request<Array<Record<string, unknown>>>("/api/agent/orders", { mode: "agent" }),
   settlements: () => request<Array<Record<string, unknown>>>("/api/agent/settlements", { mode: "agent" }),
-  clawbacks: () => request<Array<Record<string, unknown>>>("/api/agent/clawbacks", { mode: "agent" })
+  clawbacks: () => request<Array<Record<string, unknown>>>("/api/agent/clawbacks", { mode: "agent" }),
+  notifications: () => request<Array<Record<string, unknown>>>("/api/agent/notifications", { mode: "agent" })
 };

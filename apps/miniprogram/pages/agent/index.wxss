@@ -19,6 +19,14 @@
   border-top: 1rpx solid #e8edf0;
   padding-top: 14rpx;
 }
+.stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12rpx;
+  background: #f4f8fa;
+  border-radius: 8rpx;
+  padding: 16rpx;
+}
 .actions,
 .price-row {
   display: flex;

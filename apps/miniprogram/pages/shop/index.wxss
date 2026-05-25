@@ -8,6 +8,9 @@
   padding: 24rpx;
   margin-bottom: 20rpx;
 }
+.shop-head {
+  border-top: 8rpx solid #1677ff;
+}
 .shop-name,
 .title {
   display: block;

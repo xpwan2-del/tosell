@@ -29,7 +29,7 @@ export function buildApp() {
 
   app.get("/api/user/shops/:shopId", async (request) => {
     const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
-    return services.getShop(shopId);
+    return services.getPublicShop(shopId);
   });
 
   app.get("/api/user/shops/:shopId/products", async (request) => {
@@ -102,6 +102,8 @@ export function buildApp() {
 
   app.get("/api/agent/shop", async (request) => services.getAgentShop(getAgentActor(request)));
 
+  app.get("/api/agent/dashboard", async (request) => serializeBigInt(services.agentDashboard(getAgentActor(request))));
+
   app.patch("/api/agent/shop", async (request) => {
     const body = z.object({
       name: z.string().optional(),
@@ -111,7 +113,20 @@ export function buildApp() {
     return services.updateAgentShop(getAgentActor(request), body);
   });
 
-  app.get("/api/agent/products/platform", async () => serializeBigInt(services.listPlatformProducts()));
+  app.patch("/api/agent/shop/decor", async (request) => {
+    const body = z.object({
+      themeColor: z.string().optional(),
+      bannerUrl: z.string().optional(),
+      shareTitle: z.string().optional(),
+      productGroups: z.array(z.object({
+        name: z.string(),
+        agentProductIds: z.array(z.string())
+      })).optional()
+    }).parse(request.body);
+    return serializeBigInt(services.updateShopDecor(getAgentActor(request), body));
+  });
+
+  app.get("/api/agent/products/platform", async (request) => serializeBigInt(services.listPlatformProducts(getAgentActor(request))));
   app.get("/api/agent/products", async (request) => serializeBigInt(services.listAgentProducts(getAgentActor(request))));
   app.get("/api/agent/products/own", async (request) => serializeBigInt(services.listOwnProductReviews(getAgentActor(request))));
 
@@ -133,6 +148,13 @@ export function buildApp() {
     return serializeBigInt(services.selectPlatformProduct(getAgentActor(request), body));
   });
 
+  app.post("/api/agent/products/platform/batch", async (request) => {
+    const body = z.object({
+      items: z.array(z.object({ platformProductId: z.string(), salePriceCents: bigintString }))
+    }).parse(request.body);
+    return serializeBigInt(services.batchSelectPlatformProducts(getAgentActor(request), body));
+  });
+
   app.patch("/api/agent/products/:agentProductId/price", async (request) => {
     const { agentProductId } = z.object({ agentProductId: z.string() }).parse(request.params);
     const body = z.object({ salePriceCents: bigintString }).parse(request.body);
@@ -143,6 +165,12 @@ export function buildApp() {
   app.get("/api/agent/settlements", async (request) => serializeBigInt(services.listAgentSettlements(getAgentActor(request))));
   app.get("/api/agent/clawbacks", async (request) => serializeBigInt(services.listAgentClawbacks(getAgentActor(request))));
   app.get("/api/agent/deposit-transactions", async (request) => serializeBigInt(services.listAgentDepositTransactions(getAgentActor(request))));
+  app.get("/api/agent/notifications", async (request) => serializeBigInt(services.listNotifications(getAgentActor(request))));
+
+  app.post("/api/agent/notifications/:notificationId/read", async (request) => {
+    const { notificationId } = z.object({ notificationId: z.string() }).parse(request.params);
+    return serializeBigInt(services.markNotificationRead(getAgentActor(request), notificationId));
+  });
 
   app.post("/api/agent/scope-check", async (request) => {
     const body = z.object({ resourceAgentId: z.string(), resourceShopId: z.string().optional() }).parse(request.body);
@@ -184,6 +212,20 @@ export function buildApp() {
       suggestedSalePriceCents: bigintString
     }).parse(request.body);
     return serializeBigInt(services.createPlatformProduct(getAdminActor(request), body));
+  });
+
+  app.get("/api/admin/rights-codes", async (request) => {
+    const query = z.object({ productId: z.string().optional() }).parse(request.query);
+    return serializeBigInt(services.listRightsCodes(getAdminActor(request), query.productId));
+  });
+
+  app.post("/api/admin/rights-codes/import", async (request) => {
+    const body = z.object({
+      productId: z.string(),
+      codes: z.array(z.string()),
+      batchNo: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.addRightsCodes(getAdminActor(request), body));
   });
 
   app.post("/api/admin/agent-products/reviews/:ownProductId/review", async (request) => {
@@ -276,6 +318,11 @@ export function buildApp() {
   });
 
   app.get("/api/admin/audit-logs", async (request) => serializeBigInt(services.listAuditLogs(getAdminActor(request))));
+  app.get("/api/admin/risk-dashboard", async (request) => serializeBigInt(services.adminRiskDashboard(getAdminActor(request))));
+  app.get("/api/admin/payment-onboarding-guide", async (request) => {
+    getAdminActor(request);
+    return services.paymentOnboardingGuide();
+  });
 
   app.post("/api/callbacks/payments/mock", async (request) => {
     const body = z.object({ channel: z.string().default("mock"), channelTradeNo: z.string(), orderNo: z.string(), amountCents: bigintString }).parse(request.body);

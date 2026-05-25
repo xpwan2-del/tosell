@@ -1,6 +1,7 @@
 <view class="page">
-  <view class="shop-head">
+  <view class="shop-head" style="{{shop.themeStyle}}">
     <text class="shop-name">{{shop.name}}</text>
+    <text class="shop-desc">{{shop.shareTitle}}</text>
     <text class="shop-desc">{{shop.announcement || '本店虚拟权益购买后按商品规则发放'}}</text>
     <text class="status">店铺状态：{{shop.status}}</text>
     <view class="actions">

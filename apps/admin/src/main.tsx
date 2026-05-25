@@ -14,7 +14,12 @@ type LoadState = {
   settlements: JsonRecord[];
   clawbacks: JsonRecord[];
   auditLogs: JsonRecord[];
+  rightsCodes: JsonRecord[];
+  notifications: JsonRecord[];
   reconciliation?: JsonRecord;
+  agentDashboard?: JsonRecord;
+  riskDashboard?: JsonRecord;
+  paymentGuide?: JsonRecord;
 };
 
 const initialState: LoadState = {
@@ -26,7 +31,9 @@ const initialState: LoadState = {
   adminOrders: [],
   settlements: [],
   clawbacks: [],
-  auditLogs: []
+  auditLogs: [],
+  rightsCodes: [],
+  notifications: []
 };
 
 const adminNav = [
@@ -41,7 +48,10 @@ const adminNav = [
   "售后退款",
   "结算管理",
   "风控冻结",
-  "审计日志"
+  "审计日志",
+  "V2经营看板",
+  "权益码池",
+  "支付开通"
 ];
 
 const agentNav = [
@@ -49,7 +59,9 @@ const agentNav = [
   "选品与定价",
   "订单收益",
   "结算记录",
-  "追扣记录"
+  "追扣记录",
+  "店铺装修",
+  "消息通知"
 ];
 
 function App() {
@@ -86,7 +98,12 @@ function App() {
         clawbacks,
         adminOrders,
         auditLogs,
-        reconciliation
+        reconciliation,
+        rightsCodes,
+        notifications,
+        agentDashboard,
+        riskDashboard,
+        paymentGuide
       ] = await Promise.all([
         api.shop(),
         api.shopProducts(),
@@ -98,9 +115,31 @@ function App() {
         api.agentClawbacks(),
         api.adminOrders(),
         api.auditLogs(),
-        api.reconciliationSummary()
+        api.reconciliationSummary(),
+        api.rightsCodes(),
+        api.notifications(),
+        api.agentDashboard(),
+        api.riskDashboard(),
+        api.paymentGuide()
       ]);
-      setData({ shop, publicProducts, agentProducts, platformProducts, ownProducts, agentOrders, settlements, clawbacks, adminOrders, auditLogs, reconciliation });
+      setData({
+        shop,
+        publicProducts,
+        agentProducts,
+        platformProducts,
+        ownProducts,
+        agentOrders,
+        settlements,
+        clawbacks,
+        adminOrders,
+        auditLogs,
+        reconciliation,
+        rightsCodes,
+        notifications,
+        agentDashboard,
+        riskDashboard,
+        paymentGuide
+      });
       setCurrentOrder((order: JsonRecord | undefined) => order ?? adminOrders[0] ?? agentOrders[0]);
       setMessage(status);
     } catch (error) {
@@ -138,9 +177,11 @@ function App() {
       { label: "GMV", value: cents(reconciliation.totalPaidCents) },
       { label: "退款金额", value: cents(reconciliation.totalRefundedCents) },
       { label: "服务费", value: cents(reconciliation.totalServiceFeeCents) },
-      { label: "保证金余额", value: cents(reconciliation.depositAvailableCents) }
+      { label: "保证金余额", value: cents(reconciliation.depositAvailableCents) },
+      { label: "活跃商品", value: text(data.agentDashboard?.activeProductCount, "0") },
+      { label: "未读消息", value: text(data.agentDashboard?.noticeCount, "0") }
     ];
-  }, [data.reconciliation]);
+  }, [data.reconciliation, data.agentDashboard]);
 
   return (
     <main className="shell">
@@ -277,6 +318,30 @@ function App() {
             <KeyValue label="审计记录数" value={String(data.auditLogs.length)} />
             <Table rows={data.auditLogs.slice(-5)} columns={["action", "targetType", "targetId", "actor"]} />
           </Panel>
+
+          <Panel title="V2经营看板" owner="运营/代理" id="V2经营看板">
+            <KeyValue label="成交订单" value={text(data.agentDashboard?.paidOrderCount, "0")} />
+            <KeyValue label="预估收益" value={cents(data.agentDashboard?.expectedIncomeCents)} />
+            <KeyValue label="退款率" value={`${(Number(data.agentDashboard?.refundRateBps ?? 0) / 100).toFixed(2)}%`} />
+            <KeyValue label="低保证金代理" value={String((data.riskDashboard?.lowDepositAgents as unknown[] | undefined)?.length ?? 0)} />
+            <KeyValue label="低库存商品" value={String((data.riskDashboard?.lowStockProducts as unknown[] | undefined)?.length ?? 0)} />
+          </Panel>
+
+          <Panel title="权益码池" owner="运营" id="权益码池">
+            <KeyValue label="权益码总数" value={String(data.rightsCodes.length)} />
+            <KeyValue label="可用权益码" value={String(data.rightsCodes.filter((item) => text(item.status) === "available").length)} />
+            <div className="actions">
+              <button onClick={() => void runAction("导入权益码", api.importRightsCodes)}>导入测试权益码</button>
+              <button onClick={() => void runAction("批量选品", api.batchSelectProducts)}>批量上架示例商品</button>
+            </div>
+            <Table rows={data.rightsCodes.slice(0, 6)} columns={["codeId", "productId", "batchNo", "status", "orderNo"]} />
+          </Panel>
+
+          <Panel title="支付开通" owner="技术/财务" id="支付开通">
+            <KeyValue label="当前状态" value={text(data.paymentGuide?.status, "not_configured")} />
+            <KeyValue label="生产规则" value={text(data.paymentGuide?.productionRule)} />
+            <Table rows={arrayRows(data.paymentGuide?.envVars, "envVar")} columns={["envVar"]} />
+          </Panel>
         </section>
 
         <section className="section">
@@ -303,6 +368,17 @@ function App() {
 
             <Panel title="追扣记录" owner="代理" id="追扣记录">
               <Table rows={data.clawbacks} columns={["clawbackNo", "orderNo", "status", "remainingAmountCents"]} moneyColumns={["remainingAmountCents"]} />
+            </Panel>
+
+            <Panel title="店铺装修" owner="代理" id="店铺装修">
+              <KeyValue label="主题色" value={text(data.shop?.themeColor)} />
+              <KeyValue label="分享标题" value={text(data.shop?.shareTitle)} />
+              <button onClick={() => void runAction("店铺装修保存", api.saveShopDecor)}>保存 V2 装修示例</button>
+            </Panel>
+
+            <Panel title="消息通知" owner="代理" id="消息通知">
+              <KeyValue label="消息数" value={String(data.notifications.length)} />
+              <Table rows={data.notifications.slice(0, 5)} columns={["title", "type", "readAt"]} />
             </Panel>
           </div>
         </section>
@@ -390,6 +466,10 @@ function orderIncomeRows(rows: JsonRecord[]): JsonRecord[] {
       settlementStatus: row.settlementStatus
     };
   });
+}
+
+function arrayRows(value: unknown, key: string): JsonRecord[] {
+  return Array.isArray(value) ? value.map((item) => ({ [key]: item })) : [];
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

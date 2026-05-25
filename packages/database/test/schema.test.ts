@@ -14,6 +14,10 @@ const constraintsMigrationSql = readFileSync(
   resolve(testDir, "../prisma/migrations/000002_constraints/migration.sql"),
   "utf8"
 );
+const v2MigrationSql = readFileSync(
+  resolve(testDir, "../prisma/migrations/000003_v2_operations/migration.sql"),
+  "utf8"
+);
 
 function modelBlock(modelName: string) {
   const match = schema.match(new RegExp(`model\\s+${modelName}\\s+\\{([\\s\\S]*?)\\n\\}`));
@@ -84,7 +88,10 @@ describe("Prisma database contract", () => {
       "Role",
       "Permission",
       "AdminUserRole",
-      "RolePermission"
+      "RolePermission",
+      "ShopProductGroup",
+      "RightsCode",
+      "AgentNotification"
     ];
 
     for (const model of requiredModels) {
@@ -187,5 +194,18 @@ describe("Prisma database contract", () => {
       expect(constraintsMigrationSql).toContain(trigger);
     }
     expect(constraintsMigrationSql).toContain("refund total cannot exceed order paid amount");
+  });
+
+  it("adds V2 non-payment operations tables and constraints", () => {
+    expect(schema).toContain("enum RightsCodeStatus");
+    expect(modelBlock("Shop")).toContain("themeColor");
+    expect(modelBlock("PlatformProduct")).toContain("tagsJson");
+    expect(modelBlock("RightsCode")).toMatch(/@@unique\(\[productId,\s*codeCiphertext\]\)/);
+    expect(modelBlock("RightsCode")).toMatch(/issueKey\s+String\?\s+@unique\s+@map\("issue_key"\)/);
+    expect(v2MigrationSql).toContain('CREATE TABLE "rights_codes"');
+    expect(v2MigrationSql).toContain('CREATE TABLE "shop_product_groups"');
+    expect(v2MigrationSql).toContain('CREATE TABLE "agent_notifications"');
+    expect(v2MigrationSql).toContain("shops_theme_color_check");
+    expect(v2MigrationSql).toContain("rights_codes_issue_key_key");
   });
 });

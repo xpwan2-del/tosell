@@ -708,4 +708,195 @@ describe("api", () => {
     expect(created.statusCode).toBe(400);
     expect(created.json().code).toBe("ORDER_CREATE_FAILED");
   });
+
+  it("runs V2 shop decor, batch listing, dashboard, notifications, and payment guide", async () => {
+    const app = buildApp();
+    const agentHeaders = { "x-agent-id": "agent-1", "x-shop-id": "shop-1" };
+
+    const decor = await app.inject({
+      method: "PATCH",
+      url: "/api/agent/shop/decor",
+      headers: agentHeaders,
+      payload: {
+        themeColor: "#00aa88",
+        bannerUrl: "https://example.test/banner.png",
+        shareTitle: "代理 A 精选权益",
+        productGroups: [{ name: "自动履约", agentProductIds: ["ap-code"] }]
+      }
+    });
+    expect(decor.statusCode).toBe(200);
+    expect(decor.json()).toMatchObject({ themeColor: "#00aa88", shareTitle: "代理 A 精选权益" });
+
+    const batch = await app.inject({
+      method: "POST",
+      url: "/api/agent/products/platform/batch",
+      headers: agentHeaders,
+      payload: {
+        items: [
+          { platformProductId: "prod-1", salePriceCents: "15000" },
+          { platformProductId: "prod-code", salePriceCents: "4900" }
+        ]
+      }
+    });
+    expect(batch.statusCode).toBe(200);
+    expect(batch.json().count).toBe(2);
+
+    const dashboard = await app.inject({
+      method: "GET",
+      url: "/api/agent/dashboard",
+      headers: agentHeaders
+    });
+    expect(dashboard.statusCode).toBe(200);
+    expect(dashboard.json()).toMatchObject({ activeProductCount: 2 });
+
+    const notifications = await app.inject({
+      method: "GET",
+      url: "/api/agent/notifications",
+      headers: agentHeaders
+    });
+    expect(notifications.statusCode).toBe(200);
+    expect(notifications.json().length).toBeGreaterThan(0);
+
+    const guide = await app.inject({
+      method: "GET",
+      url: "/api/admin/payment-onboarding-guide",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
+    expect(guide.statusCode).toBe(200);
+    expect(guide.json().envVars).toContain("WECHAT_MCH_ID");
+    expect(JSON.stringify(guide.json())).toContain("JSAPI 支付");
+  });
+
+  it("protects internal platform product pricing behind agent auth", async () => {
+    const app = buildApp();
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/agent/products/platform"
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json().message).toMatch(/x-agent-id/);
+  });
+
+  it("does not partially apply failed batch product selection", async () => {
+    const app = buildApp();
+    const before = await app.inject({
+      method: "GET",
+      url: "/api/agent/products",
+      headers: { "x-agent-id": "agent-2", "x-shop-id": "shop-2" }
+    });
+
+    const failed = await app.inject({
+      method: "POST",
+      url: "/api/agent/products/platform/batch",
+      headers: { "x-agent-id": "agent-2", "x-shop-id": "shop-2" },
+      payload: {
+        items: [
+          { platformProductId: "prod-code", salePriceCents: "4900" },
+          { platformProductId: "prod-1", salePriceCents: "11999" }
+        ]
+      }
+    });
+
+    const after = await app.inject({
+      method: "GET",
+      url: "/api/agent/products",
+      headers: { "x-agent-id": "agent-2", "x-shop-id": "shop-2" }
+    });
+
+    expect(failed.statusCode).toBe(400);
+    expect(failed.json().code).toBe("PRICE_RULE_FAILED");
+    expect(after.json()).toEqual(before.json());
+  });
+
+  it("imports rights codes and auto-fulfills code-pool orders after mock payment", async () => {
+    const app = buildApp();
+    const imported = await app.inject({
+      method: "POST",
+      url: "/api/admin/rights-codes/import",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: {
+        productId: "prod-code",
+        batchNo: "v2-test",
+        codes: ["V2-CODE-001", "V2-CODE-002"]
+      }
+    });
+    expect(imported.statusCode).toBe(200);
+    expect(imported.json().count).toBe(2);
+
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-v2" },
+      payload: { shopId: "shop-1", agentProductId: "ap-code", clientPaidAmountCents: "4900" }
+    });
+    expect(order.statusCode).toBe(200);
+
+    const payment = await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: {
+        channel: "mock",
+        channelTradeNo: "trade-v2-code",
+        orderNo: order.json().orderNo,
+        amountCents: "4900"
+      }
+    });
+    expect(payment.statusCode).toBe(200);
+
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/user/orders/${order.json().orderNo}`,
+      headers: { "x-user-id": "user-v2" }
+    });
+    expect(detail.json()).toMatchObject({ status: "fulfilled", fulfillmentStatus: "success" });
+
+    const risk = await app.inject({
+      method: "GET",
+      url: "/api/admin/risk-dashboard",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
+    expect(risk.statusCode).toBe(200);
+    expect(risk.json()).toHaveProperty("lowStockProducts");
+  });
+
+  it("auto-fulfills one rights code per purchased quantity", async () => {
+    const app = buildApp();
+    await app.inject({
+      method: "POST",
+      url: "/api/admin/rights-codes/import",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: {
+        productId: "prod-code",
+        batchNo: "quantity-test",
+        codes: ["QTY-CODE-001", "QTY-CODE-002", "QTY-CODE-003"]
+      }
+    });
+
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-qty" },
+      payload: { shopId: "shop-1", agentProductId: "ap-code", quantity: 2, clientPaidAmountCents: "9800" }
+    });
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: {
+        channel: "mock",
+        channelTradeNo: "trade-v2-qty",
+        orderNo: order.json().orderNo,
+        amountCents: "9800"
+      }
+    });
+
+    const codes = await app.inject({
+      method: "GET",
+      url: "/api/admin/rights-codes?productId=prod-code",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
+
+    const issuedForOrder = codes.json().filter((code: { orderNo?: string }) => code.orderNo === order.json().orderNo);
+    expect(issuedForOrder).toHaveLength(2);
+  });
 });

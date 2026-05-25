@@ -51,6 +51,22 @@ class BackendServices {
     return requireEntity(this.store.shops.get(shopId), "RESOURCE_NOT_FOUND", "shop not found");
   }
 
+  getPublicShop(shopId: string) {
+    const shop = this.getShop(shopId);
+    return {
+      id: shop.id,
+      agentId: shop.agentId,
+      name: shop.name,
+      status: shop.status,
+      announcement: shop.announcement,
+      customerServiceWechat: shop.customerServiceWechat,
+      themeColor: shop.themeColor,
+      bannerUrl: shop.bannerUrl,
+      shareTitle: shop.shareTitle,
+      productGroups: shop.productGroups ?? []
+    };
+  }
+
   listShopProducts(shopId: string) {
     this.getShop(shopId);
     return [...this.store.agentProducts.values()]
@@ -210,8 +226,56 @@ class BackendServices {
     return shop;
   }
 
-  listPlatformProducts() {
+  updateShopDecor(actor: AgentActor, input: {
+    themeColor?: string;
+    bannerUrl?: string;
+    shareTitle?: string;
+    productGroups?: Array<{ name: string; agentProductIds: string[] }>;
+  }) {
+    const shop = this.getAgentShop(actor);
+    if (input.themeColor && !/^#[0-9a-fA-F]{6}$/.test(input.themeColor)) {
+      throw new ApiError(400, "SHOP_DECOR_INVALID", "themeColor must be a hex color");
+    }
+    if (input.productGroups) {
+      for (const group of input.productGroups) {
+        for (const agentProductId of group.agentProductIds) {
+          const agentProduct = requireEntity(this.store.agentProducts.get(agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
+          assertAgentScope(actor, agentProduct);
+        }
+      }
+    }
+    Object.assign(shop, input);
+    this.notify(actor.agentId, "shop.decor.updated", "店铺装修已更新", "新的店铺主题、分享标题或商品分组已经保存。");
+    this.audit("agent", "shop.decor.update", "shop", shop.id, input);
+    return shop;
+  }
+
+  listPlatformProducts(actor?: AgentActor) {
+    if (actor) this.getAgentShop(actor);
     return [...this.store.platformProducts.values()];
+  }
+
+  agentDashboard(actor: AgentActor) {
+    const orders = this.listAgentOrders(actor);
+    const paidOrders = orders.filter((order) => order.paymentStatus === "paid");
+    const fulfilledOrders = orders.filter((order) => order.fulfillmentStatus === "success");
+    const refundedOrders = orders.filter((order) => order.refundStatus === "refunded");
+    const account = this.store.depositAccounts.get(actor.agentId);
+    return {
+      orderCount: orders.length,
+      paidOrderCount: paidOrders.length,
+      fulfilledOrderCount: fulfilledOrders.length,
+      refundOrderCount: refundedOrders.length,
+      gmvCents: sum(paidOrders.map((order) => order.snapshot.amountSnapshot.paidAmountCents)),
+      expectedIncomeCents: sum(paidOrders.map((order) => order.snapshot.amountSnapshot.agentExpectedIncomeCents)),
+      pendingIncomeCents: this.store.pendingIncomeByAgent.get(actor.agentId) ?? 0n,
+      payableIncomeCents: this.store.payableIncomeByAgent.get(actor.agentId) ?? 0n,
+      paidIncomeCents: this.store.paidIncomeByAgent.get(actor.agentId) ?? 0n,
+      refundRateBps: paidOrders.length === 0 ? 0 : Math.round((refundedOrders.length / paidOrders.length) * 10_000),
+      depositAvailableCents: account?.availableAmountCents ?? 0n,
+      activeProductCount: this.listAgentProducts(actor).filter((item) => item.status === "listed").length,
+      noticeCount: this.listNotifications(actor).filter((item) => !item.readAt).length
+    };
   }
 
   listAgentProducts(actor: AgentActor) {
@@ -325,6 +389,27 @@ class BackendServices {
     return agentProduct;
   }
 
+  batchSelectPlatformProducts(actor: AgentActor, input: { items: Array<{ platformProductId: string; salePriceCents: bigint }> }) {
+    if (input.items.length === 0) throw new ApiError(400, "BATCH_EMPTY", "items are required");
+    if (input.items.length > 50) throw new ApiError(400, "BATCH_TOO_LARGE", "batch size cannot exceed 50");
+    for (const item of input.items) {
+      const product = requireEntity(this.store.platformProducts.get(item.platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
+      try {
+        quotePlatformProduct({
+          salePriceCents: item.salePriceCents,
+          supplyPriceCents: product.supplyPriceCents,
+          minSalePriceCents: product.minSalePriceCents
+        });
+      } catch (error) {
+        throw new ApiError(400, "PRICE_RULE_FAILED", `${product.id}: ${getErrorMessage(error)}`);
+      }
+    }
+    const results = input.items.map((item) => this.selectPlatformProduct(actor, item));
+    this.notify(actor.agentId, "product.batch_listed", "批量选品已完成", `已处理 ${results.length} 个商品。`);
+    this.audit("agent", "agent_product.batch_select_platform", "agent_product", actor.shopId, { count: results.length });
+    return { count: results.length, items: results };
+  }
+
   reviewAgent(actor: AdminActor, agentId: string, input: { approved: boolean; reason?: string }) {
     assertAdminPermission(actor, "agent.review");
     const agent = requireEntity(this.store.agents.get(agentId), "RESOURCE_NOT_FOUND", "agent not found");
@@ -416,6 +501,35 @@ class BackendServices {
   listAdminOrders(actor: AdminActor) {
     assertAdminPermission(actor, "audit.read");
     return [...this.store.orders.values()];
+  }
+
+  listRightsCodes(actor: AdminActor, productId?: string) {
+    assertAdminPermission(actor, "product.manage");
+    return this.store.rightsCodes.filter((code) => !productId || code.productId === productId);
+  }
+
+  addRightsCodes(actor: AdminActor, input: { productId: string; codes: string[]; batchNo?: string }) {
+    assertAdminPermission(actor, "product.manage");
+    const product = requireEntity(this.store.platformProducts.get(input.productId), "RESOURCE_NOT_FOUND", "platform product not found");
+    const uniqueCodes = [...new Set(input.codes.map((code) => code.trim()).filter(Boolean))];
+    if (uniqueCodes.length === 0) throw new ApiError(400, "RIGHTS_CODE_EMPTY", "codes are required");
+    const created: RightsCode[] = [];
+    for (const code of uniqueCodes) {
+      if (this.store.rightsCodes.some((item) => item.productId === product.id && item.code === code)) continue;
+      const item: RightsCode = {
+        codeId: nextId(this.store, "code"),
+        productId: product.id,
+        code,
+        batchNo: input.batchNo ?? "manual",
+        status: "available",
+        createdAt: new Date()
+      };
+      this.store.rightsCodes.push(item);
+      created.push(item);
+    }
+    product.fulfillmentRule = { ...(isRecord(product.fulfillmentRule) ? product.fulfillmentRule : {}), mode: "code_pool" };
+    this.audit(actor.role, "rights_code.import", "platform_product", product.id, { count: created.length });
+    return { count: created.length, product, codes: created };
   }
 
   fulfillOrder(actor: AdminActor, orderNo: string, input: { status: "success" | "failed"; attemptNo: number; evidence?: string; failReason?: string }) {
@@ -510,6 +624,7 @@ class BackendServices {
           order.fulfillmentStatus = "processing";
           order.paidAt = new Date();
           this.store.pendingIncomeByAgent.set(order.agentId, (this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n) + order.snapshot.amountSnapshot.agentExpectedIncomeCents);
+          this.tryAutoFulfillWithRightsCode(order);
         }
       });
       this.audit("system", "payment.callback", "order", order.orderNo, result);
@@ -700,6 +815,81 @@ class BackendServices {
     };
   }
 
+  adminRiskDashboard(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    const orders = [...this.store.orders.values()];
+    const paidOrders = orders.filter((order) => order.paymentStatus === "paid");
+    const refundOrders = orders.filter((order) => order.refundStatus === "refunded" || order.refundStatus === "refunding");
+    const lowDepositAgents = [...this.store.depositAccounts.values()]
+      .filter((account) => account.availableAmountCents < account.requiredAmountCents / 5n)
+      .map((account) => ({ agentId: account.agentId, availableAmountCents: account.availableAmountCents, requiredAmountCents: account.requiredAmountCents }));
+    const lowStockProducts = this.listPlatformProducts()
+      .map((product) => ({
+        productId: product.id,
+        name: product.name,
+        availableCodeCount: this.store.rightsCodes.filter((code) => code.productId === product.id && code.status === "available").length
+      }))
+      .filter((item) => item.availableCodeCount > 0 && item.availableCodeCount < 5);
+    return {
+      paidOrderCount: paidOrders.length,
+      refundOrderCount: refundOrders.length,
+      refundRateBps: paidOrders.length === 0 ? 0 : Math.round((refundOrders.length / paidOrders.length) * 10_000),
+      activeRiskFreezeCount: this.store.riskFreezes.filter((freeze) => freeze.status === "active").length,
+      lowDepositAgents,
+      lowStockProducts,
+      pendingAfterSaleCount: [...this.store.afterSales.values()].filter((item) => item.status === "pending").length
+    };
+  }
+
+  listNotifications(actor: AgentActor) {
+    return this.store.notifications.filter((item) => item.agentId === actor.agentId);
+  }
+
+  markNotificationRead(actor: AgentActor, notificationId: string) {
+    const notification = requireEntity(
+      this.store.notifications.find((item) => item.id === notificationId && item.agentId === actor.agentId),
+      "RESOURCE_NOT_FOUND",
+      "notification not found"
+    );
+    notification.readAt = notification.readAt ?? new Date();
+    return notification;
+  }
+
+  paymentOnboardingGuide() {
+    return {
+      status: "not_configured",
+      reason: "微信支付商户号尚未开通，当前仅保留 mock 支付用于本地业务闭环。",
+      requiredAccounts: [
+        "已认证微信小程序 AppID",
+        "微信支付商户号 MCH_ID",
+        "商户 API v3 密钥",
+        "商户 API 证书/私钥",
+        "微信支付平台证书或公钥",
+        "支付回调域名与退款回调域名"
+      ],
+      setupSteps: [
+        "在微信公众平台完成小程序主体认证。",
+        "在微信支付商户平台申请并绑定小程序 AppID。",
+        "开通 JSAPI 支付，配置结算银行账户。",
+        "生成 API 证书，设置 API v3 密钥，保存证书序列号。",
+        "配置支付通知 URL 和退款通知 URL，域名必须 HTTPS 且可公网访问。",
+        "把 AppID、MCH_ID、API v3 密钥、证书路径、证书序列号写入服务端环境变量。",
+        "上线前用真实 1 分钱订单完成支付、退款、回调、对账验证。"
+      ],
+      envVars: [
+        "WECHAT_APP_ID",
+        "WECHAT_MCH_ID",
+        "WECHAT_PAY_API_KEY",
+        "WECHAT_PAY_CERT_SERIAL_NO",
+        "WECHAT_PAY_PRIVATE_KEY_PATH",
+        "WECHAT_PAY_PLATFORM_CERT_PATH",
+        "WECHAT_PAY_NOTIFY_URL",
+        "WECHAT_REFUND_NOTIFY_URL"
+      ],
+      productionRule: "生产环境必须关闭 MOCK_PAYMENT_ENABLED，并拒绝未验签的支付/退款回调。"
+    };
+  }
+
   private buildSnapshot(input: { orderNo: string; userId: string; shopId: string; agentProductId: string; quantity?: number; entrySource?: string }) {
     const shop = requireEntity(this.store.shops.get(input.shopId), "RESOURCE_NOT_FOUND", "shop not found");
     const agent = requireEntity(this.store.agents.get(shop.agentId), "RESOURCE_NOT_FOUND", "agent not found");
@@ -739,6 +929,7 @@ class BackendServices {
       productType: agentProduct.productType,
       salePriceCents: agentProduct.salePriceCents,
       status: agentProduct.status,
+      groupName: agentProduct.groupName,
       product: product ? {
         id: product.id,
         name: product.name,
@@ -814,6 +1005,41 @@ class BackendServices {
     return clawback;
   }
 
+  private tryAutoFulfillWithRightsCode(order: DemoOrder) {
+    const agentProduct = this.store.agentProducts.get(order.agentProductId);
+    const product = agentProduct?.platformProductId ? this.store.platformProducts.get(agentProduct.platformProductId) : undefined;
+    const rule = product?.fulfillmentRule;
+    if (!isRecord(rule) || rule.mode !== "code_pool" || !product) return;
+    const quantity = order.snapshot.quantity;
+    const codes = this.store.rightsCodes
+      .filter((item) => item.productId === product.id && item.status === "available")
+      .slice(0, quantity);
+    if (codes.length < quantity) {
+      order.fulfillmentStatus = "failed";
+      order.status = "fulfillment_failed";
+      order.settlementStatus = "frozen";
+      this.notify(order.agentId, "stock.empty", "权益码库存不足", `${product.name} 库存不足，订单 ${order.orderNo} 已冻结结算。`);
+      return;
+    }
+    for (const [index, code] of codes.entries()) {
+      code.status = "issued";
+      code.orderNo = order.orderNo;
+      code.issueKey = `${order.orderNo}:${index + 1}`;
+      code.issuedAt = new Date();
+    }
+    order.fulfillmentStatus = "success";
+    order.status = "fulfilled";
+    order.fulfilledAt = new Date();
+    this.store.fulfillmentRecords.set(order.orderNo, {
+      fulfillmentId: `fulfillment-${order.orderNo}`,
+      orderItemId: `${order.orderNo}-item-1`,
+      status: "success",
+      attemptCount: 1
+    });
+    this.notify(order.agentId, "order.auto_fulfilled", "订单已自动履约", `${order.orderNo} 已从权益码池自动发放。`);
+    this.audit("system", "fulfillment.auto_code_pool", "order", order.orderNo, { codeIds: codes.map((code) => code.codeId) });
+  }
+
   private applyPayableClawbackToOpenSettlement(order: DemoOrder, deductions: Array<{ from: string; amountCents: bigint }>) {
     let payableDeductionCents = deductions
       .filter((deduction) => deduction.from === "payable_income")
@@ -855,6 +1081,24 @@ class BackendServices {
       createdAt: new Date()
     });
   }
+
+  private notify(agentId: string, type: string, title: string, content: string) {
+    const notification: NotificationItem = {
+      id: nextId(this.store, "notice"),
+      agentId,
+      type,
+      title,
+      content,
+      createdAt: new Date(),
+      readAt: null
+    };
+    this.store.notifications.push(notification);
+    return notification;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function createMemoryStore(): MemoryStore {
@@ -879,6 +1123,8 @@ function createMemoryStore(): MemoryStore {
     riskFreezes: [],
     activeRiskFreezeKeys: new Set(),
     auditLogs: [],
+    rightsCodes: [],
+    notifications: [],
     pendingIncomeByAgent: new Map(),
     payableIncomeByAgent: new Map(),
     paidIncomeByAgent: new Map()
@@ -887,12 +1133,30 @@ function createMemoryStore(): MemoryStore {
   store.agents.set("agent-1", { id: "agent-1", userId: "agent-user-1", name: "测试代理 A", status: "active", riskStatus: "normal", depositStatus: "paid", contactPhone: "13800000000" });
   store.agents.set("agent-2", { id: "agent-2", userId: "agent-user-2", name: "测试代理 B", status: "active", riskStatus: "normal", depositStatus: "paid", contactPhone: "13900000000" });
   store.agents.set("agent-new", { id: "agent-new", userId: "agent-user-new", name: "新代理", status: "draft", riskStatus: "normal", depositStatus: "pending_payment" });
-  store.shops.set("shop-1", { id: "shop-1", agentId: "agent-1", name: "测试代理 A 小店", status: "open", riskStatus: "normal", customerServiceWechat: "agent_a_service" });
+  store.shops.set("shop-1", {
+    id: "shop-1",
+    agentId: "agent-1",
+    name: "测试代理 A 小店",
+    status: "open",
+    riskStatus: "normal",
+    customerServiceWechat: "agent_a_service",
+    themeColor: "#1677ff",
+    bannerUrl: "https://example.test/banner-a.png",
+    shareTitle: "测试代理 A 小店",
+    productGroups: [{ name: "推荐权益", agentProductIds: ["ap-1"] }]
+  });
   store.shops.set("shop-2", { id: "shop-2", agentId: "agent-2", name: "测试代理 B 小店", status: "open", riskStatus: "normal", customerServiceWechat: "agent_b_service" });
   store.shops.set("shop-new", { id: "shop-new", agentId: "agent-new", name: "新代理小店", status: "not_opened", riskStatus: "normal" });
-  store.platformProducts.set("prod-1", { id: "prod-1", name: "测试虚拟权益", supplyPriceCents: 10_000n, minSalePriceCents: 12_000n, suggestedSalePriceCents: 15_000n, fulfillmentRule: { mode: "manual" }, afterSaleRule: { refundBeforeFulfillment: true }, status: "active" });
+  store.platformProducts.set("prod-1", { id: "prod-1", name: "测试虚拟权益", category: "会员权益", tags: ["热卖"], supplyPriceCents: 10_000n, minSalePriceCents: 12_000n, suggestedSalePriceCents: 15_000n, fulfillmentRule: { mode: "manual" }, afterSaleRule: { refundBeforeFulfillment: true }, status: "active" });
+  store.platformProducts.set("prod-code", { id: "prod-code", name: "自动发码权益", category: "权益码", tags: ["自动履约"], supplyPriceCents: 2_000n, minSalePriceCents: 3_000n, suggestedSalePriceCents: 4_900n, fulfillmentRule: { mode: "code_pool" }, afterSaleRule: { refundBeforeFulfillment: true }, status: "active" });
   store.agentProducts.set("ap-1", { id: "ap-1", agentId: "agent-1", shopId: "shop-1", productType: "platform", platformProductId: "prod-1", ownProductReviewId: null, salePriceCents: 15_000n, status: "listed" });
+  store.agentProducts.set("ap-code", { id: "ap-code", agentId: "agent-1", shopId: "shop-1", productType: "platform", platformProductId: "prod-code", ownProductReviewId: null, salePriceCents: 4_900n, status: "listed", groupName: "自动履约" });
   store.agentProducts.set("ap-2", { id: "ap-2", agentId: "agent-2", shopId: "shop-2", productType: "platform", platformProductId: "prod-1", ownProductReviewId: null, salePriceCents: 16_000n, status: "listed" });
+  store.rightsCodes.push(
+    { codeId: "code-1", productId: "prod-code", code: "RIGHT-CODE-001", batchNo: "seed", status: "available", createdAt: new Date() },
+    { codeId: "code-2", productId: "prod-code", code: "RIGHT-CODE-002", batchNo: "seed", status: "available", createdAt: new Date() }
+  );
+  store.notifications.push({ id: "notice-1", agentId: "agent-1", type: "system", title: "V2 经营工具已开启", content: "可以使用店铺装修、批量选品、权益码自动履约和经营看板。", createdAt: new Date(), readAt: null });
   store.depositAccounts.set("agent-1", { agentId: "agent-1", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
   store.depositAccounts.set("agent-2", { agentId: "agent-2", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
   store.depositAccounts.set("agent-new", { agentId: "agent-new", requiredAmountCents: 50_000n, availableAmountCents: 0n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "pending_payment" });
@@ -961,11 +1225,17 @@ type DemoShop = {
   riskStatus: string;
   announcement?: string;
   customerServiceWechat?: string;
+  themeColor?: string;
+  bannerUrl?: string;
+  shareTitle?: string;
+  productGroups?: Array<{ name: string; agentProductIds: string[] }>;
 };
 
 type DemoPlatformProduct = {
   id: string;
   name: string;
+  category?: string;
+  tags?: string[];
   supplyPriceCents: bigint;
   minSalePriceCents: bigint;
   suggestedSalePriceCents: bigint;
@@ -996,6 +1266,7 @@ type DemoAgentProduct = {
   ownProductReviewId?: string | null;
   salePriceCents: bigint;
   status: string;
+  groupName?: string;
 };
 
 type DemoOrder = {
@@ -1066,6 +1337,28 @@ type SettlementSheet = {
   totalAgentIncomeCents: bigint;
 };
 
+type RightsCode = {
+  codeId: string;
+  productId: string;
+  code: string;
+  batchNo: string;
+  status: "available" | "issued" | "voided";
+  orderNo?: string;
+  issueKey?: string;
+  createdAt: Date;
+  issuedAt?: Date;
+};
+
+type NotificationItem = {
+  id: string;
+  agentId: string;
+  type: string;
+  title: string;
+  content: string;
+  createdAt: Date;
+  readAt: Date | null;
+};
+
 type MemoryStore = {
   sequence: number;
   agentApplications: Map<string, AgentApplication>;
@@ -1087,6 +1380,8 @@ type MemoryStore = {
   riskFreezes: Array<Record<string, unknown>>;
   activeRiskFreezeKeys: Set<string>;
   auditLogs: Array<Record<string, unknown>>;
+  rightsCodes: RightsCode[];
+  notifications: NotificationItem[];
   pendingIncomeByAgent: Map<string, bigint>;
   payableIncomeByAgent: Map<string, bigint>;
   paidIncomeByAgent: Map<string, bigint>;

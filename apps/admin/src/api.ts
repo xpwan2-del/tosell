@@ -50,6 +50,15 @@ export const api = {
   reconciliationSummary: () => request<JsonRecord>("/api/exports/reconciliation-summary", {
     headers: adminHeaders("finance")
   }),
+  agentDashboard: () => request<JsonRecord>("/api/agent/dashboard", {
+    headers: agentHeaders
+  }),
+  riskDashboard: () => request<JsonRecord>("/api/admin/risk-dashboard", {
+    headers: adminHeaders("operator")
+  }),
+  paymentGuide: () => request<JsonRecord>("/api/admin/payment-onboarding-guide", {
+    headers: adminHeaders("operator")
+  }),
   adminOrders: () => request<JsonRecord[]>("/api/admin/orders", {
     headers: adminHeaders("operator")
   }),
@@ -194,6 +203,16 @@ export const api = {
   agentShop: () => request<JsonRecord>("/api/agent/shop", {
     headers: agentHeaders
   }),
+  saveShopDecor: () => request<JsonRecord>("/api/agent/shop/decor", {
+    method: "PATCH",
+    headers: agentHeaders,
+    body: {
+      themeColor: "#00aa88",
+      bannerUrl: "https://example.test/banner.png",
+      shareTitle: "代理 A 精选权益",
+      productGroups: [{ name: "自动履约", agentProductIds: ["ap-code"] }]
+    }
+  }),
   saveAgentShop: (name: string, announcement: string) => request<JsonRecord>("/api/agent/shop", {
     method: "PATCH",
     headers: agentHeaders,
@@ -205,6 +224,31 @@ export const api = {
     body: { contactPhone: "13800000000", customerServiceWechat: "agent_a_service" }
   }),
   platformProducts: () => request<JsonRecord[]>("/api/agent/products/platform", {
+    headers: agentHeaders
+  }),
+  batchSelectProducts: () => request<JsonRecord>("/api/agent/products/platform/batch", {
+    method: "POST",
+    headers: agentHeaders,
+    body: {
+      items: [
+        { platformProductId: "prod-1", salePriceCents: "15000" },
+        { platformProductId: "prod-code", salePriceCents: "4900" }
+      ]
+    }
+  }),
+  rightsCodes: () => request<JsonRecord[]>("/api/admin/rights-codes", {
+    headers: adminHeaders("operator")
+  }),
+  importRightsCodes: () => request<JsonRecord>("/api/admin/rights-codes/import", {
+    method: "POST",
+    headers: adminHeaders("operator"),
+    body: {
+      productId: "prod-code",
+      batchNo: `ui-${Date.now()}`,
+      codes: [`UI-CODE-${Date.now()}-1`, `UI-CODE-${Date.now()}-2`]
+    }
+  }),
+  notifications: () => request<JsonRecord[]>("/api/agent/notifications", {
     headers: agentHeaders
   }),
   agentProducts: () => request<JsonRecord[]>("/api/agent/products", {

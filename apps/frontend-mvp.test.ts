@@ -74,7 +74,12 @@ describe("frontend MVP static checks", () => {
       "结算记录",
       "追扣记录",
       "提交自有商品",
-      "确认人工打款"
+      "确认人工打款",
+      "V2经营看板",
+      "权益码池",
+      "支付开通",
+      "店铺装修",
+      "消息通知"
     ];
 
     for (const label of required) {

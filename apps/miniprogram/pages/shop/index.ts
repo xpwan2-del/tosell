@@ -26,7 +26,10 @@ Page({
         api.shopProducts(this.data.shopId)
       ]);
       this.setData({
-        shop,
+        shop: {
+          ...shop,
+          themeStyle: `border-top-color: ${text(shop.themeColor, "#1677ff")};`
+        },
         products: products.map((item: Record<string, unknown>) => ({
           ...item,
           displayName: text((item.product as Record<string, unknown> | undefined)?.name),
