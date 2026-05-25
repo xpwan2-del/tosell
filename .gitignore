@@ -1,0 +1,15 @@
+# CCB runtime state. Keep committed project CCB config and memory only.
+.ccb/.codex-*-session
+.ccb/ccbd/
+.ccb/shared-cache/
+.ccb/workspaces/
+.ccb/runtime-root.json
+.ccb/runtime-root-ref.json
+.ccb/agents/*/agent.json
+.ccb/agents/*/events.jsonl
+.ccb/agents/*/helper.json
+.ccb/agents/*/jobs.jsonl
+.ccb/agents/*/restore.json
+.ccb/agents/*/runtime.json
+.ccb/agents/*/provider-runtime/
+.ccb/agents/*/provider-state/
