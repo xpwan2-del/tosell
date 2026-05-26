@@ -1,0 +1,8 @@
+.ccb/
+.vercel/
+node_modules/
+dist/
+coverage/
+.env
+.env.local
+*.log
