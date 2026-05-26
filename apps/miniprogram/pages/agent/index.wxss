@@ -27,6 +27,12 @@
   border-radius: 8rpx;
   padding: 16rpx;
 }
+.service-qr {
+  width: 156rpx;
+  height: 156rpx;
+  border-radius: 8rpx;
+  background: #eef3f6;
+}
 .actions,
 .price-row {
   display: flex;

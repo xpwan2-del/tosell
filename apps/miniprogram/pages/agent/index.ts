@@ -7,6 +7,7 @@ Page({
     priceCents: "15000",
     contactPhone: "13800000000",
     customerServiceWechat: "agent_a_service",
+    customerServiceQrUrl: "https://example.test/qr-agent-a.png",
     shopName: "测试代理 A 小店",
     announcement: "购买后按商品规则发放权益",
     selectedPlatformProductId: "prod-1",
@@ -53,6 +54,7 @@ Page({
         shopName: text(shop.name, this.data.shopName),
         announcement: text(shop.announcement, this.data.announcement),
         customerServiceWechat: text(shop.customerServiceWechat, this.data.customerServiceWechat),
+        customerServiceQrUrl: text(shop.customerServiceQrUrl, this.data.customerServiceQrUrl),
         themeColor: text(shop.themeColor, this.data.themeColor),
         shareTitle: text(shop.shareTitle, this.data.shareTitle),
         bannerUrl: text(shop.bannerUrl, this.data.bannerUrl),
@@ -98,7 +100,7 @@ Page({
   },
   async saveShop(this: any) {
     try {
-      await api.saveAgentShop(this.data.shopName, this.data.announcement, this.data.customerServiceWechat);
+      await api.saveAgentShop(this.data.shopName, this.data.announcement, this.data.customerServiceWechat, this.data.customerServiceQrUrl);
       wx.showToast({ title: "店铺资料已保存", icon: "none" });
       void this.loadAgentCenter();
     } catch (error) {
@@ -113,6 +115,9 @@ Page({
   },
   onCustomerServiceInput(this: any, event: WechatMiniprogram.InputEvent) {
     this.setData({ customerServiceWechat: event.detail.value });
+  },
+  onCustomerServiceQrInput(this: any, event: WechatMiniprogram.InputEvent) {
+    this.setData({ customerServiceQrUrl: event.detail.value });
   },
   onShopNameInput(this: any, event: WechatMiniprogram.InputEvent) {
     this.setData({ shopName: event.detail.value });

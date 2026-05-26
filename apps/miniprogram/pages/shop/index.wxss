@@ -36,6 +36,19 @@
 .actions {
   margin-top: 16rpx;
 }
+.service {
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+  margin-top: 16rpx;
+  color: #65737d;
+}
+.service-qr {
+  width: 148rpx;
+  height: 148rpx;
+  border-radius: 8rpx;
+  background: #eef3f6;
+}
 .error {
   color: #a32626;
   background: #fff0f0;

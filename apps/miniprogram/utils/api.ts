@@ -107,10 +107,10 @@ export const api = {
   }),
   agentShop: () => request<Record<string, unknown>>("/api/agent/shop", { mode: "agent" }),
   agentDashboard: () => request<Record<string, unknown>>("/api/agent/dashboard", { mode: "agent" }),
-  saveAgentShop: (name: string, announcement: string, customerServiceWechat?: string) => request<Record<string, unknown>>("/api/agent/shop", {
+  saveAgentShop: (name: string, announcement: string, customerServiceWechat?: string, customerServiceQrUrl?: string) => request<Record<string, unknown>>("/api/agent/shop", {
     method: "PATCH",
     mode: "agent",
-    body: { name, announcement, customerServiceWechat }
+    body: { name, announcement, customerServiceWechat, customerServiceQrUrl }
   }),
   saveShopDecor: (themeColor: string, shareTitle: string, bannerUrl: string) => request<Record<string, unknown>>("/api/agent/shop/decor", {
     method: "PATCH",

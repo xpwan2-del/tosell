@@ -18,6 +18,10 @@ const v2MigrationSql = readFileSync(
   resolve(testDir, "../prisma/migrations/000003_v2_operations/migration.sql"),
   "utf8"
 );
+const platformSelfOperatedMigrationSql = readFileSync(
+  resolve(testDir, "../prisma/migrations/000004_platform_self_operated/migration.sql"),
+  "utf8"
+);
 
 function modelBlock(modelName: string) {
   const match = schema.match(new RegExp(`model\\s+${modelName}\\s+\\{([\\s\\S]*?)\\n\\}`));
@@ -116,9 +120,11 @@ describe("Prisma database contract", () => {
     }
   });
 
-  it("keeps settlement_items.order_id unique for V1 duplicate-settlement protection", () => {
+  it("uses order and settlement role uniqueness for controlled two-tier settlement", () => {
     const settlementItem = modelBlock("SettlementItem");
-    expect(settlementItem).toMatch(/orderId\s+String\s+@unique\s+@map\("order_id"\)/);
+    expect(settlementItem).toMatch(/orderId\s+String\s+@map\("order_id"\)/);
+    expect(settlementItem).toMatch(/settlementRole\s+String\s+@default\("single_agent"\)\s+@map\("settlement_role"\)/);
+    expect(settlementItem).toMatch(/@@unique\(\[orderId,\s*settlementRole\]\)/);
   });
 
   it("requires unique idempotency keys for ledger and key external-event records", () => {
@@ -207,5 +213,27 @@ describe("Prisma database contract", () => {
     expect(v2MigrationSql).toContain('CREATE TABLE "agent_notifications"');
     expect(v2MigrationSql).toContain("shops_theme_color_check");
     expect(v2MigrationSql).toContain("rights_codes_issue_key_key");
+  });
+
+  it("models platform self-operated shops and sales channels", () => {
+    const shop = modelBlock("Shop");
+    const order = modelBlock("Order");
+
+    expect(schema).toContain("enum ShopOwnerType");
+    expect(schema).toContain("enum SalesChannelType");
+    expect(schema).toContain("platform_self_operated");
+    expect(schema).toContain("single_agent");
+    expect(schema).toContain("two_tier");
+    expect(schema).toContain("first_tier");
+    expect(schema).toContain("second_tier");
+    expect(shop).toMatch(/ownerType\s+ShopOwnerType\s+@default\(agent\)\s+@map\("owner_type"\)/);
+    expect(shop).toMatch(/agentId\s+String\?\s+@unique\s+@map\("agent_id"\)/);
+    expect(shop).toMatch(/customerServiceQrUrl\s+String\?\s+@map\("customer_service_qr_url"\)/);
+    expect(order).toMatch(/salesChannelType\s+SalesChannelType\s+@default\(single_agent\)\s+@map\("sales_channel_type"\)/);
+    expect(order).toMatch(/platformShopId\s+String\?\s+@map\("platform_shop_id"\)/);
+    expect(platformSelfOperatedMigrationSql).toContain("CREATE TYPE \"ShopOwnerType\"");
+    expect(platformSelfOperatedMigrationSql).toContain("sales_channel_type");
+    expect(platformSelfOperatedMigrationSql).toContain('DROP INDEX IF EXISTS "settlement_items_order_id_key"');
+    expect(platformSelfOperatedMigrationSql).toContain("settlement_items_order_id_settlement_role_key");
   });
 });

@@ -162,9 +162,22 @@ enum AfterSaleStatus {
 enum Responsibility {
   platform
   agent
+  first_tier
+  second_tier
   user
   mixed
   undecided
+}
+
+enum ShopOwnerType {
+  platform
+  agent
+}
+
+enum SalesChannelType {
+  platform_self_operated
+  single_agent
+  two_tier
 }
 
 enum ServiceFeeBearer {
@@ -350,11 +363,13 @@ model AgentApplication {
 
 model Shop {
   id           String     @id @default(cuid())
-  agentId      String     @unique @map("agent_id")
+  ownerType    ShopOwnerType @default(agent) @map("owner_type")
+  agentId      String?    @unique @map("agent_id")
   shopNo       String     @unique @map("shop_no")
   name         String
   logoUrl      String?    @map("logo_url")
   announcement String?
+  customerServiceQrUrl String? @map("customer_service_qr_url")
   themeColor   String?    @map("theme_color")
   bannerUrl    String?    @map("banner_url")
   shareTitle   String?    @map("share_title")
@@ -364,7 +379,7 @@ model Shop {
   createdAt    DateTime   @default(now()) @map("created_at")
   updatedAt    DateTime   @updatedAt @map("updated_at")
 
-  agent             Agent                        @relation(fields: [agentId], references: [id])
+  agent             Agent?                       @relation(fields: [agentId], references: [id])
   customerServices  ShopCustomerServiceBinding[]
   productGroups     ShopProductGroup[]
   agentProducts     AgentProduct[]
@@ -375,6 +390,7 @@ model Shop {
   ledgerEntries     LedgerEntry[]
 
   @@index([status])
+  @@index([ownerType, status])
   @@map("shops")
 }
 
@@ -514,8 +530,10 @@ model Order {
   id                String            @id @default(cuid())
   orderNo           String            @unique @map("order_no")
   userId            String            @map("user_id")
-  agentId           String            @map("agent_id")
+  agentId           String?           @map("agent_id")
   shopId            String            @map("shop_id")
+  salesChannelType  SalesChannelType  @default(single_agent) @map("sales_channel_type")
+  platformShopId    String?           @map("platform_shop_id")
   status            OrderStatus       @default(pending_payment)
   paymentStatus     PaymentStatus     @default(unpaid) @map("payment_status")
   fulfillmentStatus FulfillmentStatus @default(not_started) @map("fulfillment_status")
@@ -530,7 +548,7 @@ model Order {
   updatedAt         DateTime          @updatedAt @map("updated_at")
 
   user               User                 @relation(fields: [userId], references: [id])
-  agent              Agent                @relation(fields: [agentId], references: [id])
+  agent              Agent?               @relation(fields: [agentId], references: [id])
   shop               Shop                 @relation(fields: [shopId], references: [id])
   items              OrderItem[]
   amountSnapshot     OrderAmountSnapshot?
@@ -539,11 +557,12 @@ model Order {
   entitlements       Entitlement[]
   afterSales         AfterSale[]
   refunds            Refund[]
-  settlementItem     SettlementItem?
+  settlementItems    SettlementItem[]
   ledgerEntries      LedgerEntry[]
   rightsCodes        RightsCode[]
 
   @@index([agentId, createdAt])
+  @@index([salesChannelType, createdAt])
   @@index([shopId, status])
   @@index([userId, createdAt])
   @@index([fulfilledAt])
@@ -811,7 +830,8 @@ model SettlementSheet {
 model SettlementItem {
   id                 String   @id @default(cuid())
   settlementId       String   @map("settlement_id")
-  orderId            String   @unique @map("order_id")
+  orderId            String   @map("order_id")
+  settlementRole     String   @default("single_agent") @map("settlement_role")
   agentId            String   @map("agent_id")
   shopId             String   @map("shop_id")
   paidAmountCents    BigInt   @map("paid_amount_cents")
@@ -828,6 +848,7 @@ model SettlementItem {
   order      Order           @relation(fields: [orderId], references: [id])
   shop       Shop            @relation(fields: [shopId], references: [id])
 
+  @@unique([orderId, settlementRole])
   @@index([settlementId])
   @@index([agentId, createdAt])
   @@map("settlement_items")

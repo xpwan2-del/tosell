@@ -213,10 +213,10 @@ export const api = {
       productGroups: [{ name: "自动履约", agentProductIds: ["ap-code"] }]
     }
   }),
-  saveAgentShop: (name: string, announcement: string) => request<JsonRecord>("/api/agent/shop", {
+  saveAgentShop: (name: string, announcement: string, customerServiceWechat = "agent_a_service", customerServiceQrUrl = "https://example.test/qr-agent-a.png") => request<JsonRecord>("/api/agent/shop", {
     method: "PATCH",
     headers: agentHeaders,
-    body: { name, announcement }
+    body: { name, announcement, customerServiceWechat, customerServiceQrUrl }
   }),
   submitAgentApplication: () => request<JsonRecord>("/api/agent/applications", {
     method: "POST",

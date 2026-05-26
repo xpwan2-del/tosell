@@ -9,6 +9,7 @@ Page({
       name: "",
       announcement: "",
       customerServiceWechat: "",
+      customerServiceQrUrl: "",
       status: ""
     },
     products: [] as Array<Record<string, unknown>>

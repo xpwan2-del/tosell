@@ -5,7 +5,9 @@ import "./styles.css";
 
 type LoadState = {
   shop?: JsonRecord;
+  platformShop?: JsonRecord;
   publicProducts: JsonRecord[];
+  platformShopProducts: JsonRecord[];
   agentProducts: JsonRecord[];
   platformProducts: JsonRecord[];
   ownProducts: JsonRecord[];
@@ -24,6 +26,7 @@ type LoadState = {
 
 const initialState: LoadState = {
   publicProducts: [],
+  platformShopProducts: [],
   agentProducts: [],
   platformProducts: [],
   ownProducts: [],
@@ -41,6 +44,7 @@ const adminNav = [
   "代理审核",
   "保证金",
   "店铺管理",
+  "平台自营",
   "商品管理",
   "代理商品审核",
   "订单管理",
@@ -77,6 +81,7 @@ function App() {
   const [currentAllocation, setCurrentAllocation] = useState<JsonRecord | undefined>();
 
   const selectedPublicProduct = data.publicProducts[0];
+  const selectedPlatformShopProduct = data.platformShopProducts[0];
   const selectedAgentProduct = data.agentProducts[0];
   const selectedOrder = currentOrder ?? data.adminOrders[0] ?? data.agentOrders[0];
   const selectedSettlement = data.settlements.find((sheet) => text(sheet.status) !== "paid") ?? data.settlements[0];
@@ -89,7 +94,9 @@ function App() {
     try {
       const [
         shop,
+        platformShop,
         publicProducts,
+        platformShopProducts,
         agentProducts,
         platformProducts,
         ownProducts,
@@ -106,7 +113,9 @@ function App() {
         paymentGuide
       ] = await Promise.all([
         api.shop(),
+        api.shop("shop-platform"),
         api.shopProducts(),
+        api.shopProducts("shop-platform"),
         api.agentProducts(),
         api.platformProducts(),
         api.ownProducts(),
@@ -124,7 +133,9 @@ function App() {
       ]);
       setData({
         shop,
+        platformShop,
         publicProducts,
+        platformShopProducts,
         agentProducts,
         platformProducts,
         ownProducts,
@@ -177,6 +188,7 @@ function App() {
       { label: "GMV", value: cents(reconciliation.totalPaidCents) },
       { label: "退款金额", value: cents(reconciliation.totalRefundedCents) },
       { label: "服务费", value: cents(reconciliation.totalServiceFeeCents) },
+      { label: "自营毛收益", value: cents(reconciliation.platformSelfOperatedGrossMarginCents) },
       { label: "保证金余额", value: cents(reconciliation.depositAvailableCents) },
       { label: "活跃商品", value: text(data.agentDashboard?.activeProductCount, "0") },
       { label: "未读消息", value: text(data.agentDashboard?.noticeCount, "0") }
@@ -234,7 +246,23 @@ function App() {
           <Panel title="店铺管理" owner="运营" id="店铺管理">
             <KeyValue label="店铺" value={`${text(data.shop?.name)} (${text(data.shop?.status)})`} />
             <KeyValue label="客服微信" value={text(data.shop?.customerServiceWechat)} />
+            <KeyValue label="客服二维码" value={text(data.shop?.customerServiceQrUrl)} />
             <button onClick={() => void runAction("店铺资料保存", () => api.saveAgentShop("测试代理 A 小店", "购买后按商品规则发放权益"))}>保存店铺资料</button>
+          </Panel>
+
+          <Panel title="平台自营" owner="平台" id="平台自营">
+            <KeyValue label="自营店" value={`${text(data.platformShop?.name)} (${text(data.platformShop?.status)})`} />
+            <KeyValue label="客服二维码" value={text(data.platformShop?.customerServiceQrUrl)} />
+            <KeyValue label="自营成交额" value={cents(data.reconciliation?.platformSelfOperatedPaidCents)} />
+            <KeyValue label="自营毛收益" value={cents(data.reconciliation?.platformSelfOperatedGrossMarginCents)} />
+            <Table rows={data.platformShopProducts} columns={["id", "productType", "salePriceCents", "status"]} moneyColumns={["salePriceCents"]} />
+            <div className="actions">
+              <button onClick={() => void runAction("平台自营报价", () => api.quoteOrder("shop-platform", text(selectedPlatformShopProduct?.id, "psp-1")), false)}>自营报价</button>
+              <button onClick={() => void runAction("创建平台自营订单", async () => {
+                const quote = await api.quoteOrder("shop-platform", text(selectedPlatformShopProduct?.id, "psp-1"));
+                return api.createOrder("shop-platform", text(selectedPlatformShopProduct?.id, "psp-1"), text(quote.paidAmountCents));
+              })}>创建自营订单</button>
+            </div>
           </Panel>
 
           <Panel title="商品管理" owner="运营" id="商品管理">

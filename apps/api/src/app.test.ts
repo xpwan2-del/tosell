@@ -727,6 +727,17 @@ describe("api", () => {
     expect(decor.statusCode).toBe(200);
     expect(decor.json()).toMatchObject({ themeColor: "#00aa88", shareTitle: "代理 A 精选权益" });
 
+    const shopUpdate = await app.inject({
+      method: "PATCH",
+      url: "/api/agent/shop",
+      headers: agentHeaders,
+      payload: {
+        customerServiceQrUrl: "https://example.test/qr-agent-a-new.png"
+      }
+    });
+    expect(shopUpdate.statusCode).toBe(200);
+    expect(shopUpdate.json().customerServiceQrUrl).toBe("https://example.test/qr-agent-a-new.png");
+
     const batch = await app.inject({
       method: "POST",
       url: "/api/agent/products/platform/batch",
@@ -765,6 +776,83 @@ describe("api", () => {
     expect(guide.statusCode).toBe(200);
     expect(guide.json().envVars).toContain("WECHAT_MCH_ID");
     expect(JSON.stringify(guide.json())).toContain("JSAPI 支付");
+  });
+
+  it("supports platform self-operated shop orders without agent settlement", async () => {
+    const app = buildApp();
+
+    const shop = await app.inject({
+      method: "GET",
+      url: "/api/user/shops/shop-platform",
+      headers: { "x-user-id": "user-platform" }
+    });
+    expect(shop.statusCode).toBe(200);
+    expect(shop.json()).toMatchObject({
+      ownerType: "platform",
+      customerServiceQrUrl: "https://example.test/qr-platform-service.png"
+    });
+
+    const products = await app.inject({
+      method: "GET",
+      url: "/api/user/shops/shop-platform/products",
+      headers: { "x-user-id": "user-platform" }
+    });
+    expect(products.statusCode).toBe(200);
+    expect(products.json()[0]).toMatchObject({ id: "psp-1", productType: "platform_self_operated" });
+
+    const quote = await app.inject({
+      method: "POST",
+      url: "/api/user/orders/quote",
+      headers: { "x-user-id": "user-platform" },
+      payload: { shopId: "shop-platform", agentProductId: "psp-1" }
+    });
+    expect(quote.statusCode).toBe(200);
+    expect(quote.json()).toMatchObject({ paidAmountCents: "14900", salePriceCents: "14900" });
+    expect(JSON.stringify(quote.json())).not.toMatch(/fulfillmentCostCents|platformSelfOperatedGrossMarginCents/);
+
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-platform" },
+      payload: { shopId: "shop-platform", agentProductId: "psp-1", clientPaidAmountCents: "14900" }
+    });
+    expect(order.statusCode).toBe(200);
+    expect(order.json()).toMatchObject({
+      salesChannelType: "platform_self_operated",
+      customerServiceQrUrl: "https://example.test/qr-platform-service.png"
+    });
+    expect(JSON.stringify(order.json())).not.toMatch(/platformSelfOperatedGrossMarginCents|fulfillmentCostCents/);
+
+    const payment = await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: {
+        channel: "mock",
+        channelTradeNo: "trade-platform-self",
+        orderNo: order.json().orderNo,
+        amountCents: "14900"
+      }
+    });
+    expect(payment.statusCode).toBe(200);
+
+    const settlement = await app.inject({
+      method: "POST",
+      url: "/api/admin/settlements/generate",
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" },
+      payload: { agentId: "platform", now: "2030-01-01T00:00:00.000Z", batchNo: "platform-self" }
+    });
+    expect(settlement.statusCode).toBe(200);
+    expect(settlement.json().items).toHaveLength(0);
+
+    const reconciliation = await app.inject({
+      method: "GET",
+      url: "/api/exports/reconciliation-summary",
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" }
+    });
+    expect(reconciliation.json()).toMatchObject({
+      platformSelfOperatedPaidCents: "14900",
+      platformSelfOperatedGrossMarginCents: "4825"
+    });
   });
 
   it("protects internal platform product pricing behind agent auth", async () => {

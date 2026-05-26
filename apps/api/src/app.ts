@@ -108,7 +108,8 @@ export function buildApp() {
     const body = z.object({
       name: z.string().optional(),
       announcement: z.string().optional(),
-      customerServiceWechat: z.string().optional()
+      customerServiceWechat: z.string().optional(),
+      customerServiceQrUrl: z.string().optional()
     }).parse(request.body);
     return services.updateAgentShop(getAgentActor(request), body);
   });

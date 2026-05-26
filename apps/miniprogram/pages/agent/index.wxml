@@ -13,8 +13,10 @@
     <text>店铺：{{shop.name}}</text>
     <text>店铺状态：{{shop.status}}</text>
     <text>客服微信：{{shop.customerServiceWechat}}</text>
+    <image wx:if="{{shop.customerServiceQrUrl}}" class="service-qr" src="{{shop.customerServiceQrUrl}}" mode="aspectFill" />
     <input placeholder="联系人手机号" value="{{contactPhone}}" bindinput="onContactPhoneInput" />
     <input placeholder="客服微信" value="{{customerServiceWechat}}" bindinput="onCustomerServiceInput" />
+    <input placeholder="客服二维码图片地址" value="{{customerServiceQrUrl}}" bindinput="onCustomerServiceQrInput" />
     <input placeholder="店铺名称" value="{{shopName}}" bindinput="onShopNameInput" />
     <input placeholder="店铺公告" value="{{announcement}}" bindinput="onAnnouncementInput" />
     <view class="actions">

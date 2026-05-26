@@ -11,6 +11,7 @@ import {
   assertUserScope,
   buildOrderSnapshot,
   buildSettlementItems,
+  calculateServiceFeeCents,
   deductDeposit,
   processPaymentCallback,
   quoteAgentOwnedProduct,
@@ -56,10 +57,12 @@ class BackendServices {
     return {
       id: shop.id,
       agentId: shop.agentId,
+      ownerType: shop.ownerType ?? "agent",
       name: shop.name,
       status: shop.status,
       announcement: shop.announcement,
       customerServiceWechat: shop.customerServiceWechat,
+      customerServiceQrUrl: shop.customerServiceQrUrl,
       themeColor: shop.themeColor,
       bannerUrl: shop.bannerUrl,
       shareTitle: shop.shareTitle,
@@ -68,13 +71,20 @@ class BackendServices {
   }
 
   listShopProducts(shopId: string) {
-    this.getShop(shopId);
+    const shop = this.getShop(shopId);
+    if ((shop.ownerType ?? "agent") === "platform") {
+      return [...this.store.platformShopProducts.values()]
+        .filter((shopProduct) => shopProduct.shopId === shopId && shopProduct.status === "listed")
+        .map((shopProduct) => this.serializePublicShopProduct(shopProduct));
+    }
     return [...this.store.agentProducts.values()]
       .filter((agentProduct) => agentProduct.shopId === shopId && agentProduct.status === "listed")
       .map((agentProduct) => this.serializePublicAgentProduct(agentProduct));
   }
 
   getAgentProduct(agentProductId: string) {
+    const platformShopProduct = this.store.platformShopProducts.get(agentProductId);
+    if (platformShopProduct) return this.serializePublicShopProduct(platformShopProduct);
     return this.serializePublicAgentProduct(
       requireEntity(this.store.agentProducts.get(agentProductId), "RESOURCE_NOT_FOUND", "product not found")
     );
@@ -123,6 +133,7 @@ class BackendServices {
         agentId: snapshot.agentId,
         shopId: snapshot.shopId,
         agentProductId: snapshot.agentProductId,
+        salesChannelType: "salesChannelType" in snapshot ? snapshot.salesChannelType : "single_agent",
         status: "pending_payment",
         paymentStatus: "unpaid",
         fulfillmentStatus: "not_started",
@@ -215,11 +226,11 @@ class BackendServices {
 
   getAgentShop(actor: AgentActor) {
     const shop = requireEntity(this.store.shops.get(actor.shopId), "RESOURCE_NOT_FOUND", "shop not found");
-    assertAgentScope(actor, shop);
+    assertAgentScope(actor, { agentId: required(shop.agentId, "agentId"), shopId: shop.id });
     return shop;
   }
 
-  updateAgentShop(actor: AgentActor, input: { name?: string; announcement?: string; customerServiceWechat?: string }) {
+  updateAgentShop(actor: AgentActor, input: { name?: string; announcement?: string; customerServiceWechat?: string; customerServiceQrUrl?: string }) {
     const shop = this.getAgentShop(actor);
     Object.assign(shop, input);
     this.audit("agent", "shop.update", "shop", shop.id, input);
@@ -623,7 +634,9 @@ class BackendServices {
           order.status = "fulfilling";
           order.fulfillmentStatus = "processing";
           order.paidAt = new Date();
-          this.store.pendingIncomeByAgent.set(order.agentId, (this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n) + order.snapshot.amountSnapshot.agentExpectedIncomeCents);
+          if (order.salesChannelType !== "platform_self_operated") {
+            this.store.pendingIncomeByAgent.set(order.agentId, (this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n) + order.snapshot.amountSnapshot.agentExpectedIncomeCents);
+          }
           this.tryAutoFulfillWithRightsCode(order);
         }
       });
@@ -644,7 +657,9 @@ class BackendServices {
       order.refundStatus = "refunded";
       order.status = "refunded";
 
-      if (refund.wasSettled) {
+      if (order.salesChannelType === "platform_self_operated") {
+        refund.pendingIncomeDeductedCents = 0n;
+      } else if (refund.wasSettled) {
         this.createClawback(order, refund.agentClawbackCents, "refund", refund.refundNo);
       } else {
         const pending = this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n;
@@ -665,7 +680,7 @@ class BackendServices {
     if (duplicate) return { status: "duplicate" as const, sheet: duplicate };
     const now = input.now ?? new Date();
     const orders = [...this.store.orders.values()]
-      .filter((order) => order.agentId === input.agentId)
+      .filter((order) => order.agentId === input.agentId && order.salesChannelType !== "platform_self_operated")
       .map((order) => ({
         orderId: order.orderNo,
         agentId: order.agentId,
@@ -803,11 +818,14 @@ class BackendServices {
   reconciliationSummary(actor: AdminActor) {
     assertAdminPermission(actor, "audit.read");
     const orders = [...this.store.orders.values()];
+    const platformSelfOperatedOrders = orders.filter((order) => order.salesChannelType === "platform_self_operated" && order.paymentStatus === "paid");
     return {
       totalPaidCents: sum(orders.filter((order) => order.paymentStatus === "paid").map((order) => order.snapshot.amountSnapshot.paidAmountCents)),
       totalRefundedCents: sum(orders.map((order) => order.refundedAmountCents)),
       totalServiceFeeCents: sum(orders.filter((order) => order.paymentStatus === "paid").map((order) => order.snapshot.amountSnapshot.serviceFeeCents)),
       totalAgentIncomeCents: sum(orders.filter((order) => order.paymentStatus === "paid").map((order) => order.snapshot.amountSnapshot.agentExpectedIncomeCents)),
+      platformSelfOperatedPaidCents: sum(platformSelfOperatedOrders.map((order) => order.snapshot.amountSnapshot.paidAmountCents)),
+      platformSelfOperatedGrossMarginCents: sum(platformSelfOperatedOrders.map((order) => getPlatformSelfGrossMargin(order.snapshot))),
       settlementCount: this.store.settlementSheets.length,
       payoutCount: this.store.manualPayouts.length,
       clawbackCount: this.store.clawbacks.length,
@@ -890,9 +908,12 @@ class BackendServices {
     };
   }
 
-  private buildSnapshot(input: { orderNo: string; userId: string; shopId: string; agentProductId: string; quantity?: number; entrySource?: string }) {
+  private buildSnapshot(input: { orderNo: string; userId: string; shopId: string; agentProductId: string; quantity?: number; entrySource?: string }): DemoOrderSnapshot {
     const shop = requireEntity(this.store.shops.get(input.shopId), "RESOURCE_NOT_FOUND", "shop not found");
-    const agent = requireEntity(this.store.agents.get(shop.agentId), "RESOURCE_NOT_FOUND", "agent not found");
+    if ((shop.ownerType ?? "agent") === "platform") {
+      return this.buildPlatformSelfOperatedSnapshot(input, shop);
+    }
+    const agent = requireEntity(this.store.agents.get(required(shop.agentId, "agentId")), "RESOURCE_NOT_FOUND", "agent not found");
     const account = requireEntity(this.store.depositAccounts.get(agent.id), "RESOURCE_NOT_FOUND", "deposit account not found");
     if (shouldRestrictForDeposit(account)) throw new ApiError(400, "DEPOSIT_INSUFFICIENT", "agent deposit is insufficient");
     const agentProduct = requireEntity(this.store.agentProducts.get(input.agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
@@ -910,6 +931,84 @@ class BackendServices {
       quantity: input.quantity,
       entrySource: input.entrySource
     });
+  }
+
+  private buildPlatformSelfOperatedSnapshot(
+    input: { orderNo: string; userId: string; shopId: string; agentProductId: string; quantity?: number; entrySource?: string },
+    shop: DemoShop
+  ): PlatformSelfOperatedSnapshot {
+    if (shop.status !== "open") throw new ApiError(400, "SHOP_NOT_OPEN", "platform shop is not open");
+    if (shop.riskStatus !== "normal") throw new ApiError(400, "RISK_BLOCKED", "risk freeze blocks order creation");
+    const shopProduct = requireEntity(this.store.platformShopProducts.get(input.agentProductId), "RESOURCE_NOT_FOUND", "platform shop product not found");
+    if (shopProduct.shopId !== shop.id) throw new ApiError(400, "RESOURCE_SCOPE_MISMATCH", "product does not belong to platform shop");
+    if (shopProduct.status !== "listed") throw new ApiError(400, "PRODUCT_NOT_LISTED", "platform shop product is not listed");
+    const product = requireEntity(this.store.platformProducts.get(shopProduct.platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
+    if (product.status !== "active") throw new ApiError(400, "PRODUCT_NOT_ACTIVE", "platform product is not active");
+    if (shopProduct.salePriceCents < product.minSalePriceCents) {
+      throw new ApiError(400, "PRICE_RULE_FAILED", "sale price is below minimum sale price");
+    }
+    const quantity = input.quantity ?? 1;
+    const paidAmountCents = shopProduct.salePriceCents * BigInt(quantity);
+    const fulfillmentCostCents = shopProduct.fulfillmentCostCents * BigInt(quantity);
+    const serviceFeeBps = 50n;
+    const paymentChannelFeeCents = calculateServiceFeeCents(paidAmountCents, serviceFeeBps);
+    const grossMarginCents = paidAmountCents - fulfillmentCostCents - paymentChannelFeeCents;
+    if (grossMarginCents < 0n) throw new ApiError(400, "PRICE_RULE_FAILED", "platform self-operated margin cannot be negative");
+
+    return {
+      orderNo: input.orderNo,
+      userId: input.userId,
+      agentId: PLATFORM_AGENT_ID,
+      shopId: shop.id,
+      agentProductId: shopProduct.id,
+      salesChannelType: "platform_self_operated",
+      productType: "platform",
+      productNameSnapshot: product.name,
+      quantity,
+      quote: {
+        serviceFeeBps,
+        paidAmountCents,
+        supplyAmountCents: fulfillmentCostCents,
+        serviceFeeCents: paymentChannelFeeCents,
+        agentExpectedIncomeCents: 0n
+      },
+      amountSnapshot: {
+        serviceFeeBps,
+        paidAmountCents,
+        supplyAmountCents: fulfillmentCostCents,
+        serviceFeeCents: paymentChannelFeeCents,
+        agentExpectedIncomeCents: 0n,
+        platformSelfOperatedGrossMarginCents: grossMarginCents
+      },
+      productSnapshot: {
+        id: product.id,
+        type: "platform",
+        name: product.name
+      },
+      shopSnapshot: {
+        id: shop.id,
+        name: shop.name,
+        ownerType: "platform",
+        customerServiceWechat: shop.customerServiceWechat,
+        customerServiceQrUrl: shop.customerServiceQrUrl,
+        shopStatus: shop.status,
+        entrySource: input.entrySource
+      },
+      pricingSnapshot: {
+        salePriceCents: shopProduct.salePriceCents,
+        minSalePriceCents: product.minSalePriceCents,
+        suggestedSalePriceCents: product.suggestedSalePriceCents
+      },
+      selfOperatedSnapshot: {
+        platformShopId: shop.id,
+        finalSalePriceCents: paidAmountCents,
+        fulfillmentCostCents,
+        paymentChannelFeeCents,
+        platformSelfOperatedGrossMarginCents: grossMarginCents
+      },
+      fulfillmentRuleSnapshot: product.fulfillmentRule,
+      afterSaleRuleSnapshot: product.afterSaleRule
+    };
   }
 
   private serializeAgentProduct(agentProduct: DemoAgentProduct) {
@@ -941,7 +1040,26 @@ class BackendServices {
     };
   }
 
-  private serializePublicQuote(snapshot: ReturnType<typeof buildOrderSnapshot>) {
+  private serializePublicShopProduct(shopProduct: DemoPlatformShopProduct) {
+    const product = this.store.platformProducts.get(shopProduct.platformProductId);
+    return {
+      id: shopProduct.id,
+      shopId: shopProduct.shopId,
+      productType: "platform_self_operated",
+      salePriceCents: shopProduct.salePriceCents,
+      status: shopProduct.status,
+      groupName: shopProduct.groupName,
+      product: product ? {
+        id: product.id,
+        name: product.name,
+        fulfillmentRule: product.fulfillmentRule,
+        afterSaleRule: product.afterSaleRule,
+        status: product.status
+      } : null
+    };
+  }
+
+  private serializePublicQuote(snapshot: DemoOrderSnapshot) {
     return {
       paidAmountCents: snapshot.amountSnapshot.paidAmountCents,
       salePriceCents: snapshot.amountSnapshot.paidAmountCents / BigInt(snapshot.quantity),
@@ -955,6 +1073,7 @@ class BackendServices {
       userId: order.userId,
       shopId: order.shopId,
       agentProductId: order.agentProductId,
+      salesChannelType: order.salesChannelType,
       status: order.status,
       paymentStatus: order.paymentStatus,
       fulfillmentStatus: order.fulfillmentStatus,
@@ -969,6 +1088,7 @@ class BackendServices {
       productName: order.snapshot.productNameSnapshot,
       shopName: (order.snapshot.shopSnapshot as { name?: string }).name,
       customerServiceWechat: (order.snapshot.shopSnapshot as { customerServiceWechat?: string }).customerServiceWechat,
+      customerServiceQrUrl: (order.snapshot.shopSnapshot as { customerServiceQrUrl?: string }).customerServiceQrUrl,
       snapshot: {
         productType: order.snapshot.productType
       }
@@ -1007,7 +1127,9 @@ class BackendServices {
 
   private tryAutoFulfillWithRightsCode(order: DemoOrder) {
     const agentProduct = this.store.agentProducts.get(order.agentProductId);
-    const product = agentProduct?.platformProductId ? this.store.platformProducts.get(agentProduct.platformProductId) : undefined;
+    const shopProduct = this.store.platformShopProducts.get(order.agentProductId);
+    const productId = agentProduct?.platformProductId ?? shopProduct?.platformProductId;
+    const product = productId ? this.store.platformProducts.get(productId) : undefined;
     const rule = product?.fulfillmentRule;
     if (!isRecord(rule) || rule.mode !== "code_pool" || !product) return;
     const quantity = order.snapshot.quantity;
@@ -1018,7 +1140,9 @@ class BackendServices {
       order.fulfillmentStatus = "failed";
       order.status = "fulfillment_failed";
       order.settlementStatus = "frozen";
-      this.notify(order.agentId, "stock.empty", "权益码库存不足", `${product.name} 库存不足，订单 ${order.orderNo} 已冻结结算。`);
+      if (order.salesChannelType !== "platform_self_operated") {
+        this.notify(order.agentId, "stock.empty", "权益码库存不足", `${product.name} 库存不足，订单 ${order.orderNo} 已冻结结算。`);
+      }
       return;
     }
     for (const [index, code] of codes.entries()) {
@@ -1036,7 +1160,9 @@ class BackendServices {
       status: "success",
       attemptCount: 1
     });
-    this.notify(order.agentId, "order.auto_fulfilled", "订单已自动履约", `${order.orderNo} 已从权益码池自动发放。`);
+    if (order.salesChannelType !== "platform_self_operated") {
+      this.notify(order.agentId, "order.auto_fulfilled", "订单已自动履约", `${order.orderNo} 已从权益码池自动发放。`);
+    }
     this.audit("system", "fulfillment.auto_code_pool", "order", order.orderNo, { codeIds: codes.map((code) => code.codeId) });
   }
 
@@ -1097,6 +1223,13 @@ class BackendServices {
   }
 }
 
+const PLATFORM_AGENT_ID = "platform";
+
+function getPlatformSelfGrossMargin(snapshot: DemoOrderSnapshot) {
+  const amount = snapshot.amountSnapshot as { platformSelfOperatedGrossMarginCents?: bigint };
+  return amount.platformSelfOperatedGrossMarginCents ?? 0n;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -1108,6 +1241,7 @@ function createMemoryStore(): MemoryStore {
     agents: new Map(),
     shops: new Map(),
     platformProducts: new Map(),
+    platformShopProducts: new Map(),
     ownProducts: new Map(),
     agentProducts: new Map(),
     depositAccounts: new Map(),
@@ -1140,15 +1274,32 @@ function createMemoryStore(): MemoryStore {
     status: "open",
     riskStatus: "normal",
     customerServiceWechat: "agent_a_service",
+    customerServiceQrUrl: "https://example.test/qr-agent-a.png",
     themeColor: "#1677ff",
     bannerUrl: "https://example.test/banner-a.png",
     shareTitle: "测试代理 A 小店",
     productGroups: [{ name: "推荐权益", agentProductIds: ["ap-1"] }]
   });
-  store.shops.set("shop-2", { id: "shop-2", agentId: "agent-2", name: "测试代理 B 小店", status: "open", riskStatus: "normal", customerServiceWechat: "agent_b_service" });
+  store.shops.set("shop-2", { id: "shop-2", agentId: "agent-2", ownerType: "agent", name: "测试代理 B 小店", status: "open", riskStatus: "normal", customerServiceWechat: "agent_b_service", customerServiceQrUrl: "https://example.test/qr-agent-b.png" });
   store.shops.set("shop-new", { id: "shop-new", agentId: "agent-new", name: "新代理小店", status: "not_opened", riskStatus: "normal" });
+  store.shops.set("shop-platform", {
+    id: "shop-platform",
+    ownerType: "platform",
+    name: "ToSell 平台自营店",
+    status: "open",
+    riskStatus: "normal",
+    announcement: "平台自营虚拟权益，购买后按商品规则发放",
+    customerServiceWechat: "tosell_service",
+    customerServiceQrUrl: "https://example.test/qr-platform-service.png",
+    themeColor: "#0f5f6f",
+    bannerUrl: "https://example.test/banner-platform.png",
+    shareTitle: "ToSell 官方权益精选",
+    productGroups: [{ name: "官方精选", agentProductIds: ["psp-1", "psp-code"] }]
+  });
   store.platformProducts.set("prod-1", { id: "prod-1", name: "测试虚拟权益", category: "会员权益", tags: ["热卖"], supplyPriceCents: 10_000n, minSalePriceCents: 12_000n, suggestedSalePriceCents: 15_000n, fulfillmentRule: { mode: "manual" }, afterSaleRule: { refundBeforeFulfillment: true }, status: "active" });
   store.platformProducts.set("prod-code", { id: "prod-code", name: "自动发码权益", category: "权益码", tags: ["自动履约"], supplyPriceCents: 2_000n, minSalePriceCents: 3_000n, suggestedSalePriceCents: 4_900n, fulfillmentRule: { mode: "code_pool" }, afterSaleRule: { refundBeforeFulfillment: true }, status: "active" });
+  store.platformShopProducts.set("psp-1", { id: "psp-1", shopId: "shop-platform", platformProductId: "prod-1", salePriceCents: 14_900n, fulfillmentCostCents: 10_000n, status: "listed", groupName: "官方精选" });
+  store.platformShopProducts.set("psp-code", { id: "psp-code", shopId: "shop-platform", platformProductId: "prod-code", salePriceCents: 4_900n, fulfillmentCostCents: 2_000n, status: "listed", groupName: "自动履约" });
   store.agentProducts.set("ap-1", { id: "ap-1", agentId: "agent-1", shopId: "shop-1", productType: "platform", platformProductId: "prod-1", ownProductReviewId: null, salePriceCents: 15_000n, status: "listed" });
   store.agentProducts.set("ap-code", { id: "ap-code", agentId: "agent-1", shopId: "shop-1", productType: "platform", platformProductId: "prod-code", ownProductReviewId: null, salePriceCents: 4_900n, status: "listed", groupName: "自动履约" });
   store.agentProducts.set("ap-2", { id: "ap-2", agentId: "agent-2", shopId: "shop-2", productType: "platform", platformProductId: "prod-1", ownProductReviewId: null, salePriceCents: 16_000n, status: "listed" });
@@ -1219,12 +1370,14 @@ type DemoAgent = {
 
 type DemoShop = {
   id: string;
-  agentId: string;
+  ownerType?: "platform" | "agent";
+  agentId?: string;
   name: string;
   status: string;
   riskStatus: string;
   announcement?: string;
   customerServiceWechat?: string;
+  customerServiceQrUrl?: string;
   themeColor?: string;
   bannerUrl?: string;
   shareTitle?: string;
@@ -1269,12 +1422,50 @@ type DemoAgentProduct = {
   groupName?: string;
 };
 
+type SalesChannelType = "platform_self_operated" | "single_agent" | "two_tier";
+
+type DemoPlatformShopProduct = {
+  id: string;
+  shopId: string;
+  platformProductId: string;
+  salePriceCents: bigint;
+  fulfillmentCostCents: bigint;
+  status: string;
+  groupName?: string;
+};
+
+type DemoOrderSnapshot = ReturnType<typeof buildOrderSnapshot> | PlatformSelfOperatedSnapshot;
+
+type PlatformSelfOperatedSnapshot = Omit<ReturnType<typeof buildOrderSnapshot>, "salesChannelType" | "amountSnapshot" | "shopSnapshot"> & {
+  salesChannelType: "platform_self_operated";
+  amountSnapshot: ReturnType<typeof buildOrderSnapshot>["amountSnapshot"] & {
+    platformSelfOperatedGrossMarginCents: bigint;
+  };
+  shopSnapshot: {
+    id: string;
+    name: string;
+    ownerType: "platform";
+    customerServiceWechat?: string;
+    customerServiceQrUrl?: string;
+    shopStatus: string;
+    entrySource?: string;
+  };
+  selfOperatedSnapshot: {
+    platformShopId: string;
+    finalSalePriceCents: bigint;
+    fulfillmentCostCents: bigint;
+    paymentChannelFeeCents: bigint;
+    platformSelfOperatedGrossMarginCents: bigint;
+  };
+};
+
 type DemoOrder = {
   orderNo: string;
   userId: string;
   agentId: string;
   shopId: string;
   agentProductId: string;
+  salesChannelType: SalesChannelType;
   status: string;
   paymentStatus: string;
   fulfillmentStatus: string;
@@ -1285,7 +1476,7 @@ type DemoOrder = {
   fulfilledAt: Date | null;
   paidAt: Date | null;
   refundedAmountCents: bigint;
-  snapshot: ReturnType<typeof buildOrderSnapshot>;
+  snapshot: DemoOrderSnapshot;
 };
 
 type DemoAfterSale = {
@@ -1365,6 +1556,7 @@ type MemoryStore = {
   agents: Map<string, DemoAgent>;
   shops: Map<string, DemoShop>;
   platformProducts: Map<string, DemoPlatformProduct>;
+  platformShopProducts: Map<string, DemoPlatformShopProduct>;
   ownProducts: Map<string, DemoOwnProduct>;
   agentProducts: Map<string, DemoAgentProduct>;
   depositAccounts: Map<string, Parameters<typeof deductDeposit>[0]["account"]>;
