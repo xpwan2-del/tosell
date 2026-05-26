@@ -1,8 +1,13 @@
 .ccb/
+.ccb/**
 .vercel/
+.vercel/**
 node_modules/
+node_modules/**
 dist/
+dist/**
 coverage/
+coverage/**
 .env
 .env.local
 *.log
