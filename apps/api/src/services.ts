@@ -18,7 +18,7 @@ import {
   quotePlatformProduct,
   refundCallbackKey,
   shouldRestrictForDeposit
-} from "@tosell/core";
+} from "../../../packages/core/src/index.js";
 
 export class ApiError extends Error {
   constructor(

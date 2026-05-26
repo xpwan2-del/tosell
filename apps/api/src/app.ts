@@ -1,7 +1,7 @@
 import cors from "@fastify/cors";
 import Fastify, { type FastifyRequest } from "fastify";
 import { z } from "zod";
-import { isSettlementCandidate } from "@tosell/core";
+import { isSettlementCandidate } from "../../../packages/core/src/index.js";
 import {
   ApiError,
   type AdminActor,
