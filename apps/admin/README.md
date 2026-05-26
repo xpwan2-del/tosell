@@ -1,6 +1,6 @@
 # Admin MVP
 
-Vite React 管理台默认访问 `http://localhost:3000` 的 Fastify MVP API。
+Vite React 管理台开发环境默认访问 `http://localhost:3000` 的 Fastify MVP API；生产环境默认使用同源 `/api`。
 
 可覆盖的演示入口：
 
@@ -14,4 +14,4 @@ npm run api:dev
 npm run admin:dev
 ```
 
-可通过 `VITE_API_BASE_URL` 指向其他 API 地址。管理台使用 demo mock header，不包含真实密钥。
+可通过 `VITE_API_BASE_URL` 指向其他 API 地址。生产部署不要把该变量配置为本地 `localhost`。管理台使用 demo mock header，不包含真实密钥。

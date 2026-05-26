@@ -1,4 +1,4 @@
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:3000";
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV ? "http://localhost:3000" : "");
 
 type RequestOptions = {
   method?: "GET" | "POST" | "PATCH";
@@ -45,8 +45,8 @@ const userHeaders = {
 };
 
 export const api = {
-  baseUrl: API_BASE_URL,
-  health: () => request<JsonRecord>("/health"),
+  baseUrl: API_BASE_URL || "同源 /api",
+  health: () => request<JsonRecord>("/api/health"),
   reconciliationSummary: () => request<JsonRecord>("/api/exports/reconciliation-summary", {
     headers: adminHeaders("finance")
   }),

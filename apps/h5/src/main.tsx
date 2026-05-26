@@ -53,8 +53,8 @@ function App() {
       setLoading(true);
       const quote = await api.quote(shopId, productId);
       const order = await api.createOrder(shopId, productId, text(quote.paidAmountCents));
+      setOrders((current) => upsertOrder(current, order));
       setMessage(`订单已创建：${text(order.orderNo)}`);
-      await load(shopId);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "下单失败");
     } finally {
@@ -65,9 +65,9 @@ function App() {
   async function pay(order: JsonRecord) {
     try {
       setLoading(true);
-      await api.mockPayment(text(order.orderNo), text(order.paidAmountCents));
+      await api.mockPayment(text(order.orderNo), orderPaidAmount(order));
+      setOrders((current) => upsertOrder(current, { ...order, status: "paid", paymentStatus: "paid" }));
       setMessage(`支付已完成：${text(order.orderNo)}`);
-      await load(shopId);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "支付失败");
     } finally {
@@ -78,9 +78,9 @@ function App() {
   async function afterSale(order: JsonRecord) {
     try {
       setLoading(true);
-      await api.createAfterSale(text(order.orderNo), text(order.paidAmountCents));
+      await api.createAfterSale(text(order.orderNo), orderPaidAmount(order));
+      setOrders((current) => upsertOrder(current, { ...order, refundStatus: "requested" }));
       setMessage(`售后已提交：${text(order.orderNo)}`);
-      await load(shopId);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "售后提交失败");
     } finally {
@@ -134,7 +134,7 @@ function App() {
         {orders.length === 0 ? <p>暂无订单</p> : orders.slice(0, 5).map((order) => (
           <div key={text(order.orderNo)}>
             <span>{text(order.orderNo)}</span>
-            <strong>{cents(order.paidAmountCents)}</strong>
+            <strong>{cents(orderPaidAmount(order))}</strong>
             <em>{text(order.status)}</em>
             {text(order.paymentStatus) === "unpaid" ? <button type="button" onClick={() => void pay(order)}>模拟支付</button> : null}
             {text(order.paymentStatus) === "paid" && text(order.refundStatus) === "none" ? <button type="button" onClick={() => void afterSale(order)}>申请售后</button> : null}
@@ -143,6 +143,19 @@ function App() {
       </section>
     </main>
   );
+}
+
+function upsertOrder(orders: JsonRecord[], order: JsonRecord): JsonRecord[] {
+  const orderNo = text(order.orderNo);
+  const next = orders.filter((item) => text(item.orderNo) !== orderNo);
+  return [order, ...next];
+}
+
+function orderPaidAmount(order: JsonRecord): string {
+  const snapshot = order.snapshot as JsonRecord | undefined;
+  const amountSnapshot = snapshot?.amountSnapshot as JsonRecord | undefined;
+  const quote = snapshot?.quote as JsonRecord | undefined;
+  return text(order.paidAmountCents, text(amountSnapshot?.paidAmountCents, text(quote?.paidAmountCents, "0")));
 }
 
 createRoot(document.getElementById("root")!).render(<App />);
