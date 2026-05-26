@@ -13,8 +13,9 @@
 7. 支付、退款、履约、结算、追扣、保证金交易必须有幂等键和唯一约束。
 8. 代理侧所有查询必须以后端认证主体派生 `agent_id/shop_id`，不能信任前端传参。
 9. 数据库、API、页面、导出不得出现邀请奖励、团队业绩、代理等级、返佣比例、团队订单奖励等设计。
-10. 受控两级渠道只允许平台 -> 一级渠道商 -> 二级渠道商 -> 消费者，禁止三级渠道。
+10. 受控两级渠道只允许平台供货 -> 一级渠道商 -> 二级渠道商 -> 消费者，禁止三级渠道。
 11. 渠道收益必须按供货价差计算，不得按招募人数、团队订单或返佣比例计算。
+12. 平台自营店是平台自己的销售渠道，不属于一级渠道商，不参与一级/二级渠道结算。
 
 ## 2. 平台后台 V1 模块
 
@@ -112,6 +113,14 @@
 
 要求：二级不得继续创建三级；转供价调整必须写审计；历史订单不得受后续转供价变化影响。
 
+### 2.13 平台自营管理
+
+字段：平台自营店、平台自营商品、自营售价、履约成本、支付通道费、平台自营毛收益、自营订单、自营售后、自营对账状态。
+
+操作：配置平台自营店、上架/下架自营商品、调整自营售价、查看自营订单、处理自营售后、查看自营看板和对账。
+
+要求：平台自营订单不生成渠道结算项，但必须进入平台收入、成本、退款、ledger 和对账。
+
 ## 3. 后端领域模块
 
 1. Auth/RBAC：微信登录、后台账号、角色权限、菜单权限、数据权限、敏感操作授权。
@@ -129,7 +138,8 @@
 13. Reconciliation/Export：订单、支付、退款、结算、人工打款、保证金、ledger 对账导出。
 14. ChannelSupply：渠道授权、渠道关系、转供商品、转供价、供货链快照、一级/二级结算。
 15. H5Frontend：H5 店铺、H5 用户身份、H5 订单和售后入口。
-16. PaymentChannel：微信小程序、微信 H5/JSAPI、支付宝手机网站、mock 支付统一模型。
+16. PaymentChannel：微信小程序、微信内 H5 JSAPI、微信外 H5、支付宝手机网站、mock 支付统一模型。
+17. PlatformSelfOperated：平台自营店、自营商品、自营订单、自营履约、自营售后、自营对账。
 
 ## 4. 核心数据库实体
 
@@ -141,7 +151,9 @@
 
 `agent_applications`：`id`、`agent_id`、`user_id`、`identity_info_json`、`contact_info_json`、`customer_service_wechat`、`status`、`reject_reason`、`reviewed_by`、`reviewed_at`。
 
-`shops`：`id`、`agent_id`、`shop_no`、`name`、`logo_url`、`announcement`、`share_path`、`status`、`risk_status`。
+`shops`：`id`、`owner_type`、`agent_id`、`shop_no`、`name`、`logo_url`、`announcement`、`share_path`、`status`、`risk_status`。
+
+`owner_type` 枚举：`platform`、`agent`。平台自营店使用 `owner_type=platform`，渠道店使用 `owner_type=agent`。
 
 `shop_customer_service_bindings`：`id`、`shop_id`、`wechat_id`、`qr_code_url`、`status`、`review_status`、`reviewed_by`。
 
@@ -175,7 +187,9 @@
 
 ### 4.4 订单与快照
 
-`orders`：`id`、`order_no`、`buyer_type`、`user_id`、`mini_user_id`、`h5_user_id`、`unified_user_id`、`agent_id`、`shop_id`、`status`、`payment_status`、`fulfillment_status`、`refund_status`、`settlement_status`、`risk_status`、`paid_amount_cents`、`created_at`、`paid_at`。
+`orders`：`id`、`order_no`、`sales_channel_type`、`buyer_type`、`user_id`、`mini_user_id`、`h5_user_id`、`unified_user_id`、`agent_id`、`shop_id`、`platform_shop_id`、`status`、`payment_status`、`fulfillment_status`、`refund_status`、`settlement_status`、`risk_status`、`paid_amount_cents`、`created_at`、`paid_at`。
+
+`sales_channel_type` 枚举：`platform_self_operated`、`single_agent`、`two_tier`。
 
 买家身份规则：小程序订单写 `buyer_type=mini_program` 和 `mini_user_id/user_id`；H5 订单写 `buyer_type=h5` 和 `h5_user_id`；如果后续完成手机号或 unionid 合并，可写 `unified_user_id`。订单、售后和权益查询必须从登录态派生对应买家身份。
 
@@ -186,6 +200,8 @@
 订单快照必须固化：`agent_id`、`shop_id`、店铺名称、客服微信、用户入口来源、商品 ID 与版本、商品名称、商品类型、履约规则、售后规则、销售价、实付金额、平台供货价、最低限价、服务费率、服务费金额、代理预计收益、创建时代理/店铺状态。
 
 两级渠道订单快照必须额外固化：`first_tier_agent_id`、`second_tier_agent_id`、`first_tier_shop_id`、`second_tier_shop_id`、`platform_supply_price_cents`、`resell_supply_price_cents`、`final_sale_price_cents`、`first_tier_margin_cents`、`second_tier_margin_cents`、`service_fee_bearer`、`channel_relation_id`、`channel_authorization_snapshot_json`。
+
+平台自营订单快照必须额外固化：`platform_shop_id`、`final_sale_price_cents`、`fulfillment_cost_cents`、`payment_channel_fee_cents`、`platform_self_operated_gross_margin_cents`。
 
 ### 4.5 支付、履约、权益
 
@@ -222,6 +238,8 @@
 两级渠道结算建议扩展：`settlement_role`、`first_tier_agent_id`、`second_tier_agent_id`、`platform_supply_price_cents`、`resell_supply_price_cents`、`final_sale_price_cents`、`first_tier_margin_cents`、`second_tier_margin_cents`。
 
 唯一约束：单层订单可使用 `order_id` 唯一；两级渠道必须使用 `order_id + settlement_role` 唯一，其中 `settlement_role` 至少包含 `single_agent`、`first_tier`、`second_tier`。
+
+平台自营订单不插入渠道结算明细；平台自营订单进入平台收入、履约成本、支付通道费、退款和 ledger 对账。
 
 `manual_payouts`：`id`、`settlement_id`、`agent_id`、`amount_cents`、`payee_info_snapshot_json`、`payout_method`、`payout_voucher_url`、`status`、`paid_by`、`paid_at`。
 
