@@ -24,9 +24,10 @@ describe("frontend MVP static checks", () => {
   it("keeps prohibited growth-model wording out of frontend app code", () => {
     const files = [
       ...readFiles(join(root, "apps", "admin", "src"), [".ts", ".tsx", ".css"]),
+      ...readFiles(join(root, "apps", "h5", "src"), [".ts", ".tsx", ".css"]),
       ...readFiles(join(root, "apps", "miniprogram"), [".ts", ".wxml", ".wxss", ".json"])
     ];
-    const prohibited = [/分销/u, /返佣/u, /团队奖/u, /邀请奖励/u, /代理等级/u, /下级/u, /commission_rate/u, /team_performance/u];
+    const prohibited = [/直播/u, /分销/u, /返佣/u, /团队奖/u, /邀请奖励/u, /代理等级/u, /下级/u, /commission_rate/u, /team_performance/u];
 
     for (const file of files) {
       for (const pattern of prohibited) {
@@ -59,7 +60,9 @@ describe("frontend MVP static checks", () => {
       "基础看板",
       "代理审核",
       "保证金",
+      "二级渠道管理",
       "店铺管理",
+      "平台自营",
       "商品管理",
       "代理商品审核",
       "订单管理",
@@ -68,6 +71,7 @@ describe("frontend MVP static checks", () => {
       "结算管理",
       "风控冻结",
       "审计日志",
+      "客服二维码",
       "入驻与店铺",
       "选品与定价",
       "订单收益",

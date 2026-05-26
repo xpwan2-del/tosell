@@ -220,7 +220,7 @@ async function main() {
       paymentNo: "PAY000001",
       orderId: order.id,
       userId: user.id,
-      channel: "wechat",
+      channel: "wechat_miniprogram",
       channelTradeNo: "WXTRADE000001",
       amountCents: 15_000n,
       status: "paid",
@@ -234,7 +234,7 @@ async function main() {
     update: {},
     create: {
       paymentId: payment.id,
-      channel: "wechat",
+      channel: "wechat_miniprogram",
       channelEventId: "WXEVENT_PAY_000001",
       rawPayloadJson: { transactionId: "WXTRADE000001", amountCents: "15000" },
       processedStatus: "processed",
@@ -294,11 +294,12 @@ async function main() {
   });
 
   await prisma.settlementItem.upsert({
-    where: { orderId: order.id },
+    where: { orderId_settlementRole: { orderId: order.id, settlementRole: "single_agent" } },
     update: {},
     create: {
       settlementId: settlement.id,
       orderId: order.id,
+      settlementRole: "single_agent",
       agentId: agent.id,
       shopId: shop.id,
       paidAmountCents: 15_000n,
@@ -371,7 +372,7 @@ async function main() {
     update: {},
     create: {
       refundId: refund.id,
-      channel: "wechat",
+      channel: "wechat_miniprogram",
       channelEventId: "WXEVENT_REFUND_000001",
       rawPayloadJson: { refundId: "WXREFUND000001", amountCents: "3000" },
       processedStatus: "processed",

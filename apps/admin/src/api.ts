@@ -59,11 +59,70 @@ export const api = {
   paymentGuide: () => request<JsonRecord>("/api/admin/payment-onboarding-guide", {
     headers: adminHeaders("operator")
   }),
+  paymentConfigStatus: () => request<JsonRecord[]>("/api/admin/payment-config/status", {
+    headers: adminHeaders("operator")
+  }),
+  paymentConfigCheck: () => request<JsonRecord>("/api/admin/payment-config/check", {
+    method: "POST",
+    headers: adminHeaders("operator")
+  }),
+  updatePaymentConfig: () => request<JsonRecord>("/api/admin/payment-config/metadata", {
+    method: "PATCH",
+    headers: adminHeaders("finance"),
+    body: { channel: "wechat_miniprogram", enabled: false, statusNote: "等待微信支付商户号开通" }
+  }),
   adminOrders: () => request<JsonRecord[]>("/api/admin/orders", {
+    headers: adminHeaders("operator")
+  }),
+  agentApplications: () => request<JsonRecord[]>("/api/admin/agent-applications", {
+    headers: adminHeaders("operator")
+  }),
+  adminAfterSales: () => request<JsonRecord[]>("/api/admin/after-sales", {
+    headers: adminHeaders("operator")
+  }),
+  adminRefunds: () => request<JsonRecord[]>("/api/admin/refunds", {
+    headers: adminHeaders("operator")
+  }),
+  adminSettlements: () => request<JsonRecord[]>("/api/admin/settlements", {
+    headers: adminHeaders("finance")
+  }),
+  adminDeposits: () => request<JsonRecord[]>("/api/admin/deposits", {
+    headers: adminHeaders("finance")
+  }),
+  adminChannels: () => request<JsonRecord>("/api/admin/channels", {
+    headers: adminHeaders("operator")
+  }),
+  createChannelRelation: () => request<JsonRecord>("/api/admin/channels/relations", {
+    method: "POST",
+    headers: adminHeaders("operator"),
+    body: { firstTierAgentId: "agent-1", secondTierAgentId: "agent-2", reason: "受控二级供货关系" }
+  }),
+  upsertChannelOffer: () => request<JsonRecord>("/api/admin/channels/offers", {
+    method: "POST",
+    headers: adminHeaders("operator"),
+    body: { channelRelationId: "channel-rel-1", platformProductId: "prod-1", resellSupplyPriceCents: "11000" }
+  }),
+  reviewChannel: (agentId = "agent-2") => request<JsonRecord>(`/api/admin/channels/${agentId}/review`, {
+    method: "POST",
+    headers: adminHeaders("operator"),
+    body: { approved: true, reason: "开通受控二级供货能力" }
+  }),
+  serviceQrCodes: () => request<JsonRecord[]>("/api/admin/service-qrcodes", {
+    headers: adminHeaders("operator")
+  }),
+  saveServiceQrCode: () => request<JsonRecord>("/api/admin/shops/shop-1/service-qrcode", {
+    method: "PATCH",
+    headers: adminHeaders("operator"),
+    body: { customerServiceQrUrl: "https://example.test/admin-qr.png" }
+  }),
+  riskFreezes: () => request<JsonRecord[]>("/api/admin/risk-freezes", {
     headers: adminHeaders("operator")
   }),
   auditLogs: () => request<JsonRecord[]>("/api/admin/audit-logs", {
     headers: adminHeaders("operator")
+  }),
+  ledgerEntries: () => request<JsonRecord[]>("/api/admin/ledger-entries", {
+    headers: adminHeaders("finance")
   }),
   reviewAgent: (agentId: string, approved: boolean, reason?: string) => request<JsonRecord>(`/api/admin/agents/${agentId}/review`, {
     method: "POST",
@@ -225,6 +284,23 @@ export const api = {
   }),
   platformProducts: () => request<JsonRecord[]>("/api/agent/products/platform", {
     headers: agentHeaders
+  }),
+  adminPlatformProducts: () => request<JsonRecord[]>("/api/admin/products", {
+    headers: adminHeaders("operator")
+  }),
+  adminPlatformShopProducts: () => request<JsonRecord[]>("/api/admin/platform-shop-products", {
+    headers: adminHeaders("operator")
+  }),
+  upsertPlatformShopProduct: () => request<JsonRecord>("/api/admin/platform-shop-products", {
+    method: "POST",
+    headers: adminHeaders("operator"),
+    body: {
+      shopId: "shop-platform",
+      platformProductId: "prod-1",
+      salePriceCents: "14900",
+      fulfillmentCostCents: "10000",
+      status: "listed"
+    }
   }),
   batchSelectProducts: () => request<JsonRecord>("/api/agent/products/platform/batch", {
     method: "POST",

@@ -12,6 +12,7 @@ import {
 
 const bigintString = z.union([z.string(), z.number(), z.bigint()]).transform((value) => BigInt(value));
 const adminRole = z.enum(["operator", "finance", "admin"]);
+const paymentChannel = z.enum(["wechat_miniprogram", "wechat_h5_jsapi", "wechat_h5", "alipay_wap", "mock"]);
 
 export function buildApp() {
   const app = Fastify({ logger: false });
@@ -20,6 +21,9 @@ export function buildApp() {
   app.setErrorHandler((error: Error, _request, reply) => {
     if (error instanceof ApiError) {
       return reply.status(error.statusCode).send({ code: error.code, message: error.message });
+    }
+    if (error.message.startsWith("missing admin permission")) {
+      return reply.status(403).send({ code: "FORBIDDEN_ADMIN_PERMISSION", message: error.message });
     }
     return reply.status(500).send({ code: "INTERNAL_ERROR", message: error.message });
   });
@@ -187,6 +191,7 @@ export function buildApp() {
     const body = z.object({ approved: z.boolean(), reason: z.string().optional() }).parse(request.body);
     return services.reviewAgent(getAdminActor(request), agentId, body);
   });
+  app.get("/api/admin/agent-applications", async (request) => serializeBigInt(services.listAgentApplications(getAdminActor(request))));
 
   app.post("/api/admin/deposits/:agentId/confirm", async (request) => {
     const { agentId } = z.object({ agentId: z.string() }).parse(request.params);
@@ -214,6 +219,29 @@ export function buildApp() {
     }).parse(request.body);
     return serializeBigInt(services.createPlatformProduct(getAdminActor(request), body));
   });
+  app.get("/api/admin/products", async (request) => serializeBigInt(services.listAdminPlatformProducts(getAdminActor(request))));
+  app.patch("/api/admin/products/:productId", async (request) => {
+    const { productId } = z.object({ productId: z.string() }).parse(request.params);
+    const body = z.object({
+      name: z.string().optional(),
+      supplyPriceCents: bigintString.optional(),
+      minSalePriceCents: bigintString.optional(),
+      suggestedSalePriceCents: bigintString.optional(),
+      status: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.updatePlatformProduct(getAdminActor(request), productId, body));
+  });
+  app.get("/api/admin/platform-shop-products", async (request) => serializeBigInt(services.listAdminPlatformShopProducts(getAdminActor(request))));
+  app.post("/api/admin/platform-shop-products", async (request) => {
+    const body = z.object({
+      shopId: z.string(),
+      platformProductId: z.string(),
+      salePriceCents: bigintString,
+      fulfillmentCostCents: bigintString.optional(),
+      status: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.upsertPlatformShopProduct(getAdminActor(request), body));
+  });
 
   app.get("/api/admin/rights-codes", async (request) => {
     const query = z.object({ productId: z.string().optional() }).parse(request.query);
@@ -236,6 +264,33 @@ export function buildApp() {
   });
 
   app.get("/api/admin/orders", async (request) => serializeBigInt(services.listAdminOrders(getAdminActor(request))));
+  app.get("/api/admin/after-sales", async (request) => serializeBigInt(services.listAdminAfterSales(getAdminActor(request))));
+  app.get("/api/admin/refunds", async (request) => serializeBigInt(services.listAdminRefunds(getAdminActor(request))));
+  app.get("/api/admin/settlements", async (request) => serializeBigInt(services.listAdminSettlements(getAdminActor(request))));
+  app.get("/api/admin/deposits", async (request) => serializeBigInt(services.listAdminDeposits(getAdminActor(request))));
+  app.get("/api/admin/channels", async (request) => serializeBigInt(services.listAdminChannels(getAdminActor(request))));
+  app.post("/api/admin/channels/:agentId/review", async (request) => {
+    const { agentId } = z.object({ agentId: z.string() }).parse(request.params);
+    const body = z.object({ approved: z.boolean(), reason: z.string().optional() }).parse(request.body);
+    return serializeBigInt(services.reviewChannelAuthorization(getAdminActor(request), agentId, body));
+  });
+  app.post("/api/admin/channels/relations", async (request) => {
+    const body = z.object({
+      firstTierAgentId: z.string(),
+      secondTierAgentId: z.string(),
+      reason: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.createChannelRelation(getAdminActor(request), body));
+  });
+  app.post("/api/admin/channels/offers", async (request) => {
+    const body = z.object({
+      channelRelationId: z.string(),
+      platformProductId: z.string(),
+      resellSupplyPriceCents: bigintString,
+      status: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.upsertChannelProductOffer(getAdminActor(request), body));
+  });
 
   app.post("/api/admin/fulfillment/:orderNo", async (request) => {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
@@ -317,9 +372,36 @@ export function buildApp() {
     }).parse(request.body);
     return services.createRiskFreeze(getAdminActor(request), body);
   });
+  app.get("/api/admin/risk-freezes", async (request) => serializeBigInt(services.listRiskFreezes(getAdminActor(request))));
+  app.post("/api/admin/risk-freezes/:freezeId/release", async (request) => {
+    const { freezeId } = z.object({ freezeId: z.string() }).parse(request.params);
+    return serializeBigInt(services.releaseRiskFreeze(getAdminActor(request), freezeId));
+  });
 
   app.get("/api/admin/audit-logs", async (request) => serializeBigInt(services.listAuditLogs(getAdminActor(request))));
+  app.get("/api/admin/ledger-entries", async (request) => serializeBigInt(services.listLedgerEntries(getAdminActor(request))));
   app.get("/api/admin/risk-dashboard", async (request) => serializeBigInt(services.adminRiskDashboard(getAdminActor(request))));
+  app.get("/api/admin/service-qrcodes", async (request) => serializeBigInt(services.listServiceQrCodes(getAdminActor(request))));
+  app.patch("/api/admin/shops/:shopId/service-qrcode", async (request) => {
+    const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
+    const body = z.object({
+      customerServiceWechat: z.string().optional(),
+      customerServiceQrUrl: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.updateShopServiceQrCode(getAdminActor(request), shopId, body));
+  });
+  app.get("/api/admin/payment-config/status", async (request) => serializeBigInt(services.paymentConfigStatus(getAdminActor(request))));
+  app.patch("/api/admin/payment-config/metadata", async (request) => {
+    const body = z.object({
+      channel: paymentChannel,
+      enabled: z.boolean().optional(),
+      feeBps: z.number().int().nonnegative().optional(),
+      fixedFeeCents: bigintString.optional(),
+      statusNote: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.updatePaymentConfigMetadata(getAdminActor(request), body));
+  });
+  app.post("/api/admin/payment-config/check", async (request) => serializeBigInt(services.checkPaymentConfig(getAdminActor(request))));
   app.get("/api/admin/payment-onboarding-guide", async (request) => {
     getAdminActor(request);
     return services.paymentOnboardingGuide();

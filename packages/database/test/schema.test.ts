@@ -22,6 +22,10 @@ const platformSelfOperatedMigrationSql = readFileSync(
   resolve(testDir, "../prisma/migrations/000004_platform_self_operated/migration.sql"),
   "utf8"
 );
+const productionChannelMigrationSql = readFileSync(
+  resolve(testDir, "../prisma/migrations/000005_production_channel_foundation/migration.sql"),
+  "utf8"
+);
 
 function modelBlock(modelName: string) {
   const match = schema.match(new RegExp(`model\\s+${modelName}\\s+\\{([\\s\\S]*?)\\n\\}`));
@@ -123,7 +127,7 @@ describe("Prisma database contract", () => {
   it("uses order and settlement role uniqueness for controlled two-tier settlement", () => {
     const settlementItem = modelBlock("SettlementItem");
     expect(settlementItem).toMatch(/orderId\s+String\s+@map\("order_id"\)/);
-    expect(settlementItem).toMatch(/settlementRole\s+String\s+@default\("single_agent"\)\s+@map\("settlement_role"\)/);
+    expect(settlementItem).toMatch(/settlementRole\s+SettlementRole\s+@default\(single_agent\)\s+@map\("settlement_role"\)/);
     expect(settlementItem).toMatch(/@@unique\(\[orderId,\s*settlementRole\]\)/);
   });
 
@@ -235,5 +239,29 @@ describe("Prisma database contract", () => {
     expect(platformSelfOperatedMigrationSql).toContain("sales_channel_type");
     expect(platformSelfOperatedMigrationSql).toContain('DROP INDEX IF EXISTS "settlement_items_order_id_key"');
     expect(platformSelfOperatedMigrationSql).toContain("settlement_items_order_id_settlement_role_key");
+  });
+
+  it("adds production foundation for H5 identities and controlled two-tier supply", () => {
+    expect(modelBlock("User")).toContain("identities");
+    expect(modelBlock("UserIdentity")).toMatch(/@@unique\(\[identityType,\s*provider,\s*externalId\]\)/);
+    expect(modelBlock("PlatformShopProduct")).toMatch(/fulfillmentCostCents\s+BigInt\s+@default\(0\)\s+@map\("fulfillment_cost_cents"\)/);
+    expect(modelBlock("ChannelAuthorization")).toMatch(/firstTierAgentId\s+String\s+@unique\s+@map\("first_tier_agent_id"\)/);
+    expect(modelBlock("ChannelRelation")).toMatch(/activeUniqueKey\s+String\?\s+@unique\s+@map\("active_unique_key"\)/);
+    expect(modelBlock("ChannelProductOffer")).toMatch(/resellSupplyPriceCents\s+BigInt\s+@map\("resell_supply_price_cents"\)/);
+    expect(modelBlock("Order")).toMatch(/firstTierAgentId\s+String\?\s+@map\("first_tier_agent_id"\)/);
+    expect(modelBlock("Order")).toMatch(/secondTierAgentId\s+String\?\s+@map\("second_tier_agent_id"\)/);
+    expect(modelBlock("OrderAmountSnapshot")).toContain("platformSupplyPriceCents");
+    expect(modelBlock("OrderAmountSnapshot")).toContain("firstTierIncomeCents");
+    expect(modelBlock("Payment")).toMatch(/channel\s+PaymentChannel/);
+    expect(modelBlock("PaymentChannelConfig")).toMatch(/channel\s+PaymentChannel\s+@unique/);
+    expect(productionChannelMigrationSql).toContain('CREATE TABLE "user_identities"');
+    expect(productionChannelMigrationSql).toContain('CREATE TABLE "channel_relations"');
+    expect(productionChannelMigrationSql).toContain('CREATE TABLE "channel_product_offers"');
+    expect(productionChannelMigrationSql).toContain("WHEN 'wechat' THEN 'wechat_miniprogram'");
+    expect(productionChannelMigrationSql).toContain("shops_owner_agent_scope_check");
+    expect(productionChannelMigrationSql).toContain("channel_relations_active_unique_key_required_check");
+    expect(productionChannelMigrationSql).toContain("channel_relations_active_unique_key_set");
+    expect(productionChannelMigrationSql).toContain("channel_product_offers_supply_price_check");
+    expect(productionChannelMigrationSql).toContain("resell supply price cannot be below platform supply price");
   });
 });

@@ -13,9 +13,19 @@ type LoadState = {
   ownProducts: JsonRecord[];
   agentOrders: JsonRecord[];
   adminOrders: JsonRecord[];
+  agentApplications: JsonRecord[];
+  adminAfterSales: JsonRecord[];
+  adminRefunds: JsonRecord[];
+  adminSettlements: JsonRecord[];
+  adminDeposits: JsonRecord[];
+  serviceQrCodes: JsonRecord[];
+  riskFreezes: JsonRecord[];
+  paymentConfigs: JsonRecord[];
   settlements: JsonRecord[];
   clawbacks: JsonRecord[];
   auditLogs: JsonRecord[];
+  ledgerEntries: JsonRecord[];
+  channels?: JsonRecord;
   rightsCodes: JsonRecord[];
   notifications: JsonRecord[];
   reconciliation?: JsonRecord;
@@ -32,9 +42,18 @@ const initialState: LoadState = {
   ownProducts: [],
   agentOrders: [],
   adminOrders: [],
+  agentApplications: [],
+  adminAfterSales: [],
+  adminRefunds: [],
+  adminSettlements: [],
+  adminDeposits: [],
+  serviceQrCodes: [],
+  riskFreezes: [],
+  paymentConfigs: [],
   settlements: [],
   clawbacks: [],
   auditLogs: [],
+  ledgerEntries: [],
   rightsCodes: [],
   notifications: []
 };
@@ -53,6 +72,8 @@ const adminNav = [
   "结算管理",
   "风控冻结",
   "审计日志",
+  "账务流水",
+  "客服二维码",
   "V2经营看板",
   "权益码池",
   "支付开通"
@@ -104,7 +125,17 @@ function App() {
         settlements,
         clawbacks,
         adminOrders,
+        agentApplications,
+        adminAfterSales,
+        adminRefunds,
+        adminSettlements,
+        adminDeposits,
+        channels,
+        serviceQrCodes,
+        riskFreezes,
+        paymentConfigs,
         auditLogs,
+        ledgerEntries,
         reconciliation,
         rightsCodes,
         notifications,
@@ -115,15 +146,25 @@ function App() {
         api.shop(),
         api.shop("shop-platform"),
         api.shopProducts(),
-        api.shopProducts("shop-platform"),
+        api.adminPlatformShopProducts(),
         api.agentProducts(),
-        api.platformProducts(),
+        api.adminPlatformProducts(),
         api.ownProducts(),
         api.agentOrders(),
         api.agentSettlements(),
         api.agentClawbacks(),
         api.adminOrders(),
+        api.agentApplications(),
+        api.adminAfterSales(),
+        api.adminRefunds(),
+        api.adminSettlements(),
+        api.adminDeposits(),
+        api.adminChannels(),
+        api.serviceQrCodes(),
+        api.riskFreezes(),
+        api.paymentConfigStatus(),
         api.auditLogs(),
+        api.ledgerEntries(),
         api.reconciliationSummary(),
         api.rightsCodes(),
         api.notifications(),
@@ -143,7 +184,17 @@ function App() {
         settlements,
         clawbacks,
         adminOrders,
+        agentApplications,
+        adminAfterSales,
+        adminRefunds,
+        adminSettlements,
+        adminDeposits,
+        channels,
+        serviceQrCodes,
+        riskFreezes,
+        paymentConfigs,
         auditLogs,
+        ledgerEntries,
         reconciliation,
         rightsCodes,
         notifications,
@@ -226,6 +277,8 @@ function App() {
           <Panel title="代理审核" owner="运营" id="代理审核">
             <KeyValue label="示例代理" value="agent-1 / 测试代理 A" />
             <KeyValue label="审核状态" value="active，可演示重新置为待缴保证金" />
+            <KeyValue label="入驻申请数" value={String(data.agentApplications.length)} />
+            <Table rows={data.agentApplications.slice(0, 4)} columns={["applicationNo", "agentId", "status", "contactPhone", "customerServiceWechat"]} />
             <div className="actions">
               <button onClick={() => void runAction("代理审核通过", () => api.reviewAgent("agent-1", true, "资料通过"))}>审核通过</button>
               <button onClick={() => void runAction("代理审核拒绝", () => api.reviewAgent("agent-1", false, "资料需补充"))}>审核拒绝</button>
@@ -236,10 +289,25 @@ function App() {
 
           <Panel title="保证金" owner="财务" id="保证金">
             <KeyValue label="应缴/可用" value="¥500.00 / 以后端账户为准" />
+            <KeyValue label="保证金账户" value={String(data.adminDeposits.length)} />
             <KeyValue label="操作约束" value="扣减写交易和审计；余额不足触发限制" />
+            <Table rows={data.adminDeposits} columns={["agentId", "requiredAmountCents", "availableAmountCents", "status"]} moneyColumns={["requiredAmountCents", "availableAmountCents"]} />
             <div className="actions">
               <button onClick={() => void runAction("新代理保证金确认", () => api.confirmDeposit())}>确认新代理保证金</button>
               <button onClick={() => void runAction("保证金扣减", api.deductDeposit)}>扣减 ¥10.00</button>
+            </div>
+          </Panel>
+
+          <Panel title="二级渠道管理" owner="运营" id="二级渠道管理">
+            <KeyValue label="授权记录" value={String(channelRows(data.channels, "authorizations").length)} />
+            <KeyValue label="渠道关系" value={String(channelRows(data.channels, "relations").length)} />
+            <KeyValue label="转供商品" value={String(channelRows(data.channels, "offers").length)} />
+            <Table rows={channelRows(data.channels, "relations")} columns={["id", "firstTierAgentId", "secondTierAgentId", "status"]} />
+            <Table rows={channelRows(data.channels, "offers")} columns={["id", "channelRelationId", "platformProductId", "resellSupplyPriceCents", "status"]} moneyColumns={["resellSupplyPriceCents"]} />
+            <div className="actions">
+              <button onClick={() => void runAction("一级渠道授权", api.reviewChannel)}>开通二级供货能力</button>
+              <button onClick={() => void runAction("创建二级关系", api.createChannelRelation)}>绑定一级/二级</button>
+              <button onClick={() => void runAction("配置转供价", api.upsertChannelOffer)}>保存转供价</button>
             </div>
           </Panel>
 
@@ -257,6 +325,7 @@ function App() {
             <KeyValue label="自营毛收益" value={cents(data.reconciliation?.platformSelfOperatedGrossMarginCents)} />
             <Table rows={data.platformShopProducts} columns={["id", "productType", "salePriceCents", "status"]} moneyColumns={["salePriceCents"]} />
             <div className="actions">
+              <button onClick={() => void runAction("自营商品配置", api.upsertPlatformShopProduct)}>保存自营商品</button>
               <button onClick={() => void runAction("平台自营报价", () => api.quoteOrder("shop-platform", text(selectedPlatformShopProduct?.id, "psp-1")), false)}>自营报价</button>
               <button onClick={() => void runAction("创建平台自营订单", async () => {
                 const quote = await api.quoteOrder("shop-platform", text(selectedPlatformShopProduct?.id, "psp-1"));
@@ -310,6 +379,8 @@ function App() {
 
           <Panel title="售后退款" owner="运营" id="售后退款">
             <KeyValue label="退款状态" value={text(selectedOrder?.refundStatus)} />
+            <KeyValue label="售后单数" value={String(data.adminAfterSales.length)} />
+            <KeyValue label="退款单数" value={String(data.adminRefunds.length)} />
             <KeyValue label="售后单" value={text(currentAfterSale?.afterSaleNo, "暂无，先提交售后")} />
             <KeyValue label="退款单" value={text(currentRefund?.refundNo, "暂无，先审批退款")} />
             <KeyValue label="最近拆账" value={currentAllocation ? `平台 ${cents(currentAllocation.platformBearCents)} / 代理 ${cents(currentAllocation.agentBearCents)}` : "暂无"} />
@@ -322,10 +393,12 @@ function App() {
               <button disabled={!currentAfterSale?.afterSaleNo} onClick={() => void runAction("退款审批建单", () => api.createRefund(text(currentAfterSale?.afterSaleNo, ""), selectedOrder ?? {}, refundCents, "mixed"))}>审批退款</button>
               <button disabled={!currentRefund?.refundNo} onClick={() => void runAction("退款回调", () => api.mockRefund(text(currentRefund?.refundNo, "")))}>mock 退款成功</button>
             </div>
+            <Table rows={data.adminAfterSales.slice(0, 4)} columns={["afterSaleNo", "orderNo", "status", "reasonCode", "requestedRefundCents"]} moneyColumns={["requestedRefundCents"]} />
           </Panel>
 
           <Panel title="结算管理" owner="财务" id="结算管理">
             <KeyValue label="结算单数" value={String(data.settlements.length)} />
+            <KeyValue label="后台结算单数" value={String(data.adminSettlements.length)} />
             <KeyValue label="当前订单结算状态" value={text(selectedOrder?.settlementStatus)} />
             <KeyValue label="待打款结算单" value={text(selectedSettlement?.settlementNo, "暂无，先生成")} />
             <div className="actions">
@@ -336,6 +409,8 @@ function App() {
 
           <Panel title="风控冻结" owner="运营/管理员" id="风控冻结">
             <KeyValue label="当前订单风控" value={text(selectedOrder?.riskStatus)} />
+            <KeyValue label="冻结记录" value={String(data.riskFreezes.length)} />
+            <Table rows={data.riskFreezes.slice(0, 4)} columns={["id", "targetType", "targetId", "freezeType", "status"]} />
             <div className="actions">
               <button disabled={!selectedOrderNo} onClick={() => void runAction("订单风控冻结", () => api.riskFreeze("order", selectedOrderNo))}>冻结订单</button>
               <button onClick={() => void runAction("店铺风控冻结", () => api.riskFreeze("shop", "shop-2"))}>冻结测试店铺 B</button>
@@ -345,6 +420,17 @@ function App() {
           <Panel title="审计日志" owner="管理员" id="审计日志">
             <KeyValue label="审计记录数" value={String(data.auditLogs.length)} />
             <Table rows={data.auditLogs.slice(-5)} columns={["action", "targetType", "targetId", "actor"]} />
+          </Panel>
+
+          <Panel title="账务流水" owner="财务" id="账务流水">
+            <KeyValue label="流水记录数" value={String(data.ledgerEntries.length)} />
+            <Table rows={data.ledgerEntries.slice(-6)} columns={["ledgerNo", "entryType", "orderNo", "agentId", "amountCents"]} moneyColumns={["amountCents"]} />
+          </Panel>
+
+          <Panel title="客服二维码" owner="运营" id="客服二维码">
+            <KeyValue label="二维码记录" value={String(data.serviceQrCodes.length)} />
+            <Table rows={data.serviceQrCodes} columns={["shopId", "ownerType", "name", "customerServiceWechat", "customerServiceQrUrl", "status"]} />
+            <button onClick={() => void runAction("客服二维码保存", api.saveServiceQrCode)}>保存示例二维码</button>
           </Panel>
 
           <Panel title="V2经营看板" owner="运营/代理" id="V2经营看板">
@@ -368,6 +454,11 @@ function App() {
           <Panel title="支付开通" owner="技术/财务" id="支付开通">
             <KeyValue label="当前状态" value={text(data.paymentGuide?.status, "not_configured")} />
             <KeyValue label="生产规则" value={text(data.paymentGuide?.productionRule)} />
+            <Table rows={data.paymentConfigs} columns={["channel", "enabled", "feeBps", "fixedFeeCents", "statusNote"]} moneyColumns={["fixedFeeCents"]} />
+            <div className="actions">
+              <button onClick={() => void runAction("支付配置检查", api.paymentConfigCheck, false)}>检查配置</button>
+              <button onClick={() => void runAction("支付配置状态保存", api.updatePaymentConfig)}>保存配置状态</button>
+            </div>
             <Table rows={arrayRows(data.paymentGuide?.envVars, "envVar")} columns={["envVar"]} />
           </Panel>
         </section>
@@ -498,6 +589,11 @@ function orderIncomeRows(rows: JsonRecord[]): JsonRecord[] {
 
 function arrayRows(value: unknown, key: string): JsonRecord[] {
   return Array.isArray(value) ? value.map((item) => ({ [key]: item })) : [];
+}
+
+function channelRows(channels: JsonRecord | undefined, key: string): JsonRecord[] {
+  const value = channels?.[key];
+  return Array.isArray(value) ? value as JsonRecord[] : [];
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

@@ -148,6 +148,10 @@ class BackendServices {
       };
       this.store.orders.set(orderNo, order);
       this.audit("system", "order.create", "order", orderNo, { agentId: order.agentId, shopId: order.shopId });
+      this.ledger("ORDER_CREATED", { orderNo: order.orderNo, agentId: order.agentId }, order.snapshot.amountSnapshot.paidAmountCents, {
+        salesChannelType: order.salesChannelType,
+        channel: getChannelSnapshot(order.snapshot)
+      });
       return this.serializePublicOrder(order);
     } catch (error) {
       if (error instanceof ApiError && error.code !== "RESOURCE_NOT_FOUND") throw error;
@@ -266,6 +270,69 @@ class BackendServices {
     return [...this.store.platformProducts.values()];
   }
 
+  listAdminPlatformProducts(actor: AdminActor) {
+    assertAdminPermission(actor, "product.manage");
+    return [...this.store.platformProducts.values()];
+  }
+
+  updatePlatformProduct(actor: AdminActor, productId: string, input: {
+    name?: string;
+    supplyPriceCents?: bigint;
+    minSalePriceCents?: bigint;
+    suggestedSalePriceCents?: bigint;
+    status?: string;
+  }) {
+    assertAdminPermission(actor, "product.manage");
+    const product = requireEntity(this.store.platformProducts.get(productId), "RESOURCE_NOT_FOUND", "platform product not found");
+    Object.assign(product, input);
+    if (product.supplyPriceCents < 0n || product.minSalePriceCents < 0n || product.suggestedSalePriceCents < 0n) {
+      throw new ApiError(400, "PRICE_RULE_FAILED", "product prices must be non-negative");
+    }
+    if (product.minSalePriceCents < product.supplyPriceCents) {
+      throw new ApiError(400, "PRICE_RULE_FAILED", "minimum sale price cannot be below supply price");
+    }
+    this.audit(actor.role, "platform_product.update", "platform_product", product.id, input);
+    return product;
+  }
+
+  listAdminPlatformShopProducts(actor: AdminActor) {
+    assertAdminPermission(actor, "product.manage");
+    return [...this.store.platformShopProducts.values()].map((item) => ({
+      ...item,
+      product: this.store.platformProducts.get(item.platformProductId)
+    }));
+  }
+
+  upsertPlatformShopProduct(actor: AdminActor, input: {
+    shopId: string;
+    platformProductId: string;
+    salePriceCents: bigint;
+    fulfillmentCostCents?: bigint;
+    status?: string;
+  }) {
+    assertAdminPermission(actor, "product.manage");
+    const shop = this.getShop(input.shopId);
+    if ((shop.ownerType ?? "agent") !== "platform") throw new ApiError(400, "SHOP_SCOPE_INVALID", "shop is not platform-owned");
+    const product = requireEntity(this.store.platformProducts.get(input.platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
+    if (input.salePriceCents < product.minSalePriceCents) throw new ApiError(400, "PRICE_RULE_FAILED", "sale price is below minimum sale price");
+    const existing = [...this.store.platformShopProducts.values()]
+      .find((item) => item.shopId === input.shopId && item.platformProductId === input.platformProductId);
+    const shopProduct = existing ?? {
+      id: nextId(this.store, "psp"),
+      shopId: input.shopId,
+      platformProductId: input.platformProductId,
+      salePriceCents: input.salePriceCents,
+      fulfillmentCostCents: input.fulfillmentCostCents ?? product.supplyPriceCents,
+      status: input.status ?? "listed"
+    };
+    shopProduct.salePriceCents = input.salePriceCents;
+    shopProduct.fulfillmentCostCents = input.fulfillmentCostCents ?? shopProduct.fulfillmentCostCents;
+    shopProduct.status = input.status ?? shopProduct.status;
+    this.store.platformShopProducts.set(shopProduct.id, shopProduct);
+    this.audit(actor.role, "platform_shop_product.upsert", "platform_shop_product", shopProduct.id, shopProduct);
+    return shopProduct;
+  }
+
   agentDashboard(actor: AgentActor) {
     const orders = this.listAgentOrders(actor);
     const paidOrders = orders.filter((order) => order.paymentStatus === "paid");
@@ -296,7 +363,11 @@ class BackendServices {
   }
 
   listAgentOrders(actor: AgentActor) {
-    return [...this.store.orders.values()].filter((order) => order.agentId === actor.agentId && order.shopId === actor.shopId);
+    return [...this.store.orders.values()].filter((order) => {
+      if (order.agentId === actor.agentId && order.shopId === actor.shopId) return true;
+      const channel = getChannelSnapshot(order.snapshot);
+      return channel?.firstTierAgentId === actor.agentId && channel.firstTierShopId === actor.shopId;
+    });
   }
 
   listAgentSettlements(actor: AgentActor) {
@@ -429,6 +500,11 @@ class BackendServices {
     return agent;
   }
 
+  listAgentApplications(actor: AdminActor) {
+    assertAdminPermission(actor, "agent.review");
+    return [...this.store.agentApplications.values()];
+  }
+
   confirmDeposit(actor: AdminActor, agentId: string, input: { amountCents: bigint; requiredAmountCents?: bigint; voucherUrl?: string }) {
     assertAdminPermission(actor, "deposit.manage");
     const agent = requireEntity(this.store.agents.get(agentId), "RESOURCE_NOT_FOUND", "agent not found");
@@ -455,6 +531,7 @@ class BackendServices {
         relatedId: agentId,
         idempotencyKey
       });
+      this.ledger("DEPOSIT_CONFIRMED", { agentId }, input.amountCents, { transactionNo: transaction.transactionNo });
       this.audit(actor.role, "deposit.confirm", "agent", agentId, transaction);
       return { status: "processed" as const, idempotencyKey, account, transaction };
     });
@@ -512,6 +589,105 @@ class BackendServices {
   listAdminOrders(actor: AdminActor) {
     assertAdminPermission(actor, "audit.read");
     return [...this.store.orders.values()];
+  }
+
+  listAdminAfterSales(actor: AdminActor) {
+    assertAdminPermission(actor, "after_sale.arbitrate");
+    return [...this.store.afterSales.values()];
+  }
+
+  listAdminRefunds(actor: AdminActor) {
+    assertAdminPermission(actor, "after_sale.arbitrate");
+    return [...this.store.refunds.values()];
+  }
+
+  listAdminSettlements(actor: AdminActor) {
+    assertAdminPermission(actor, "settlement.generate");
+    return this.store.settlementSheets;
+  }
+
+  listAdminDeposits(actor: AdminActor) {
+    assertAdminPermission(actor, "deposit.manage");
+    return [...this.store.depositAccounts.values()].map((account) => ({
+      ...account,
+      transactions: this.store.depositTransactions.filter((transaction) => transaction.agentId === account.agentId)
+    }));
+  }
+
+  listAdminChannels(actor: AdminActor) {
+    assertAdminPermission(actor, "agent.review");
+    return {
+      authorizations: this.store.channelAuthorizations,
+      relations: this.store.channelRelations,
+      offers: this.store.channelProductOffers
+    };
+  }
+
+  reviewChannelAuthorization(actor: AdminActor, agentId: string, input: { approved: boolean; reason?: string }) {
+    assertAdminPermission(actor, "agent.review");
+    const agent = requireEntity(this.store.agents.get(agentId), "RESOURCE_NOT_FOUND", "agent not found");
+    const existing = this.store.channelAuthorizations.find((item) => item.firstTierAgentId === agent.id);
+    const authorization = existing ?? {
+      id: nextId(this.store, "channel-auth"),
+      firstTierAgentId: agent.id,
+      status: "pending_review",
+      reason: null,
+      reviewedAt: null
+    };
+    authorization.status = input.approved ? "active" : "rejected";
+    authorization.reason = input.reason ?? null;
+    authorization.reviewedAt = new Date();
+    if (!existing) this.store.channelAuthorizations.push(authorization);
+    this.audit(actor.role, "channel.authorization.review", "agent", agent.id, authorization);
+    return authorization;
+  }
+
+  createChannelRelation(actor: AdminActor, input: { firstTierAgentId: string; secondTierAgentId: string; reason?: string }) {
+    assertAdminPermission(actor, "agent.review");
+    if (input.firstTierAgentId === input.secondTierAgentId) throw new ApiError(400, "CHANNEL_RULE_FAILED", "first tier and second tier cannot be same agent");
+    const firstTier = requireEntity(this.store.agents.get(input.firstTierAgentId), "RESOURCE_NOT_FOUND", "first tier agent not found");
+    const secondTier = requireEntity(this.store.agents.get(input.secondTierAgentId), "RESOURCE_NOT_FOUND", "second tier agent not found");
+    const authorization = this.store.channelAuthorizations.find((item) => item.firstTierAgentId === firstTier.id && item.status === "active");
+    if (!authorization) throw new ApiError(400, "CHANNEL_RULE_FAILED", "first tier agent is not authorized");
+    if (firstTier.status !== "active" || secondTier.status !== "active") throw new ApiError(400, "CHANNEL_RULE_FAILED", "both agents must be active");
+    const activeUniqueKey = `second-tier:${secondTier.id}`;
+    const existing = this.store.channelRelations.find((item) => item.activeUniqueKey === activeUniqueKey && item.status === "active");
+    if (existing) return existing;
+    const relation = {
+      id: nextId(this.store, "channel-rel"),
+      firstTierAgentId: firstTier.id,
+      secondTierAgentId: secondTier.id,
+      status: "active",
+      reason: input.reason ?? null,
+      reviewedAt: new Date(),
+      activeUniqueKey
+    };
+    this.store.channelRelations.push(relation);
+    this.audit(actor.role, "channel.relation.create", "channel_relation", relation.id, relation);
+    return relation;
+  }
+
+  upsertChannelProductOffer(actor: AdminActor, input: { channelRelationId: string; platformProductId: string; resellSupplyPriceCents: bigint; status?: string }) {
+    assertAdminPermission(actor, "product.manage");
+    const relation = requireEntity(this.store.channelRelations.find((item) => item.id === input.channelRelationId), "RESOURCE_NOT_FOUND", "channel relation not found");
+    if (relation.status !== "active") throw new ApiError(400, "CHANNEL_RULE_FAILED", "channel relation is not active");
+    const product = requireEntity(this.store.platformProducts.get(input.platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
+    if (input.resellSupplyPriceCents < product.supplyPriceCents) {
+      throw new ApiError(400, "PRICE_RULE_FAILED", "resell supply price cannot be below platform supply price");
+    }
+    const existing = this.store.channelProductOffers.find((item) => item.channelRelationId === relation.id && item.platformProductId === product.id);
+    const offer = existing ?? {
+      id: nextId(this.store, "channel-offer"),
+      channelRelationId: relation.id,
+      platformProductId: product.id,
+      resellSupplyPriceCents: input.resellSupplyPriceCents,
+      status: input.status ?? "listed"
+    };
+    offer.resellSupplyPriceCents = input.resellSupplyPriceCents;
+    offer.status = input.status ?? offer.status;
+    if (!existing) this.store.channelProductOffers.push(offer);
+    this.audit(actor.role, "channel.offer.upsert", "channel_product_offer", offer.id, offer);
+    return offer;
   }
 
   listRightsCodes(actor: AdminActor, productId?: string) {
@@ -636,7 +812,12 @@ class BackendServices {
           order.paidAt = new Date();
           if (order.salesChannelType !== "platform_self_operated") {
             this.store.pendingIncomeByAgent.set(order.agentId, (this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n) + order.snapshot.amountSnapshot.agentExpectedIncomeCents);
+            const channel = getChannelSnapshot(order.snapshot);
+            if (channel) {
+              this.store.pendingIncomeByAgent.set(channel.firstTierAgentId, (this.store.pendingIncomeByAgent.get(channel.firstTierAgentId) ?? 0n) + channel.firstTierIncomeCents);
+            }
           }
+          this.ledger("PAYMENT_SUCCEEDED", { orderNo: order.orderNo, agentId: order.agentId }, order.snapshot.amountSnapshot.paidAmountCents, { channel: input.channel });
           this.tryAutoFulfillWithRightsCode(order);
         }
       });
@@ -656,6 +837,7 @@ class BackendServices {
       order.refundedAmountCents += refund.amountCents;
       order.refundStatus = "refunded";
       order.status = "refunded";
+      this.ledger("REFUND_SUCCEEDED", { orderNo: order.orderNo, agentId: order.agentId }, refund.amountCents, { refundNo: refund.refundNo });
 
       if (order.salesChannelType === "platform_self_operated") {
         refund.pendingIncomeDeductedCents = 0n;
@@ -680,25 +862,54 @@ class BackendServices {
     if (duplicate) return { status: "duplicate" as const, sheet: duplicate };
     const now = input.now ?? new Date();
     const orders = [...this.store.orders.values()]
-      .filter((order) => order.agentId === input.agentId && order.salesChannelType !== "platform_self_operated")
-      .map((order) => ({
-        orderId: order.orderNo,
-        agentId: order.agentId,
-        shopId: order.shopId,
-        paymentStatus: order.paymentStatus,
-        fulfillmentStatus: order.fulfillmentStatus,
-        settlementStatus: order.settlementStatus,
-        refundStatus: order.refundStatus,
-        riskStatus: order.riskStatus,
-        complaintStatus: order.complaintStatus,
-        fulfilledAt: order.fulfilledAt,
-        now,
-        paidAmountCents: order.snapshot.amountSnapshot.paidAmountCents,
-        supplyAmountCents: order.snapshot.amountSnapshot.supplyAmountCents,
-        serviceFeeCents: order.snapshot.amountSnapshot.serviceFeeCents,
-        agentIncomeCents: order.snapshot.amountSnapshot.agentExpectedIncomeCents
-      }));
-    const items = buildSettlementItems(orders, this.store.settlementItemOrderIds, input.agentId);
+      .filter((order) => order.salesChannelType !== "platform_self_operated")
+      .flatMap((order) => {
+        const channel = getChannelSnapshot(order.snapshot);
+        if (channel?.firstTierAgentId === input.agentId) {
+          return [{
+            orderId: order.orderNo,
+            settlementRole: "first_tier",
+            agentId: channel.firstTierAgentId,
+            shopId: channel.firstTierShopId,
+            paymentStatus: order.paymentStatus,
+            fulfillmentStatus: order.fulfillmentStatus,
+            settlementStatus: order.settlementStatus,
+            refundStatus: order.refundStatus,
+            riskStatus: order.riskStatus,
+            complaintStatus: order.complaintStatus,
+            fulfilledAt: order.fulfilledAt,
+            now,
+            paidAmountCents: order.snapshot.amountSnapshot.paidAmountCents,
+            supplyAmountCents: channel.platformSupplyPriceCents,
+            serviceFeeCents: 0n,
+            agentIncomeCents: channel.firstTierIncomeCents
+          }];
+        }
+        if (order.agentId !== input.agentId) return [];
+        return [{
+          orderId: order.orderNo,
+          settlementRole: channel ? "second_tier" : "single_agent",
+          agentId: order.agentId,
+          shopId: order.shopId,
+          paymentStatus: order.paymentStatus,
+          fulfillmentStatus: order.fulfillmentStatus,
+          settlementStatus: order.settlementStatus,
+          refundStatus: order.refundStatus,
+          riskStatus: order.riskStatus,
+          complaintStatus: order.complaintStatus,
+          fulfilledAt: order.fulfilledAt,
+          now,
+          paidAmountCents: order.snapshot.amountSnapshot.paidAmountCents,
+          supplyAmountCents: order.snapshot.amountSnapshot.supplyAmountCents,
+          serviceFeeCents: order.snapshot.amountSnapshot.serviceFeeCents,
+          agentIncomeCents: order.snapshot.amountSnapshot.agentExpectedIncomeCents
+        }];
+      });
+    const candidates = orders.filter((order) => !this.store.settlementItemKeys.has(`${order.orderId}:${order.settlementRole}:${order.agentId}`));
+    const items = buildSettlementItems(candidates, [], input.agentId).map((item) => {
+      const source = candidates.find((candidate) => candidate.orderId === item.orderId && candidate.agentId === item.agentId);
+      return { ...item, settlementRole: source?.settlementRole ?? "single_agent" };
+    });
     const sheet: SettlementSheet = {
       settlementNo: nextId(this.store, "settlement"),
       agentId: input.agentId,
@@ -711,15 +922,16 @@ class BackendServices {
       totalAgentIncomeCents: sum(items.map((item) => item.agentIncomeCents))
     };
     for (const item of items) {
-      this.store.settlementItemOrderIds.add(item.orderId);
+      this.store.settlementItemKeys.add(`${item.orderId}:${item.settlementRole}:${item.agentId}`);
       const order = this.store.orders.get(item.orderId);
-      if (order) order.settlementStatus = "settling";
+      if (order && (!getChannelSnapshot(order.snapshot) || item.settlementRole === "second_tier")) order.settlementStatus = "settling";
     }
     const pending = this.store.pendingIncomeByAgent.get(input.agentId) ?? 0n;
     this.store.pendingIncomeByAgent.set(input.agentId, pending > sheet.totalAgentIncomeCents ? pending - sheet.totalAgentIncomeCents : 0n);
     this.store.payableIncomeByAgent.set(input.agentId, (this.store.payableIncomeByAgent.get(input.agentId) ?? 0n) + sheet.totalAgentIncomeCents);
     this.store.settlementSheets.push(sheet);
     this.audit(actor.role, "settlement.generate", "settlement", sheet.settlementNo, { count: items.length });
+    this.ledger("SETTLEMENT_GENERATED", { agentId: input.agentId }, sheet.totalAgentIncomeCents, { settlementNo: sheet.settlementNo });
     return { status: "processed" as const, sheet };
   }
 
@@ -746,6 +958,7 @@ class BackendServices {
     };
     this.store.manualPayouts.push(payout);
     this.audit(actor.role, "manual_payout.confirm", "settlement", settlementNo, payout);
+    this.ledger("PAYOUT_CONFIRMED", { agentId: sheet.agentId }, sheet.totalAgentIncomeCents, { settlementNo });
     return { status: "processed" as const, sheet, payout };
   }
 
@@ -768,6 +981,7 @@ class BackendServices {
       });
     }
     this.audit(actor.role, "deposit.deduct", "agent", agentId, result);
+    this.ledger("DEPOSIT_DEDUCTED", { agentId }, result.status === "processed" ? result.deductedAmountCents : 0n, { sourceType: input.sourceType, sourceId: input.sourceId });
     return result;
   }
 
@@ -781,7 +995,8 @@ class BackendServices {
     const key = `${input.targetType}:${input.targetId}:${input.freezeType}`;
     if (this.store.activeRiskFreezeKeys.has(key)) return { status: "duplicate" as const, key };
     this.store.activeRiskFreezeKeys.add(key);
-    this.store.riskFreezes.push({ ...input, status: "active" });
+    const freeze = { id: nextId(this.store, "risk"), ...input, status: "active", createdAt: new Date(), releasedAt: null };
+    this.store.riskFreezes.push(freeze);
     if (input.targetType === "order") {
       const order = requireEntity(this.store.orders.get(input.targetId), "RESOURCE_NOT_FOUND", "order not found");
       order.riskStatus = input.freezeType;
@@ -807,12 +1022,32 @@ class BackendServices {
       if (!product && !agentProduct) throw new ApiError(404, "RESOURCE_NOT_FOUND", "product not found");
     }
     this.audit(actor.role, "risk.freeze", input.targetType, input.targetId, input);
-    return { status: "processed" as const, key };
+    return { status: "processed" as const, key, freeze };
+  }
+
+  listRiskFreezes(actor: AdminActor) {
+    assertAdminPermission(actor, "risk.freeze");
+    return this.store.riskFreezes;
+  }
+
+  releaseRiskFreeze(actor: AdminActor, freezeId: string) {
+    assertAdminPermission(actor, "risk.freeze");
+    const freeze = requireEntity(this.store.riskFreezes.find((item) => item.id === freezeId), "RESOURCE_NOT_FOUND", "risk freeze not found");
+    freeze.status = "released";
+    freeze.releasedAt = new Date();
+    this.store.activeRiskFreezeKeys.delete(`${freeze.targetType}:${freeze.targetId}:${freeze.freezeType}`);
+    this.audit(actor.role, "risk.release", String(freeze.targetType), String(freeze.targetId), freeze);
+    return freeze;
   }
 
   listAuditLogs(actor: AdminActor) {
     assertAdminPermission(actor, "audit.read");
     return this.store.auditLogs;
+  }
+
+  listLedgerEntries(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return this.store.ledgerEntries;
   }
 
   reconciliationSummary(actor: AdminActor) {
@@ -908,6 +1143,70 @@ class BackendServices {
     };
   }
 
+  paymentConfigStatus(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return this.store.paymentChannelConfigs;
+  }
+
+  updatePaymentConfigMetadata(actor: AdminActor, input: { channel: PaymentChannel; enabled?: boolean; feeBps?: number; fixedFeeCents?: bigint; statusNote?: string }) {
+    assertAdminPermission(actor, "payment_config.manage");
+    const existing = this.store.paymentChannelConfigs.find((item) => item.channel === input.channel);
+    const config = existing ?? {
+      channel: input.channel,
+      enabled: false,
+      feeBps: 0,
+      fixedFeeCents: 0n,
+      statusNote: "not_configured",
+      updatedAt: new Date()
+    };
+    config.enabled = input.enabled ?? config.enabled;
+    config.feeBps = input.feeBps ?? config.feeBps;
+    config.fixedFeeCents = input.fixedFeeCents ?? config.fixedFeeCents;
+    config.statusNote = input.statusNote ?? config.statusNote;
+    config.updatedAt = new Date();
+    if (!existing) this.store.paymentChannelConfigs.push(config);
+    this.audit(actor.role, "payment_config.update", "payment_channel", input.channel, config);
+    return config;
+  }
+
+  checkPaymentConfig(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return {
+      mockReady: true,
+      productionReady: false,
+      missing: [
+        "WECHAT_APP_ID",
+        "WECHAT_MCH_ID",
+        "WECHAT_PAY_API_KEY",
+        "WECHAT_PAY_CERT_SERIAL_NO",
+        "ALIPAY_APP_ID"
+      ],
+      channels: this.store.paymentChannelConfigs
+    };
+  }
+
+  listServiceQrCodes(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return [...this.store.shops.values()].map((shop) => ({
+      shopId: shop.id,
+      ownerType: shop.ownerType ?? "agent",
+      agentId: shop.agentId,
+      name: shop.name,
+      customerServiceWechat: shop.customerServiceWechat,
+      customerServiceQrUrl: shop.customerServiceQrUrl,
+      status: shop.status
+    }));
+  }
+
+  updateShopServiceQrCode(actor: AdminActor, shopId: string, input: { customerServiceWechat?: string; customerServiceQrUrl?: string }) {
+    assertAdminPermission(actor, "agent.review");
+    const shop = this.getShop(shopId);
+    shop.customerServiceWechat = input.customerServiceWechat ?? shop.customerServiceWechat;
+    shop.customerServiceQrUrl = input.customerServiceQrUrl ?? shop.customerServiceQrUrl;
+    this.audit(actor.role, "shop.service_qrcode.update", "shop", shop.id, input);
+    return shop;
+  }
+
   private buildSnapshot(input: { orderNo: string; userId: string; shopId: string; agentProductId: string; quantity?: number; entrySource?: string }): DemoOrderSnapshot {
     const shop = requireEntity(this.store.shops.get(input.shopId), "RESOURCE_NOT_FOUND", "shop not found");
     if ((shop.ownerType ?? "agent") === "platform") {
@@ -920,6 +1219,10 @@ class BackendServices {
     if (agentProduct.shopId !== shop.id) throw new ApiError(400, "RESOURCE_SCOPE_MISMATCH", "agent product does not belong to shop");
     const platformProduct = agentProduct.platformProductId ? this.store.platformProducts.get(agentProduct.platformProductId) : undefined;
     const ownProduct = agentProduct.ownProductReviewId ? this.store.ownProducts.get(agentProduct.ownProductReviewId) : undefined;
+    const relation = this.findActiveChannelRelationForSecondTier(agent.id);
+    if (relation && agentProduct.productType === "platform" && platformProduct) {
+      return this.buildTwoTierSnapshot(input, shop, agent, agentProduct, platformProduct, relation);
+    }
     return buildOrderSnapshot({
       orderNo: input.orderNo,
       userId: input.userId,
@@ -931,6 +1234,99 @@ class BackendServices {
       quantity: input.quantity,
       entrySource: input.entrySource
     });
+  }
+
+  private buildTwoTierSnapshot(
+    input: { orderNo: string; userId: string; shopId: string; agentProductId: string; quantity?: number; entrySource?: string },
+    shop: DemoShop,
+    secondTier: DemoAgent,
+    agentProduct: DemoAgentProduct,
+    platformProduct: DemoPlatformProduct,
+    relation: ChannelRelation
+  ): DemoOrderSnapshot {
+    const firstTier = requireEntity(this.store.agents.get(relation.firstTierAgentId), "RESOURCE_NOT_FOUND", "first tier agent not found");
+    const firstTierShop = requireEntity([...this.store.shops.values()].find((candidate) => candidate.agentId === firstTier.id), "RESOURCE_NOT_FOUND", "first tier shop not found");
+    const firstTierAccount = requireEntity(this.store.depositAccounts.get(firstTier.id), "RESOURCE_NOT_FOUND", "first tier deposit account not found");
+    if (secondTier.status !== "active" || firstTier.status !== "active") throw new ApiError(400, "AGENT_NOT_ACTIVE", "channel agents must be active");
+    if (shop.status !== "open" || firstTierShop.status !== "open") throw new ApiError(400, "SHOP_NOT_OPEN", "channel shops must be open");
+    if (agentProduct.status !== "listed") throw new ApiError(400, "PRODUCT_NOT_LISTED", "agent product is not listed");
+    if (platformProduct.status !== "active") throw new ApiError(400, "PRODUCT_NOT_ACTIVE", "platform product is not active");
+    if (secondTier.riskStatus !== "normal" || firstTier.riskStatus !== "normal" || shop.riskStatus !== "normal") {
+      throw new ApiError(400, "RISK_BLOCKED", "risk freeze blocks order creation");
+    }
+    if (shouldRestrictForDeposit(firstTierAccount)) throw new ApiError(400, "DEPOSIT_INSUFFICIENT", "first tier deposit is insufficient");
+    const offer = requireEntity(
+      this.store.channelProductOffers.find((item) => item.channelRelationId === relation.id && item.platformProductId === platformProduct.id && item.status === "listed"),
+      "RESOURCE_NOT_FOUND",
+      "channel product offer not found"
+    );
+    if (offer.resellSupplyPriceCents < platformProduct.supplyPriceCents) {
+      throw new ApiError(400, "PRICE_RULE_FAILED", "resell supply price cannot be below platform supply price");
+    }
+    const quantity = input.quantity ?? 1;
+    const quote = quotePlatformProduct({
+      salePriceCents: agentProduct.salePriceCents,
+      supplyPriceCents: offer.resellSupplyPriceCents,
+      minSalePriceCents: platformProduct.minSalePriceCents,
+      quantity
+    });
+    const platformSupplyPriceCents = platformProduct.supplyPriceCents * BigInt(quantity);
+    const resellSupplyPriceCents = offer.resellSupplyPriceCents * BigInt(quantity);
+    const firstTierIncomeCents = resellSupplyPriceCents - platformSupplyPriceCents;
+
+    return {
+      orderNo: input.orderNo,
+      userId: input.userId,
+      agentId: secondTier.id,
+      shopId: shop.id,
+      agentProductId: agentProduct.id,
+      salesChannelType: "two_tier",
+      productType: "platform",
+      productNameSnapshot: platformProduct.name,
+      quantity,
+      quote,
+      amountSnapshot: {
+        serviceFeeBps: quote.serviceFeeBps,
+        paidAmountCents: quote.paidAmountCents,
+        supplyAmountCents: quote.supplyAmountCents,
+        serviceFeeCents: quote.serviceFeeCents,
+        agentExpectedIncomeCents: quote.agentExpectedIncomeCents,
+        platformSupplyPriceCents,
+        resellSupplyPriceCents,
+        finalSalePriceCents: quote.paidAmountCents,
+        firstTierIncomeCents,
+        secondTierIncomeCents: quote.agentExpectedIncomeCents
+      },
+      productSnapshot: { id: platformProduct.id, type: "platform", name: platformProduct.name },
+      shopSnapshot: {
+        id: shop.id,
+        name: shop.name,
+        customerServiceWechat: shop.customerServiceWechat,
+        customerServiceQrUrl: shop.customerServiceQrUrl,
+        agentStatus: secondTier.status,
+        shopStatus: shop.status,
+        entrySource: input.entrySource
+      },
+      pricingSnapshot: {
+        salePriceCents: agentProduct.salePriceCents,
+        minSalePriceCents: platformProduct.minSalePriceCents,
+        suggestedSalePriceCents: platformProduct.suggestedSalePriceCents
+      },
+      channelSnapshot: {
+        relationId: relation.id,
+        firstTierAgentId: firstTier.id,
+        firstTierShopId: firstTierShop.id,
+        secondTierAgentId: secondTier.id,
+        secondTierShopId: shop.id,
+        platformSupplyPriceCents,
+        resellSupplyPriceCents,
+        finalSalePriceCents: quote.paidAmountCents,
+        firstTierIncomeCents,
+        secondTierIncomeCents: quote.agentExpectedIncomeCents
+      },
+      fulfillmentRuleSnapshot: platformProduct.fulfillmentRule,
+      afterSaleRuleSnapshot: platformProduct.afterSaleRule
+    } as DemoOrderSnapshot;
   }
 
   private buildPlatformSelfOperatedSnapshot(
@@ -1186,6 +1582,10 @@ class BackendServices {
     }
   }
 
+  private findActiveChannelRelationForSecondTier(agentId: string) {
+    return this.store.channelRelations.find((relation) => relation.secondTierAgentId === agentId && relation.status === "active");
+  }
+
   private addDepositTransaction(agentId: string, input: Omit<DepositTransaction, "transactionNo" | "agentId">) {
     const transaction: DepositTransaction = {
       transactionNo: nextId(this.store, "deposit-tx"),
@@ -1204,6 +1604,18 @@ class BackendServices {
       targetType,
       targetId,
       after,
+      createdAt: new Date()
+    });
+  }
+
+  private ledger(entryType: string, target: { orderNo?: string; agentId?: string }, amountCents: bigint, metadata: unknown) {
+    this.store.ledgerEntries.push({
+      ledgerNo: nextId(this.store, "ledger"),
+      entryType,
+      orderNo: target.orderNo,
+      agentId: target.agentId,
+      amountCents,
+      metadata,
       createdAt: new Date()
     });
   }
@@ -1230,6 +1642,10 @@ function getPlatformSelfGrossMargin(snapshot: DemoOrderSnapshot) {
   return amount.platformSelfOperatedGrossMarginCents ?? 0n;
 }
 
+function getChannelSnapshot(snapshot: DemoOrderSnapshot): TwoTierChannelSnapshot | undefined {
+  return (snapshot as { channelSnapshot?: TwoTierChannelSnapshot }).channelSnapshot;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -1251,14 +1667,25 @@ function createMemoryStore(): MemoryStore {
     refunds: new Map(),
     fulfillmentRecords: new Map(),
     settlementSheets: [],
-    settlementItemOrderIds: new Set(),
+    settlementItemKeys: new Set(),
     manualPayouts: [],
     clawbacks: [],
     riskFreezes: [],
     activeRiskFreezeKeys: new Set(),
     auditLogs: [],
+    ledgerEntries: [],
     rightsCodes: [],
     notifications: [],
+    channelAuthorizations: [],
+    channelRelations: [],
+    channelProductOffers: [],
+    paymentChannelConfigs: [
+      { channel: "mock", enabled: true, feeBps: 50, fixedFeeCents: 0n, statusNote: "dev_only", updatedAt: new Date() },
+      { channel: "wechat_miniprogram", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
+      { channel: "wechat_h5_jsapi", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
+      { channel: "wechat_h5", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
+      { channel: "alipay_wap", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "alipay_account_required", updatedAt: new Date() }
+    ],
     pendingIncomeByAgent: new Map(),
     payableIncomeByAgent: new Map(),
     paidIncomeByAgent: new Map()
@@ -1311,6 +1738,9 @@ function createMemoryStore(): MemoryStore {
   store.depositAccounts.set("agent-1", { agentId: "agent-1", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
   store.depositAccounts.set("agent-2", { agentId: "agent-2", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
   store.depositAccounts.set("agent-new", { agentId: "agent-new", requiredAmountCents: 50_000n, availableAmountCents: 0n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "pending_payment" });
+  store.channelAuthorizations.push({ id: "channel-auth-1", firstTierAgentId: "agent-1", status: "active", reason: null, reviewedAt: new Date() });
+  store.channelRelations.push({ id: "channel-rel-1", firstTierAgentId: "agent-1", secondTierAgentId: "agent-2", status: "active", reason: null, reviewedAt: new Date(), activeUniqueKey: "second-tier:agent-2" });
+  store.channelProductOffers.push({ id: "channel-offer-1", channelRelationId: "channel-rel-1", platformProductId: "prod-1", resellSupplyPriceCents: 11_000n, status: "listed" });
   return store;
 }
 
@@ -1423,6 +1853,7 @@ type DemoAgentProduct = {
 };
 
 type SalesChannelType = "platform_self_operated" | "single_agent" | "two_tier";
+type PaymentChannel = "wechat_miniprogram" | "wechat_h5_jsapi" | "wechat_h5" | "alipay_wap" | "mock";
 
 type DemoPlatformShopProduct = {
   id: string;
@@ -1521,11 +1952,34 @@ type SettlementSheet = {
   agentId: string;
   idempotencyKey: string;
   status: string;
-  items: ReturnType<typeof buildSettlementItems>;
+  items: Array<ReturnType<typeof buildSettlementItems>[number] & { settlementRole?: string }>;
   totalOrderCount: number;
   totalPaidCents: bigint;
   totalServiceFeeCents: bigint;
   totalAgentIncomeCents: bigint;
+};
+
+type TwoTierChannelSnapshot = {
+  relationId: string;
+  firstTierAgentId: string;
+  firstTierShopId: string;
+  secondTierAgentId: string;
+  secondTierShopId: string;
+  platformSupplyPriceCents: bigint;
+  resellSupplyPriceCents: bigint;
+  finalSalePriceCents: bigint;
+  firstTierIncomeCents: bigint;
+  secondTierIncomeCents: bigint;
+};
+
+type LedgerEntry = {
+  ledgerNo: string;
+  entryType: string;
+  orderNo?: string;
+  agentId?: string;
+  amountCents: bigint;
+  metadata: unknown;
+  createdAt: Date;
 };
 
 type RightsCode = {
@@ -1550,6 +2004,50 @@ type NotificationItem = {
   readAt: Date | null;
 };
 
+type ChannelAuthorization = {
+  id: string;
+  firstTierAgentId: string;
+  status: string;
+  reason: string | null;
+  reviewedAt: Date | null;
+};
+
+type ChannelRelation = {
+  id: string;
+  firstTierAgentId: string;
+  secondTierAgentId: string;
+  status: string;
+  reason: string | null;
+  reviewedAt: Date | null;
+  activeUniqueKey?: string;
+};
+
+type ChannelProductOffer = {
+  id: string;
+  channelRelationId: string;
+  platformProductId: string;
+  resellSupplyPriceCents: bigint;
+  status: string;
+};
+
+type PaymentChannelConfig = {
+  channel: PaymentChannel;
+  enabled: boolean;
+  feeBps: number;
+  fixedFeeCents: bigint;
+  statusNote: string;
+  updatedAt: Date;
+};
+
+type RiskFreezeItem = Record<string, unknown> & {
+  id: string;
+  targetType: string;
+  targetId: string;
+  freezeType: string;
+  status: string;
+  releasedAt: Date | null;
+};
+
 type MemoryStore = {
   sequence: number;
   agentApplications: Map<string, AgentApplication>;
@@ -1566,14 +2064,19 @@ type MemoryStore = {
   refunds: Map<string, DemoRefund>;
   fulfillmentRecords: Map<string, Parameters<typeof applyFulfillmentAttempt>[0]["record"]>;
   settlementSheets: SettlementSheet[];
-  settlementItemOrderIds: Set<string>;
+  settlementItemKeys: Set<string>;
   manualPayouts: Array<Record<string, unknown>>;
   clawbacks: Array<Record<string, unknown>>;
-  riskFreezes: Array<Record<string, unknown>>;
+  riskFreezes: RiskFreezeItem[];
   activeRiskFreezeKeys: Set<string>;
   auditLogs: Array<Record<string, unknown>>;
+  ledgerEntries: LedgerEntry[];
   rightsCodes: RightsCode[];
   notifications: NotificationItem[];
+  channelAuthorizations: ChannelAuthorization[];
+  channelRelations: ChannelRelation[];
+  channelProductOffers: ChannelProductOffer[];
+  paymentChannelConfigs: PaymentChannelConfig[];
   pendingIncomeByAgent: Map<string, bigint>;
   payableIncomeByAgent: Map<string, bigint>;
   paidIncomeByAgent: Map<string, bigint>;

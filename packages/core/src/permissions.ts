@@ -11,6 +11,7 @@ export type AdminPermission =
   | "settlement.confirm"
   | "payout.confirm"
   | "deposit.manage"
+  | "payment_config.manage"
   | "risk.freeze"
   | "audit.read"
   | "rbac.manage";
@@ -53,6 +54,7 @@ export function hasAdminPermission(actor: Actor, permission: AdminPermission): b
       "settlement.confirm",
       "payout.confirm",
       "deposit.manage",
+      "payment_config.manage",
       "audit.read"
     ].includes(permission);
   }

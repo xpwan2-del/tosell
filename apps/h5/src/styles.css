@@ -1,0 +1,146 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: #172026;
+  background: #f5f7f8;
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+}
+
+button {
+  border: 1px solid var(--brand);
+  background: var(--brand);
+  color: #fff;
+  border-radius: 6px;
+  padding: 10px 14px;
+  font: inherit;
+}
+
+.page {
+  width: min(1120px, 100%);
+  margin: 0 auto;
+  padding: 20px;
+}
+
+.shop-hero {
+  min-height: 220px;
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid #dde5ea;
+  border-radius: 8px;
+}
+
+.shop-hero img {
+  width: 100%;
+  height: 100%;
+  min-height: 220px;
+  object-fit: cover;
+}
+
+.shop-hero > div {
+  display: grid;
+  align-content: center;
+  gap: 10px;
+  padding: 28px;
+  border-top: 6px solid var(--brand);
+}
+
+.shop-hero span,
+.product span {
+  color: var(--brand);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+.switcher,
+.grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.service,
+.orders,
+.product,
+.notice {
+  margin-top: 16px;
+  background: #fff;
+  border: 1px solid #dde5ea;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.service {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+}
+
+.service div {
+  display: grid;
+  gap: 6px;
+}
+
+.service img {
+  width: 112px;
+  height: 112px;
+  border-radius: 8px;
+  object-fit: cover;
+  background: #eef3f6;
+}
+
+.notice {
+  color: #174d5b;
+  background: #edf8fb;
+}
+
+.notice.loading {
+  color: #6c5200;
+  background: #fff8e5;
+}
+
+.product {
+  width: min(100%, 260px);
+  display: grid;
+  gap: 10px;
+}
+
+.product strong {
+  color: #0a6b5f;
+  font-size: 22px;
+}
+
+.orders {
+  display: grid;
+  gap: 10px;
+}
+
+.orders div {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #edf1f4;
+}
+
+@media (max-width: 720px) {
+  .shop-hero {
+    grid-template-columns: 1fr;
+  }
+
+  .product {
+    width: 100%;
+  }
+}

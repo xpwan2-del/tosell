@@ -855,6 +855,182 @@ describe("api", () => {
     });
   });
 
+  it("exposes production management surfaces for every P0 backend module", async () => {
+    const app = buildApp();
+    const operatorHeaders = { "x-admin-id": "operator-1", "x-admin-role": "operator" };
+    const financeHeaders = { "x-admin-id": "finance-1", "x-admin-role": "finance" };
+
+    const agentApplications = await app.inject({ method: "GET", url: "/api/admin/agent-applications", headers: operatorHeaders });
+    const afterSales = await app.inject({ method: "GET", url: "/api/admin/after-sales", headers: operatorHeaders });
+    const refunds = await app.inject({ method: "GET", url: "/api/admin/refunds", headers: operatorHeaders });
+    const settlements = await app.inject({ method: "GET", url: "/api/admin/settlements", headers: financeHeaders });
+    const deposits = await app.inject({ method: "GET", url: "/api/admin/deposits", headers: financeHeaders });
+    const channels = await app.inject({ method: "GET", url: "/api/admin/channels", headers: operatorHeaders });
+    const qrcodes = await app.inject({ method: "GET", url: "/api/admin/service-qrcodes", headers: operatorHeaders });
+    const paymentConfig = await app.inject({ method: "GET", url: "/api/admin/payment-config/status", headers: operatorHeaders });
+
+    expect(agentApplications.statusCode).toBe(200);
+    expect(afterSales.statusCode).toBe(200);
+    expect(refunds.statusCode).toBe(200);
+    expect(settlements.statusCode).toBe(200);
+    expect(deposits.statusCode).toBe(200);
+    expect(channels.statusCode).toBe(200);
+    expect(channels.json()).toHaveProperty("authorizations");
+    expect(channels.json()).toHaveProperty("relations");
+    expect(qrcodes.statusCode).toBe(200);
+    expect(qrcodes.json()[0]).toHaveProperty("customerServiceQrUrl");
+    expect(paymentConfig.statusCode).toBe(200);
+    expect(paymentConfig.json().map((item: Record<string, unknown>) => item.channel)).toContain("mock");
+
+    const updatedQr = await app.inject({
+      method: "PATCH",
+      url: "/api/admin/shops/shop-1/service-qrcode",
+      headers: operatorHeaders,
+      payload: { customerServiceQrUrl: "https://example.test/admin-qr.png" }
+    });
+    expect(updatedQr.statusCode).toBe(200);
+    expect(updatedQr.json().customerServiceQrUrl).toBe("https://example.test/admin-qr.png");
+
+    const channelReview = await app.inject({
+      method: "POST",
+      url: "/api/admin/channels/agent-2/review",
+      headers: operatorHeaders,
+      payload: { approved: true, reason: "允许作为一级渠道配置二级供货" }
+    });
+    expect(channelReview.statusCode).toBe(200);
+    expect(channelReview.json()).toMatchObject({ firstTierAgentId: "agent-2", status: "active" });
+
+    const operatorPaymentUpdate = await app.inject({
+      method: "PATCH",
+      url: "/api/admin/payment-config/metadata",
+      headers: operatorHeaders,
+      payload: { channel: "wechat_miniprogram", enabled: false, statusNote: "等待商户号开通" }
+    });
+    expect(operatorPaymentUpdate.statusCode).toBe(403);
+
+    const paymentUpdate = await app.inject({
+      method: "PATCH",
+      url: "/api/admin/payment-config/metadata",
+      headers: financeHeaders,
+      payload: { channel: "wechat_miniprogram", enabled: false, statusNote: "等待商户号开通" }
+    });
+    expect(paymentUpdate.statusCode).toBe(200);
+    expect(paymentUpdate.json()).toMatchObject({ channel: "wechat_miniprogram", statusNote: "等待商户号开通" });
+
+    const paymentCheck = await app.inject({ method: "POST", url: "/api/admin/payment-config/check", headers: operatorHeaders });
+    expect(paymentCheck.statusCode).toBe(200);
+    expect(paymentCheck.json()).toMatchObject({ mockReady: true, productionReady: false });
+
+    const freeze = await app.inject({
+      method: "POST",
+      url: "/api/admin/risk-freezes",
+      headers: operatorHeaders,
+      payload: {
+        targetType: "shop",
+        targetId: "shop-2",
+        freezeType: "shop_frozen",
+        reasonCode: "manual_risk"
+      }
+    });
+    expect(freeze.statusCode).toBe(200);
+    const riskList = await app.inject({ method: "GET", url: "/api/admin/risk-freezes", headers: operatorHeaders });
+    expect(riskList.json()).toHaveLength(1);
+    const released = await app.inject({
+      method: "POST",
+      url: `/api/admin/risk-freezes/${freeze.json().freeze.id}/release`,
+      headers: operatorHeaders
+    });
+    expect(released.statusCode).toBe(200);
+    expect(released.json().status).toBe("released");
+  });
+
+  it("runs controlled two-tier supply without rebate semantics", async () => {
+    const app = buildApp();
+    const operatorHeaders = { "x-admin-id": "operator-1", "x-admin-role": "operator" };
+    const financeHeaders = { "x-admin-id": "finance-1", "x-admin-role": "finance" };
+
+    const invalidOffer = await app.inject({
+      method: "POST",
+      url: "/api/admin/channels/offers",
+      headers: operatorHeaders,
+      payload: {
+        channelRelationId: "channel-rel-1",
+        platformProductId: "prod-1",
+        resellSupplyPriceCents: "9900"
+      }
+    });
+    expect(invalidOffer.statusCode).toBe(400);
+
+    const quote = await app.inject({
+      method: "POST",
+      url: "/api/user/orders/quote",
+      headers: { "x-user-id": "two-tier-user" },
+      payload: { shopId: "shop-2", agentProductId: "ap-2" }
+    });
+    expect(quote.json()).toMatchObject({ paidAmountCents: "16000", salePriceCents: "16000" });
+    expect(JSON.stringify(quote.json())).not.toMatch(/firstTierIncomeCents|resellSupplyPriceCents|commission|返佣/);
+
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "two-tier-user" },
+      payload: { shopId: "shop-2", agentProductId: "ap-2", clientPaidAmountCents: "16000" }
+    });
+    expect(order.statusCode).toBe(200);
+    expect(order.json()).toMatchObject({ salesChannelType: "two_tier", paidAmountCents: "16000" });
+    expect(JSON.stringify(order.json())).not.toMatch(/firstTierIncomeCents|secondTierIncomeCents|resellSupplyPriceCents/);
+
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: {
+        channel: "mock",
+        channelTradeNo: "trade-two-tier",
+        orderNo: order.json().orderNo,
+        amountCents: "16000"
+      }
+    });
+    await app.inject({
+      method: "POST",
+      url: `/api/admin/fulfillment/${order.json().orderNo}`,
+      headers: operatorHeaders,
+      payload: { status: "success", attemptNo: 1, evidence: "two-tier-manual" }
+    });
+
+    const firstTierSettlement = await app.inject({
+      method: "POST",
+      url: "/api/admin/settlements/generate",
+      headers: financeHeaders,
+      payload: { agentId: "agent-1", now: "2030-01-01T00:00:00.000Z", batchNo: "two-tier-first" }
+    });
+    expect(firstTierSettlement.statusCode).toBe(200);
+    expect(firstTierSettlement.json().items[0]).toMatchObject({
+      orderId: order.json().orderNo,
+      settlementRole: "first_tier",
+      agentIncomeCents: "1000"
+    });
+
+    const secondTierSettlement = await app.inject({
+      method: "POST",
+      url: "/api/admin/settlements/generate",
+      headers: financeHeaders,
+      payload: { agentId: "agent-2", now: "2030-01-01T00:00:00.000Z", batchNo: "two-tier-second" }
+    });
+    expect(secondTierSettlement.statusCode).toBe(200);
+    expect(secondTierSettlement.json().items[0]).toMatchObject({
+      orderId: order.json().orderNo,
+      settlementRole: "second_tier",
+      agentIncomeCents: "4920"
+    });
+
+    const ledger = await app.inject({ method: "GET", url: "/api/admin/ledger-entries", headers: financeHeaders });
+    expect(ledger.statusCode).toBe(200);
+    expect(ledger.json().map((item: Record<string, unknown>) => item.entryType)).toEqual(
+      expect.arrayContaining(["ORDER_CREATED", "PAYMENT_SUCCEEDED", "SETTLEMENT_GENERATED"])
+    );
+    expect(JSON.stringify(ledger.json())).not.toMatch(/commission|rebate|返佣|团队奖|三级/);
+  });
+
   it("protects internal platform product pricing behind agent auth", async () => {
     const app = buildApp();
     const response = await app.inject({
