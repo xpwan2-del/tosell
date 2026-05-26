@@ -3,6 +3,10 @@
   "outputDirectory": "apps/h5/dist",
   "rewrites": [
     {
+      "source": "/api/:path*",
+      "destination": "/api?path=:path*"
+    },
+    {
       "source": "/admin",
       "destination": "/admin/index.html"
     },

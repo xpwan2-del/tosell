@@ -30,6 +30,7 @@ export function buildApp() {
   app.register(cors, { origin: true });
 
   app.get("/health", async () => services.health());
+  app.get("/api/health", async () => services.health());
 
   app.get("/api/user/shops/:shopId", async (request) => {
     const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
