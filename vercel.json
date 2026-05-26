@@ -1,0 +1,18 @@
+{
+  "buildCommand": "npm run vercel:build",
+  "outputDirectory": "apps/h5/dist",
+  "rewrites": [
+    {
+      "source": "/admin",
+      "destination": "/admin/index.html"
+    },
+    {
+      "source": "/admin/:path*",
+      "destination": "/admin/index.html"
+    },
+    {
+      "source": "/s/:path*",
+      "destination": "/index.html"
+    }
+  ]
+}
