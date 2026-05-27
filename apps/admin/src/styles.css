@@ -5,7 +5,7 @@
 body {
   margin: 0;
   color: #172026;
-  background: #f3f5f7;
+  background: #eef3f4;
   font-family: Inter, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
 }
 
@@ -15,8 +15,9 @@ input {
 }
 
 button {
-  border: 1px solid #0f5f6f;
-  background: #0f5f6f;
+  min-height: 38px;
+  border: 1px solid #106270;
+  background: #106270;
   color: #fff;
   border-radius: 6px;
   padding: 8px 12px;
@@ -30,9 +31,10 @@ button:disabled {
 
 input {
   width: 130px;
-  border: 1px solid #cdd6dc;
+  border: 1px solid #cdd9dd;
   border-radius: 6px;
   padding: 7px 9px;
+  background: #fff;
 }
 
 .shell {
@@ -46,15 +48,16 @@ input {
   top: 0;
   height: 100vh;
   overflow: auto;
-  background: #11181c;
+  background: #102126;
   color: #fff;
-  padding: 24px 16px;
+  padding: 24px 14px;
 }
 
 .brand {
-  font-size: 22px;
-  font-weight: 700;
+  font-size: 24px;
+  font-weight: 800;
   margin-bottom: 10px;
+  letter-spacing: 0;
 }
 
 .sidebar small {
@@ -71,7 +74,7 @@ input {
 .sidebar a {
   color: #d3dee5;
   text-decoration: none;
-  padding: 9px 10px;
+  padding: 9px 11px;
   border-radius: 6px;
 }
 
@@ -81,15 +84,21 @@ input {
 }
 
 .content {
-  padding: 28px;
+  padding: 30px;
 }
 
 .topbar {
+  min-height: 132px;
   display: flex;
   justify-content: space-between;
   gap: 18px;
-  align-items: flex-start;
+  align-items: center;
   margin-bottom: 16px;
+  padding: 24px;
+  color: #fff;
+  background: #12333a;
+  border-radius: 8px;
+  box-shadow: 0 18px 42px rgba(18, 51, 58, 0.12);
 }
 
 h1,
@@ -98,8 +107,9 @@ h2 {
 }
 
 h1 {
-  font-size: 26px;
+  font-size: 30px;
   margin-bottom: 6px;
+  letter-spacing: 0;
 }
 
 h2 {
@@ -109,6 +119,10 @@ h2 {
 p {
   margin: 0;
   color: #5d6a72;
+}
+
+.topbar p {
+  color: #c7d8dd;
 }
 
 .notice {
@@ -129,7 +143,7 @@ p {
 .metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
+  gap: 14px;
   margin-bottom: 18px;
 }
 
@@ -143,6 +157,7 @@ p {
 
 .metrics div {
   padding: 16px;
+  border-top: 4px solid #106270;
 }
 
 .metrics span {
@@ -159,11 +174,12 @@ p {
 .two-col {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+  gap: 16px;
 }
 
 .panel {
   padding: 18px;
+  min-width: 0;
 }
 
 .panel-head {
@@ -175,8 +191,9 @@ p {
 }
 
 .panel-head span {
-  color: #66757f;
+  color: #106270;
   font-size: 13px;
+  font-weight: 800;
 }
 
 .kv {
@@ -193,6 +210,7 @@ p {
 
 .kv strong {
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 .actions,
@@ -221,6 +239,9 @@ p {
 
 .table-wrap {
   overflow-x: auto;
+  margin-top: 10px;
+  border: 1px solid #edf1f4;
+  border-radius: 8px;
 }
 
 table {
@@ -231,7 +252,7 @@ table {
 
 th,
 td {
-  padding: 8px;
+  padding: 9px 10px;
   border-bottom: 1px solid #edf1f4;
   text-align: left;
   white-space: nowrap;
@@ -240,6 +261,7 @@ td {
 th {
   color: #66757f;
   font-weight: 600;
+  background: #f7fafb;
 }
 
 .empty,

@@ -47,13 +47,13 @@ export const api = {
       amountCents
     }
   }),
-  createAfterSale: (orderNo: string, requestedRefundCents: string) => request<JsonRecord>("/api/user/after-sales", {
+  createAfterSale: (orderNo: string, requestedRefundCents: string, description = "H5 用户售后申请") => request<JsonRecord>("/api/user/after-sales", {
     method: "POST",
     body: {
       orderNo,
       reasonCode: "fulfillment_issue",
       requestedRefundCents,
-      description: "H5 用户售后申请"
+      description
     }
   }),
   orders: () => request<JsonRecord[]>("/api/user/orders")
