@@ -35,7 +35,7 @@ function App() {
   const theme = useMemo(() => ({ "--brand": text(shop.themeColor, "#106270") }) as React.CSSProperties, [shop.themeColor]);
   const featured = products[0];
   const activeProduct = selectedProduct ?? featured;
-  const filteredOrders = orders.filter((order) => {
+  const filteredOrders = orders.filter((order) => belongsToShop(order, shopId)).filter((order) => {
     if (orderTab === "待支付") return text(order.paymentStatus) === "unpaid";
     if (orderTab === "已支付") return text(order.paymentStatus) === "paid" && text(order.refundStatus, "none") === "none";
     if (orderTab === "售后") return text(order.refundStatus, "none") !== "none";
@@ -53,7 +53,7 @@ function App() {
       setShop(nextShop);
       setProducts(nextProducts);
       setSelectedProduct((current) => current ?? nextProducts[0]);
-      const mergedOrders = mergeOrders(readCachedOrders(targetShopId), nextOrders);
+      const mergedOrders = mergeOrders(readCachedOrders(targetShopId), nextOrders.filter((order) => belongsToShop(order, targetShopId)));
       setOrders(mergedOrders);
       writeCachedOrders(targetShopId, mergedOrders);
       setMessage("店铺已准备好");
@@ -74,7 +74,7 @@ function App() {
     setCheckout(undefined);
     setSelectedOrder(undefined);
     setAfterSaleOrder(undefined);
-    setOrders(readCachedOrders(targetShopId));
+    setOrders(readCachedOrders(targetShopId).filter((order) => belongsToShop(order, targetShopId)));
     window.history.replaceState(null, "", `/s/${targetShopId}`);
     await load(targetShopId);
   }
@@ -279,11 +279,11 @@ function App() {
               <button type="button" className="icon-button" onClick={() => setSelectedOrder(undefined)}>关闭</button>
             </div>
             <div className="checkout-row"><span>订单号</span><strong>{text(selectedOrder.orderNo)}</strong></div>
-            <div className="checkout-row"><span>店铺</span><strong>{text(shop.name)}</strong></div>
+            <div className="checkout-row"><span>店铺</span><strong>{text(selectedOrder.shopName, text(shop.name))}</strong></div>
             <div className="checkout-row"><span>实付金额</span><strong>{cents(orderPaidAmount(selectedOrder))}</strong></div>
             <div className="checkout-row"><span>支付状态</span><strong>{statusLabel(selectedOrder)}</strong></div>
             <div className="checkout-row"><span>履约方式</span><strong>{text(selectedOrder.fulfillmentStatus, "待处理")}</strong></div>
-            <div className="checkout-row"><span>客服微信</span><strong>{text(shop.customerServiceWechat, "未配置")}</strong></div>
+            <div className="checkout-row"><span>客服微信</span><strong>{text(selectedOrder.customerServiceWechat, text(shop.customerServiceWechat, "未配置"))}</strong></div>
             <p>虚拟权益订单会保留支付、履约和售后记录；遇到问题请联系店铺客服。</p>
           </section>
         </div>
@@ -390,6 +390,10 @@ function upsertOrder(orders: JsonRecord[], order: JsonRecord): JsonRecord[] {
 
 function mergeOrders(...groups: JsonRecord[][]): JsonRecord[] {
   return groups.flat().reduce<JsonRecord[]>((current, order) => upsertOrder(current, order), []);
+}
+
+function belongsToShop(order: JsonRecord, shopId: string): boolean {
+  return text(order.shopId, shopId) === shopId;
 }
 
 function orderPaidAmount(order: JsonRecord): string {
