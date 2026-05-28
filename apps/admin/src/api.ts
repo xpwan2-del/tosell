@@ -14,6 +14,12 @@ export type AdminSession = {
   expiresAt: number;
   admin: JsonRecord;
 };
+export type AgentSession = {
+  token: string;
+  expiresAt: number;
+  agent: JsonRecord;
+  shop: JsonRecord;
+};
 
 export class ApiClientError extends Error {
   status: number;
@@ -53,6 +59,8 @@ function adminHeaders(): Record<string, string> {
 }
 
 function agentHeaders(): Record<string, string> {
+  const session = currentAgentSession();
+  if (session?.token) return { authorization: `Bearer ${session.token}` };
   if (!import.meta.env.DEV || import.meta.env.VITE_ALLOW_DEMO_AGENT_HEADERS !== "true") {
     return {};
   }
@@ -111,12 +119,22 @@ export const api = {
   currentAdminSession,
   saveAdminSession,
   clearAdminSession,
+  currentAgentSession,
+  saveAgentSession,
+  clearAgentSession,
   adminLogin: (input: { username: string; password: string; requestedRole?: AdminRole }) => request<AdminSession>("/api/auth/admin/login", {
     method: "POST",
     body: input
   }),
   adminSession: () => request<JsonRecord>("/api/auth/admin/session", {
     headers: adminHeaders()
+  }),
+  agentLogin: (input: { account: string; password: string }) => request<AgentSession>("/api/auth/agent/login", {
+    method: "POST",
+    body: input
+  }),
+  agentSession: () => request<JsonRecord>("/api/auth/agent/session", {
+    headers: agentHeaders()
   }),
   health: () => request<JsonRecord>("/api/health"),
   reconciliationSummary: () => request<JsonRecord>("/api/exports/reconciliation-summary", {
@@ -152,6 +170,33 @@ export const api = {
   agentApplications: () => request<JsonRecord[]>("/api/admin/agent-applications", {
     headers: adminHeaders()
   }),
+  inviteCodes: () => request<JsonRecord[]>("/api/admin/invite-codes", {
+    headers: adminHeaders()
+  }),
+  agentInviteCodes: () => request<JsonRecord[]>("/api/agent/invite-codes", {
+    headers: agentHeaders()
+  }),
+  createInviteCode: (input: { code: string; targetTier: string; maxUses: string; expiresAt: string; depositRequiredAmountCents: string }) => request<JsonRecord>("/api/admin/invite-codes", {
+    method: "POST",
+    headers: adminHeaders(),
+    body: {
+      code: input.code || undefined,
+      targetTier: input.targetTier || "first_tier",
+      maxUses: input.maxUses ? Number(requirePositiveIntegerString(input.maxUses, "最大使用次数")) : undefined,
+      expiresAt: input.expiresAt ? new Date(input.expiresAt).toISOString() : undefined,
+      depositRequiredAmountCents: requirePositiveCents(input.depositRequiredAmountCents, "应缴保证金金额")
+    }
+  }),
+  createAgentInviteCode: (input: { code: string; maxUses: string; expiresAt: string; depositRequiredAmountCents: string }) => request<JsonRecord>("/api/agent/invite-codes", {
+    method: "POST",
+    headers: agentHeaders(),
+    body: {
+      code: input.code || undefined,
+      maxUses: input.maxUses ? Number(requirePositiveIntegerString(input.maxUses, "最大使用次数")) : undefined,
+      expiresAt: input.expiresAt ? new Date(input.expiresAt).toISOString() : undefined,
+      depositRequiredAmountCents: input.depositRequiredAmountCents ? requirePositiveCents(input.depositRequiredAmountCents, "应缴保证金金额") : undefined
+    }
+  }),
   createManualAgent: (input: { name: string; shopName: string; contactPhone: string; customerServiceWechat: string; initialPassword: string; depositRequiredAmountCents: string; depositPaid: boolean }) => request<JsonRecord>("/api/admin/agents/manual", {
     method: "POST",
     headers: adminHeaders(),
@@ -160,7 +205,7 @@ export const api = {
       shopName: input.shopName,
       contactPhone: input.contactPhone,
       customerServiceWechat: input.customerServiceWechat,
-      initialPassword: input.initialPassword,
+      initialPassword: input.initialPassword || undefined,
       targetTier: "first_tier",
       depositRequiredAmountCents: requirePositiveCents(input.depositRequiredAmountCents, "应缴保证金金额"),
       depositPaid: input.depositPaid
@@ -289,7 +334,16 @@ export const api = {
     body: {
       amountCents: requirePositiveCents(amountCents, "确认收款金额"),
       voucherUrl: `manual://offline-payment/${orderNo}/${Date.now()}`,
-      note: "支付账号未开通阶段的后台人工确认收款"
+      note: "后台人工确认收款"
+    }
+  }),
+  confirmAgentPayment: (orderNo: string, amountCents: string) => request<JsonRecord>(`/api/agent/orders/${orderNo}/confirm-payment`, {
+    method: "POST",
+    headers: agentHeaders(),
+    body: {
+      amountCents: requirePositiveCents(amountCents, "确认收款金额"),
+      voucherUrl: `manual://agent-offline-payment/${orderNo}/${Date.now()}`,
+      note: "商户后台人工确认收款"
     }
   }),
   allocateRefund: (order: JsonRecord, refundAmountCents: string, responsibility: "platform" | "agent" | "user" | "mixed") => {
@@ -367,7 +421,7 @@ export const api = {
       orderNo,
       reasonCode: "fulfillment_issue",
       requestedRefundCents: requirePositiveCents(requestedRefundCents, "退款金额"),
-      description: "用户端售后申请演示"
+      description: "后台提交售后申请"
     }
   }),
   createRefund: (afterSaleNo: string, order: JsonRecord, refundAmountCents: string, responsibility: "platform" | "agent" | "user" | "mixed") => {
@@ -384,6 +438,14 @@ export const api = {
       }
     });
   },
+  confirmRefund: (refundNo: string, voucherUrl: string) => request<JsonRecord>(`/api/admin/refunds/${refundNo}/manual-confirm`, {
+    method: "POST",
+    headers: adminHeaders(),
+    body: {
+      channel: "manual",
+      channelRefundNo: requireText(voucherUrl, "人工退款凭证")
+    }
+  }),
   agentShop: () => request<JsonRecord>("/api/agent/shop", {
     headers: agentHeaders()
   }),
@@ -447,7 +509,19 @@ export const api = {
     headers: agentHeaders(),
     body: { items }
   }),
+  upsertAgentChannelOffer: (downstreamAgentId: string, platformProductId: string, resellSupplyPriceCents: string) => request<JsonRecord>("/api/agent/channels/offers", {
+    method: "POST",
+    headers: agentHeaders(),
+    body: {
+      downstreamAgentId: requireText(downstreamAgentId, "下游商户ID"),
+      platformProductId: requireText(platformProductId, "平台商品ID"),
+      resellSupplyPriceCents: requirePositiveCents(resellSupplyPriceCents, "转供价")
+    }
+  }),
   rightsCodes: () => request<JsonRecord[]>("/api/admin/rights-codes", {
+    headers: adminHeaders()
+  }).then((rows) => rows.map(stripRightsCodePlaintext)),
+  rightsCodesPlaintext: () => request<JsonRecord[]>("/api/admin/rights-codes/plaintext", {
     headers: adminHeaders()
   }),
   importRightsCodes: (input: { productId: string; batchNo: string; codes: string[] }) => request<JsonRecord>("/api/admin/rights-codes/import", {
@@ -493,6 +567,19 @@ export const api = {
   }),
   agentOrders: () => request<JsonRecord[]>("/api/agent/orders", {
     headers: agentHeaders()
+  }),
+  fulfillAgentOrder: (orderNo: string, attemptNo: number) => request<JsonRecord>(`/api/agent/orders/${orderNo}/fulfillment`, {
+    method: "POST",
+    headers: agentHeaders(),
+    body: { status: "success", evidence: `merchant-evidence-${attemptNo}`, attemptNo }
+  }),
+  agentAfterSales: () => request<JsonRecord[]>("/api/agent/after-sales", {
+    headers: agentHeaders()
+  }),
+  assistAgentAfterSale: (afterSaleNo: string, note: string) => request<JsonRecord>(`/api/agent/after-sales/${afterSaleNo}/assist`, {
+    method: "POST",
+    headers: agentHeaders(),
+    body: { note: requireText(note, "协处理说明") }
   }),
   agentSettlements: () => request<JsonRecord[]>("/api/agent/settlements", {
     headers: agentHeaders()
@@ -546,6 +633,32 @@ function saveAdminSession(session: AdminSession) {
 
 function clearAdminSession() {
   window.localStorage.removeItem("tosell_admin_session");
+}
+
+function currentAgentSession(): AgentSession | undefined {
+  if (typeof window === "undefined") return undefined;
+  try {
+    const raw = window.localStorage.getItem("tosell_agent_session");
+    if (!raw) return undefined;
+    const session = JSON.parse(raw) as AgentSession;
+    if (!session.token || session.expiresAt * 1000 <= Date.now() + 30_000) return undefined;
+    return session;
+  } catch {
+    return undefined;
+  }
+}
+
+function saveAgentSession(session: AgentSession) {
+  window.localStorage.setItem("tosell_agent_session", JSON.stringify(session));
+}
+
+function clearAgentSession() {
+  window.localStorage.removeItem("tosell_agent_session");
+}
+
+function stripRightsCodePlaintext(row: JsonRecord): JsonRecord {
+  const { code: _code, rightsCode: _rightsCode, codeCiphertext: _codeCiphertext, ...safe } = row;
+  return safe;
 }
 
 function splitLines(value?: string): string[] {

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ApiClientError, api, cents, text, type AdminSession, type JsonRecord } from "./api.js";
+import { ApiClientError, api, cents, text, type AdminSession, type AgentSession, type JsonRecord } from "./api.js";
 import "./styles.css";
 
 type LoadState = {
@@ -14,6 +14,7 @@ type LoadState = {
   agentOrders: JsonRecord[];
   adminOrders: JsonRecord[];
   agentApplications: JsonRecord[];
+  inviteCodes: JsonRecord[];
   adminAfterSales: JsonRecord[];
   adminRefunds: JsonRecord[];
   adminSettlements: JsonRecord[];
@@ -46,6 +47,7 @@ const initialState: LoadState = {
   agentOrders: [],
   adminOrders: [],
   agentApplications: [],
+  inviteCodes: [],
   adminAfterSales: [],
   adminRefunds: [],
   adminSettlements: [],
@@ -81,6 +83,7 @@ const navItems = [
 ] as const;
 
 type ModuleId = (typeof navItems)[number]["id"];
+type BackendSession = AdminSession | AgentSession;
 const configuredShopId = import.meta.env.VITE_SHOP_ID ?? "";
 const configuredPlatformShopId = import.meta.env.VITE_PLATFORM_SHOP_ID ?? "";
 
@@ -117,7 +120,8 @@ const mvpCoverageLabels = [
 function App() {
   const [data, setData] = useState<LoadState>(initialState);
   const [active, setActive] = useState<ModuleId>(() => moduleFromHash());
-  const [session, setSession] = useState<AdminSession | undefined>(() => api.currentAdminSession());
+  const [session, setSession] = useState<BackendSession | undefined>(() => api.currentAdminSession() ?? api.currentAgentSession());
+  const [loginMode, setLoginMode] = useState<"admin" | "merchant">(() => api.currentAgentSession() ? "merchant" : "admin");
   const [message, setMessage] = useState(session ? "正在连接 API..." : "请先登录后台");
   const [loading, setLoading] = useState(false);
   const [authError, setAuthError] = useState("");
@@ -131,6 +135,8 @@ function App() {
   const [channelOfferCents, setChannelOfferCents] = useState("");
   const [depositConfirmCents, setDepositConfirmCents] = useState("");
   const [depositDeductCents, setDepositDeductCents] = useState("");
+  const [downstreamAgentId, setDownstreamAgentId] = useState("");
+  const [afterSaleAssistNote, setAfterSaleAssistNote] = useState("");
   const [attemptNo, setAttemptNo] = useState(1);
   const [productForm, setProductForm] = useState({
     name: "",
@@ -144,25 +150,25 @@ function App() {
     detailSections: "",
     stockCount: "",
     soldCount: "",
-    fulfillmentMode: "code_pool",
+    fulfillmentMode: "",
     supplyPriceCents: "",
     minSalePriceCents: "",
     suggestedSalePriceCents: ""
   });
   const [inventoryForm, setInventoryForm] = useState({
     productId: "",
-    batchNo: `batch-${Date.now()}`,
+    batchNo: "",
     codes: ""
   });
   const [collectionForm, setCollectionForm] = useState({
     shopId: "",
-    collectionAccountName: "商家人工收款",
+    collectionAccountName: "",
     collectionQrUrl: "",
-    collectionNote: "支付账号开通前使用，后台人工确认收款"
+    collectionNote: ""
   });
   const [shopForm, setShopForm] = useState({
-    name: "商家精选小店",
-    announcement: "精选虚拟权益，付款后按规则发放",
+    name: "",
+    announcement: "",
     customerServiceWechat: "",
     customerServiceQrUrl: ""
   });
@@ -170,9 +176,9 @@ function App() {
     name: "",
     discountCents: "",
     productIds: "",
-    validDays: "30",
-    grantOnFirstRegister: true,
-    status: "active"
+    validDays: "",
+    grantOnFirstRegister: false,
+    status: ""
   });
   const [manualAgentForm, setManualAgentForm] = useState({
     name: "",
@@ -188,14 +194,21 @@ function App() {
     customerServiceWechat: "",
     inviteCode: ""
   });
+  const [inviteForm, setInviteForm] = useState({
+    code: "",
+    targetTier: "first_tier",
+    maxUses: "",
+    expiresAt: "",
+    depositRequiredAmountCents: ""
+  });
   const [ownProductForm, setOwnProductForm] = useState({
     name: "",
     salePriceCents: "",
     minSalePriceCents: "",
-    fulfillmentMode: "manual"
+    fulfillmentMode: ""
   });
   const [collectionChannelForm, setCollectionChannelForm] = useState({
-    channelType: "alipay_personal_qr",
+    channelType: "",
     displayName: "",
     accountName: "",
     qrUrl: "",
@@ -205,29 +218,69 @@ function App() {
   const [currentAfterSale, setCurrentAfterSale] = useState<JsonRecord | undefined>();
   const [currentRefund, setCurrentRefund] = useState<JsonRecord | undefined>();
   const [currentAllocation, setCurrentAllocation] = useState<JsonRecord | undefined>();
+  const [createdCredential, setCreatedCredential] = useState<JsonRecord | undefined>();
+  const [refundVoucher, setRefundVoucher] = useState("");
+  const [showSensitiveCodes, setShowSensitiveCodes] = useState(false);
+  const [sensitiveRightsCodes, setSensitiveRightsCodes] = useState<JsonRecord[]>([]);
 
   const selectedPublicProduct = data.publicProducts[0];
   const selectedPlatformShopProduct = data.platformShopProducts[0];
   const selectedAgentProduct = data.agentProducts[0];
   const selectedOwnProduct = data.ownProducts.find((item) => text(item.reviewStatus) === "pending_review") ?? data.ownProducts[0];
-  const selectedOrder = currentOrder ?? data.adminOrders.find((order) => text(order.paymentStatus) === "unpaid") ?? data.adminOrders[0] ?? data.agentOrders[0];
+  const activeAgentSession = isAgentSession(session) ? session : undefined;
+  const merchantSessionActive = Boolean(activeAgentSession);
+  const visibleOrders = merchantSessionActive ? data.agentOrders : data.adminOrders;
+  const selectedOrder = currentOrder ?? visibleOrders.find((order) => text(order.paymentStatus) === "unpaid") ?? visibleOrders[0];
   const selectedOrderNo = text(selectedOrder?.orderNo, "");
   const selectedOrderAmount = amountOf(selectedOrder);
   const selectedSettlement = data.settlements.find((sheet) => text(sheet.status) !== "paid") ?? data.settlements[0];
-  const currentShopId = text(data.shop?.id, "");
+  const currentShopId = text(data.shop?.id, text(activeAgentSession?.shop.shopId, ""));
+  const currentShopShareUrl = shopShareUrl(currentShopId);
   const currentProductId = text(selectedPublicProduct?.id, "");
-  const currentAgentId = text(data.shop?.agentId, text(data.agentApplications[0]?.agentId, ""));
+  const currentAgentId = text(data.shop?.agentId, text(activeAgentSession?.agent.agentId, text(data.agentApplications[0]?.agentId, "")));
+  const currentAgentTier = text(activeAgentSession?.agent.tier, "");
+  const canConfigureDownstreamOffer = merchantSessionActive && ["first_tier", "second_tier"].includes(currentAgentTier);
+  const merchantInviteTargetTier = currentAgentTier === "first_tier" ? "second_tier" : currentAgentTier === "second_tier" ? "third_tier" : "";
   const peerAgentId = text(data.agentApplications.find((item) => text(item.agentId) !== currentAgentId)?.agentId, "");
   const currentPlatformProductId = text(data.platformProducts[0]?.id, "");
   const currentChannelRelationId = text(channelRows(data.channels, "relations")[0]?.id, "");
   const currentDeposit = data.adminDeposits.find((item) => text(item.agentId) === currentAgentId);
-  const merchantBlockedReason = currentAgentId && text(currentDeposit?.status) !== "paid"
-    ? `保证金未确认，后端将拒绝销售、选品、代理和转供价操作；当前状态：${text(currentDeposit?.status, "unknown")}`
+  const currentDepositStatus = text(currentDeposit?.status, text(activeAgentSession?.agent.depositStatus, ""));
+  const merchantBlockedReason = currentAgentId && currentDepositStatus !== "paid"
+    ? `保证金未确认，后端将拒绝销售、选品、代理和转供价操作；当前状态：${text(currentDepositStatus, "unknown")}`
     : "";
   const merchantBlocked = Boolean(merchantBlockedReason);
   const pendingCollectionChannel = data.collectionChannels.find((item) => text(item.reviewStatus) === "pending_review") ?? data.collectionChannels[0];
+  const platformProductColumns = merchantSessionActive
+    ? [
+      "id",
+      "name",
+      "category",
+      "tags",
+      "fulfillmentMode",
+      "stockCount",
+      "soldCount",
+      currentAgentTier === "first_tier" ? "supplyPriceCents" : "visibleUpstreamSupplyPriceCents",
+      "minSalePriceCents",
+      "suggestedSalePriceCents",
+      "status"
+    ]
+    : ["id", "name", "category", "tags", "fulfillmentMode", "stockCount", "soldCount", "supplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents", "status"];
+  const agentProductColumns = merchantSessionActive
+    ? ["id", "productName", "category", "fulfillmentMode", "stockCount", "soldCount", "salePriceCents", currentAgentTier === "first_tier" ? "platformSupplyPriceCents" : "visibleUpstreamSupplyPriceCents", "minSalePriceCents", "status"]
+    : ["id", "productName", "category", "fulfillmentMode", "stockCount", "soldCount", "salePriceCents", "supplyPriceCents", "minSalePriceCents", "status"];
 
   const metrics = useMemo(() => {
+    if (merchantSessionActive) {
+      return [
+        { label: "成交额", value: cents(data.agentDashboard?.totalPaidCents), tone: "strong" },
+        { label: "订单数", value: String(data.agentOrders.length) },
+        { label: "已收款", value: text(data.agentDashboard?.paidOrderCount, "0") },
+        { label: "预估收益", value: cents(data.agentDashboard?.expectedIncomeCents) },
+        { label: "售后中", value: String(data.agentOrders.filter((item) => text(item.refundStatus, "none") !== "none").length) },
+        { label: "待结算", value: String(data.settlements.filter((item) => text(item.status) !== "paid").length) }
+      ];
+    }
     const reconciliation = data.reconciliation ?? {};
     return [
       { label: "成交额", value: cents(reconciliation.totalPaidCents), tone: "strong" },
@@ -237,17 +290,17 @@ function App() {
       { label: "售后中", value: String(data.adminAfterSales.filter((item) => text(item.status) !== "closed").length) },
       { label: "待结算", value: String(data.settlements.filter((item) => text(item.status) !== "paid").length) }
     ];
-  }, [data]);
+  }, [data, merchantSessionActive]);
 
   const todoItems = useMemo(() => [
     {
       label: "待确认收款",
-      value: data.adminOrders.filter((order) => text(order.paymentStatus) === "unpaid").length,
+      value: visibleOrders.filter((order) => text(order.paymentStatus) === "unpaid").length,
       target: "orders" as ModuleId
     },
     {
       label: "待发货订单",
-      value: data.adminOrders.filter((order) => text(order.paymentStatus) === "paid" && text(order.fulfillmentStatus) !== "success").length,
+      value: visibleOrders.filter((order) => text(order.paymentStatus) === "paid" && text(order.fulfillmentStatus) !== "success").length,
       target: "fulfillment" as ModuleId
     },
     {
@@ -257,20 +310,26 @@ function App() {
     },
     {
       label: "待处理售后",
-      value: data.adminAfterSales.filter((item) => text(item.status) === "pending").length,
+      value: merchantSessionActive
+        ? visibleOrders.filter((order) => text(order.refundStatus, "none") !== "none").length
+        : data.adminAfterSales.filter((item) => text(item.status) === "pending").length,
       target: "afterSales" as ModuleId
     }
-  ], [data]);
+  ], [data, merchantSessionActive, visibleOrders]);
 
   async function loadAll(status = "数据已刷新") {
-    if (!api.currentAdminSession()) {
+    const adminSession = api.currentAdminSession();
+    const agentSession = api.currentAgentSession();
+    if (!adminSession && !agentSession) {
       setSession(undefined);
       setMessage("请先登录后台");
       return;
     }
+    const merchantSessionActive = Boolean(agentSession && !adminSession);
     setLoading(true);
     try {
-      await api.adminSession();
+      if (merchantSessionActive) await api.agentSession();
+      else await api.adminSession();
       const optional = async <T,>(loader: () => Promise<T>, fallback: T): Promise<T> => {
         try {
           return await loader();
@@ -281,8 +340,18 @@ function App() {
           throw error;
         }
       };
+      const shop = merchantSessionActive
+        ? await optional(api.agentShop, {} as JsonRecord)
+        : configuredShopId
+          ? await optional(() => api.shop(configuredShopId), {} as JsonRecord)
+          : {} as JsonRecord;
+      const shopIdForPublicData = text(shop.id, configuredShopId);
+      const loadPlatformProducts = merchantSessionActive ? api.platformProducts : api.adminPlatformProducts;
+      const loadOrders = merchantSessionActive ? api.agentOrders : api.adminOrders;
+      const loadCollectionChannels = merchantSessionActive ? api.agentCollectionChannels : api.collectionChannels;
+      const loadAfterSales = merchantSessionActive ? api.agentAfterSales : api.adminAfterSales;
+      const loadInviteCodes = merchantSessionActive ? api.agentInviteCodes : api.inviteCodes;
       const [
-        shop,
         platformShop,
         publicProducts,
         platformShopProducts,
@@ -294,6 +363,7 @@ function App() {
         clawbacks,
         adminOrders,
         agentApplications,
+        inviteCodes,
         adminAfterSales,
         adminRefunds,
         adminSettlements,
@@ -314,37 +384,37 @@ function App() {
         salesDashboard,
         paymentGuide
       ] = await Promise.all([
-        optional(() => api.shop(configuredShopId), {}),
-        optional(() => api.shop(configuredPlatformShopId), {}),
-        optional(() => api.shopProducts(configuredShopId), []),
-        optional(api.adminPlatformShopProducts, []),
+        configuredPlatformShopId ? optional(() => api.shop(configuredPlatformShopId), {}) : Promise.resolve({} as JsonRecord),
+        shopIdForPublicData ? optional(() => api.shopProducts(shopIdForPublicData), []) : Promise.resolve([] as JsonRecord[]),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminPlatformShopProducts, []),
         optional(api.agentProducts, []),
-        optional(api.adminPlatformProducts, []),
+        optional(loadPlatformProducts, []),
         optional(api.ownProducts, []),
         optional(api.agentOrders, []),
         optional(api.agentSettlements, []),
         optional(api.agentClawbacks, []),
-        optional(api.adminOrders, []),
-        optional(api.agentApplications, []),
-        optional(api.adminAfterSales, []),
-        optional(api.adminRefunds, []),
-        optional(api.adminSettlements, []),
-        optional(api.adminDeposits, []),
-        optional(api.adminChannels, {}),
-        optional(api.serviceQrCodes, []),
-        optional(api.riskFreezes, []),
-        optional(api.paymentConfigStatus, []),
-        optional(api.collectionChannels, []),
-        optional(api.adminCoupons, []),
-        optional(api.auditLogs, []),
-        optional(api.ledgerEntries, []),
-        optional(api.reconciliationSummary, {}),
-        optional(api.rightsCodes, []),
+        optional(loadOrders, []),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.agentApplications, []),
+        optional(loadInviteCodes, []),
+        optional(loadAfterSales, []),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminRefunds, []),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminSettlements, []),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminDeposits, []),
+        merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.adminChannels, {}),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.serviceQrCodes, []),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.riskFreezes, []),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.paymentConfigStatus, []),
+        optional(loadCollectionChannels, []),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminCoupons, []),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.auditLogs, []),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.ledgerEntries, []),
+        merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.reconciliationSummary, {}),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.rightsCodes, []),
         optional(api.notifications, []),
         optional(api.agentDashboard, {}),
-        optional(api.riskDashboard, {}),
-        optional(api.salesDashboard, {}),
-        optional(api.paymentGuide, {})
+        merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.riskDashboard, {}),
+        merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.salesDashboard, {}),
+        merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.paymentGuide, {})
       ]);
       const visiblePaymentConfigs = paymentConfigs.filter((item) => !blockedPaymentConfigChannels().includes(text(item.channel)));
       setData({
@@ -360,6 +430,7 @@ function App() {
         clawbacks,
         adminOrders,
         agentApplications,
+        inviteCodes,
         adminAfterSales,
         adminRefunds,
         adminSettlements,
@@ -380,10 +451,11 @@ function App() {
         salesDashboard,
         paymentGuide
       });
-      setCurrentOrder((order) => order ?? adminOrders.find((item) => text(item.paymentStatus) === "unpaid") ?? adminOrders[0] ?? agentOrders[0]);
+      const nextVisibleOrders = merchantSessionActive ? agentOrders : adminOrders;
+      setCurrentOrder((order) => order ?? nextVisibleOrders.find((item) => text(item.paymentStatus) === "unpaid") ?? nextVisibleOrders[0]);
       setShopForm({
-        name: text(shop.name, "商家精选小店"),
-        announcement: text(shop.announcement, "精选虚拟权益，付款后按规则发放"),
+        name: text(shop.name, ""),
+        announcement: text(shop.announcement, ""),
         customerServiceWechat: text(shop.customerServiceWechat, ""),
         customerServiceQrUrl: text(shop.customerServiceQrUrl, "")
       });
@@ -393,6 +465,7 @@ function App() {
     } catch (error) {
       if (error instanceof ApiClientError && error.status === 401) {
         api.clearAdminSession();
+        api.clearAgentSession();
         setSession(undefined);
         setAuthError(error.code === "AUTH_EXPIRED" ? "登录已过期，请重新登录。" : "未登录或登录无效，请重新登录。");
         setMessage("请先登录后台");
@@ -425,11 +498,13 @@ function App() {
       if (isRecord(result) && result.refundNo) setCurrentRefund(result);
       if (isRecord(result) && isRecord(result.refund)) setCurrentRefund(result.refund as JsonRecord);
       if (isRecord(result) && isRecord(result.allocation)) setCurrentAllocation(result.allocation as JsonRecord);
+      if (isRecord(result) && isRecord(result.credential)) setCreatedCredential(result.credential as JsonRecord);
       setMessage(`${label}成功`);
       if (refresh) await loadAll(`${label}成功，数据已刷新`);
     } catch (error) {
       if (error instanceof ApiClientError && error.status === 401) {
         api.clearAdminSession();
+        api.clearAgentSession();
         setSession(undefined);
         setAuthError(error.code === "AUTH_EXPIRED" ? "登录已过期，请重新登录。" : "未登录或登录无效，请重新登录。");
         setMessage("请先登录后台");
@@ -443,16 +518,40 @@ function App() {
     }
   }
 
+  async function copyShopShareUrl() {
+    if (!currentShopShareUrl) {
+      setMessage("当前店铺还没有可复制的分享地址");
+      return;
+    }
+    try {
+      await navigator.clipboard?.writeText(currentShopShareUrl);
+      setMessage("店铺分享地址已复制");
+    } catch {
+      setMessage("复制失败，请手动复制店铺分享地址");
+    }
+  }
+
   async function login() {
     setLoading(true);
     setAuthError("");
     try {
-      const nextSession = await api.adminLogin({
-        username: loginForm.username.trim(),
-        password: loginForm.password,
-        requestedRole: loginForm.requestedRole
-      });
-      api.saveAdminSession(nextSession);
+      const nextSession = loginMode === "merchant"
+        ? await api.agentLogin({
+          account: loginForm.username.trim(),
+          password: loginForm.password
+        })
+        : await api.adminLogin({
+          username: loginForm.username.trim(),
+          password: loginForm.password,
+          requestedRole: loginForm.requestedRole
+        });
+      if (loginMode === "merchant") {
+        api.clearAdminSession();
+        api.saveAgentSession(nextSession as AgentSession);
+      } else {
+        api.clearAgentSession();
+        api.saveAdminSession(nextSession as AdminSession);
+      }
       setSession(nextSession);
       setMessage("登录成功，正在加载后台数据");
     } catch (error) {
@@ -465,6 +564,7 @@ function App() {
 
   function logout() {
     api.clearAdminSession();
+    api.clearAgentSession();
     setSession(undefined);
     setData(initialState);
     setMessage("已退出登录");
@@ -491,6 +591,20 @@ function App() {
       batchNo: inventoryForm.batchNo.trim(),
       codes
     }));
+  }
+
+  async function revealRightsCodes(label = "查看明文") {
+    setLoading(true);
+    try {
+      const rows = await api.rightsCodesPlaintext();
+      setSensitiveRightsCodes(rows);
+      setShowSensitiveCodes(true);
+      setMessage(`${label}已触发；生产环境需确认当前账号具备卡密明文权限，并在后端审计中保留查看/导出原因。`);
+    } catch (error) {
+      setMessage(`${label}失败：${error instanceof Error ? error.message : "未知错误"}`);
+    } finally {
+      setLoading(false);
+    }
   }
 
   function submitCouponTemplate() {
@@ -532,6 +646,21 @@ function App() {
     void runAction(label, action, label !== "退款拆账");
   }
 
+  function submitConfirmPayment() {
+    const action = merchantSessionActive
+      ? () => api.confirmAgentPayment(selectedOrderNo, selectedOrderAmount)
+      : () => api.confirmOfflinePayment(selectedOrderNo, selectedOrderAmount);
+    void runAction("人工确认收款", action);
+  }
+
+  function submitFulfillment() {
+    if (merchantSessionActive) {
+      void runAction("确认发货", () => api.fulfillAgentOrder(selectedOrderNo, attemptNo));
+    } else {
+      void runAction("确认发货", () => api.fulfillOrder(selectedOrderNo, attemptNo));
+    }
+  }
+
   function submitManualAgent() {
     const error = validateManualAgentForm(manualAgentForm);
     if (error) {
@@ -539,6 +668,14 @@ function App() {
       return;
     }
     void runAction("手工创建一级商户", () => api.createManualAgent(manualAgentForm));
+  }
+
+  function submitAgentInviteCode() {
+    if (!merchantInviteTargetTier) {
+      setMessage("三级商户不能继续创建渠道邀请码。");
+      return;
+    }
+    void runAction("创建商户邀请码", () => api.createAgentInviteCode(inviteForm));
   }
 
   function submitConfirmDeposit() {
@@ -565,7 +702,11 @@ function App() {
       setMessage(error);
       return;
     }
-    void runAction(label, () => api.upsertChannelOffer(currentChannelRelationId, currentPlatformProductId, channelOfferCents));
+    if (merchantSessionActive) {
+      void runAction(label, () => api.upsertAgentChannelOffer(downstreamAgentId, currentPlatformProductId, channelOfferCents));
+    } else {
+      void runAction(label, () => api.upsertChannelOffer(currentChannelRelationId, currentPlatformProductId, channelOfferCents));
+    }
   }
 
   function switchModule(moduleId: ModuleId) {
@@ -595,7 +736,7 @@ function App() {
             <button type="button" onClick={() => switchModule("shops")}>配置收款码</button>
           </section>
           <Panel title="最近订单" kicker="运营">
-            <OrdersTable rows={data.adminOrders.slice(0, 6)} onPick={setCurrentOrder} />
+            <OrdersTable rows={visibleOrders.slice(0, 6)} onPick={setCurrentOrder} />
           </Panel>
         </Module>
       );
@@ -605,30 +746,37 @@ function App() {
       return (
         <Module title="商品管理" subtitle="平台供货、自营上架、代理自有商品审核">
           <section className="split">
-            <Panel title="新增平台供货商品" kicker="平台">
-              <div className="form-grid">
-                <label>商品名称<input value={productForm.name} onChange={(event) => setProductForm({ ...productForm, name: event.target.value })} placeholder="例如：会员月卡/账号成品号" /></label>
-                <label>类目<input value={productForm.category} onChange={(event) => setProductForm({ ...productForm, category: event.target.value })} placeholder="例如：AI 会员" /></label>
-                <label>标签<input value={productForm.tags} onChange={(event) => setProductForm({ ...productForm, tags: event.target.value })} placeholder="逗号分隔" /></label>
-                <label>副标题<input value={productForm.subtitle} onChange={(event) => setProductForm({ ...productForm, subtitle: event.target.value })} placeholder="一句话说明卖点" /></label>
-                <label>商品图<input value={productForm.imageUrl} onChange={(event) => setProductForm({ ...productForm, imageUrl: event.target.value })} placeholder="https://..." /></label>
-                <label>规格<textarea value={productForm.specs} onChange={(event) => setProductForm({ ...productForm, specs: event.target.value })} rows={3} placeholder="一行一个规格" /></label>
-                <label>商品说明<textarea value={productForm.description} onChange={(event) => setProductForm({ ...productForm, description: event.target.value })} rows={3} /></label>
-                <label>使用说明<textarea value={productForm.usageGuide} onChange={(event) => setProductForm({ ...productForm, usageGuide: event.target.value })} rows={3} /></label>
-                <label>详情模块<textarea value={productForm.detailSections} onChange={(event) => setProductForm({ ...productForm, detailSections: event.target.value })} rows={5} placeholder="标题：内容一；内容二" /></label>
-                <label>发货方式<select value={productForm.fulfillmentMode} onChange={(event) => setProductForm({ ...productForm, fulfillmentMode: event.target.value })}><option value="manual">人工交付</option><option value="code_pool">自动发码</option></select></label>
-                <label>库存<input inputMode="numeric" value={productForm.stockCount} onChange={(event) => setProductForm({ ...productForm, stockCount: event.target.value })} placeholder="必填，非负整数" /></label>
-                <label>销量<input inputMode="numeric" value={productForm.soldCount} onChange={(event) => setProductForm({ ...productForm, soldCount: event.target.value })} placeholder="选填，非负整数" /></label>
-                <label>供货价(分)<input inputMode="numeric" value={productForm.supplyPriceCents} onChange={(event) => setProductForm({ ...productForm, supplyPriceCents: event.target.value })} placeholder="必填，正整数" /></label>
-                <label>最低售价(分)<input inputMode="numeric" value={productForm.minSalePriceCents} onChange={(event) => setProductForm({ ...productForm, minSalePriceCents: event.target.value })} placeholder="必填，不低于供货价" /></label>
-                <label>建议售价(分)<input inputMode="numeric" value={productForm.suggestedSalePriceCents} onChange={(event) => setProductForm({ ...productForm, suggestedSalePriceCents: event.target.value })} placeholder="必填，不低于最低售价" /></label>
-              </div>
-              <div className="actions">
-                <button onClick={submitPlatformProduct}>保存并入库</button>
+            {merchantSessionActive ? (
+              <Panel title="平台商品选品" kicker="商户">
+                <p className="hint">商户账号通过 /api/agent/products/platform 读取可选商品，不加载平台 admin 商品管理接口。</p>
                 {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
                 <button className="secondary" disabled={merchantBlocked || data.platformProducts.length === 0} onClick={submitBatchSelection}>批量选品上架</button>
-              </div>
-            </Panel>
+              </Panel>
+            ) : (
+              <Panel title="新增平台供货商品" kicker="平台">
+                <div className="form-grid">
+                  <label>商品名称<input value={productForm.name} onChange={(event) => setProductForm({ ...productForm, name: event.target.value })} placeholder="例如：会员月卡/账号成品号" /></label>
+                  <label>类目<input value={productForm.category} onChange={(event) => setProductForm({ ...productForm, category: event.target.value })} placeholder="例如：AI 会员" /></label>
+                  <label>标签<input value={productForm.tags} onChange={(event) => setProductForm({ ...productForm, tags: event.target.value })} placeholder="逗号分隔" /></label>
+                  <label>副标题<input value={productForm.subtitle} onChange={(event) => setProductForm({ ...productForm, subtitle: event.target.value })} placeholder="一句话说明卖点" /></label>
+                  <label>商品图<input value={productForm.imageUrl} onChange={(event) => setProductForm({ ...productForm, imageUrl: event.target.value })} placeholder="https://..." /></label>
+                  <label>规格<textarea value={productForm.specs} onChange={(event) => setProductForm({ ...productForm, specs: event.target.value })} rows={3} placeholder="一行一个规格" /></label>
+                  <label>商品说明<textarea value={productForm.description} onChange={(event) => setProductForm({ ...productForm, description: event.target.value })} rows={3} /></label>
+                  <label>使用说明<textarea value={productForm.usageGuide} onChange={(event) => setProductForm({ ...productForm, usageGuide: event.target.value })} rows={3} /></label>
+                  <label>详情模块<textarea value={productForm.detailSections} onChange={(event) => setProductForm({ ...productForm, detailSections: event.target.value })} rows={5} placeholder="标题：内容一；内容二" /></label>
+                  <label>发货方式<select value={productForm.fulfillmentMode} onChange={(event) => setProductForm({ ...productForm, fulfillmentMode: event.target.value })}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发码</option></select></label>
+                  <label>库存<input inputMode="numeric" value={productForm.stockCount} onChange={(event) => setProductForm({ ...productForm, stockCount: event.target.value })} placeholder="必填，非负整数" /></label>
+                  <label>销量<input inputMode="numeric" value={productForm.soldCount} onChange={(event) => setProductForm({ ...productForm, soldCount: event.target.value })} placeholder="选填，非负整数" /></label>
+                  <label>供货价(分)<input inputMode="numeric" value={productForm.supplyPriceCents} onChange={(event) => setProductForm({ ...productForm, supplyPriceCents: event.target.value })} placeholder="必填，正整数" /></label>
+                  <label>最低售价(分)<input inputMode="numeric" value={productForm.minSalePriceCents} onChange={(event) => setProductForm({ ...productForm, minSalePriceCents: event.target.value })} placeholder="必填，不低于供货价" /></label>
+                  <label>建议售价(分)<input inputMode="numeric" value={productForm.suggestedSalePriceCents} onChange={(event) => setProductForm({ ...productForm, suggestedSalePriceCents: event.target.value })} placeholder="必填，不低于最低售价" /></label>
+                </div>
+                <div className="actions">
+                  <button onClick={submitPlatformProduct}>保存并入库</button>
+                  {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
+                </div>
+              </Panel>
+            )}
             <Panel title="代理改价" kicker="商家">
               <KeyValue label="当前商品" value={text(selectedAgentProduct?.id, "暂无代理商品")} />
               <div className="inline-form">
@@ -638,10 +786,10 @@ function App() {
             </Panel>
           </section>
           <Panel title="平台商品库" kicker={`${data.platformProducts.length} 个商品`}>
-            <Table rows={data.platformProducts} columns={["id", "name", "category", "tags", "fulfillmentMode", "stockCount", "soldCount", "supplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents", "status"]} moneyColumns={["supplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents"]} />
+            <Table rows={data.platformProducts} columns={platformProductColumns} moneyColumns={["supplyPriceCents", "visibleUpstreamSupplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents"]} />
           </Panel>
           <Panel title="店铺已上架商品" kicker={`${data.agentProducts.length} 个商品`}>
-            <Table rows={agentProductRows(data.agentProducts)} columns={["id", "productName", "category", "fulfillmentMode", "stockCount", "soldCount", "salePriceCents", "supplyPriceCents", "minSalePriceCents", "status"]} moneyColumns={["salePriceCents", "supplyPriceCents", "minSalePriceCents"]} />
+            <Table rows={agentProductRows(data.agentProducts)} columns={agentProductColumns} moneyColumns={["salePriceCents", "supplyPriceCents", "platformSupplyPriceCents", "visibleUpstreamSupplyPriceCents", "minSalePriceCents"]} />
           </Panel>
           <Panel title="代理自有商品审核" kicker="平台审核">
             <div className="actions">
@@ -650,11 +798,15 @@ function App() {
                 <label>商品名称<input value={ownProductForm.name} onChange={(event) => setOwnProductForm({ ...ownProductForm, name: event.target.value })} /></label>
                 <label>售价(分)<input value={ownProductForm.salePriceCents} onChange={(event) => setOwnProductForm({ ...ownProductForm, salePriceCents: event.target.value })} /></label>
                 <label>最低价(分)<input value={ownProductForm.minSalePriceCents} onChange={(event) => setOwnProductForm({ ...ownProductForm, minSalePriceCents: event.target.value })} /></label>
-                <label>交付方式<select value={ownProductForm.fulfillmentMode} onChange={(event) => setOwnProductForm({ ...ownProductForm, fulfillmentMode: event.target.value })}><option value="manual">人工交付</option><option value="code_pool">自动发码</option></select></label>
+                <label>交付方式<select value={ownProductForm.fulfillmentMode} onChange={(event) => setOwnProductForm({ ...ownProductForm, fulfillmentMode: event.target.value })}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发码</option></select></label>
               </div>
-              <button disabled={merchantBlocked || !ownProductForm.name || !ownProductForm.salePriceCents} onClick={() => void runAction("代理提交自有商品", () => api.submitOwnProduct(ownProductForm))}>提交自有商品</button>
-              <button disabled={!selectedOwnProduct?.id} onClick={() => void runAction("自有商品审核通过", () => api.reviewOwnProduct(text(selectedOwnProduct?.id, "")))}>审核通过</button>
-              <button className="secondary" disabled={!selectedOwnProduct?.id} onClick={() => void runAction("自有商品审核拒绝", () => api.reviewOwnProduct(text(selectedOwnProduct?.id, ""), false))}>审核拒绝</button>
+              <button disabled={merchantBlocked || !ownProductForm.name || !ownProductForm.salePriceCents || !ownProductForm.fulfillmentMode} onClick={() => void runAction("代理提交自有商品", () => api.submitOwnProduct(ownProductForm))}>提交自有商品</button>
+              {merchantSessionActive ? null : (
+                <>
+                  <button disabled={!selectedOwnProduct?.id} onClick={() => void runAction("自有商品审核通过", () => api.reviewOwnProduct(text(selectedOwnProduct?.id, "")))}>审核通过</button>
+                  <button className="secondary" disabled={!selectedOwnProduct?.id} onClick={() => void runAction("自有商品审核拒绝", () => api.reviewOwnProduct(text(selectedOwnProduct?.id, ""), false))}>审核拒绝</button>
+                </>
+              )}
             </div>
             <Table rows={data.ownProducts} columns={["id", "name", "salePriceCents", "minSalePriceCents", "reviewStatus", "status"]} moneyColumns={["salePriceCents", "minSalePriceCents"]} />
           </Panel>
@@ -663,6 +815,15 @@ function App() {
     }
 
     if (active === "inventory") {
+      if (merchantSessionActive) {
+        return (
+          <Module title="库存卡密" subtitle="商户库存仅允许通过商户 scoped API 管理">
+            <Panel title="库存权限" kicker="商户后台">
+              <p className="hint">当前后端只提供平台 admin 卡密导入和明文审计接口。商户态不调用 /api/admin/rights-codes，不展示卡密明文，不提供导入写库按钮。</p>
+            </Panel>
+          </Module>
+        );
+      }
       return (
         <Module title="库存卡密" subtitle="自动发码商品的卡密导入、库存和发放状态">
           <section className="split">
@@ -680,14 +841,28 @@ function App() {
               <KeyValue label="已发放" value={String(data.rightsCodes.filter((item) => text(item.status) === "issued").length)} />
             </Panel>
           </section>
-          <Panel title="卡密明细" kicker="最近记录">
-            <Table rows={data.rightsCodes.slice(0, 12)} columns={["codeId", "productId", "batchNo", "status", "orderNo"]} />
+          <Panel title="卡密明细" kicker="默认脱敏">
+            <p className="hint">默认只展示批次、状态、商品和订单归属；查看或导出明文需单独操作并按审计要求留痕。</p>
+            <div className="actions">
+              <button className="secondary" onClick={() => void revealRightsCodes()}>查看明文</button>
+              <button className="secondary" onClick={() => void revealRightsCodes("导出明文")}>导出明文</button>
+            </div>
+            <Table rows={(showSensitiveCodes ? sensitiveRightsCodes : data.rightsCodes).slice(0, 12)} columns={showSensitiveCodes ? ["codeId", "productId", "batchNo", "status", "orderNo", "code"] : ["codeId", "productId", "batchNo", "status", "orderNo"]} />
           </Panel>
         </Module>
       );
     }
 
     if (active === "coupons") {
+      if (merchantSessionActive) {
+        return (
+          <Module title="优惠券" subtitle="商户后台优惠券只读占位">
+            <Panel title="优惠券权限" kicker="商户后台">
+              <p className="hint">优惠券模板由平台后台管理；商户态不调用 /api/admin/coupons 创建、停用或启用券模板。</p>
+            </Panel>
+          </Module>
+        );
+      }
       const selectedCoupon = data.coupons[0];
       return (
         <Module title="优惠券" subtitle="平台券模板、注册赠券和商品适用范围">
@@ -697,7 +872,7 @@ function App() {
                 <label>名称<input value={couponForm.name} onChange={(event) => setCouponForm({ ...couponForm, name: event.target.value })} placeholder="必填" /></label>
                 <label>抵扣金额(分)<input inputMode="numeric" value={couponForm.discountCents} onChange={(event) => setCouponForm({ ...couponForm, discountCents: event.target.value })} placeholder="必填，正整数" /></label>
                 <label>有效天数<input value={couponForm.validDays} onChange={(event) => setCouponForm({ ...couponForm, validDays: event.target.value })} /></label>
-                <label>状态<select value={couponForm.status} onChange={(event) => setCouponForm({ ...couponForm, status: event.target.value })}><option value="active">启用</option><option value="disabled">停用</option></select></label>
+                <label>状态<select value={couponForm.status} onChange={(event) => setCouponForm({ ...couponForm, status: event.target.value })}><option value="">请选择</option><option value="active">启用</option><option value="disabled">停用</option></select></label>
                 <label className="span-2">适用平台商品ID<textarea rows={3} value={couponForm.productIds} onChange={(event) => setCouponForm({ ...couponForm, productIds: event.target.value })} placeholder="为空表示不限商品；一行一个商品ID" /></label>
                 <label className="checkbox-line"><input type="checkbox" checked={couponForm.grantOnFirstRegister} onChange={(event) => setCouponForm({ ...couponForm, grantOnFirstRegister: event.target.checked })} />首次注册自动赠送</label>
               </div>
@@ -722,7 +897,7 @@ function App() {
 
     if (active === "orders") {
       return (
-        <Module title="订单管理" subtitle="查单、人工确认收款、创建测试订单">
+        <Module title="订单管理" subtitle="查单、人工确认收款、订单履约流转">
           <section className="split">
             <Panel title="当前订单" kicker={selectedOrderNo || "未选择"}>
               <KeyValue label="订单号" value={selectedOrderNo || "暂无订单"} />
@@ -730,24 +905,16 @@ function App() {
               <KeyValue label="支付状态" value={text(selectedOrder?.paymentStatus)} />
               <KeyValue label="履约状态" value={text(selectedOrder?.fulfillmentStatus)} />
               <div className="actions">
-                <button disabled={!selectedOrderNo || text(selectedOrder?.paymentStatus) === "paid"} onClick={() => void runAction("人工确认收款", () => api.confirmOfflinePayment(selectedOrderNo, selectedOrderAmount))}>人工确认收款</button>
+                <button disabled={!selectedOrderNo || text(selectedOrder?.paymentStatus) === "paid"} onClick={submitConfirmPayment}>人工确认收款</button>
                 <button className="secondary" disabled={!selectedOrderNo} onClick={() => switchModule("fulfillment")}>去发货</button>
               </div>
             </Panel>
-            <Panel title="快速创建订单" kicker="验收">
-              <KeyValue label="店铺" value={currentShopId || "暂无店铺"} />
-              <KeyValue label="商品" value={currentProductId || "暂无商品"} />
-              <div className="actions">
-                <button disabled={!currentShopId || !currentProductId} onClick={() => void runAction("订单报价", () => api.quoteOrder(currentShopId, currentProductId), false)}>获取报价</button>
-                <button onClick={() => void runAction("创建订单", async () => {
-                  const quote = await api.quoteOrder(currentShopId, currentProductId);
-                  return api.createOrder(currentShopId, currentProductId, text(quote.buyerPaidAmountCents, text(quote.paidAmountCents)));
-                })} disabled={!currentShopId || !currentProductId}>创建订单</button>
-              </div>
+            <Panel title="操作说明" kicker="生产">
+              <p className="hint">生产后台不提供快捷写单入口。订单必须由 H5 买家端按当前店铺、商品、收款通道和后端价格规则创建；商户账号只处理自己店铺订单。</p>
             </Panel>
           </section>
-          <Panel title="订单列表" kicker={`${data.adminOrders.length} 笔`}>
-            <OrdersTable rows={data.adminOrders} onPick={setCurrentOrder} />
+          <Panel title="订单列表" kicker={`${visibleOrders.length} 笔`}>
+            <OrdersTable rows={visibleOrders} onPick={setCurrentOrder} />
           </Panel>
         </Module>
       );
@@ -762,11 +929,12 @@ function App() {
               <KeyValue label="当前状态" value={text(selectedOrder?.fulfillmentStatus)} />
               <div className="inline-form">
                 <label>尝试次数<input value={String(attemptNo)} onChange={(event) => setAttemptNo(Number(event.target.value) || 1)} /></label>
-                <button disabled={!selectedOrderNo || text(selectedOrder?.paymentStatus) !== "paid"} onClick={() => void runAction("确认发货", () => api.fulfillOrder(selectedOrderNo, attemptNo))}>确认发货</button>
+                <button disabled={!selectedOrderNo || text(selectedOrder?.paymentStatus) !== "paid"} onClick={submitFulfillment}>确认发货</button>
               </div>
+              {merchantSessionActive ? <p className="hint">商户态调用 /api/agent/orders/:orderNo/fulfillment，不使用平台 admin 发货接口。</p> : null}
             </Panel>
             <Panel title="待发货" kicker="已收款未完成">
-              <OrdersTable rows={data.adminOrders.filter((order) => text(order.paymentStatus) === "paid" && text(order.fulfillmentStatus) !== "success").slice(0, 6)} onPick={setCurrentOrder} />
+              <OrdersTable rows={visibleOrders.filter((order) => text(order.paymentStatus) === "paid" && text(order.fulfillmentStatus) !== "success").slice(0, 6)} onPick={setCurrentOrder} />
             </Panel>
           </section>
         </Module>
@@ -781,19 +949,34 @@ function App() {
               <KeyValue label="当前订单" value={selectedOrderNo || "暂无订单"} />
               <KeyValue label="售后单" value={text(currentAfterSale?.afterSaleNo, "暂无")} />
               <KeyValue label="退款单" value={text(currentRefund?.refundNo, "暂无")} />
-              <KeyValue label="最近拆账" value={currentAllocation ? `平台 ${cents(currentAllocation.platformBearCents)} / 代理 ${cents(currentAllocation.agentBearCents)}` : "暂无"} />
-              <div className="inline-form">
-                <label>金额(分)<input inputMode="numeric" value={refundCents} onChange={(event) => setRefundCents(event.target.value)} placeholder="必填，正整数" /></label>
-              </div>
-              <div className="actions">
-                <button disabled={!selectedOrderNo || text(selectedOrder?.paymentStatus) !== "paid"} onClick={() => submitRefundAction("提交售后", () => api.createAfterSale(selectedOrderNo, refundCents))}>提交售后</button>
-                <button disabled={!selectedOrderNo} onClick={() => submitRefundAction("退款拆账", () => api.allocateRefund(selectedOrder ?? {}, refundCents, "mixed"))}>拆账预览</button>
-                <button disabled={!currentAfterSale?.afterSaleNo} onClick={() => submitRefundAction("审批退款", () => api.createRefund(text(currentAfterSale?.afterSaleNo, ""), selectedOrder ?? {}, refundCents, "mixed"))}>审批退款</button>
-                <button className="secondary" disabled={!currentRefund?.refundNo} onClick={() => void loadAll("退款单已生成，等待财务渠道确认")}>刷新退款状态</button>
-              </div>
+              {merchantSessionActive ? (
+                <>
+                  <p className="hint">商户态调用 /api/agent/after-sales 查看自己的售后，不暴露平台退款拆账、审批和人工退款确认动作。</p>
+                  <div className="inline-form">
+                    <label>协处理说明<input value={afterSaleAssistNote} onChange={(event) => setAfterSaleAssistNote(event.target.value)} placeholder="填写处理说明或凭证备注" /></label>
+                    <button disabled={!data.adminAfterSales[0]?.afterSaleNo || !afterSaleAssistNote.trim()} onClick={() => void runAction("售后协处理", () => api.assistAgentAfterSale(text(data.adminAfterSales[0]?.afterSaleNo, ""), afterSaleAssistNote.trim()))}>提交协处理</button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <KeyValue label="最近拆账" value={currentAllocation ? `平台 ${cents(currentAllocation.platformBearCents)} / 代理 ${cents(currentAllocation.agentBearCents)}` : "暂无"} />
+                  <div className="inline-form">
+                    <label>金额(分)<input inputMode="numeric" value={refundCents} onChange={(event) => setRefundCents(event.target.value)} placeholder="必填，正整数" /></label>
+                  </div>
+                  <div className="actions">
+                    <button disabled={!selectedOrderNo || text(selectedOrder?.paymentStatus) !== "paid"} onClick={() => submitRefundAction("提交售后", () => api.createAfterSale(selectedOrderNo, refundCents))}>提交售后</button>
+                    <button disabled={!selectedOrderNo} onClick={() => submitRefundAction("退款拆账", () => api.allocateRefund(selectedOrder ?? {}, refundCents, "mixed"))}>拆账预览</button>
+                    <button disabled={!currentAfterSale?.afterSaleNo} onClick={() => submitRefundAction("审批退款", () => api.createRefund(text(currentAfterSale?.afterSaleNo, ""), selectedOrder ?? {}, refundCents, "mixed"))}>审批退款</button>
+                    <label>退款凭证<input value={refundVoucher} onChange={(event) => setRefundVoucher(event.target.value)} placeholder="必填，人工退款流水/凭证号" /></label>
+                    <button className="secondary" disabled={!currentRefund?.refundNo || !refundVoucher.trim()} onClick={() => void runAction("人工退款确认", () => api.confirmRefund(text(currentRefund?.refundNo, ""), refundVoucher.trim()))}>确认退款成功</button>
+                  </div>
+                </>
+              )}
             </Panel>
-            <Panel title="售后列表" kicker={`${data.adminAfterSales.length} 单`}>
-              <Table rows={data.adminAfterSales} columns={["afterSaleNo", "orderNo", "status", "reasonCode", "requestedRefundCents"]} moneyColumns={["requestedRefundCents"]} />
+            <Panel title="售后列表" kicker={merchantSessionActive ? `${data.adminAfterSales.length} 单` : `${data.adminAfterSales.length} 单`}>
+              {merchantSessionActive
+                ? <Table rows={data.adminAfterSales} columns={["afterSaleNo", "orderNo", "status", "reasonCode", "requestedRefundCents"]} moneyColumns={["requestedRefundCents"]} />
+                : <Table rows={data.adminAfterSales} columns={["afterSaleNo", "orderNo", "status", "reasonCode", "requestedRefundCents"]} moneyColumns={["requestedRefundCents"]} />}
             </Panel>
           </section>
         </Module>
@@ -804,17 +987,25 @@ function App() {
       return (
         <Module title="销售统计" subtitle="订单、商品、店铺销售表现">
           <section className="metric-grid">
-            <Metric label="销售额" value={cents(data.salesDashboard?.totalPaidCents)} tone="strong" />
-            <Metric label="客单价" value={cents(data.salesDashboard?.averageOrderPaidCents)} />
-            <Metric label="履约成功" value={text(data.salesDashboard?.fulfilledOrderCount, "0")} />
-            <Metric label="服务费" value={cents(data.reconciliation?.totalServiceFeeCents)} />
+            <Metric label="销售额" value={merchantSessionActive ? cents(data.agentDashboard?.totalPaidCents) : cents(data.salesDashboard?.totalPaidCents)} tone="strong" />
+            <Metric label="成交订单" value={merchantSessionActive ? text(data.agentDashboard?.paidOrderCount, "0") : text(data.salesDashboard?.paidOrderCount, "0")} />
+            <Metric label="履约成功" value={merchantSessionActive ? text(data.agentDashboard?.fulfilledOrderCount, "0") : text(data.salesDashboard?.fulfilledOrderCount, "0")} />
+            <Metric label={merchantSessionActive ? "预估收益" : "服务费"} value={merchantSessionActive ? cents(data.agentDashboard?.expectedIncomeCents) : cents(data.reconciliation?.totalServiceFeeCents)} />
           </section>
-          <Panel title="商品销售" kicker="商品维度">
-            <Table rows={arrayValue(data.salesDashboard?.productRows)} columns={["productId", "name", "category", "fulfillmentMode", "stockCount", "soldCount", "paidOrderCount", "totalPaidCents", "availableCodeCount", "issuedCodeCount"]} moneyColumns={["totalPaidCents"]} />
-          </Panel>
-          <Panel title="店铺销售" kicker="店铺维度">
-            <Table rows={arrayValue(data.salesDashboard?.shopRows)} columns={["shopId", "name", "ownerType", "orderCount", "paidOrderCount", "totalPaidCents"]} moneyColumns={["totalPaidCents"]} />
-          </Panel>
+          {merchantSessionActive ? (
+            <Panel title="商户订单" kicker="当前店铺">
+              <OrdersTable rows={data.agentOrders} onPick={setCurrentOrder} />
+            </Panel>
+          ) : (
+            <>
+              <Panel title="商品销售" kicker="商品维度">
+                <Table rows={arrayValue(data.salesDashboard?.productRows)} columns={["productId", "name", "category", "fulfillmentMode", "stockCount", "soldCount", "paidOrderCount", "totalPaidCents", "availableCodeCount", "issuedCodeCount"]} moneyColumns={["totalPaidCents"]} />
+              </Panel>
+              <Panel title="店铺销售" kicker="店铺维度">
+                <Table rows={arrayValue(data.salesDashboard?.shopRows)} columns={["shopId", "name", "ownerType", "orderCount", "paidOrderCount", "totalPaidCents"]} moneyColumns={["totalPaidCents"]} />
+              </Panel>
+            </>
+          )}
         </Module>
       );
     }
@@ -824,6 +1015,14 @@ function App() {
         <Module title="店铺设置" subtitle="商家页面、客服二维码、人工收款码">
           <section className="split">
             <Panel title="店铺资料" kicker="商家">
+              <div className="share-box">
+                <span>店铺分享地址</span>
+                <div>
+                  <input value={currentShopShareUrl || "店铺加载后自动生成"} readOnly />
+                  {currentShopShareUrl ? <button type="button" onClick={() => void copyShopShareUrl()}>复制</button> : null}
+                  {currentShopShareUrl ? <a href={currentShopShareUrl} target="_blank" rel="noreferrer">打开</a> : null}
+                </div>
+              </div>
               <div className="form-grid wide">
                 <label>店铺名称<input value={shopForm.name} onChange={(event) => setShopForm({ ...shopForm, name: event.target.value })} /></label>
                 <label>客服微信<input value={shopForm.customerServiceWechat} onChange={(event) => setShopForm({ ...shopForm, customerServiceWechat: event.target.value })} /></label>
@@ -839,34 +1038,60 @@ function App() {
                 <label className="span-2">收款码URL<input value={collectionForm.collectionQrUrl} onChange={(event) => setCollectionForm({ ...collectionForm, collectionQrUrl: event.target.value })} /></label>
                 <label className="span-2">收款说明<input value={collectionForm.collectionNote} onChange={(event) => setCollectionForm({ ...collectionForm, collectionNote: event.target.value })} /></label>
               </div>
-              <button onClick={() => void runAction("保存人工收款码", () => api.saveCollectionChannel(collectionForm.shopId, collectionForm.collectionAccountName, collectionForm.collectionQrUrl, collectionForm.collectionNote))}>保存收款码</button>
+              {merchantSessionActive
+                ? <p className="hint">商户收款通道请使用下方提交审核入口；商户态不调用平台 admin 店铺收款码接口。</p>
+                : <button onClick={() => void runAction("保存人工收款码", () => api.saveCollectionChannel(collectionForm.shopId, collectionForm.collectionAccountName, collectionForm.collectionQrUrl, collectionForm.collectionNote))}>保存收款码</button>}
             </Panel>
             <Panel title="收款通道提交/审核" kicker="商户+平台">
               <div className="form-grid wide">
-                <label>通道类型<select value={collectionChannelForm.channelType} onChange={(event) => setCollectionChannelForm({ ...collectionChannelForm, channelType: event.target.value })}><option value="alipay_personal_qr">支付宝个人码</option><option value="alipay_merchant_qr">支付宝商户码</option><option value="wechat_personal_qr">微信个人码</option><option value="wechat_merchant_qr">微信商户码</option></select></label>
+                <label>通道类型<select value={collectionChannelForm.channelType} onChange={(event) => setCollectionChannelForm({ ...collectionChannelForm, channelType: event.target.value })}><option value="">请选择</option><option value="alipay_personal_qr">支付宝个人码</option><option value="alipay_merchant_qr">支付宝商户码</option><option value="wechat_personal_qr">微信个人码</option><option value="wechat_merchant_qr">微信商户码</option></select></label>
                 <label>展示名称<input value={collectionChannelForm.displayName} onChange={(event) => setCollectionChannelForm({ ...collectionChannelForm, displayName: event.target.value })} /></label>
                 <label>账户名<input value={collectionChannelForm.accountName} onChange={(event) => setCollectionChannelForm({ ...collectionChannelForm, accountName: event.target.value })} /></label>
                 <label>收款码URL<input value={collectionChannelForm.qrUrl} onChange={(event) => setCollectionChannelForm({ ...collectionChannelForm, qrUrl: event.target.value })} /></label>
                 <label className="span-2">支付链接<input value={collectionChannelForm.paymentUrl} onChange={(event) => setCollectionChannelForm({ ...collectionChannelForm, paymentUrl: event.target.value })} /></label>
               </div>
               <div className="actions">
-                <button disabled={!collectionChannelForm.displayName || (!collectionChannelForm.qrUrl && !collectionChannelForm.paymentUrl)} onClick={() => void runAction("提交收款通道", () => api.submitCollectionChannel(collectionChannelForm))}>提交审核</button>
-                <button disabled={!pendingCollectionChannel?.id} onClick={() => void runAction("审核通过收款通道", () => api.reviewCollectionChannel(text(pendingCollectionChannel?.id, ""), true))}>审核通过</button>
-                <button className="secondary" disabled={!pendingCollectionChannel?.id} onClick={() => void runAction("审核拒绝收款通道", () => api.reviewCollectionChannel(text(pendingCollectionChannel?.id, ""), false))}>审核拒绝</button>
+                <button disabled={!collectionChannelForm.channelType || !collectionChannelForm.displayName || (!collectionChannelForm.qrUrl && !collectionChannelForm.paymentUrl)} onClick={() => void runAction("提交收款通道", () => api.submitCollectionChannel(collectionChannelForm))}>提交审核</button>
+                {merchantSessionActive ? null : (
+                  <>
+                    <button disabled={!pendingCollectionChannel?.id} onClick={() => void runAction("审核通过收款通道", () => api.reviewCollectionChannel(text(pendingCollectionChannel?.id, ""), true))}>审核通过</button>
+                    <button className="secondary" disabled={!pendingCollectionChannel?.id} onClick={() => void runAction("审核拒绝收款通道", () => api.reviewCollectionChannel(text(pendingCollectionChannel?.id, ""), false))}>审核拒绝</button>
+                  </>
+                )}
               </div>
             </Panel>
           </section>
           <Panel title="店铺清单" kicker="客服/收款">
             <Table rows={data.collectionChannels} columns={["shopId", "ownerType", "name", "collectionAccountName", "collectionQrUrl", "collectionNote", "status"]} />
           </Panel>
-          <Panel title="客服二维码" kicker={`${data.serviceQrCodes.length} 条`}>
-            <Table rows={data.serviceQrCodes} columns={["shopId", "ownerType", "name", "customerServiceWechat", "customerServiceQrUrl", "status"]} />
-          </Panel>
+          {merchantSessionActive ? null : (
+            <Panel title="客服二维码" kicker={`${data.serviceQrCodes.length} 条`}>
+              <Table rows={data.serviceQrCodes} columns={["shopId", "ownerType", "name", "customerServiceWechat", "customerServiceQrUrl", "status"]} />
+            </Panel>
+          )}
         </Module>
       );
     }
 
     if (active === "agents") {
+      if (merchantSessionActive) {
+        return (
+          <Module title="商户/渠道" subtitle="商户账号仅查看自身状态和可用能力">
+            <section className="split">
+              <Panel title="商户状态" kicker="当前账号">
+                <KeyValue label="商户ID" value={currentAgentId || "未知"} />
+                <KeyValue label="店铺ID" value={currentShopId || "未知"} />
+                <KeyValue label="商户层级" value={text(currentAgentTier, "未知")} />
+                <KeyValue label="保证金状态" value={text(currentDepositStatus, "未知")} />
+                {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
+              </Panel>
+              <Panel title="渠道能力" kicker="商户后台">
+                <p className="hint">{canConfigureDownstreamOffer ? "当前层级可在二级渠道管理中配置下游转供价。" : "三级商户不展示下游转供配置；商户态不调用平台 /api/admin/channels。"}</p>
+              </Panel>
+            </section>
+          </Module>
+        );
+      }
       return (
         <Module title="商户/渠道" subtitle="入驻审核、保证金、一级商户与受控转供价">
           <section className="split">
@@ -883,6 +1108,17 @@ function App() {
               </div>
               <Table rows={data.agentApplications} columns={["applicationNo", "agentId", "status", "contactPhone", "customerServiceWechat"]} />
             </Panel>
+            <Panel title="平台邀请码" kicker="入驻通道">
+              <div className="form-grid wide">
+                <label>邀请码<input value={inviteForm.code} onChange={(event) => setInviteForm({ ...inviteForm, code: event.target.value })} placeholder="不填则由后端生成" /></label>
+                <label>目标层级<select value={inviteForm.targetTier} onChange={(event) => setInviteForm({ ...inviteForm, targetTier: event.target.value })}><option value="first_tier">一级商户</option></select></label>
+                <label>应缴保证金(分)<input inputMode="numeric" value={inviteForm.depositRequiredAmountCents} onChange={(event) => setInviteForm({ ...inviteForm, depositRequiredAmountCents: event.target.value })} placeholder="由平台填写" /></label>
+                <label>最大使用次数<input inputMode="numeric" value={inviteForm.maxUses} onChange={(event) => setInviteForm({ ...inviteForm, maxUses: event.target.value })} /></label>
+                <label>失效时间<input type="datetime-local" value={inviteForm.expiresAt} onChange={(event) => setInviteForm({ ...inviteForm, expiresAt: event.target.value })} /></label>
+              </div>
+              <button disabled={!inviteForm.depositRequiredAmountCents} onClick={() => void runAction("创建平台邀请码", () => api.createInviteCode(inviteForm))}>创建邀请码</button>
+              <Table rows={data.inviteCodes} columns={["id", "code", "targetTier", "status", "maxUses", "usedCount", "depositRequiredAmountCents", "expiresAt"]} moneyColumns={["depositRequiredAmountCents"]} />
+            </Panel>
             <Panel title="手工创建一级商户" kicker="平台">
               <div className="form-grid wide">
                 <label>商户名称<input value={manualAgentForm.name} onChange={(event) => setManualAgentForm({ ...manualAgentForm, name: event.target.value })} /></label>
@@ -894,6 +1130,13 @@ function App() {
                 <label className="checkbox-line"><input type="checkbox" checked={manualAgentForm.depositPaid} onChange={(event) => setManualAgentForm({ ...manualAgentForm, depositPaid: event.target.checked })} />创建时已确认保证金</label>
               </div>
               <button disabled={!manualAgentForm.name || !manualAgentForm.shopName} onClick={submitManualAgent}>创建一级商户</button>
+              {createdCredential ? (
+                <div className="hint-box">
+                  <strong>初始账号</strong>
+                  <span>账号：{text(createdCredential.account)} / 初始密码：{text(createdCredential.initialPassword)}</span>
+                  <small>请按线下交付流程给商户，首次登录后按平台安全要求处理。</small>
+                </div>
+              ) : null}
             </Panel>
             <Panel title="保证金" kicker="财务">
               <div className="inline-form">
@@ -923,6 +1166,52 @@ function App() {
     }
 
     if (active === "secondTierChannels") {
+      if (merchantSessionActive) {
+        return (
+          <Module title="二级渠道管理" subtitle="商户侧只展示授权商品和后端允许的转供能力">
+            <section className="split">
+              <Panel title="商户授权商品" kicker="商户后台">
+                <KeyValue label="商户层级" value={text(currentAgentTier, "未知")} />
+                <KeyValue label="保证金状态" value={text(currentDepositStatus, "未知")} />
+                <KeyValue label="可售商品" value={String(data.agentProducts.filter((item) => text(item.status) === "listed").length)} />
+                <KeyValue label="待清算订单" value={String(data.agentOrders.filter((item) => text(item.settlementStatus) !== "settled").length)} />
+                {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
+              </Panel>
+              <Panel title="商户邀请码" kicker={merchantInviteTargetTier ? `创建 ${merchantInviteTargetTier}` : "三级不可创建"}>
+                {merchantInviteTargetTier ? (
+                  <>
+                    <div className="form-grid wide">
+                      <label>邀请码<input value={inviteForm.code} onChange={(event) => setInviteForm({ ...inviteForm, code: event.target.value })} placeholder="不填则由后端生成" /></label>
+                      <label>目标层级<input value={merchantInviteTargetTier} readOnly /></label>
+                      <label>最大使用次数<input inputMode="numeric" value={inviteForm.maxUses} onChange={(event) => setInviteForm({ ...inviteForm, maxUses: event.target.value })} placeholder="选填，正整数" /></label>
+                      <label>失效时间<input type="datetime-local" value={inviteForm.expiresAt} onChange={(event) => setInviteForm({ ...inviteForm, expiresAt: event.target.value })} /></label>
+                      <label>保证金要求(分)<input inputMode="numeric" value={inviteForm.depositRequiredAmountCents} onChange={(event) => setInviteForm({ ...inviteForm, depositRequiredAmountCents: event.target.value })} placeholder="选填，后端可按规则生成" /></label>
+                    </div>
+                    <button disabled={merchantBlocked} onClick={submitAgentInviteCode}>创建邀请码</button>
+                  </>
+                ) : (
+                  <p className="warning">三级商户不能继续创建渠道邀请码。</p>
+                )}
+              </Panel>
+              <Panel title="转供价配置" kicker="待后端 scoped API">
+                <p className="hint">前端已隔离平台 admin 渠道接口。商户配置转供价调用 /api/agent/channels/offers；跨关系由后端返回 4xx。</p>
+                {canConfigureDownstreamOffer ? (
+                  <div className="inline-form">
+                    <label>下游商户ID<input value={downstreamAgentId} onChange={(event) => setDownstreamAgentId(event.target.value)} placeholder={currentAgentTier === "first_tier" ? "二级商户ID" : "三级商户ID"} /></label>
+                    <label>转供价(分)<input inputMode="numeric" value={channelOfferCents} onChange={(event) => setChannelOfferCents(event.target.value)} placeholder="必填" /></label>
+                    <button className="secondary" disabled={merchantBlocked || !downstreamAgentId.trim() || !currentPlatformProductId} onClick={() => submitChannelOffer("配置商户转供价")}>配置转供价</button>
+                  </div>
+                ) : (
+                  <p className="warning">三级商户不能继续配置下游转供价。</p>
+                )}
+              </Panel>
+            </section>
+            <Panel title="我的邀请码" kicker={`${data.inviteCodes.length} 条`}>
+              <Table rows={data.inviteCodes} columns={["id", "code", "targetTier", "status", "maxUses", "usedCount", "depositRequiredAmountCents", "expiresAt"]} moneyColumns={["depositRequiredAmountCents"]} />
+            </Panel>
+          </Module>
+        );
+      }
       return (
         <Module title="二级渠道管理" subtitle="平台配置二级供货关系，商户侧查看授权商品与转供价">
           <section className="split">
@@ -957,10 +1246,14 @@ function App() {
             <Panel title="结算操作" kicker="财务">
               <KeyValue label="待打款单" value={text(selectedSettlement?.settlementNo, "暂无")} />
               <KeyValue label="当前订单结算" value={text(selectedOrder?.settlementStatus)} />
-              <div className="actions">
-                <button disabled={!currentAgentId} onClick={() => void runAction("生成 T+1 结算单", () => api.generateSettlement(currentAgentId))}>生成结算单</button>
-                <button disabled={!selectedSettlement?.settlementNo} onClick={() => void runAction("人工打款确认", () => api.confirmPayout(text(selectedSettlement?.settlementNo, "")))}>确认打款</button>
-              </div>
+              {merchantSessionActive
+                ? <p className="hint">商户态只查看自己的结算和追扣记录，不提供生成结算单或确认打款动作。</p>
+                : (
+                  <div className="actions">
+                    <button disabled={!currentAgentId} onClick={() => void runAction("生成 T+1 结算单", () => api.generateSettlement(currentAgentId))}>生成结算单</button>
+                    <button disabled={!selectedSettlement?.settlementNo} onClick={() => void runAction("人工打款确认", () => api.confirmPayout(text(selectedSettlement?.settlementNo, "")))}>确认打款</button>
+                  </div>
+                )}
             </Panel>
             <Panel title="代理收益" kicker="商家">
               <KeyValue label="成交订单" value={text(data.agentDashboard?.paidOrderCount, "0")} />
@@ -979,6 +1272,16 @@ function App() {
     }
 
     if (active === "risk") {
+      if (merchantSessionActive) {
+        return (
+          <Module title="风控日志" subtitle="商户态只展示自身订单风险状态">
+            <Panel title="订单风险状态" kicker="商户后台">
+              <OrdersTable rows={data.agentOrders.filter((order) => text(order.riskStatus, "normal") !== "normal")} onPick={setCurrentOrder} />
+              <p className="hint">商户账号不提供冻结、解冻、审计日志读取等平台 admin 动作。</p>
+            </Panel>
+          </Module>
+        );
+      }
       return (
         <Module title="风控日志" subtitle="冻结、审计、风险看板">
           <section className="split">
@@ -1000,6 +1303,16 @@ function App() {
           </Panel>
           <Panel title="审计日志" kicker={`${data.auditLogs.length} 条`}>
             <Table rows={data.auditLogs.slice(-10)} columns={["action", "targetType", "targetId", "actor"]} />
+          </Panel>
+        </Module>
+      );
+    }
+
+    if (merchantSessionActive) {
+      return (
+        <Module title="支付配置" subtitle="商户收款通道由店铺设置页维护">
+          <Panel title="商户收款" kicker="商户后台">
+            <p className="hint">商户态不调用平台支付配置接口；请在店铺设置中提交自己的收款通道并等待平台审核。</p>
           </Panel>
         </Module>
       );
@@ -1033,13 +1346,17 @@ function App() {
         <section className="login-card">
           <div>
             <span className="eyebrow">ToSell Admin</span>
-            <h1>后台登录</h1>
-            <p>使用后台账号登录后，系统通过服务端签发的 Bearer Token 访问平台管理 API。</p>
+            <h1>{loginMode === "merchant" ? "商户后台登录" : "平台后台登录"}</h1>
+            <p>登录后使用服务端签发的 Bearer Token 访问对应后台 API，生产环境不使用临时认证头。</p>
           </div>
           <div className="login-form">
-            <label>账号<input autoComplete="username" value={loginForm.username} onChange={(event) => setLoginForm({ ...loginForm, username: event.target.value })} /></label>
+            <div className="segmented">
+              <button type="button" className={loginMode === "admin" ? "active" : ""} onClick={() => setLoginMode("admin")}>平台后台</button>
+              <button type="button" className={loginMode === "merchant" ? "active" : ""} onClick={() => setLoginMode("merchant")}>商户后台</button>
+            </div>
+            <label>{loginMode === "merchant" ? "商户账号" : "账号"}<input autoComplete="username" value={loginForm.username} onChange={(event) => setLoginForm({ ...loginForm, username: event.target.value })} /></label>
             <label>密码<input type="password" autoComplete="current-password" value={loginForm.password} onChange={(event) => setLoginForm({ ...loginForm, password: event.target.value })} /></label>
-            {import.meta.env.DEV ? (
+            {import.meta.env.DEV && loginMode === "admin" ? (
               <label>本地角色
                 <select value={loginForm.requestedRole} onChange={(event) => setLoginForm({ ...loginForm, requestedRole: event.target.value as "operator" | "finance" | "admin" })}>
                   <option value="admin">管理员</option>
@@ -1066,7 +1383,7 @@ function App() {
           <span>虚拟商品运营台</span>
         </div>
         <span className="coverage-labels" aria-hidden="true">{mvpCoverageLabels.join(" ")}</span>
-        {groupedNav().map((group) => (
+        {groupedNav(merchantSessionActive).map((group) => (
           <nav key={group.name} aria-label={group.name}>
             <small>{group.name}</small>
             {group.items.map((item) => (
@@ -1090,8 +1407,9 @@ function App() {
             <h1>虚拟账号小店后台</h1>
           </div>
           <div className="top-actions">
-            <span>{text(session.admin.displayName, text(session.admin.adminRole, "admin"))}</span>
-            {currentShopId ? <a href={`/s/${currentShopId}`} target="_blank" rel="noreferrer">打开店铺</a> : null}
+            <span>{sessionLabel(session)}</span>
+            {currentShopShareUrl ? <a href={currentShopShareUrl} target="_blank" rel="noreferrer">打开店铺</a> : null}
+            {currentShopShareUrl ? <button className="secondary" onClick={() => void copyShopShareUrl()}>复制分享地址</button> : null}
             <button onClick={() => void loadAll()} disabled={loading}>刷新</button>
             <button className="secondary" onClick={logout}>退出</button>
           </div>
@@ -1218,6 +1536,29 @@ function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isAgentSession(session: BackendSession | undefined): session is AgentSession {
+  return Boolean(session && "agent" in session && "shop" in session);
+}
+
+function sessionLabel(session: BackendSession): string {
+  if (isAgentSession(session)) return text(session.agent.displayName, text(session.agent.username, "商户"));
+  return text(session.admin.displayName, text(session.admin.adminRole, "admin"));
+}
+
+function shopShareUrl(shopId: string): string {
+  if (!shopId) return "";
+  const configured = text(import.meta.env.VITE_H5_BASE_URL, "").replace(/\/+$/, "");
+  const base = configured || localH5BaseUrl();
+  return `${base}/s/${encodeURIComponent(shopId)}`;
+}
+
+function localH5BaseUrl(): string {
+  if (window.location.port === "5173") {
+    return `${window.location.protocol}//${window.location.hostname}:5174`;
+  }
+  return window.location.origin;
+}
+
 function agentProductRows(rows: JsonRecord[]): JsonRecord[] {
   return rows.map((row) => {
     const product = row.product as JsonRecord | undefined;
@@ -1230,6 +1571,8 @@ function agentProductRows(rows: JsonRecord[]): JsonRecord[] {
       soldCount: product?.soldCount,
       salePriceCents: row.salePriceCents,
       supplyPriceCents: product?.supplyPriceCents,
+      platformSupplyPriceCents: product?.platformSupplyPriceCents,
+      visibleUpstreamSupplyPriceCents: product?.visibleUpstreamSupplyPriceCents,
       minSalePriceCents: product?.minSalePriceCents,
       status: row.status
     };
@@ -1256,6 +1599,7 @@ function channelRows(channels: JsonRecord | undefined, key: string): JsonRecord[
 
 function validatePlatformProductForm(form: {
   name: string;
+  fulfillmentMode: string;
   stockCount: string;
   soldCount: string;
   supplyPriceCents: string;
@@ -1263,6 +1607,7 @@ function validatePlatformProductForm(form: {
   suggestedSalePriceCents: string;
 }): string {
   if (!form.name.trim()) return "请填写商品名称";
+  if (!form.fulfillmentMode) return "请选择发货方式";
   if (!isNonNegativeInteger(form.stockCount)) return "请填写合法库存，库存必须是非负整数";
   if (form.soldCount && !isNonNegativeInteger(form.soldCount)) return "销量必须是非负整数";
   if (!isPositiveInteger(form.supplyPriceCents)) return "请填写合法供货价，金额必须是正整数分";
@@ -1283,10 +1628,11 @@ function validateRightsCodeForm(productId: string, batchNo: string, codes: strin
   return "";
 }
 
-function validateCouponForm(form: { name: string; discountCents: string; validDays: string }): string {
+function validateCouponForm(form: { name: string; discountCents: string; validDays: string; status: string }): string {
   if (!form.name.trim()) return "请填写优惠券名称";
   if (!isPositiveInteger(form.discountCents)) return "请填写合法抵扣金额，金额必须是正整数分";
   if (!isPositiveInteger(form.validDays)) return "有效天数必须是正整数";
+  if (!form.status) return "请选择优惠券状态";
   return "";
 }
 
@@ -1319,12 +1665,15 @@ function isNonNegativeInteger(value: string): boolean {
   return /^(0|[1-9]\d*)$/.test(value.trim());
 }
 
-function groupedNav() {
-  const groups = [...new Set(navItems.map((item) => item.group))];
+function groupedNav(merchantSessionActive = false) {
+  const visibleItems = merchantSessionActive
+    ? navItems.filter((item) => !["agents", "risk", "payment"].includes(item.id))
+    : navItems;
+  const groups = [...new Set(visibleItems.map((item) => item.group))];
   return groups.map((name) => ({
     name,
-    items: navItems.filter((item) => item.group === name)
-  }));
+    items: visibleItems.filter((item) => item.group === name)
+  })).filter((group) => group.items.length > 0);
 }
 
 function moduleFromHash(): ModuleId {

@@ -25,7 +25,8 @@ const permissions = [
   "coupon.manage",
   "clearing.manage",
   "ledger.read",
-  "risk.manage"
+  "risk.manage",
+  "rights_code.secret.read"
 ];
 
 const paymentChannels = [

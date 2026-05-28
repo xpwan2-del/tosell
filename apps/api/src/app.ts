@@ -41,6 +41,9 @@ export function buildApp() {
     if (error.message.startsWith("missing admin permission")) {
       return reply.status(403).send({ code: "FORBIDDEN_ADMIN_PERMISSION", message: error.message });
     }
+    if (error.message.includes("agent cannot access another") || error.message === "actor is not an agent") {
+      return reply.status(403).send({ code: "FORBIDDEN_AGENT_SCOPE", message: error.message });
+    }
     return reply.status(500).send({ code: "INTERNAL_ERROR", message: error.message });
   });
   app.register(cors, { origin: true });
@@ -84,6 +87,29 @@ export function buildApp() {
       password: z.string().min(1).max(200)
     }).parse(request.body);
     return createAdminAuthSession(await services.loginAdmin(body));
+  });
+
+  app.post("/api/auth/agent/login", async (request) => {
+    const body = z.object({
+      account: z.string().min(1).max(120),
+      password: z.string().min(1).max(200)
+    }).parse(request.body);
+    return createAgentAuthSession(await services.loginAgent(body));
+  });
+
+  app.get("/api/auth/agent/session", async (request) => {
+    const actor = getAgentActor(request);
+    const shop = await services.getAgentShop(actor);
+    return {
+      agent: {
+        agentId: actor.agentId
+      },
+      shop: {
+        shopId: actor.shopId,
+        name: shop.name,
+        status: shop.status
+      }
+    };
   });
 
   app.get("/api/auth/admin/session", async (request) => {
@@ -258,7 +284,8 @@ export function buildApp() {
     const body = z.object({
       code: z.string().min(1).max(80).optional(),
       maxUses: z.number().int().positive().optional(),
-      expiresAt: z.string().datetime().optional()
+      expiresAt: z.string().datetime().optional(),
+      depositRequiredAmountCents: bigintString.optional()
     }).parse(request.body);
     return serializeBigInt(services.createAgentInviteCode(getAgentActor(request), body));
   });
@@ -350,7 +377,21 @@ export function buildApp() {
     return serializeBigInt(services.setAgentProductPrice(getAgentActor(request), agentProductId, body.salePriceCents));
   });
 
+  app.post("/api/agent/channels/offers", async (request) => {
+    const body = z.object({
+      downstreamAgentId: z.string(),
+      platformProductId: z.string(),
+      resellSupplyPriceCents: bigintString,
+      status: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.upsertAgentChannelProductOffer(getAgentActor(request), body));
+  });
+
   app.get("/api/agent/orders", async (request) => serializeBigInt(services.listAgentOrders(getAgentActor(request))));
+  app.get("/api/agent/orders/:orderNo", async (request) => {
+    const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
+    return serializeBigInt(services.getAgentOrder(getAgentActor(request), orderNo));
+  });
   app.post("/api/agent/orders/:orderNo/confirm-payment", async (request) => {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
     const body = z.object({
@@ -359,6 +400,25 @@ export function buildApp() {
       note: z.string().optional()
     }).parse(request.body);
     return serializeBigInt(services.confirmAgentOfflinePayment(getAgentActor(request), orderNo, body));
+  });
+  app.post("/api/agent/orders/:orderNo/fulfillment", async (request) => {
+    const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
+    const body = z.object({
+      status: z.enum(["success", "failed"]),
+      attemptNo: z.number().int().positive().default(1),
+      evidence: z.string().optional(),
+      failReason: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.fulfillAgentOrder(getAgentActor(request), orderNo, body));
+  });
+  app.get("/api/agent/after-sales", async (request) => serializeBigInt(services.listAgentAfterSales(getAgentActor(request))));
+  app.post("/api/agent/after-sales/:afterSaleNo/assist", async (request) => {
+    const { afterSaleNo } = z.object({ afterSaleNo: z.string() }).parse(request.params);
+    const body = z.object({
+      note: z.string().min(1).max(500),
+      evidenceUrl: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.updateAgentAfterSaleAssist(getAgentActor(request), afterSaleNo, body));
   });
   app.get("/api/agent/settlements", async (request) => serializeBigInt(services.listAgentSettlements(getAgentActor(request))));
   app.get("/api/agent/clawbacks", async (request) => serializeBigInt(services.listAgentClawbacks(getAgentActor(request))));
@@ -406,7 +466,8 @@ export function buildApp() {
       code: z.string().min(1).max(80).optional(),
       targetTier: agentTierSchema.optional(),
       maxUses: z.number().int().positive().optional(),
-      expiresAt: z.string().datetime().optional()
+      expiresAt: z.string().datetime().optional(),
+      depositRequiredAmountCents: bigintString.optional()
     }).parse(request.body);
     return serializeBigInt(services.createPlatformInviteCode(getAdminActor(request), body));
   });
@@ -503,6 +564,16 @@ export function buildApp() {
     return serializeBigInt(services.listRightsCodes(getAdminActor(request), query));
   });
 
+  app.get("/api/admin/rights-codes/plaintext", async (request) => {
+    const query = z.object({
+      productId: z.string().optional(),
+      orderNo: z.string().optional(),
+      shopId: z.string().optional(),
+      status: z.enum(["available", "issued", "voided"]).optional()
+    }).parse(request.query);
+    return serializeBigInt(services.revealRightsCodesPlaintext(getAdminActor(request), query));
+  });
+
   app.post("/api/admin/rights-codes/import", async (request) => {
     const body = z.object({
       productId: z.string(),
@@ -588,6 +659,16 @@ export function buildApp() {
       serviceFeeBearer: true
     }).parse(request.body);
     return serializeBigInt(services.approveRefund(getAdminActor(request), afterSaleNo, body));
+  });
+
+  app.post("/api/admin/refunds/:refundNo/manual-confirm", async (request) => {
+    const { refundNo } = z.object({ refundNo: z.string() }).parse(request.params);
+    const body = z.object({
+      channelRefundNo: z.string().optional(),
+      voucherUrl: z.string().optional(),
+      note: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.confirmManualRefund(getAdminActor(request), refundNo, body));
   });
 
   app.post("/api/admin/settlements/candidate", async (request) => {
@@ -797,6 +878,45 @@ function createAdminAuthSession(input: {
       username: input.username,
       adminRole: input.role,
       displayName: input.displayName
+    }
+  };
+}
+
+function createAgentAuthSession(input: {
+  agentId: string;
+  shopId: string;
+  username: string;
+  displayName: string;
+  tier?: string;
+  status: string;
+  depositStatus: string;
+  shopName: string;
+  shopStatus: string;
+  mustChangePassword: boolean;
+}) {
+  const expiresAt = Math.floor(Date.now() / 1000) + 60 * 60 * 12;
+  const token = signToken({
+    role: "agent",
+    agentId: input.agentId,
+    shopId: input.shopId,
+    exp: expiresAt
+  });
+  return {
+    token,
+    expiresAt,
+    agent: {
+      agentId: input.agentId,
+      username: input.username,
+      displayName: input.displayName,
+      tier: input.tier,
+      status: input.status,
+      depositStatus: input.depositStatus,
+      mustChangePassword: input.mustChangePassword
+    },
+    shop: {
+      shopId: input.shopId,
+      name: input.shopName,
+      status: input.shopStatus
     }
   };
 }

@@ -24,8 +24,7 @@ describe("frontend MVP static checks", () => {
   it("keeps prohibited growth-model wording out of frontend app code", () => {
     const files = [
       ...readFiles(join(root, "apps", "admin", "src"), [".ts", ".tsx", ".css"]),
-      ...readFiles(join(root, "apps", "h5", "src"), [".ts", ".tsx", ".css"]),
-      ...readFiles(join(root, "apps", "miniprogram"), [".ts", ".wxml", ".wxss", ".json"])
+      ...readFiles(join(root, "apps", "h5", "src"), [".ts", ".tsx", ".css"])
     ];
     const prohibited = [/直播/u, /分销/u, /返佣/u, /团队奖/u, /邀请奖励/u, /代理等级/u, /下级/u, /commission_rate/u, /team_performance/u];
 
@@ -36,14 +35,8 @@ describe("frontend MVP static checks", () => {
     }
   });
 
-  it("does not show internal finance fields on user mini-program pages", () => {
-    const userPageFiles = [
-      join(root, "apps", "miniprogram", "pages", "shop", "index.wxml"),
-      join(root, "apps", "miniprogram", "pages", "product", "detail.wxml"),
-      join(root, "apps", "miniprogram", "pages", "payment", "result.wxml"),
-      join(root, "apps", "miniprogram", "pages", "order", "index.wxml"),
-      join(root, "apps", "miniprogram", "pages", "order", "detail.wxml")
-    ];
+  it("does not show internal finance fields on user H5 pages", () => {
+    const userPageFiles = [join(root, "apps", "h5", "src", "main.tsx")];
     const hiddenTerms = [/供货价/u, /服务费/u, /代理收益/u, /结算金额/u, /冻结金额/u];
 
     for (const filePath of userPageFiles) {
@@ -88,6 +81,25 @@ describe("frontend MVP static checks", () => {
 
     for (const label of required) {
       expect(source).toContain(label);
+    }
+  });
+
+  it("keeps production admin free of test write shortcuts and default business payloads", () => {
+    const source = readFileSync(join(root, "apps", "admin", "src", "main.tsx"), "utf8");
+    const prohibited = [
+      "创建测试订单",
+      "快速创建订单",
+      "CARD-001",
+      "CARD-002",
+      "CARD-003",
+      "新用户立减券",
+      "discountCents: \"300\"",
+      "priceCents, setPriceCents] = useState(\"15000\")",
+      "refundCents, setRefundCents] = useState(\"3000\")"
+    ];
+
+    for (const text of prohibited) {
+      expect(source).not.toContain(text);
     }
   });
 });

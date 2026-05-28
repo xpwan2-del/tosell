@@ -1152,6 +1152,130 @@ describe.sequential("api", () => {
     expect(JSON.stringify(thirdOrders.json())).not.toMatch(/platformSupplyPriceCents|firstTierSupplyPriceCents/);
   });
 
+  it("scopes merchant channel offers, fulfillment, and after-sale assistance", async () => {
+    const app = buildApp();
+    const firstHeaders = { "x-agent-id": "agent-1", "x-shop-id": "shop-1" };
+    const secondHeaders = { "x-agent-id": "agent-2", "x-shop-id": "shop-2" };
+    const thirdHeaders = { "x-agent-id": "agent-3", "x-shop-id": "shop-3" };
+
+    const firstOffer = await app.inject({
+      method: "POST",
+      url: "/api/agent/channels/offers",
+      headers: firstHeaders,
+      payload: { downstreamAgentId: "agent-2", platformProductId: "prod-1", resellSupplyPriceCents: "11200" }
+    });
+    const secondOffer = await app.inject({
+      method: "POST",
+      url: "/api/agent/channels/offers",
+      headers: secondHeaders,
+      payload: { downstreamAgentId: "agent-3", platformProductId: "prod-1", resellSupplyPriceCents: "13200" }
+    });
+    const thirdOffer = await app.inject({
+      method: "POST",
+      url: "/api/agent/channels/offers",
+      headers: thirdHeaders,
+      payload: { downstreamAgentId: "agent-new", platformProductId: "prod-1", resellSupplyPriceCents: "14000" }
+    });
+    const crossOffer = await app.inject({
+      method: "POST",
+      url: "/api/agent/channels/offers",
+      headers: firstHeaders,
+      payload: { downstreamAgentId: "agent-3", platformProductId: "prod-1", resellSupplyPriceCents: "14000" }
+    });
+
+    expect(firstOffer.statusCode).toBe(200);
+    expect(firstOffer.json()).toMatchObject({ channelRelationId: "channel-rel-1", resellSupplyPriceCents: "11200" });
+    expect(secondOffer.statusCode).toBe(200);
+    expect(secondOffer.json()).toMatchObject({ channelRelationId: "channel-rel-2", resellSupplyPriceCents: "13200" });
+    expect(thirdOffer.statusCode).toBe(403);
+    expect(thirdOffer.json().code).toBe("FOURTH_TIER_FORBIDDEN");
+    expect(crossOffer.statusCode).toBe(403);
+
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "merchant-scope-user" },
+      payload: { shopId: "shop-3", agentProductId: "ap-3", clientPaidAmountCents: "15000" }
+    });
+    expect(order.statusCode).toBe(200);
+
+    const thirdOrders = await app.inject({ method: "GET", url: "/api/agent/orders", headers: thirdHeaders });
+    expect(thirdOrders.statusCode).toBe(200);
+    expect(thirdOrders.json().some((item: Record<string, unknown>) => item.orderNo === order.json().orderNo)).toBe(true);
+
+    const thirdOrderDetail = await app.inject({ method: "GET", url: `/api/agent/orders/${order.json().orderNo}`, headers: thirdHeaders });
+    const crossOrderDetail = await app.inject({
+      method: "GET",
+      url: `/api/agent/orders/${order.json().orderNo}`,
+      headers: { "x-agent-id": "agent-new", "x-shop-id": "shop-new" }
+    });
+    expect(thirdOrderDetail.statusCode).toBe(200);
+    expect(thirdOrderDetail.json()).toMatchObject({ orderNo: order.json().orderNo });
+    expect(crossOrderDetail.statusCode).toBe(404);
+
+    const crossConfirm = await app.inject({
+      method: "POST",
+      url: `/api/agent/orders/${order.json().orderNo}/confirm-payment`,
+      headers: secondHeaders,
+      payload: { amountCents: "15000", voucherUrl: "manual://cross-confirm" }
+    });
+    expect(crossConfirm.statusCode).toBe(403);
+
+    const confirm = await app.inject({
+      method: "POST",
+      url: `/api/agent/orders/${order.json().orderNo}/confirm-payment`,
+      headers: thirdHeaders,
+      payload: { amountCents: "15000", voucherUrl: "manual://third-confirm" }
+    });
+    expect(confirm.statusCode).toBe(200);
+
+    const crossFulfill = await app.inject({
+      method: "POST",
+      url: `/api/agent/orders/${order.json().orderNo}/fulfillment`,
+      headers: secondHeaders,
+      payload: { status: "success", attemptNo: 1, evidence: "wrong merchant" }
+    });
+    expect(crossFulfill.statusCode).toBe(403);
+
+    const fulfillment = await app.inject({
+      method: "POST",
+      url: `/api/agent/orders/${order.json().orderNo}/fulfillment`,
+      headers: thirdHeaders,
+      payload: { status: "success", attemptNo: 1, evidence: "manual delivery" }
+    });
+    expect(fulfillment.statusCode).toBe(200);
+
+    const afterSale = await app.inject({
+      method: "POST",
+      url: "/api/user/after-sales",
+      headers: { "x-user-id": "merchant-scope-user" },
+      payload: { orderNo: order.json().orderNo, reasonCode: "need_help", requestedRefundCents: "1000" }
+    });
+    expect(afterSale.statusCode).toBe(200);
+
+    const secondAfterSales = await app.inject({ method: "GET", url: "/api/agent/after-sales", headers: secondHeaders });
+    const thirdAfterSales = await app.inject({ method: "GET", url: "/api/agent/after-sales", headers: thirdHeaders });
+    expect(secondAfterSales.json().some((item: Record<string, unknown>) => item.afterSaleNo === afterSale.json().afterSaleNo)).toBe(false);
+    expect(thirdAfterSales.json().some((item: Record<string, unknown>) => item.afterSaleNo === afterSale.json().afterSaleNo)).toBe(true);
+
+    const crossAssist = await app.inject({
+      method: "POST",
+      url: `/api/agent/after-sales/${afterSale.json().afterSaleNo}/assist`,
+      headers: secondHeaders,
+      payload: { note: "越权协处理", evidenceUrl: "manual://cross-assist" }
+    });
+    expect(crossAssist.statusCode).toBe(403);
+
+    const assist = await app.inject({
+      method: "POST",
+      url: `/api/agent/after-sales/${afterSale.json().afterSaleNo}/assist`,
+      headers: thirdHeaders,
+      payload: { note: "已补充商户处理意见", evidenceUrl: "manual://assist" }
+    });
+    expect(assist.statusCode).toBe(200);
+    expect(assist.json()).toMatchObject({ status: "recorded" });
+  });
+
   it("lists only active shop collection channels and lets the selling merchant confirm collection idempotently", async () => {
     const app = buildApp();
     const channels = await app.inject({ method: "GET", url: "/api/h5/shops/shop-1/collection-channels" });
@@ -1232,8 +1356,8 @@ describe.sequential("api", () => {
       headers: { "x-agent-id": "agent-2", "x-shop-id": "shop-2" },
       payload: {
         items: [
-          { platformProductId: "prod-code", salePriceCents: "4900" },
-          { platformProductId: "prod-1", salePriceCents: "11999" }
+          { platformProductId: "prod-1", salePriceCents: "16000" },
+          { platformProductId: "prod-1", salePriceCents: "10000" }
         ]
       }
     });
@@ -1670,6 +1794,53 @@ describe.sequential("api", () => {
     }
   });
 
+  it("issues merchant bearer sessions for manual first-tier accounts", async () => {
+    const app = buildApp();
+    const adminHeaders = { "x-admin-id": "operator-1", "x-admin-role": "operator" };
+    const create = await app.inject({
+      method: "POST",
+      url: "/api/admin/agents/manual",
+      headers: adminHeaders,
+      payload: {
+        name: "Bearer 登录商户",
+        shopName: "Bearer 登录店铺",
+        contactPhone: "13600000001",
+        customerServiceWechat: "merchant_service",
+        initialPassword: "merchant-pass-1",
+        depositRequiredAmountCents: "50000"
+      }
+    });
+    expect(create.statusCode).toBe(200);
+
+    const account = create.json().credential.account;
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/auth/agent/login",
+      payload: { account, password: "merchant-pass-1" }
+    });
+    expect(login.statusCode).toBe(200);
+    expect(login.json().agent).toMatchObject({
+      agentId: create.json().agent.id,
+      depositStatus: "pending_payment"
+    });
+
+    const session = await app.inject({
+      method: "GET",
+      url: "/api/auth/agent/session",
+      headers: { authorization: `Bearer ${login.json().token}` }
+    });
+    expect(session.statusCode).toBe(200);
+    expect(session.json().shop).toMatchObject({ shopId: create.json().shop.id });
+
+    const shop = await app.inject({
+      method: "GET",
+      url: "/api/agent/shop",
+      headers: { authorization: `Bearer ${login.json().token}` }
+    });
+    expect(shop.statusCode).toBe(200);
+    expect(shop.json()).toMatchObject({ id: create.json().shop.id });
+  });
+
   it("does not return a successful H5 register session when production coupon persistence fails", async () => {
     const originalNodeEnv = process.env.NODE_ENV;
     const originalDatabaseUrl = process.env.DATABASE_URL;
@@ -1754,7 +1925,7 @@ describe.sequential("api", () => {
       method: "POST",
       url: "/api/admin/invite-codes",
       headers: adminHeaders,
-      payload: { code: "P0-FIRST-E2E" }
+      payload: { code: "P0-FIRST-E2E", depositRequiredAmountCents: "50000" }
     });
     expect(firstInvite.statusCode).toBe(200);
     expect(firstInvite.json()).toMatchObject({ code: "P0-FIRST-E2E", targetTier: "first_tier" });
@@ -1767,19 +1938,48 @@ describe.sequential("api", () => {
     expect(first.statusCode).toBe(200);
     expect(first.json().agent).toMatchObject({ tier: "first_tier", status: "pending_review" });
     const firstAgentId = first.json().agent.id;
-    const firstShopId = first.json().shop.id;
+    const firstCredential = first.json().credential;
+
+    const firstBeforeReviewLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/agent/login",
+      payload: { account: firstCredential.account, password: firstCredential.initialPassword }
+    });
+    expect(firstBeforeReviewLogin.statusCode).toBe(403);
 
     await app.inject({ method: "POST", url: `/api/admin/agents/${firstAgentId}/review`, headers: adminHeaders, payload: { approved: true } });
     await app.inject({ method: "POST", url: `/api/admin/deposits/${firstAgentId}/confirm`, headers: financeHeaders, payload: { amountCents: "50000", voucherUrl: "manual://deposit/first-e2e" } });
+    const firstLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/agent/login",
+      payload: { account: firstCredential.account, password: firstCredential.initialPassword }
+    });
+    expect(firstLogin.statusCode).toBe(200);
+    const firstAgentHeaders = { authorization: `Bearer ${firstLogin.json().token}` };
 
     const secondInvite = await app.inject({
       method: "POST",
       url: "/api/agent/invite-codes",
-      headers: { "x-agent-id": firstAgentId, "x-shop-id": firstShopId },
+      headers: firstAgentHeaders,
       payload: { code: "P0-SECOND-E2E" }
     });
     expect(secondInvite.statusCode).toBe(200);
-    expect(secondInvite.json()).toMatchObject({ code: "P0-SECOND-E2E", targetTier: "second_tier" });
+    expect(secondInvite.json()).toMatchObject({
+      code: "P0-SECOND-E2E",
+      targetTier: "second_tier",
+      status: "active",
+      usedCount: 0,
+      depositRequiredAmountCents: "50000",
+      issuer: { type: "agent", agentId: firstAgentId },
+      currentMerchantScope: { agentId: firstAgentId, ownsInvite: true }
+    });
+    expect(secondInvite.json()).not.toHaveProperty("codeHash");
+
+    const firstInviteList = await app.inject({ method: "GET", url: "/api/agent/invite-codes", headers: firstAgentHeaders });
+    expect(firstInviteList.statusCode).toBe(200);
+    expect(firstInviteList.json().map((item: Record<string, unknown>) => item.code)).toContain("P0-SECOND-E2E");
+    expect(JSON.stringify(firstInviteList.json())).not.toContain("P0-THIRD-E2E");
+    expect(JSON.stringify(firstInviteList.json())).not.toContain("codeHash");
 
     const second = await app.inject({
       method: "POST",
@@ -1789,19 +1989,41 @@ describe.sequential("api", () => {
     expect(second.statusCode).toBe(200);
     expect(second.json().agent).toMatchObject({ tier: "second_tier", parentAgentId: firstAgentId, status: "pending_review" });
     const secondAgentId = second.json().agent.id;
-    const secondShopId = second.json().shop.id;
+    const secondCredential = second.json().credential;
 
     await app.inject({ method: "POST", url: `/api/admin/agents/${secondAgentId}/review`, headers: adminHeaders, payload: { approved: true } });
     await app.inject({ method: "POST", url: `/api/admin/deposits/${secondAgentId}/confirm`, headers: financeHeaders, payload: { amountCents: "50000", voucherUrl: "manual://deposit/second-e2e" } });
+    const secondLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/agent/login",
+      payload: { account: secondCredential.account, password: secondCredential.initialPassword }
+    });
+    expect(secondLogin.statusCode).toBe(200);
+    const secondAgentHeaders = { authorization: `Bearer ${secondLogin.json().token}` };
 
     const thirdInvite = await app.inject({
       method: "POST",
       url: "/api/agent/invite-codes",
-      headers: { "x-agent-id": secondAgentId, "x-shop-id": secondShopId },
+      headers: secondAgentHeaders,
       payload: { code: "P0-THIRD-E2E" }
     });
     expect(thirdInvite.statusCode).toBe(200);
-    expect(thirdInvite.json()).toMatchObject({ code: "P0-THIRD-E2E", targetTier: "third_tier" });
+    expect(thirdInvite.json()).toMatchObject({
+      code: "P0-THIRD-E2E",
+      targetTier: "third_tier",
+      status: "active",
+      usedCount: 0,
+      depositRequiredAmountCents: "50000",
+      issuer: { type: "agent", agentId: secondAgentId },
+      currentMerchantScope: { agentId: secondAgentId, ownsInvite: true }
+    });
+    expect(thirdInvite.json()).not.toHaveProperty("codeHash");
+
+    const secondInviteList = await app.inject({ method: "GET", url: "/api/agent/invite-codes", headers: secondAgentHeaders });
+    expect(secondInviteList.statusCode).toBe(200);
+    expect(secondInviteList.json().map((item: Record<string, unknown>) => item.code)).toContain("P0-THIRD-E2E");
+    expect(JSON.stringify(secondInviteList.json())).not.toContain("P0-SECOND-E2E");
+    expect(JSON.stringify(secondInviteList.json())).not.toContain("codeHash");
 
     const third = await app.inject({
       method: "POST",
@@ -1811,21 +2033,30 @@ describe.sequential("api", () => {
     expect(third.statusCode).toBe(200);
     expect(third.json().agent).toMatchObject({ tier: "third_tier", parentAgentId: secondAgentId, status: "pending_review" });
     const thirdAgentId = third.json().agent.id;
-    const thirdShopId = third.json().shop.id;
+    const thirdCredential = third.json().credential;
 
     await app.inject({ method: "POST", url: `/api/admin/agents/${thirdAgentId}/review`, headers: adminHeaders, payload: { approved: true } });
     await app.inject({ method: "POST", url: `/api/admin/deposits/${thirdAgentId}/confirm`, headers: financeHeaders, payload: { amountCents: "50000", voucherUrl: "manual://deposit/third-e2e" } });
+    const thirdLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/agent/login",
+      payload: { account: thirdCredential.account, password: thirdCredential.initialPassword }
+    });
+    expect(thirdLogin.statusCode).toBe(200);
 
     const fourth = await app.inject({
       method: "POST",
       url: "/api/agent/invite-codes",
-      headers: { "x-agent-id": thirdAgentId, "x-shop-id": thirdShopId },
+      headers: { authorization: `Bearer ${thirdLogin.json().token}` },
       payload: { code: "P0-FOURTH-E2E" }
     });
     const invites = await app.inject({ method: "GET", url: "/api/admin/invite-codes", headers: adminHeaders });
+    const thirdInviteList = await app.inject({ method: "GET", url: "/api/agent/invite-codes", headers: { authorization: `Bearer ${thirdLogin.json().token}` } });
 
     expect(fourth.statusCode).toBe(400);
     expect(fourth.json().code).toBe("FOURTH_TIER_FORBIDDEN");
+    expect(thirdInviteList.statusCode).toBe(200);
+    expect(thirdInviteList.json()).toEqual([]);
     expect(JSON.stringify(invites.json())).toContain("P0-FIRST-E2E");
     expect(JSON.stringify(invites.json())).toContain("P0-SECOND-E2E");
     expect(JSON.stringify(invites.json())).toContain("P0-THIRD-E2E");

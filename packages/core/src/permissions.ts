@@ -14,7 +14,8 @@ export type AdminPermission =
   | "payment_config.manage"
   | "risk.freeze"
   | "audit.read"
-  | "rbac.manage";
+  | "rbac.manage"
+  | "rights_code.secret.read";
 
 export function assertAgentScope(actor: Actor, resource: { agentId: string; shopId?: string }): void {
   if (actor.role !== "agent") throw new Error("actor is not an agent");

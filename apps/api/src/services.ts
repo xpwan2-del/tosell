@@ -95,7 +95,8 @@ function createPrismaProductionServices() {
   const repository = new PrismaStateRepository(prisma, repositories);
   const service = new BackendServices(createEmptyMemoryStore(), {
     persistenceMode: "prisma",
-    adminAuth: (input) => repository.verifyAdmin(input)
+    adminAuth: (input) => repository.verifyAdmin(input),
+    agentAuth: (input) => repository.verifyAgent(input)
   });
   let hydrated = false;
   async function hydrate() {
@@ -126,6 +127,9 @@ function createPrismaProductionServices() {
       if (typeof value !== "function") return value;
       if (property === "loginAdmin") {
         return async (...args: unknown[]) => target.loginAdmin(...(args as Parameters<BackendServices["loginAdmin"]>));
+      }
+      if (property === "loginAgent") {
+        return async (...args: unknown[]) => target.loginAgent(...(args as Parameters<BackendServices["loginAgent"]>));
       }
       if (property === "createOrder") {
         return async (...args: unknown[]) => {
@@ -176,12 +180,13 @@ function createPersistenceDisabledServices(message: string) {
 }
 
 function isMutatingServiceMethod(name: string) {
-  return /^(add|approve|batchSelect|confirm|create|deduct|fulfill|generate|grant|mark|paymentCallback|refundCallback|register|release|review|select|set|submit|update)/.test(name);
+  return /^(add|approve|batchSelect|confirm|create|deduct|fulfill|generate|grant|mark|paymentCallback|refundCallback|register|release|reveal|review|select|set|submit|update|upsert)/.test(name);
 }
 
 type BackendServicesOptions = {
   persistenceMode: "memory" | "prisma";
   adminAuth?: (input: { username: string; password: string }) => Promise<AdminLoginResult>;
+  agentAuth?: (input: { account: string; password: string }) => Promise<AgentLoginResult>;
 };
 
 export type AdminLoginResult = {
@@ -189,6 +194,19 @@ export type AdminLoginResult = {
   username: string;
   displayName: string;
   role: "operator" | "finance" | "admin";
+};
+
+export type AgentLoginResult = {
+  agentId: string;
+  shopId: string;
+  username: string;
+  displayName: string;
+  tier?: AgentTier;
+  status: string;
+  depositStatus: string;
+  shopName: string;
+  shopStatus: string;
+  mustChangePassword: boolean;
 };
 
 class BackendServices {
@@ -223,15 +241,48 @@ class BackendServices {
     };
   }
 
-  listInviteCodes(actor: AdminActor | AgentActor) {
-    if (actor.role === "agent") {
-      return [...this.store.inviteCodes.values()].filter((code) => code.issuerAgentId === actor.agentId);
+  async loginAgent(input: { account: string; password: string }): Promise<AgentLoginResult> {
+    if (this.options.agentAuth) return this.options.agentAuth(input);
+    const account = input.account.trim();
+    const agent = requireEntity(
+      [...this.store.agents.values()].find((candidate) =>
+        candidate.merchantUsername === account || candidate.id === account || candidate.contactPhone === account
+      ),
+      "AUTH_INVALID",
+      "invalid merchant credentials"
+    );
+    if (!agent.passwordHash || !verifyPassword(input.password, agent.passwordHash)) {
+      throw new ApiError(401, "AUTH_INVALID", "invalid merchant credentials");
     }
-    assertAdminPermission(actor, "agent.review");
-    return [...this.store.inviteCodes.values()];
+    if (agent.status !== "active" && agent.status !== "pending_deposit") {
+      throw new ApiError(403, "AUTH_DISABLED", "merchant account is not active");
+    }
+    const shop = requireEntity([...this.store.shops.values()].find((candidate) => candidate.agentId === agent.id), "AUTH_INVALID", "merchant shop not found");
+    return {
+      agentId: agent.id,
+      shopId: shop.id,
+      username: agent.merchantUsername ?? agent.id,
+      displayName: agent.name,
+      tier: agent.tier,
+      status: agent.status,
+      depositStatus: agent.depositStatus,
+      shopName: shop.name,
+      shopStatus: shop.status,
+      mustChangePassword: true
+    };
   }
 
-  createPlatformInviteCode(actor: AdminActor, input: { code?: string; targetTier?: AgentTier; maxUses?: number; expiresAt?: string }) {
+  listInviteCodes(actor: AdminActor | AgentActor) {
+    if (actor.role === "agent") {
+      return [...this.store.inviteCodes.values()]
+        .filter((code) => code.issuerAgentId === actor.agentId)
+        .map((code) => this.serializeInviteCode(code, actor));
+    }
+    assertAdminPermission(actor, "agent.review");
+    return [...this.store.inviteCodes.values()].map((code) => this.serializeInviteCode(code));
+  }
+
+  createPlatformInviteCode(actor: AdminActor, input: { code?: string; targetTier?: AgentTier; maxUses?: number; expiresAt?: string; depositRequiredAmountCents?: bigint }) {
     assertAdminPermission(actor, "agent.review");
     if (input.targetTier && input.targetTier !== "first_tier") {
       throw new ApiError(400, "PLATFORM_INVITE_FIRST_TIER_ONLY", "platform invite codes can only create first-tier merchants");
@@ -242,13 +293,14 @@ class BackendServices {
       targetTier: "first_tier",
       maxUses: input.maxUses,
       expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
-      createdBy: actor.adminId
+      createdBy: actor.adminId,
+      depositRequiredAmountCents: input.depositRequiredAmountCents
     });
     this.audit(actor.role, "invite_code.create.platform", "invite_code", invite.id, invite);
-    return invite;
+    return this.serializeInviteCode(invite);
   }
 
-  createAgentInviteCode(actor: AgentActor, input: { code?: string; maxUses?: number; expiresAt?: string } = {}) {
+  createAgentInviteCode(actor: AgentActor, input: { code?: string; maxUses?: number; expiresAt?: string; depositRequiredAmountCents?: bigint } = {}) {
     const agent = requireEntity(this.store.agents.get(actor.agentId), "RESOURCE_NOT_FOUND", "agent not found");
     const tier = this.agentTier(agent.id);
     if (tier === "third_tier") {
@@ -263,10 +315,11 @@ class BackendServices {
       targetTier: tier === "first_tier" ? "second_tier" : "third_tier",
       maxUses: input.maxUses,
       expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
-      createdBy: agent.id
+      createdBy: agent.id,
+      depositRequiredAmountCents: input.depositRequiredAmountCents ?? this.depositRequirementForAgentInvite(agent.id)
     });
     this.audit("agent", "invite_code.create.agent", "invite_code", invite.id, invite);
-    return invite;
+    return this.serializeInviteCode(invite, actor);
   }
 
   registerAgentByInvite(input: {
@@ -277,7 +330,7 @@ class BackendServices {
     shopName?: string;
   }) {
     const invite = requireEntity(
-      [...this.store.inviteCodes.values()].find((candidate) => candidate.code === input.inviteCode),
+      this.findInviteByCode(input.inviteCode),
       "INVITE_CODE_INVALID",
       "invite code not found"
     );
@@ -288,6 +341,7 @@ class BackendServices {
     const agentId = nextId(this.store, "agent");
     const shopId = nextId(this.store, "shop");
     const userId = nextId(this.store, "agent-user");
+    const initialPassword = `TS${Date.now().toString().slice(-6)}`;
     const agent: DemoAgent = {
       id: agentId,
       userId,
@@ -297,7 +351,10 @@ class BackendServices {
       parentAgentId: invite.issuerAgentId,
       status: "pending_review",
       riskStatus: "normal",
-      depositStatus: "pending_payment"
+      depositStatus: "pending_payment",
+      initialPasswordSet: true,
+      merchantUsername: agentId,
+      passwordHash: `sha256:${hashSecret(initialPassword)}`
     };
     const shop: DemoShop = {
       id: shopId,
@@ -322,9 +379,13 @@ class BackendServices {
     this.store.agents.set(agentId, agent);
     this.store.shops.set(shopId, shop);
     this.store.agentApplications.set(application.applicationNo, application);
+    const requiredAmount = invite.depositRequiredAmountCents;
+    if (requiredAmount === undefined || requiredAmount <= 0n) {
+      throw new ApiError(400, "DEPOSIT_REQUIREMENT_MISSING", "invite code is missing deposit requirement");
+    }
     this.store.depositAccounts.set(agentId, {
       agentId,
-      requiredAmountCents: 50_000n,
+      requiredAmountCents: requiredAmount,
       availableAmountCents: 0n,
       frozenAmountCents: 0n,
       deductedAmountCents: 0n,
@@ -334,7 +395,17 @@ class BackendServices {
     invite.usedCount += 1;
     if (invite.maxUses !== null && invite.usedCount >= invite.maxUses) invite.status = "used_up";
     this.audit("system", "agent.register_by_invite", "agent", agentId, { inviteCodeId: invite.id, targetTier: invite.targetTier });
-    return { agent, shop, application, inviteCode: this.serializeInviteCode(invite) };
+    return {
+      agent,
+      shop,
+      application,
+      inviteCode: this.serializeInviteCode(invite),
+      credential: {
+        account: agent.merchantUsername,
+        initialPassword,
+        mustResetPassword: true
+      }
+    };
   }
 
   grantRegistrationCoupon(userId: string) {
@@ -814,11 +885,18 @@ class BackendServices {
     return this.listAgentScopedOrders(actor).map((order) => this.serializeAgentOrderForActor(actor, order));
   }
 
+  getAgentOrder(actor: AgentActor, orderNo: string) {
+    const order = this.listAgentScopedOrders(actor).find((item) => item.orderNo === orderNo);
+    if (!order) throw new ApiError(404, "RESOURCE_NOT_FOUND", "order not found");
+    return this.serializeAgentOrderForActor(actor, order);
+  }
+
   private listAgentScopedOrders(actor: AgentActor) {
     return [...this.store.orders.values()].filter((order) => {
       if (order.agentId === actor.agentId && order.shopId === actor.shopId) return true;
       const channel = getChannelSnapshot(order.snapshot);
-      return channel?.firstTierAgentId === actor.agentId && channel.firstTierShopId === actor.shopId;
+      return (channel?.firstTierAgentId === actor.agentId && channel.firstTierShopId === actor.shopId)
+        || (channel?.secondTierAgentId === actor.agentId && channel.secondTierShopId === actor.shopId);
     });
   }
 
@@ -840,11 +918,11 @@ class BackendServices {
     assertAgentScope(actor, agentProduct);
     try {
       if (agentProduct.productType === "platform") {
-        const product = requireEntity(this.store.platformProducts.get(required(agentProduct.platformProductId, "platformProductId")), "RESOURCE_NOT_FOUND", "platform product not found");
+        const pricing = this.platformSelectionPricingForActor(actor, required(agentProduct.platformProductId, "platformProductId"));
         quotePlatformProduct({
           salePriceCents,
-          supplyPriceCents: product.supplyPriceCents,
-          minSalePriceCents: product.minSalePriceCents
+          supplyPriceCents: pricing.supplyPriceCents,
+          minSalePriceCents: pricing.minSalePriceCents
         });
       } else {
         const ownProduct = requireEntity(this.store.ownProducts.get(required(agentProduct.ownProductReviewId, "ownProductReviewId")), "RESOURCE_NOT_FOUND", "own product not found");
@@ -897,24 +975,24 @@ class BackendServices {
   selectPlatformProduct(actor: AgentActor, input: { platformProductId: string; salePriceCents: bigint }) {
     this.getAgentShop(actor);
     this.assertAgentDepositConfirmed(actor.agentId, "select platform product");
-    const product = requireEntity(this.store.platformProducts.get(input.platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
+    const pricing = this.platformSelectionPricingForActor(actor, input.platformProductId);
     try {
       quotePlatformProduct({
         salePriceCents: input.salePriceCents,
-        supplyPriceCents: product.supplyPriceCents,
-        minSalePriceCents: product.minSalePriceCents
+        supplyPriceCents: pricing.supplyPriceCents,
+        minSalePriceCents: pricing.minSalePriceCents
       });
     } catch (error) {
       throw new ApiError(400, "PRICE_RULE_FAILED", getErrorMessage(error));
     }
     const existing = [...this.store.agentProducts.values()]
-      .find((agentProduct) => agentProduct.shopId === actor.shopId && agentProduct.platformProductId === product.id);
+      .find((agentProduct) => agentProduct.shopId === actor.shopId && agentProduct.platformProductId === pricing.product.id);
     const agentProduct: DemoAgentProduct = existing ?? {
       id: nextId(this.store, "ap"),
       agentId: actor.agentId,
       shopId: actor.shopId,
       productType: "platform",
-      platformProductId: product.id,
+      platformProductId: pricing.product.id,
       ownProductReviewId: null,
       salePriceCents: input.salePriceCents,
       status: "listed"
@@ -926,20 +1004,33 @@ class BackendServices {
     return agentProduct;
   }
 
+  upsertAgentChannelProductOffer(actor: AgentActor, input: { downstreamAgentId: string; platformProductId: string; resellSupplyPriceCents: bigint; status?: string }) {
+    this.assertAgentDepositConfirmed(actor.agentId, "configure transfer price");
+    const relation = this.findDirectDownstreamRelation(actor.agentId, input.downstreamAgentId);
+    if (!relation) {
+      if (this.agentTier(actor.agentId) === "third_tier") {
+        throw new ApiError(403, "FOURTH_TIER_FORBIDDEN", "third-tier merchants cannot configure downstream transfer price");
+      }
+      throw new ApiError(403, "FORBIDDEN_AGENT_SCOPE", "downstream merchant is not directly related to current merchant");
+    }
+    if (relation.status !== "active") throw new ApiError(400, "CHANNEL_RULE_FAILED", "channel relation is not active");
+    return this.upsertChannelOfferForRelation("agent", relation, input);
+  }
+
   batchSelectPlatformProducts(actor: AgentActor, input: { items: Array<{ platformProductId: string; salePriceCents: bigint }> }) {
     if (input.items.length === 0) throw new ApiError(400, "BATCH_EMPTY", "items are required");
     if (input.items.length > 50) throw new ApiError(400, "BATCH_TOO_LARGE", "batch size cannot exceed 50");
     this.assertAgentDepositConfirmed(actor.agentId, "batch select platform products");
     for (const item of input.items) {
-      const product = requireEntity(this.store.platformProducts.get(item.platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
+      const pricing = this.platformSelectionPricingForActor(actor, item.platformProductId);
       try {
         quotePlatformProduct({
           salePriceCents: item.salePriceCents,
-          supplyPriceCents: product.supplyPriceCents,
-          minSalePriceCents: product.minSalePriceCents
+          supplyPriceCents: pricing.supplyPriceCents,
+          minSalePriceCents: pricing.minSalePriceCents
         });
       } catch (error) {
-        throw new ApiError(400, "PRICE_RULE_FAILED", `${product.id}: ${getErrorMessage(error)}`);
+        throw new ApiError(400, "PRICE_RULE_FAILED", `${pricing.product.id}: ${getErrorMessage(error)}`);
       }
     }
     const results = input.items.map((item) => this.selectPlatformProduct(actor, item));
@@ -952,6 +1043,18 @@ class BackendServices {
     assertAdminPermission(actor, "agent.review");
     const agent = requireEntity(this.store.agents.get(agentId), "RESOURCE_NOT_FOUND", "agent not found");
     agent.status = input.approved ? "pending_deposit" : "rejected";
+    let credential: { account: string; initialPassword: string; mustResetPassword: boolean } | undefined;
+    if (input.approved && !agent.initialPasswordSet) {
+      const initialPassword = `TS${Date.now().toString().slice(-6)}`;
+      agent.initialPasswordSet = true;
+      agent.merchantUsername = agent.id;
+      agent.passwordHash = `sha256:${hashSecret(initialPassword)}`;
+      credential = {
+        account: agent.merchantUsername,
+        initialPassword,
+        mustResetPassword: true
+      };
+    }
     for (const relation of this.store.channelRelations) {
       if (relation.status === "pending_review" && (relation.secondTierAgentId === agentId || relation.thirdTierAgentId === agentId)) {
         relation.status = input.approved ? "pending_deposit" : "closed";
@@ -959,7 +1062,7 @@ class BackendServices {
       }
     }
     this.audit(actor.role, "agent.review", "agent", agentId, input);
-    return agent;
+    return credential ? { ...agent, credential } : agent;
   }
 
   listAgentApplications(actor: AdminActor) {
@@ -990,7 +1093,10 @@ class BackendServices {
     const shopId = nextId(this.store, "shop");
     const userId = nextId(this.store, "agent-user");
     const initialPassword = input.initialPassword ?? `TS${Date.now().toString().slice(-6)}`;
-    const requiredAmount = input.depositRequiredAmountCents ?? 50_000n;
+    const requiredAmount = input.depositRequiredAmountCents ?? input.depositAmountCents;
+    if (requiredAmount === undefined || requiredAmount <= 0n) {
+      throw new ApiError(400, "DEPOSIT_REQUIREMENT_MISSING", "deposit required amount is required");
+    }
     const paidAmount = input.depositPaid ? (input.depositAmountCents ?? requiredAmount) : 0n;
     const paid = paidAmount >= requiredAmount;
     const agent: DemoAgent = {
@@ -1003,7 +1109,9 @@ class BackendServices {
       riskStatus: "normal",
       depositStatus: paid ? "paid" : "pending_payment",
       createdByAdminId: actor.adminId,
-      initialPasswordSet: true
+      initialPasswordSet: true,
+      merchantUsername: agentId,
+      passwordHash: `sha256:${hashSecret(initialPassword)}`
     };
     const shop: DemoShop = {
       id: shopId,
@@ -1280,6 +1388,14 @@ class BackendServices {
     assertAdminPermission(actor, "product.manage");
     const relation = requireEntity(this.store.channelRelations.find((item) => item.id === input.channelRelationId), "RESOURCE_NOT_FOUND", "channel relation not found");
     if (relation.status !== "active") throw new ApiError(400, "CHANNEL_RULE_FAILED", "channel relation is not active");
+    return this.upsertChannelOfferForRelation(actor.role, relation, input);
+  }
+
+  private upsertChannelOfferForRelation(
+    auditRole: string,
+    relation: ChannelRelation,
+    input: { platformProductId: string; resellSupplyPriceCents: bigint; status?: string }
+  ) {
     this.assertAgentDepositConfirmed(relation.firstTierAgentId, "configure channel offer");
     this.assertAgentDepositConfirmed(relation.secondTierAgentId, "configure channel offer");
     if (relation.thirdTierAgentId) this.assertAgentDepositConfirmed(relation.thirdTierAgentId, "configure channel offer");
@@ -1299,12 +1415,26 @@ class BackendServices {
     offer.resellSupplyPriceCents = input.resellSupplyPriceCents;
     offer.status = input.status ?? offer.status;
     if (!existing) this.store.channelProductOffers.push(offer);
-    this.audit(actor.role, "channel.offer.upsert", "channel_product_offer", offer.id, offer);
+    this.audit(auditRole, "channel.offer.upsert", "channel_product_offer", offer.id, offer);
     return offer;
   }
 
   listRightsCodes(actor: AdminActor, filters: { productId?: string; orderNo?: string; status?: RightsCode["status"]; shopId?: string } = {}) {
     assertAdminPermission(actor, "product.manage");
+    return this.filterRightsCodes(filters).map((code) => this.redactRightsCode(code));
+  }
+
+  revealRightsCodesPlaintext(actor: AdminActor, filters: { productId?: string; orderNo?: string; status?: RightsCode["status"]; shopId?: string } = {}) {
+    assertAdminPermission(actor, "rights_code.secret.read");
+    const codes = this.filterRightsCodes(filters);
+    this.audit(actor.role, "rights_code.secret.read", "rights_code", filters.orderNo ?? filters.productId ?? "filtered", {
+      ...filters,
+      count: codes.length
+    });
+    return codes;
+  }
+
+  private filterRightsCodes(filters: { productId?: string; orderNo?: string; status?: RightsCode["status"]; shopId?: string } = {}) {
     return this.store.rightsCodes.filter((code) => {
       if (filters.productId && code.productId !== filters.productId) return false;
       if (filters.orderNo && code.orderNo !== filters.orderNo) return false;
@@ -1316,6 +1446,15 @@ class BackendServices {
       }
       return true;
     });
+  }
+
+  private redactRightsCode(code: RightsCode) {
+    const preview = code.code.length <= 6 ? "***" : `${code.code.slice(0, 2)}***${code.code.slice(-2)}`;
+    return {
+      ...code,
+      code: undefined,
+      codePreview: preview
+    };
   }
 
   addRightsCodes(actor: AdminActor, input: { productId: string; codes: string[]; batchNo?: string }) {
@@ -1339,7 +1478,7 @@ class BackendServices {
     }
     product.fulfillmentRule = { ...(isRecord(product.fulfillmentRule) ? product.fulfillmentRule : {}), mode: "code_pool" };
     this.audit(actor.role, "rights_code.import", "platform_product", product.id, { count: created.length });
-    return { count: created.length, product, codes: created };
+    return { count: created.length, product, codes: created.map((code) => this.redactRightsCode(code)) };
   }
 
   fulfillOrder(actor: AdminActor, orderNo: string, input: { status: "success" | "failed"; attemptNo: number; evidence?: string; failReason?: string }) {
@@ -1359,6 +1498,40 @@ class BackendServices {
     if (record.status === "success" && !order.fulfilledAt) order.fulfilledAt = new Date();
     this.audit(actor.role, "fulfillment.update", "order", orderNo, input);
     return { ...result, order };
+  }
+
+  fulfillAgentOrder(actor: AgentActor, orderNo: string, input: { status: "success" | "failed"; attemptNo: number; evidence?: string; failReason?: string }) {
+    const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
+    assertAgentScope(actor, { agentId: order.agentId, shopId: order.shopId });
+    if (order.paymentStatus !== "paid") throw new ApiError(400, "STATE_NOT_ALLOWED", "only paid orders can be fulfilled");
+    const record = this.store.fulfillmentRecords.get(orderNo) ?? {
+      fulfillmentId: `fulfillment-${orderNo}`,
+      orderItemId: `${orderNo}-item-1`,
+      status: "not_started" as const,
+      attemptCount: 0
+    };
+    const result = applyFulfillmentAttempt({ registry: this.registry, record, attemptNo: input.attemptNo, result: input });
+    this.store.fulfillmentRecords.set(orderNo, record);
+    order.fulfillmentStatus = record.status;
+    order.status = result.orderStatus;
+    if (record.status === "success" && !order.fulfilledAt) order.fulfilledAt = new Date();
+    this.audit("agent", "fulfillment.update", "order", orderNo, input);
+    return { ...result, order };
+  }
+
+  listAgentAfterSales(actor: AgentActor) {
+    return [...this.store.afterSales.values()].filter((afterSale) => {
+      const order = this.store.orders.get(afterSale.orderNo);
+      return order?.agentId === actor.agentId && order.shopId === actor.shopId;
+    });
+  }
+
+  updateAgentAfterSaleAssist(actor: AgentActor, afterSaleNo: string, input: { note: string; evidenceUrl?: string }) {
+    const afterSale = requireEntity(this.store.afterSales.get(afterSaleNo), "RESOURCE_NOT_FOUND", "after sale not found");
+    const order = requireEntity(this.store.orders.get(afterSale.orderNo), "RESOURCE_NOT_FOUND", "order not found");
+    assertAgentScope(actor, { agentId: order.agentId, shopId: order.shopId });
+    this.audit("agent", "after_sale.agent_assist", "after_sale", afterSale.afterSaleNo, input);
+    return { status: "recorded" as const, afterSale };
   }
 
   allocateRefundForAdmin(actor: AdminActor, input: RefundAllocationRequest) {
@@ -1418,6 +1591,28 @@ class BackendServices {
     }
     this.audit(actor.role, "refund.approve", "after_sale", afterSaleNo, allocation);
     return { refund, allocation };
+  }
+
+  confirmManualRefund(actor: AdminActor, refundNo: string, input: { channelRefundNo?: string; voucherUrl?: string; note?: string }) {
+    assertAdminPermission(actor, "settlement.confirm");
+    const refund = requireEntity(this.store.refunds.get(refundNo), "RESOURCE_NOT_FOUND", "refund not found");
+    const idempotencyKey = `manual-refund:${refundNo}:${input.channelRefundNo ?? input.voucherUrl ?? "confirmation"}`;
+    const result = this.registry.runOnce(idempotencyKey, () => {
+      const applied = this.markRefundSucceeded(refund, {
+        channelRefundNo: input.channelRefundNo,
+        voucherUrl: input.voucherUrl,
+        note: input.note,
+        source: "manual"
+      });
+      this.audit(actor.role, "refund.manual_confirm", "refund", refund.refundNo, {
+        idempotencyKey,
+        channelRefundNo: input.channelRefundNo,
+        voucherUrl: input.voucherUrl,
+        note: input.note
+      });
+      return { status: "processed" as const, idempotencyKey, ...applied };
+    });
+    return result ?? { status: "duplicate" as const, idempotencyKey, refund };
   }
 
   confirmOfflinePayment(actor: AdminActor, orderNo: string, input: { amountCents: bigint; voucherUrl?: string; note?: string }) {
@@ -1498,27 +1693,55 @@ class BackendServices {
     const refund = requireEntity(this.store.refunds.get(input.refundNo), "RESOURCE_NOT_FOUND", "refund not found");
     const idempotencyKey = refundCallbackKey(input.channel, input.channelRefundNo);
     const result = this.registry.runOnce(idempotencyKey, () => {
-      const order = requireEntity(this.store.orders.get(refund.orderNo), "RESOURCE_NOT_FOUND", "order not found");
-      refund.status = "success";
-      order.refundedAmountCents += refund.amountCents;
-      order.refundStatus = "refunded";
-      order.status = "refunded";
-      this.ledger("REFUND_SUCCEEDED", { orderNo: order.orderNo, agentId: order.agentId }, refund.amountCents, { refundNo: refund.refundNo });
-
-      if (order.salesChannelType === "platform_self_operated") {
-        refund.pendingIncomeDeductedCents = 0n;
-      } else if (refund.wasSettled) {
-        this.createClawback(order, refund.agentClawbackCents, "refund", refund.refundNo);
-      } else {
-        const pending = this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n;
-        const deduction = pending > refund.agentClawbackCents ? refund.agentClawbackCents : pending;
-        this.store.pendingIncomeByAgent.set(order.agentId, pending - deduction);
-        refund.pendingIncomeDeductedCents = deduction;
-      }
+      const applied = this.markRefundSucceeded(refund, {
+        channelRefundNo: input.channelRefundNo,
+        source: input.channel
+      });
       this.audit("system", "refund.callback", "refund", refund.refundNo, { idempotencyKey });
-      return { status: "processed" as const, idempotencyKey, refund };
+      return { status: "processed" as const, idempotencyKey, ...applied };
     });
     return result ?? { status: "duplicate" as const, idempotencyKey };
+  }
+
+  private markRefundSucceeded(refund: DemoRefund, input: { channelRefundNo?: string; voucherUrl?: string; note?: string; source: string }) {
+    if (refund.status === "refunded") {
+      const existingOrder = requireEntity(this.store.orders.get(refund.orderNo), "RESOURCE_NOT_FOUND", "order not found");
+      return { refund, order: existingOrder };
+    }
+    const order = requireEntity(this.store.orders.get(refund.orderNo), "RESOURCE_NOT_FOUND", "order not found");
+    const afterSale = this.store.afterSales.get(refund.afterSaleNo);
+    refund.status = "refunded";
+    refund.channelRefundNo = input.channelRefundNo;
+    refund.voucherUrl = input.voucherUrl;
+    refund.note = input.note;
+    refund.confirmedAt = new Date();
+    if (afterSale) afterSale.status = "refunded";
+    order.refundedAmountCents += refund.amountCents;
+    order.refundStatus = "refunded";
+    order.status = "refunded";
+    order.settlementStatus = "frozen";
+    this.ledger("REFUND_SUCCEEDED", { orderNo: order.orderNo, agentId: order.agentId }, refund.amountCents, {
+      refundNo: refund.refundNo,
+      source: input.source,
+      channelRefundNo: input.channelRefundNo,
+      voucherUrl: input.voucherUrl
+    });
+
+    if (order.salesChannelType === "platform_self_operated") {
+      refund.pendingIncomeDeductedCents = 0n;
+    } else if (refund.wasSettled) {
+      this.createClawback(order, refund.agentClawbackCents, "refund", refund.refundNo);
+    } else {
+      const pending = this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n;
+      const deduction = pending > refund.agentClawbackCents ? refund.agentClawbackCents : pending;
+      this.store.pendingIncomeByAgent.set(order.agentId, pending - deduction);
+      refund.pendingIncomeDeductedCents = deduction;
+    }
+    if (order.couponId) {
+      const coupon = this.store.userCoupons.get(order.couponId);
+      if (coupon) coupon.status = "voided_after_refund";
+    }
+    return { refund, order, afterSale };
   }
 
   generateSettlement(actor: AdminActor, input: { agentId: string; now?: Date; batchNo: string }) {
@@ -2650,6 +2873,29 @@ class BackendServices {
       });
   }
 
+  private platformSelectionPricingForActor(actor: AgentActor, platformProductId: string) {
+    const product = requireEntity(this.store.platformProducts.get(platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
+    const tier = this.agentTier(actor.agentId);
+    if (tier === "first_tier") {
+      return {
+        product,
+        supplyPriceCents: product.supplyPriceCents,
+        minSalePriceCents: product.minSalePriceCents
+      };
+    }
+    const visibility = this.priceVisibilityForAgent(actor.agentId, platformProductId);
+    if (visibility.visibleUpstreamSupplyPriceCents === undefined) {
+      throw new ApiError(404, "RESOURCE_NOT_FOUND", "platform product is not available to current merchant");
+    }
+    return {
+      product,
+      supplyPriceCents: visibility.visibleUpstreamSupplyPriceCents,
+      minSalePriceCents: visibility.visibleUpstreamSupplyPriceCents > product.minSalePriceCents
+        ? visibility.visibleUpstreamSupplyPriceCents
+        : product.minSalePriceCents
+    };
+  }
+
   private priceVisibilityForAgent(agentId: string, platformProductId?: string | null) {
     if (!platformProductId) return {};
     const product = this.store.platformProducts.get(platformProductId);
@@ -2684,6 +2930,16 @@ class BackendServices {
       };
     }
     return product ? { canSeePlatformSupplyPrice: true, platformSupplyPriceCents: product.supplyPriceCents } : {};
+  }
+
+  private findDirectDownstreamRelation(upstreamAgentId: string, downstreamAgentId: string) {
+    return this.store.channelRelations.find((relation) =>
+      relation.status === "active"
+      && (
+        (!relation.thirdTierAgentId && relation.firstTierAgentId === upstreamAgentId && relation.secondTierAgentId === downstreamAgentId)
+        || (relation.thirdTierAgentId === downstreamAgentId && relation.secondTierAgentId === upstreamAgentId)
+      )
+    );
   }
 
   private resolveCouponDiscount(actor: UserActor, snapshot: DemoOrderSnapshot, couponId?: string): CouponResolution {
@@ -2887,13 +3143,18 @@ class BackendServices {
     maxUses?: number;
     expiresAt?: Date | null;
     createdBy: string;
+    depositRequiredAmountCents?: bigint;
   }) {
     const code = input.code ?? `${input.targetTier.replace("_tier", "")}-${nextId(this.store, "invite").replace("invite-", "")}`;
-    if (this.store.inviteCodes.has(code) || [...this.store.inviteCodes.values()].some((item) => item.code === code)) {
+    const codeHash = hashSecret(code);
+    if (this.store.inviteCodes.has(code) || [...this.store.inviteCodes.values()].some((item) => item.code === code || item.codeHash === codeHash)) {
       throw new ApiError(400, "INVITE_CODE_DUPLICATE", "invite code already exists");
     }
     if (input.issuerType === "platform" && input.targetTier !== "first_tier") {
       throw new ApiError(400, "INVITE_RULE_FAILED", "platform invite can only target first tier");
+    }
+    if (input.issuerType === "platform" && (input.depositRequiredAmountCents === undefined || input.depositRequiredAmountCents <= 0n)) {
+      throw new ApiError(400, "DEPOSIT_REQUIREMENT_MISSING", "platform invite requires deposit amount");
     }
     if (input.issuerType === "agent") {
       const issuer = requireEntity(input.issuerAgentId ? this.store.agents.get(input.issuerAgentId) : undefined, "RESOURCE_NOT_FOUND", "issuer agent not found");
@@ -2905,12 +3166,14 @@ class BackendServices {
     const invite: InviteCode = {
       id: nextId(this.store, "invite-code"),
       code,
+      codeHash,
       issuerType: input.issuerType,
       issuerAgentId: input.issuerAgentId,
       targetTier: input.targetTier,
       status: "active",
       maxUses: input.maxUses ?? null,
       usedCount: 0,
+      depositRequiredAmountCents: input.depositRequiredAmountCents,
       expiresAt: input.expiresAt ?? null,
       createdBy: input.createdBy,
       createdAt: new Date()
@@ -2933,6 +3196,21 @@ class BackendServices {
       const issuer = requireEntity(invite.issuerAgentId ? this.store.agents.get(invite.issuerAgentId) : undefined, "INVITE_CODE_INVALID", "issuer not found");
       if (this.agentTier(issuer.id) !== "second_tier") throw new ApiError(400, "FOURTH_TIER_FORBIDDEN", "invalid third-tier invite issuer");
     }
+  }
+
+  private findInviteByCode(code: string) {
+    const codeHash = hashSecret(code);
+    return [...this.store.inviteCodes.values()].find((candidate) => (
+      candidate.code === code || candidate.codeHash === codeHash
+    ));
+  }
+
+  private depositRequirementForAgentInvite(agentId: string) {
+    const account = requireEntity(this.store.depositAccounts.get(agentId), "RESOURCE_NOT_FOUND", "deposit account not found");
+    if (account.requiredAmountCents <= 0n) {
+      throw new ApiError(400, "DEPOSIT_REQUIREMENT_MISSING", "issuer deposit requirement is missing");
+    }
+    return account.requiredAmountCents;
   }
 
   private createPendingRelationForInvite(invite: InviteCode, childAgentId: string) {
@@ -2988,8 +3266,27 @@ class BackendServices {
     return "first_tier";
   }
 
-  private serializeInviteCode(invite: InviteCode) {
-    return { ...invite };
+  private serializeInviteCode(invite: InviteCode, actor?: AgentActor) {
+    return {
+      id: invite.id,
+      code: invite.code || undefined,
+      targetTier: invite.targetTier,
+      status: invite.status,
+      maxUses: invite.maxUses,
+      usedCount: invite.usedCount,
+      expiresAt: invite.expiresAt,
+      depositRequiredAmountCents: invite.depositRequiredAmountCents,
+      issuer: {
+        type: invite.issuerType,
+        agentId: invite.issuerAgentId
+      },
+      currentMerchantScope: actor ? {
+        agentId: actor.agentId,
+        shopId: actor.shopId,
+        ownsInvite: invite.issuerAgentId === actor.agentId
+      } : undefined,
+      createdAt: invite.createdAt
+    };
   }
 
   private findActiveChannelRelationForSellingAgent(agentId: string) {
@@ -3152,6 +3449,70 @@ class PrismaStateRepository {
     throw new ApiError(401, "AUTH_INVALID", "invalid admin credentials");
   }
 
+  async verifyAgent(input: { account: string; password: string }): Promise<AgentLoginResult> {
+    const rows = await this.prisma.$queryRaw<Array<{
+      username: string;
+      password_hash: string | null;
+      status: string;
+      must_change_password: boolean;
+      agent_id: string | null;
+      shop_id: string | null;
+      display_name: string | null;
+      tier: AgentTier | null;
+      agent_status: string | null;
+      deposit_status: string | null;
+      shop_name: string | null;
+      shop_status: string | null;
+    }>>`
+	      SELECT ma.username, ma.password_hash, ma.status, ma.must_change_password,
+	             a.id AS agent_id, s.id AS shop_id, a.name AS display_name,
+	             CASE
+	               WHEN EXISTS (
+	                 SELECT 1 FROM channel_relations cr
+	                  WHERE cr.third_tier_agent_id = a.id
+	                    AND cr.status IN ('active', 'pending_review')
+	               ) THEN 'third_tier'
+	               WHEN EXISTS (
+	                 SELECT 1 FROM channel_relations cr
+	                  WHERE cr.second_tier_agent_id = a.id
+	                    AND cr.status IN ('active', 'pending_review')
+	               ) THEN 'second_tier'
+	               ELSE 'first_tier'
+	             END AS tier,
+	             a.status AS agent_status, a.deposit_status, s.name AS shop_name, s.status AS shop_status
+	        FROM merchant_accounts ma
+	        JOIN agents a ON a.user_id = ma.user_id
+        JOIN shops s ON s.agent_id = a.id
+       WHERE ma.username = ${input.account}
+          OR ma.phone = ${input.account}
+          OR ma.email = ${input.account}
+       ORDER BY ma.created_at DESC
+       LIMIT 1
+    `;
+    const account = rows[0];
+    if (!account || account.status !== "active" || !account.password_hash || !verifyPassword(input.password, account.password_hash)) {
+      throw new ApiError(401, "AUTH_INVALID", "invalid merchant credentials");
+    }
+    if (!account.agent_id || !account.shop_id) {
+      throw new ApiError(401, "AUTH_INVALID", "merchant account is not linked to an active shop");
+    }
+    if (account.agent_status !== "active" && account.agent_status !== "pending_deposit") {
+      throw new ApiError(403, "AUTH_DISABLED", "merchant account is not active");
+    }
+    return {
+      agentId: account.agent_id,
+      shopId: account.shop_id,
+      username: account.username,
+      displayName: account.display_name ?? account.username,
+      tier: account.tier ?? undefined,
+      status: account.agent_status ?? "pending_review",
+      depositStatus: account.deposit_status ?? "pending_payment",
+      shopName: account.shop_name ?? account.username,
+      shopStatus: account.shop_status ?? "not_opened",
+      mustChangePassword: account.must_change_password
+    };
+  }
+
   async load(): Promise<MemoryStore> {
     const store = createEmptyMemoryStore();
     await Promise.all([
@@ -3173,6 +3534,7 @@ class PrismaStateRepository {
   async save(_store: MemoryStore): Promise<void> {
     await this.persistInShortTransaction((tx) => this.persistUsers(tx, _store));
     await this.persistInShortTransaction((tx) => this.persistAgents(tx, _store));
+    await this.persistInShortTransaction((tx) => this.persistMerchantAccounts(tx, _store));
     await this.persistInShortTransaction((tx) => this.persistShops(tx, _store));
     await this.persistInShortTransaction((tx) => this.persistProducts(tx, _store));
     await this.persistInShortTransaction((tx) => this.persistCollectionChannels(tx, _store));
@@ -3187,20 +3549,29 @@ class PrismaStateRepository {
     await this.persistInShortTransaction((tx) => this.persistNotificationsAndPaymentConfig(tx, _store));
   }
 
-  async saveForMethod(method: string, store: MemoryStore): Promise<void> {
-    if (method === "createAgentByAdmin") {
-      await this.persistInShortTransaction((tx) => this.persistLatestManualAgentCreation(tx, store));
+	  async saveForMethod(method: string, store: MemoryStore): Promise<void> {
+	    if (method === "createAgentByAdmin") {
+	      await this.persistInShortTransaction((tx) => this.persistLatestManualAgentCreation(tx, store));
+	      return;
+	    }
+    if (method === "createPlatformInviteCode" || method === "createAgentInviteCode") {
+      await this.persistInShortTransaction((tx) => this.persistLatestInviteCodeCreation(tx, store));
       return;
     }
-    if ([
-      "reviewAgent",
-      "submitAgentApplication",
-      "registerAgentByInvite",
-      "createPlatformInviteCode",
-      "createAgentInviteCode"
-    ].includes(method)) {
+	    if (method === "registerAgentByInvite") {
+	      await this.persistInShortTransaction((tx) => this.persistLatestInviteRegistration(tx, store));
+	      return;
+	    }
+    if (method === "reviewAgent") {
+      await this.persistInShortTransaction((tx) => this.persistLatestAgentReview(tx, store));
+      return;
+    }
+	    if ([
+	      "submitAgentApplication"
+	    ].includes(method)) {
       await this.persistInShortTransaction((tx) => this.persistUsers(tx, store));
       await this.persistInShortTransaction((tx) => this.persistAgents(tx, store));
+      await this.persistInShortTransaction((tx) => this.persistMerchantAccounts(tx, store));
       await this.persistInShortTransaction((tx) => this.persistShops(tx, store));
       await this.persistInShortTransaction((tx) => this.persistInviteAndChannelState(tx, store));
       await this.persistInShortTransaction((tx) => this.persistDeposits(tx, store));
@@ -3237,14 +3608,28 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestPlatformProductSelection(tx, store));
       return;
     }
+    if (method === "upsertPlatformShopProduct") {
+      await this.persistInShortTransaction((tx) => this.persistLatestPlatformShopProductUpsert(tx, store));
+      return;
+    }
+    if (method === "upsertChannelProductOffer" || method === "upsertAgentChannelProductOffer") {
+      await this.persistInShortTransaction((tx) => this.persistLatestChannelProductOfferUpsert(tx, store));
+      return;
+    }
+    if (method === "reviewChannelAuthorization") {
+      await this.persistInShortTransaction((tx) => this.persistLatestChannelAuthorizationReview(tx, store));
+      return;
+    }
+    if (method === "createChannelRelation") {
+      await this.persistInShortTransaction((tx) => this.persistLatestChannelRelationCreation(tx, store));
+      return;
+    }
     if ([
       "updatePlatformProduct",
       "submitOwnProduct",
       "reviewOwnProduct",
       "batchSelectPlatformProducts",
-      "setAgentProductPrice",
-      "createChannelRelation",
-      "reviewChannelAuthorization"
+      "setAgentProductPrice"
     ].includes(method)) {
       await this.persistInShortTransaction((tx) => this.persistProducts(tx, store));
       await this.persistInShortTransaction((tx) => this.persistInviteAndChannelState(tx, store));
@@ -3280,12 +3665,34 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestOfflinePaymentConfirmation(tx, store));
       return;
     }
+    if (method === "fulfillAgentOrder") {
+      await this.persistInShortTransaction((tx) => this.persistLatestFulfillmentUpdate(tx, store));
+      return;
+    }
     if (method === "createAfterSale") {
       await this.persistInShortTransaction((tx) => this.persistLatestAfterSaleCreation(tx, store));
       return;
     }
+    if (method === "updateAgentAfterSaleAssist") {
+      await this.persistInShortTransaction((tx) => {
+        const audit = this.latestAuditLog(store, ["after_sale.agent_assist"]);
+        return this.persistAuditLogs(tx, audit ? [audit] : []);
+      });
+      return;
+    }
     if (method === "approveRefund") {
       await this.persistInShortTransaction((tx) => this.persistLatestRefundApproval(tx, store));
+      return;
+    }
+    if (method === "confirmManualRefund") {
+      await this.persistInShortTransaction((tx) => this.persistLatestManualRefundConfirmation(tx, store));
+      return;
+    }
+    if (method === "revealRightsCodesPlaintext") {
+      await this.persistInShortTransaction((tx) => {
+        const audit = this.latestAuditLog(store, ["rights_code.secret.read"]);
+        return this.persistAuditLogs(tx, audit ? [audit] : []);
+      });
       return;
     }
     if ([
@@ -3324,7 +3731,7 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistRiskAuditLedger(tx, store));
       return;
     }
-    await this.save(store);
+    throw new ApiError(501, "PERSISTENCE_NOT_IMPLEMENTED", `Prisma targeted persistence is not implemented for ${method}`);
   }
 
   private persistInShortTransaction<T>(fn: (tx: PrismaTx) => Promise<T>): Promise<T> {
@@ -3346,6 +3753,14 @@ class PrismaStateRepository {
     }
   }
 
+  private async persistMerchantAccounts(tx: PrismaTx, store: MemoryStore) {
+    for (const agent of store.agents.values()) {
+      if (agent.initialPasswordSet && agent.passwordHash) {
+        await this.persistMerchantAccountForAgent(tx, agent);
+      }
+    }
+  }
+
   private async persistLatestManualAgentCreation(tx: PrismaTx, store: MemoryStore) {
     const audit = this.latestAuditLog(store, ["agent.admin_create_first_tier"]);
     const agentId = audit ? stringValue(audit.targetId) : undefined;
@@ -3361,22 +3776,132 @@ class PrismaStateRepository {
 
     await this.persistUserId(tx, agent.userId);
     await this.persistAgent(tx, agent);
+    await this.persistMerchantAccountForAgent(tx, agent);
     await this.persistShop(tx, shop);
     await this.persistDepositAccount(tx, agent.id, depositAccount);
     if (depositTransaction) await this.persistDepositTransaction(tx, depositTransaction);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistUserId(tx: PrismaTx, userId: string) {
+	  private async persistUserId(tx: PrismaTx, userId: string) {
+	    await tx.$executeRaw`
+	      INSERT INTO users (id, status, created_at, updated_at)
+	      VALUES (${userId}, 'active', now(), now())
+	      ON CONFLICT (id) DO UPDATE SET updated_at = now()
+	    `;
+	  }
+
+  private async persistLatestInviteCodeCreation(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["invite_code.create.platform", "invite_code.create.agent"]);
+    const inviteId = audit ? stringValue(audit.targetId) : undefined;
+    const invite = inviteId ? store.inviteCodes.get(inviteId) : undefined;
+    if (!invite) throw new Error("invite code creation missing current invite");
+    await this.persistInviteCode(tx, invite);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestInviteRegistration(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["agent.register_by_invite"]);
+    const agentId = audit ? stringValue(audit.targetId) : undefined;
+    const agent = agentId ? store.agents.get(agentId) : undefined;
+    if (!agent) throw new Error("invite registration missing current agent");
+    const shop = [...store.shops.values()].find((item) => item.agentId === agent.id);
+    if (!shop) throw new Error("invite registration missing current shop");
+    const application = [...store.agentApplications.values()].find((item) => item.agentId === agent.id);
+    if (!application) throw new Error("invite registration missing current application");
+    const depositAccount = store.depositAccounts.get(agent.id);
+    if (!depositAccount) throw new Error("invite registration missing deposit account");
+    const inviteId = stringValue((audit?.after as Record<string, unknown> | undefined)?.inviteCodeId) ?? application.inviteCodeId;
+    const invite = inviteId ? store.inviteCodes.get(inviteId) : undefined;
+    if (!invite) throw new Error("invite registration missing invite code");
+    const relation = store.channelRelations.find((item) =>
+      item.reason === "invite_registration"
+      && (item.secondTierAgentId === agent.id || item.thirdTierAgentId === agent.id)
+    );
+
+    await this.persistUserId(tx, agent.userId);
+    await this.persistAgent(tx, agent);
+    await this.persistMerchantAccountForAgent(tx, agent);
+    await this.persistShop(tx, shop);
+    await this.persistAgentApplication(tx, application);
+    await this.persistInviteCode(tx, invite);
+    if (relation) await this.persistChannelRelation(tx, relation);
+    await this.persistDepositAccount(tx, agent.id, depositAccount);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestAgentReview(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["agent.review"]);
+    const agentId = audit ? stringValue(audit.targetId) : undefined;
+    const agent = agentId ? store.agents.get(agentId) : undefined;
+    if (!agent) throw new Error("agent review missing current agent");
+    const shop = [...store.shops.values()].find((item) => item.agentId === agent.id);
+    const application = [...store.agentApplications.values()].find((item) => item.agentId === agent.id);
+    const depositAccount = store.depositAccounts.get(agent.id);
+    const relations = store.channelRelations.filter((item) =>
+      item.secondTierAgentId === agent.id || item.thirdTierAgentId === agent.id
+    );
+
+    await this.persistUserId(tx, agent.userId);
+    await this.persistAgent(tx, agent);
+    await this.persistMerchantAccountForAgent(tx, agent);
+    if (shop) await this.persistShop(tx, shop);
+    if (application) await this.persistAgentApplication(tx, application);
+    if (depositAccount) await this.persistDepositAccount(tx, agent.id, depositAccount);
+    for (const relation of relations) await this.persistChannelRelation(tx, relation);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestChannelAuthorizationReview(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["channel.authorization.review"]);
+    const agentId = audit ? stringValue(audit.targetId) : undefined;
+    const authorization = agentId
+      ? store.channelAuthorizations.find((item) => item.firstTierAgentId === agentId)
+      : undefined;
+    if (!authorization) throw new Error("channel authorization review missing current authorization");
+    await this.persistChannelAuthorization(tx, authorization);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestChannelRelationCreation(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["channel.relation.create"]);
+    if (!audit) return;
+    const relationId = stringValue(audit.targetId);
+    const relation = relationId ? store.channelRelations.find((item) => item.id === relationId) : undefined;
+    if (!relation) throw new Error("channel relation creation missing current relation");
+    await this.persistChannelRelation(tx, relation);
+    await this.persistAuditLogs(tx, [audit]);
+  }
+
+			  private async persistMerchantAccountForAgent(tx: PrismaTx, agent: DemoAgent) {
+    if (!agent.initialPasswordSet || !agent.passwordHash) return;
+    const username = agent.merchantUsername ?? agent.id;
     await tx.$executeRaw`
-      INSERT INTO users (id, status, created_at, updated_at)
-      VALUES (${userId}, 'active', now(), now())
-      ON CONFLICT (id) DO UPDATE SET updated_at = now()
+      INSERT INTO merchant_accounts (
+        id, user_id, merchant_id, username, phone, password_hash, role, status,
+        initial_delivery_status, initial_delivered_at, must_change_password,
+        created_by_admin_id, created_at, updated_at
+      )
+      VALUES (
+        ${stableDbId("merchant_account", agent.id)}, ${agent.userId}, NULL,
+        ${username}, ${agent.contactPhone ?? null}, ${agent.passwordHash},
+        CAST('owner' AS "MerchantAccountRole"), CAST('active' AS "MerchantAccountStatus"),
+        CAST('delivered' AS "InitialAccountDeliveryStatus"), now(), true,
+        NULL, now(), now()
+      )
+      ON CONFLICT (username) DO UPDATE SET
+        user_id = EXCLUDED.user_id,
+        phone = EXCLUDED.phone,
+        password_hash = EXCLUDED.password_hash,
+        status = EXCLUDED.status,
+        initial_delivery_status = EXCLUDED.initial_delivery_status,
+        initial_delivered_at = COALESCE(merchant_accounts.initial_delivered_at, EXCLUDED.initial_delivered_at),
+        updated_at = now()
     `;
   }
 
-  private async persistAgent(tx: PrismaTx, agent: DemoAgent) {
-    await tx.$executeRaw`
+	  private async persistAgent(tx: PrismaTx, agent: DemoAgent) {
+	    await tx.$executeRaw`
       INSERT INTO agents (
         id, user_id, agent_no, name, contact_phone, status, risk_status,
         deposit_status, approved_at, created_at, updated_at
@@ -3395,10 +3920,65 @@ class PrismaStateRepository {
         risk_status = EXCLUDED.risk_status,
         deposit_status = EXCLUDED.deposit_status,
         updated_at = now()
+	      `;
+      await this.persistMerchantForAgent(tx, agent);
+	  }
+
+  private async persistMerchantForAgent(tx: PrismaTx, agent: DemoAgent) {
+    await tx.$executeRaw`
+      INSERT INTO merchants (
+        id, merchant_no, tier, name, contact_phone, status, risk_status,
+        deposit_status, creation_source, created_by_admin_id,
+        initial_account_status, approved_at, created_at, updated_at
+      )
+      VALUES (
+        ${agent.id}, ${agent.id}, CAST(${agent.tier ?? "first_tier"} AS "MerchantTier"),
+        ${agent.name}, ${agent.contactPhone ?? null},
+        CAST(${mapAgentStatus(agent.status)} AS "AgentStatus"),
+        CAST(${mapRiskStatus(agent.riskStatus)} AS "RiskStatus"),
+        CAST(${mapDepositStatus(agent.depositStatus)} AS "DepositStatus"),
+        CAST(${agent.createdByAdminId ? "admin_manual" : "invite_application"} AS "MerchantCreationSource"),
+        ${agent.createdByAdminId ?? null},
+        CAST(${agent.initialPasswordSet ? "delivered" : "pending"} AS "InitialAccountDeliveryStatus"),
+        ${agent.status === "active" ? new Date() : null}, now(), now()
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        tier = EXCLUDED.tier,
+        name = EXCLUDED.name,
+        contact_phone = EXCLUDED.contact_phone,
+        status = EXCLUDED.status,
+        risk_status = EXCLUDED.risk_status,
+        deposit_status = EXCLUDED.deposit_status,
+        initial_account_status = EXCLUDED.initial_account_status,
+        approved_at = EXCLUDED.approved_at,
+        updated_at = now()
     `;
   }
 
-  private async persistShop(tx: PrismaTx, shop: DemoShop) {
+  private async persistAgentApplication(tx: PrismaTx, application: AgentApplication) {
+    await tx.$executeRaw`
+      INSERT INTO agent_applications (
+        id, agent_id, user_id, identity_info_json, contact_info_json,
+        customer_service_wechat, status, reject_reason, reviewed_by,
+        reviewed_at, created_at, updated_at
+      )
+      VALUES (
+        ${application.applicationNo}, ${application.agentId}, ${application.userId},
+        ${jsonForDb({ inviteCodeId: application.inviteCodeId, targetTier: application.targetTier, parentAgentId: application.parentAgentId })}::jsonb,
+        ${jsonForDb({ phone: application.contactPhone, inviteCode: application.inviteCode })}::jsonb,
+        ${application.customerServiceWechat},
+        CAST(${mapReviewStatus(application.status)} AS "ReviewStatus"),
+        NULL, NULL, NULL, now(), now()
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        status = EXCLUDED.status,
+        contact_info_json = EXCLUDED.contact_info_json,
+        customer_service_wechat = EXCLUDED.customer_service_wechat,
+        updated_at = now()
+    `;
+  }
+
+	  private async persistShop(tx: PrismaTx, shop: DemoShop) {
     await tx.$executeRaw`
       INSERT INTO shops (
         id, owner_type, agent_id, merchant_id, shop_no, name, announcement,
@@ -3574,9 +4154,37 @@ class PrismaStateRepository {
     if (!shop) throw new Error("platform product selection missing current shop");
     if (!product) throw new Error("platform product selection missing current platform product");
     await this.persistAgent(tx, agent);
+    await this.persistMerchantAccountForAgent(tx, agent);
     await this.persistShop(tx, shop);
     await this.persistPlatformProduct(tx, product);
     await this.persistAgentProduct(tx, agentProduct);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestPlatformShopProductUpsert(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["platform_shop_product.upsert"]);
+    const shopProductId = audit ? stringValue(audit.targetId) : undefined;
+    const shopProduct = shopProductId ? store.platformShopProducts.get(shopProductId) : undefined;
+    if (!shopProduct) throw new Error("platform shop product upsert missing current shop product");
+    const shop = store.shops.get(shopProduct.shopId);
+    const product = store.platformProducts.get(shopProduct.platformProductId);
+    if (!shop) throw new Error("platform shop product upsert missing current shop");
+    if (!product) throw new Error("platform shop product upsert missing current platform product");
+    await this.persistShop(tx, shop);
+    await this.persistPlatformProduct(tx, product);
+    await this.persistPlatformShopProduct(tx, shopProduct);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestChannelProductOfferUpsert(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["channel.offer.upsert"]);
+    const offerId = audit ? stringValue(audit.targetId) : undefined;
+    const offer = offerId ? store.channelProductOffers.find((item) => item.id === offerId) : undefined;
+    if (!offer) throw new Error("channel product offer upsert missing current offer");
+    const product = store.platformProducts.get(offer.platformProductId);
+    if (!product) throw new Error("channel product offer upsert missing current platform product");
+    await this.persistPlatformProduct(tx, product);
+    await this.persistChannelProductOffer(tx, offer);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
@@ -3663,6 +4271,16 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, [autoFulfillmentAudit, audit].filter((item): item is Record<string, unknown> => Boolean(item)));
   }
 
+  private async persistLatestFulfillmentUpdate(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["fulfillment.update"]);
+    const orderNo = audit ? stringValue(audit.targetId) : undefined;
+    const order = orderNo ? store.orders.get(orderNo) : undefined;
+    if (!order) throw new Error("fulfillment update missing current order");
+    await this.persistOrder(tx, order);
+    await this.persistFulfillmentRecordForOrder(tx, store, order);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
   private async persistLatestAfterSaleCreation(tx: PrismaTx, store: MemoryStore) {
     const audit = this.latestAuditLog(store, ["after_sale.create"]);
     const afterSaleNo = audit ? stringValue(audit.targetId) : undefined;
@@ -3697,6 +4315,31 @@ class PrismaStateRepository {
         await this.persistCouponVoidForRefund(tx, coupon, refund);
       }
     }
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestManualRefundConfirmation(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["refund.manual_confirm", "refund.callback"]);
+    const refundNo = audit ? stringValue(audit.targetId) : undefined;
+    const refund = refundNo ? store.refunds.get(refundNo) : undefined;
+    if (!refund) throw new Error("manual refund confirmation missing current refund");
+    const afterSale = store.afterSales.get(refund.afterSaleNo);
+    if (!afterSale) throw new Error("manual refund confirmation missing current after sale");
+    const order = store.orders.get(refund.orderNo);
+    if (!order) throw new Error("manual refund confirmation missing current order");
+    await this.persistOrder(tx, order);
+    await this.persistAfterSale(tx, afterSale);
+    await this.persistRefund(tx, refund);
+    if (order.extractionCodeHash) await this.persistOrderExtractSecret(tx, order);
+    if (order.couponId) {
+      const coupon = store.userCoupons.get(order.couponId);
+      if (coupon) {
+        await this.persistUserCoupon(tx, coupon, store.couponTemplates.get(coupon.templateId));
+        await this.persistCouponVoidForRefund(tx, coupon, refund);
+      }
+    }
+    const ledgers = store.ledgerEntries.filter((item) => item.orderNo === order.orderNo && ["REFUND_SUCCEEDED", "CLAWBACK_CREATE"].includes(item.entryType));
+    await this.persistLedgerEntries(tx, ledgers);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
@@ -3760,31 +4403,13 @@ class PrismaStateRepository {
           deposit_status = EXCLUDED.deposit_status,
           updated_at = now()
       `;
+      await this.persistMerchantAccountForAgent(tx, agent);
     }
 
-    for (const application of store.agentApplications.values()) {
-      await tx.$executeRaw`
-        INSERT INTO agent_applications (
-          id, agent_id, user_id, identity_info_json, contact_info_json,
-          customer_service_wechat, status, reject_reason, reviewed_by,
-          reviewed_at, created_at, updated_at
-        )
-        VALUES (
-          ${application.applicationNo}, ${application.agentId}, ${application.userId},
-          ${jsonForDb({ inviteCodeId: application.inviteCodeId, targetTier: application.targetTier, parentAgentId: application.parentAgentId })}::jsonb,
-          ${jsonForDb({ phone: application.contactPhone, inviteCode: application.inviteCode })}::jsonb,
-          ${application.customerServiceWechat},
-          CAST(${mapReviewStatus(application.status)} AS "ReviewStatus"),
-          NULL, NULL, NULL, now(), now()
-        )
-        ON CONFLICT (id) DO UPDATE SET
-          status = EXCLUDED.status,
-          contact_info_json = EXCLUDED.contact_info_json,
-          customer_service_wechat = EXCLUDED.customer_service_wechat,
-          updated_at = now()
-      `;
-    }
-  }
+	    for (const application of store.agentApplications.values()) {
+      await this.persistAgentApplication(tx, application);
+	    }
+	  }
 
   private async persistShops(tx: PrismaTx, store: MemoryStore) {
     for (const shop of store.shops.values()) {
@@ -3911,6 +4536,24 @@ class PrismaStateRepository {
       ON CONFLICT (id) DO UPDATE SET
         sale_price_cents = EXCLUDED.sale_price_cents,
         fulfillment_cost_cents = EXCLUDED.fulfillment_cost_cents,
+        status = EXCLUDED.status,
+        updated_at = now()
+    `;
+  }
+
+  private async persistChannelProductOffer(tx: PrismaTx, offer: ChannelProductOffer) {
+    await tx.$executeRaw`
+      INSERT INTO channel_product_offers (
+        id, channel_relation_id, platform_product_id, resell_supply_price_cents,
+        status, listed_at, idempotency_key, created_at, updated_at
+      )
+      VALUES (
+        ${offer.id}, ${offer.channelRelationId}, ${offer.platformProductId},
+        ${offer.resellSupplyPriceCents}, CAST(${mapAgentProductStatus(offer.status)} AS "AgentProductStatus"),
+        ${offer.status === "listed" ? new Date() : null}, ${`channel-offer:${offer.id}`}, now(), now()
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        resell_supply_price_cents = EXCLUDED.resell_supply_price_cents,
         status = EXCLUDED.status,
         updated_at = now()
     `;
@@ -4065,16 +4708,70 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistLatestCouponTemplateMutation(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["coupon_template.create", "coupon_template.status"]);
-    const templateId = audit ? stringValue(audit.targetId) : undefined;
-    const template = templateId ? store.couponTemplates.get(templateId) : undefined;
-    if (!template) throw new Error("coupon template mutation missing current template");
-    await this.persistCouponTemplate(tx, template);
-    await this.persistAuditLogs(tx, audit ? [audit] : []);
+	  private async persistLatestCouponTemplateMutation(tx: PrismaTx, store: MemoryStore) {
+	    const audit = this.latestAuditLog(store, ["coupon_template.create", "coupon_template.status"]);
+	    const templateId = audit ? stringValue(audit.targetId) : undefined;
+	    const template = templateId ? store.couponTemplates.get(templateId) : undefined;
+	    if (!template) throw new Error("coupon template mutation missing current template");
+	    await this.persistCouponTemplate(tx, template);
+	    await this.persistAuditLogs(tx, audit ? [audit] : []);
+	  }
+
+  private async persistInviteCode(tx: PrismaTx, invite: InviteCode) {
+    await tx.$executeRaw`
+      INSERT INTO merchant_invite_codes (
+        id, code_hash, issuer_merchant_id, tier, max_uses, used_count,
+        deposit_required_amount_cents, status, expires_at, idempotency_key, created_at, updated_at
+      )
+      VALUES (
+        ${invite.id}, ${invite.codeHash ?? hashSecret(invite.code)}, NULL,
+        CAST(${invite.targetTier} AS "MerchantTier"), ${invite.maxUses ?? 1},
+        ${invite.usedCount}, ${invite.depositRequiredAmountCents ?? null},
+        CAST(${mapInviteStatus(invite.status)} AS "ReviewStatus"),
+        ${invite.expiresAt}, ${`invite:${invite.id}`}, ${invite.createdAt}, now()
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        used_count = EXCLUDED.used_count,
+        deposit_required_amount_cents = EXCLUDED.deposit_required_amount_cents,
+        status = EXCLUDED.status,
+        expires_at = EXCLUDED.expires_at,
+        updated_at = now()
+    `;
   }
 
-  private latestAuditLog(store: MemoryStore, actions: string[]) {
+  private async persistChannelRelation(tx: PrismaTx, relation: ChannelRelation) {
+    await tx.$executeRaw`
+      INSERT INTO channel_relations (
+        id, relation_type, first_tier_agent_id, second_tier_agent_id,
+        third_tier_agent_id, first_tier_merchant_id, second_tier_merchant_id,
+        third_tier_merchant_id, status, reviewed_by, reviewed_at, reason,
+        active_unique_key, idempotency_key, created_at, updated_at
+      )
+      VALUES (
+        ${relation.id}, CAST(${relation.thirdTierAgentId ? "three_tier" : "two_tier"} AS "ChannelRelationType"),
+        ${relation.firstTierAgentId}, ${relation.secondTierAgentId}, ${relation.thirdTierAgentId ?? null},
+        ${relation.firstTierAgentId}, ${relation.secondTierAgentId}, ${relation.thirdTierAgentId ?? null},
+        CAST(${mapChannelStatus(relation.status)} AS "ChannelStatus"), NULL,
+        ${relation.reviewedAt}, ${relation.reason}, ${relation.activeUniqueKey ?? null},
+        ${`channel-relation:${relation.id}`}, now(), now()
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        relation_type = EXCLUDED.relation_type,
+        first_tier_agent_id = EXCLUDED.first_tier_agent_id,
+        second_tier_agent_id = EXCLUDED.second_tier_agent_id,
+        third_tier_agent_id = EXCLUDED.third_tier_agent_id,
+        first_tier_merchant_id = EXCLUDED.first_tier_merchant_id,
+        second_tier_merchant_id = EXCLUDED.second_tier_merchant_id,
+        third_tier_merchant_id = EXCLUDED.third_tier_merchant_id,
+        status = EXCLUDED.status,
+        reviewed_at = EXCLUDED.reviewed_at,
+        reason = EXCLUDED.reason,
+        active_unique_key = EXCLUDED.active_unique_key,
+        updated_at = now()
+    `;
+  }
+
+		  private latestAuditLog(store: MemoryStore, actions: string[]) {
     for (let index = store.auditLogs.length - 1; index >= 0; index -= 1) {
       const audit = store.auditLogs[index];
       if (actions.includes(stringValue(audit.action) ?? "")) return audit;
@@ -4124,88 +4821,42 @@ class PrismaStateRepository {
     }
   }
 
-  private async persistInviteAndChannelState(tx: PrismaTx, store: MemoryStore) {
-    for (const invite of store.inviteCodes.values()) {
-      await tx.$executeRaw`
-        INSERT INTO merchant_invite_codes (
-          id, code_hash, issuer_merchant_id, tier, max_uses, used_count,
-          status, expires_at, idempotency_key, created_at, updated_at
-        )
-        VALUES (
-          ${invite.id}, ${hashSecret(invite.code)}, NULL,
-          CAST(${invite.targetTier} AS "MerchantTier"), ${invite.maxUses ?? 1},
-          ${invite.usedCount}, CAST(${mapInviteStatus(invite.status)} AS "ReviewStatus"),
-          ${invite.expiresAt}, ${`invite:${invite.id}`}, ${invite.createdAt}, now()
-        )
-        ON CONFLICT (id) DO UPDATE SET
-          used_count = EXCLUDED.used_count,
-          status = EXCLUDED.status,
-          expires_at = EXCLUDED.expires_at,
-          updated_at = now()
-      `;
+	  private async persistInviteAndChannelState(tx: PrismaTx, store: MemoryStore) {
+	    for (const invite of store.inviteCodes.values()) {
+      await this.persistInviteCode(tx, invite);
     }
 
     for (const authorization of store.channelAuthorizations) {
-      await tx.$executeRaw`
-        INSERT INTO channel_authorizations (
-          id, first_tier_agent_id, status, reviewed_by, reviewed_at,
-          reason, idempotency_key, created_at, updated_at
-        )
-        VALUES (
-          ${authorization.id}, ${authorization.firstTierAgentId},
-          CAST(${mapChannelStatus(authorization.status)} AS "ChannelStatus"),
-          NULL, ${authorization.reviewedAt}, ${authorization.reason},
-          ${`channel-auth:${authorization.id}`}, now(), now()
-        )
-        ON CONFLICT (id) DO UPDATE SET
-          status = EXCLUDED.status,
-          reviewed_at = EXCLUDED.reviewed_at,
-          reason = EXCLUDED.reason,
-          updated_at = now()
-      `;
+      await this.persistChannelAuthorization(tx, authorization);
     }
 
-    for (const relation of store.channelRelations) {
-      await tx.$executeRaw`
-        INSERT INTO channel_relations (
-          id, relation_type, first_tier_agent_id, second_tier_agent_id,
-          third_tier_agent_id, status, reviewed_by, reviewed_at, reason,
-          active_unique_key, idempotency_key, created_at, updated_at
-        )
-        VALUES (
-          ${relation.id}, CAST(${relation.thirdTierAgentId ? "three_tier" : "two_tier"} AS "ChannelRelationType"),
-          ${relation.firstTierAgentId}, ${relation.secondTierAgentId}, ${relation.thirdTierAgentId ?? null},
-          CAST(${mapChannelStatus(relation.status)} AS "ChannelStatus"), NULL,
-          ${relation.reviewedAt}, ${relation.reason}, ${relation.activeUniqueKey ?? null},
-          ${`channel-relation:${relation.id}`}, now(), now()
-        )
-        ON CONFLICT (id) DO UPDATE SET
-          third_tier_agent_id = EXCLUDED.third_tier_agent_id,
-          status = EXCLUDED.status,
-          reviewed_at = EXCLUDED.reviewed_at,
-          reason = EXCLUDED.reason,
-          active_unique_key = EXCLUDED.active_unique_key,
-          updated_at = now()
-      `;
-    }
+	    for (const relation of store.channelRelations) {
+      await this.persistChannelRelation(tx, relation);
+	    }
 
-    for (const offer of store.channelProductOffers) {
-      await tx.$executeRaw`
-        INSERT INTO channel_product_offers (
-          id, channel_relation_id, platform_product_id, resell_supply_price_cents,
-          status, listed_at, idempotency_key, created_at, updated_at
-        )
-        VALUES (
-          ${offer.id}, ${offer.channelRelationId}, ${offer.platformProductId},
-          ${offer.resellSupplyPriceCents}, CAST(${mapAgentProductStatus(offer.status)} AS "AgentProductStatus"),
-          ${offer.status === "listed" ? new Date() : null}, ${`channel-offer:${offer.id}`}, now(), now()
-        )
-        ON CONFLICT (id) DO UPDATE SET
-          resell_supply_price_cents = EXCLUDED.resell_supply_price_cents,
-          status = EXCLUDED.status,
-          updated_at = now()
-      `;
-    }
+	    for (const offer of store.channelProductOffers) {
+      await this.persistChannelProductOffer(tx, offer);
+	    }
+	  }
+
+  private async persistChannelAuthorization(tx: PrismaTx, authorization: ChannelAuthorization) {
+    await tx.$executeRaw`
+      INSERT INTO channel_authorizations (
+        id, first_tier_agent_id, status, reviewed_by, reviewed_at,
+        reason, idempotency_key, created_at, updated_at
+      )
+      VALUES (
+        ${authorization.id}, ${authorization.firstTierAgentId},
+        CAST(${mapChannelStatus(authorization.status)} AS "ChannelStatus"),
+        NULL, ${authorization.reviewedAt}, ${authorization.reason},
+        ${`channel-auth:${authorization.id}`}, now(), now()
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        status = EXCLUDED.status,
+        reviewed_at = EXCLUDED.reviewed_at,
+        reason = EXCLUDED.reason,
+        updated_at = now()
+    `;
   }
 
   private async persistDeposits(tx: PrismaTx, store: MemoryStore) {
@@ -4560,7 +5211,7 @@ class PrismaStateRepository {
     await tx.$executeRaw`
       INSERT INTO refunds (
         id, refund_no, after_sale_id, order_id, payment_id, amount_cents,
-        status, idempotency_key, created_at, updated_at
+        status, channel_refund_no, idempotency_key, created_at, updated_at
       )
       VALUES (
         ${stableDbId("refund", refund.refundNo)}, ${refund.refundNo},
@@ -4568,10 +5219,11 @@ class PrismaStateRepository {
         (SELECT id FROM orders WHERE order_no = ${refund.orderNo}),
         (SELECT id FROM payments WHERE payment_no = ${`payment:${refund.orderNo}`}),
         ${refund.amountCents}, CAST(${mapRefundStatus(refund.status)} AS "RefundStatus"),
-        ${`refund:${refund.refundNo}`}, now(), now()
+        ${refund.channelRefundNo ?? null}, ${`refund:${refund.refundNo}`}, now(), now()
       )
       ON CONFLICT (refund_no) DO UPDATE SET
         status = EXCLUDED.status,
+        channel_refund_no = COALESCE(EXCLUDED.channel_refund_no, refunds.channel_refund_no),
         amount_cents = EXCLUDED.amount_cents,
         updated_at = now()
     `;
@@ -5472,22 +6124,25 @@ class PrismaStateRepository {
       tier: AgentTier;
       max_uses: number;
       used_count: number;
+      deposit_required_amount_cents: bigint | null;
       status: string;
       expires_at: Date | null;
       created_at: Date;
     }>>`
-      SELECT id, code_hash, tier, max_uses, used_count, status, expires_at, created_at
+      SELECT id, code_hash, tier, max_uses, used_count, deposit_required_amount_cents, status, expires_at, created_at
         FROM merchant_invite_codes
     `;
     for (const row of invites) {
       store.inviteCodes.set(row.id, {
         id: row.id,
-        code: row.code_hash,
+        code: "",
+        codeHash: row.code_hash,
         issuerType: "platform",
         targetTier: row.tier,
         status: row.status === "approved" ? "active" : "disabled",
         maxUses: row.max_uses,
         usedCount: row.used_count,
+        depositRequiredAmountCents: row.deposit_required_amount_cents ?? undefined,
         expiresAt: row.expires_at,
         createdBy: "db",
         createdAt: row.created_at
@@ -6040,10 +6695,12 @@ function createMemoryStore(): MemoryStore {
     status: "active",
     maxUses: null,
     usedCount: 0,
+    depositRequiredAmountCents: store.depositAccounts.get("agent-1")?.requiredAmountCents,
     expiresAt: null,
     createdBy: "seed",
     createdAt: new Date()
   });
+  store.sequence = Date.now();
   return store;
 }
 
@@ -6334,6 +6991,8 @@ type DemoAgent = {
   depositStatus: string;
   createdByAdminId?: string;
   initialPasswordSet?: boolean;
+  merchantUsername?: string;
+  passwordHash?: string;
 };
 
 type DemoShop = {
@@ -6516,6 +7175,10 @@ type DemoRefund = {
   agentClawbackCents: bigint;
   wasSettled: boolean;
   pendingIncomeDeductedCents?: bigint;
+  channelRefundNo?: string;
+  voucherUrl?: string;
+  note?: string;
+  confirmedAt?: Date;
   status: string;
 };
 
@@ -6714,12 +7377,14 @@ type UserCoupon = {
 type InviteCode = {
   id: string;
   code: string;
+  codeHash?: string;
   issuerType: "platform" | "agent";
   issuerAgentId?: string;
   targetTier: AgentTier;
   status: "active" | "used_up" | "expired" | "disabled";
   maxUses: number | null;
   usedCount: number;
+  depositRequiredAmountCents?: bigint;
   expiresAt: Date | null;
   createdBy: string;
   createdAt: Date;

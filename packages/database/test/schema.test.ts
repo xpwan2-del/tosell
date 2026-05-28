@@ -38,6 +38,10 @@ const storefrontDisplayMigrationSql = readFileSync(
   resolve(testDir, "../prisma/migrations/000014_product_storefront_display/migration.sql"),
   "utf8"
 );
+const productionAuthRefundCodeAuditMigrationSql = readFileSync(
+  resolve(testDir, "../prisma/migrations/000016_production_auth_refund_code_audit/migration.sql"),
+  "utf8"
+);
 
 function modelBlock(modelName: string) {
   const match = schema.match(new RegExp(`model\\s+${modelName}\\s+\\{([\\s\\S]*?)\\n\\}`));
@@ -78,6 +82,7 @@ describe("Prisma database contract", () => {
       "User",
       "Agent",
       "AgentApplication",
+      "AuthSession",
       "Shop",
       "ShopCustomerServiceBinding",
       "PlatformProduct",
@@ -94,6 +99,7 @@ describe("Prisma database contract", () => {
       "AfterSale",
       "Refund",
       "RefundCallback",
+      "RefundManualConfirmation",
       "SettlementSheet",
       "SettlementItem",
       "ManualPayout",
@@ -109,6 +115,7 @@ describe("Prisma database contract", () => {
       "Permission",
       "AdminUserRole",
       "RolePermission",
+      "CodePlaintextAccessLog",
       "ShopProductGroup",
       "RightsCode",
       "AgentNotification"
@@ -155,7 +162,10 @@ describe("Prisma database contract", () => {
       "ManualPayout",
       "DepositTransaction",
       "Clawback",
-      "AuditLog"
+      "AuditLog",
+      "AuthSession",
+      "RefundManualConfirmation",
+      "CodePlaintextAccessLog"
     ]) {
       expect(modelBlock(model)).toMatch(/idempotencyKey\s+String\s+@unique\s+@map\("idempotency_key"\)/);
     }
@@ -309,5 +319,35 @@ describe("Prisma database contract", () => {
     expect(storefrontDisplayMigrationSql).toContain('"display_badge" TEXT');
     expect(storefrontDisplayMigrationSql).toContain('"is_recommended" BOOLEAN NOT NULL DEFAULT false');
     expect(storefrontDisplayMigrationSql).toContain("platform_products_recommended_sort_idx");
+  });
+
+  it("adds production auth sessions, manual refund confirmation, and plaintext code access audit", () => {
+    expect(schema).toContain("enum AuthSubjectType");
+    expect(schema).toContain("enum AuthSessionStatus");
+    expect(schema).toContain("enum CodePlaintextAccessType");
+    expect(schema).toMatch(/enum ActorType\s+\{[\s\S]*merchant[\s\S]*\}/);
+
+    const authSession = modelBlock("AuthSession");
+    expect(authSession).toMatch(/tokenHash\s+String\s+@unique\s+@map\("token_hash"\)/);
+    expect(authSession).toMatch(/merchantAccountId\s+String\?\s+@map\("merchant_account_id"\)/);
+    expect(authSession).toMatch(/@@index\(\[merchantAccountId,\s*status\]\)/);
+
+    const refundManualConfirmation = modelBlock("RefundManualConfirmation");
+    expect(refundManualConfirmation).toMatch(/voucherUrl\s+String\?\s+@map\("voucher_url"\)/);
+    expect(refundManualConfirmation).toMatch(/confirmedById\s+String\?\s+@map\("confirmed_by"\)/);
+    expect(refundManualConfirmation).toMatch(/idempotencyKey\s+String\s+@unique\s+@map\("idempotency_key"\)/);
+
+    const codeAccess = modelBlock("CodePlaintextAccessLog");
+    expect(codeAccess).toMatch(/accessType\s+CodePlaintextAccessType\s+@map\("access_type"\)/);
+    expect(codeAccess).toMatch(/permissionCode\s+String\s+@map\("permission_code"\)/);
+    expect(codeAccess).toMatch(/idempotencyKey\s+String\s+@unique\s+@map\("idempotency_key"\)/);
+
+    expect(productionAuthRefundCodeAuditMigrationSql).toContain('CREATE TABLE IF NOT EXISTS "auth_sessions"');
+    expect(productionAuthRefundCodeAuditMigrationSql).toContain("auth_sessions_subject_shape_check");
+    expect(productionAuthRefundCodeAuditMigrationSql).toContain('CREATE TABLE IF NOT EXISTS "refund_manual_confirmations"');
+    expect(productionAuthRefundCodeAuditMigrationSql).toContain("refund_manual_confirmations_link_check");
+    expect(productionAuthRefundCodeAuditMigrationSql).toContain('CREATE TABLE IF NOT EXISTS "code_plaintext_access_logs"');
+    expect(productionAuthRefundCodeAuditMigrationSql).toContain("code_plaintext_access_logs_no_update");
+    expect(productionAuthRefundCodeAuditMigrationSql).toContain("code_plaintext_access_logs_no_delete");
   });
 });

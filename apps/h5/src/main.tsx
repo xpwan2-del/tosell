@@ -10,9 +10,18 @@ type CheckoutState = {
   couponId?: string;
 };
 
+type MerchantRegisterForm = {
+  inviteCode: string;
+  name: string;
+  shopName: string;
+  contactPhone: string;
+  customerServiceWechat: string;
+};
+
 const orderTabs = ["全部", "待支付", "已支付", "售后"] as const;
 type OrderTab = (typeof orderTabs)[number];
-const defaultShopId = import.meta.env.VITE_DEFAULT_SHOP_ID ?? "";
+const defaultShopId = import.meta.env.VITE_DEFAULT_SHOP_ID ?? "shop-1";
+const storeAiLogoSrc = "/brand/ai-store-logo.png";
 
 function currentShopId() {
   const path = window.location.pathname;
@@ -21,10 +30,18 @@ function currentShopId() {
 }
 
 function App() {
+  if (window.location.pathname.startsWith("/user/register")) {
+    return <UserRegisterPage />;
+  }
+  if (window.location.pathname.startsWith("/merchant/register")) {
+    return <MerchantRegisterPage />;
+  }
+
   const [shopId, setShopId] = useState(currentShopId());
   const [shop, setShop] = useState<JsonRecord>({});
   const [products, setProducts] = useState<JsonRecord[]>([]);
   const [collectionChannels, setCollectionChannels] = useState<JsonRecord[]>([]);
+  const [userCoupons, setUserCoupons] = useState<JsonRecord[]>([]);
   const [orders, setOrders] = useState<JsonRecord[]>(() => readCachedOrders(currentShopId()));
   const [selectedProduct, setSelectedProduct] = useState<JsonRecord | undefined>();
   const [detailProduct, setDetailProduct] = useState<JsonRecord | undefined>();
@@ -89,7 +106,13 @@ function App() {
       const mergedOrders = mergeOrders(readCachedOrders(targetShopId), nextOrders.filter((order) => belongsToShop(order, targetShopId)));
       setOrders(mergedOrders);
       writeCachedOrders(targetShopId, mergedOrders);
-      setAuth(api.currentSession());
+      const session = api.currentSession();
+      setAuth(session);
+      if (session) {
+        setUserCoupons(await api.coupons(targetShopId));
+      } else {
+        setUserCoupons([]);
+      }
       setMessage("店铺已准备好");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "店铺加载失败");
@@ -98,19 +121,38 @@ function App() {
     }
   }
 
-  async function registerOrLogin() {
+  async function submitPhoneLogin() {
     try {
+      const phone = loginPhone.trim();
+      if (!phone) {
+        setMessage("请输入手机号后再注册或登录。");
+        return;
+      }
       setLoading(true);
-      const session = loginPhone.trim()
-        ? await api.authRegister(loginPhone.trim(), loginName.trim() || undefined)
-        : await api.authGuest();
+      const session = await api.authRegister(phone, loginName.trim() || undefined);
       api.saveSession(session);
       setAuth(session);
       setShowLogin(false);
-      setMessage(loginPhone.trim() ? "登录成功" : "已以游客身份继续");
+      setMessage(session.grantedCoupon ? "注册成功，平台赠券已发放" : "登录成功");
       await load(shopId);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "登录失败");
+      setMessage(error instanceof Error ? error.message : "注册或登录失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function continueAsGuest() {
+    try {
+      setLoading(true);
+      const session = await api.authGuest();
+      api.saveSession(session);
+      setAuth(session);
+      setShowLogin(false);
+      setMessage("已以游客身份继续");
+      await load(shopId);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "游客登录失败");
     } finally {
       setLoading(false);
     }
@@ -128,6 +170,9 @@ function App() {
   }
 
   useEffect(() => {
+    if (!window.location.pathname.startsWith("/s/") && shopId) {
+      window.history.replaceState(null, "", `/s/${shopId}${window.location.hash}`);
+    }
     void load(shopId);
   }, []);
 
@@ -257,15 +302,14 @@ function App() {
     <main className="page" style={theme}>
       <header className="store-top">
         <button type="button" className="brand-link" onClick={() => void openShop(shopId)}>
-          <span className="brand-logo">T</span>
+          <span className="brand-logo"><img src={storeAiLogoSrc} alt="" /></span>
           <strong>{text(shop.name, "ToSell")}</strong>
         </button>
-        <label className="top-search" aria-label="搜索商品">
-          <input value={searchKeyword} onChange={(event) => setSearchKeyword(event.target.value)} placeholder="搜索当前店铺商品" />
-        </label>
         <nav aria-label="店铺导航">
           <a href="#mall">商城</a>
           <a href="#orders">查询订单</a>
+          <a href="/user/register">用户注册</a>
+          <a href="/merchant/register">商户入驻</a>
           <button type="button" className="nav-button" onClick={() => setShowNotice(true)}>购买须知</button>
         </nav>
         <button type="button" className="ghost" onClick={() => setShowLogin(true)}>{auth ? "账号" : "登录"}</button>
@@ -284,7 +328,7 @@ function App() {
               </div>
             </div>
             <div className="hero-visual" aria-hidden="true">
-              <ImageWithFallback src={text(shop.bannerUrl)} alt="" fallback={<ProductVisual label={text(shop.name, "ToSell")} />} />
+              <ImageWithFallback src={text(shop.bannerUrl)} alt="" fallback={<StoreLogoVisual />} />
             </div>
           </section>
 
@@ -299,11 +343,12 @@ function App() {
           </section>
         </div>
 
-        <aside className="shop-side">
+        <aside className="shop-side desktop-side">
           <section className="account-card">
             <span>个人信息</span>
             <strong>{text(auth?.user.displayName, "欢迎光临")}</strong>
             <p>{auth ? authLabel(auth) : "登录后可在服务端查询订单和售后状态"}</p>
+            <AccountBenefits coupons={userCoupons} orders={filteredOrders} />
             <div className="side-actions">
               <button type="button" onClick={() => setShowLogin(true)}>登录/注册</button>
               {auth ? <button type="button" className="ghost" onClick={() => {
@@ -326,23 +371,17 @@ function App() {
       </section>
 
       <section className="trust-bar" aria-label="服务承诺">
-        <div><strong>虚拟权益</strong><span>账号、卡密、会员服务</span></div>
-        <div><strong>发放清晰</strong><span>自动发码或人工交付</span></div>
-        <div><strong>订单可查</strong><span>支付、履约、售后留痕</span></div>
-        <div><strong>售后保障</strong><span>未履约可申请处理</span></div>
+        <div><i aria-hidden="true">卡</i><strong>虚拟权益</strong><span>账号/卡密/会员</span></div>
+        <div><i aria-hidden="true">发</i><strong>发放清晰</strong><span>自动或人工</span></div>
+        <div><i aria-hidden="true">单</i><strong>订单可查</strong><span>支付履约留痕</span></div>
+        <div><i aria-hidden="true">保</i><strong>售后保障</strong><span>未履约可处理</span></div>
       </section>
 
-      <div className={loading ? "notice loading" : "notice"}>{message}</div>
+      {loading || (message && message !== "正在打开店铺" && message !== "店铺已准备好") ? (
+        <div className={loading ? "notice loading" : "notice"}>{message}</div>
+      ) : null}
 
-      <section className="section-head" id="mall">
-        <div>
-          <span>当前店铺商品</span>
-          <h2>账号、卡密与会员权益</h2>
-        </div>
-        <small>最终金额以下单确认为准</small>
-      </section>
-
-      <section className="catalog-tools" aria-label="商品筛选">
+      <section className="catalog-tools" id="mall" aria-label="商品筛选">
         <label>
           <span>搜索</span>
           <input value={searchKeyword} onChange={(event) => setSearchKeyword(event.target.value)} placeholder="商品名、类目、标签" />
@@ -394,6 +433,32 @@ function App() {
           </article>
         ))}
       </section>
+
+      <aside className="shop-side mobile-side" aria-label="个人信息和客服">
+        <section className="account-card">
+          <span>个人信息</span>
+          <strong>{text(auth?.user.displayName, "欢迎光临")}</strong>
+          <p>{auth ? authLabel(auth) : "登录后可在服务端查询订单和售后状态"}</p>
+          <AccountBenefits coupons={userCoupons} orders={filteredOrders} />
+          <div className="side-actions">
+            <button type="button" onClick={() => setShowLogin(true)}>登录/注册</button>
+            {auth ? <button type="button" className="ghost" onClick={() => {
+              api.logout();
+              setAuth(undefined);
+              setMessage("已退出登录");
+            }}>退出</button> : null}
+          </div>
+        </section>
+
+        <section className="service">
+          <div>
+            <strong>客服微信</strong>
+            <span>{text(shop.customerServiceWechat, "未配置")}</span>
+            <button type="button" className="ghost" onClick={() => void navigator.clipboard?.writeText(text(shop.customerServiceWechat, ""))}>复制微信</button>
+          </div>
+          <ImageWithFallback src={text(shop.customerServiceQrUrl)} alt="客服二维码" fallback={<div className="qr-empty">客服二维码</div>} />
+        </section>
+      </aside>
 
       {checkout ? (
         <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="确认订单">
@@ -499,16 +564,20 @@ function App() {
             </div>
             <label className="field">
               <span>手机号</span>
-              <input value={loginPhone} onChange={(event) => setLoginPhone(event.target.value)} placeholder="用于注册或登录" />
+              <input inputMode="tel" value={loginPhone} onChange={(event) => setLoginPhone(event.target.value)} placeholder="输入手机号注册或登录" />
             </label>
             <label className="field">
               <span>昵称</span>
               <input value={loginName} onChange={(event) => setLoginName(event.target.value)} placeholder="选填" />
             </label>
             <p>H5 当前支持手机号注册登录和游客继续，订单、售后和卡密提取都会绑定到当前账号。</p>
+            <div className="login-benefits">
+              <span>注册后可用</span>
+              <strong>平台赠券、订单找回、售后进度、卡密提取记录</strong>
+            </div>
             <div className="checkout-actions">
-              <button type="button" className="ghost" onClick={() => void registerOrLogin()}>游客继续</button>
-              <button type="button" onClick={() => void registerOrLogin()}>注册/登录</button>
+              <button type="button" className="ghost" onClick={() => void continueAsGuest()}>游客继续</button>
+              <button type="button" disabled={!loginPhone.trim()} onClick={() => void submitPhoneLogin()}>注册/登录</button>
             </div>
           </section>
         </div>
@@ -601,6 +670,197 @@ function App() {
         </div>
       ) : null}
     </main>
+  );
+}
+
+function UserRegisterPage() {
+  const [phone, setPhone] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [message, setMessage] = useState("手机号注册后，订单、优惠券、售后和卡密提取记录会绑定到当前账号。");
+  const [session, setSession] = useState<AuthSession | undefined>(() => api.currentSession());
+  const [loading, setLoading] = useState(false);
+  const backHref = defaultShopId ? `/s/${defaultShopId}` : "/";
+
+  async function submit() {
+    const nextPhone = phone.trim();
+    if (!nextPhone) {
+      setMessage("请输入手机号。");
+      return;
+    }
+    setLoading(true);
+    try {
+      const nextSession = await api.authRegister(nextPhone, displayName.trim() || undefined);
+      api.saveSession(nextSession);
+      setSession(nextSession);
+      setMessage(nextSession.grantedCoupon ? "注册成功，平台赠券已发放。" : "登录成功，账号已绑定。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "注册或登录失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function guest() {
+    setLoading(true);
+    try {
+      const nextSession = await api.authGuest();
+      api.saveSession(nextSession);
+      setSession(nextSession);
+      setMessage("已以游客身份继续，订单也会绑定到游客账号。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "游客登录失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <main className="merchant-page">
+      <header className="merchant-header">
+        <a href="/">ToSell</a>
+        <a href={backHref}>返回商城</a>
+      </header>
+      <section className="user-register-page">
+        <section className="merchant-copy">
+          <span>用户注册</span>
+          <h1>绑定你的订单和虚拟权益</h1>
+          <p>注册后可以在当前浏览器查看订单、平台优惠券、售后处理进度，以及符合规则的卡密提取记录。</p>
+          <div className="merchant-rules">
+            <div><strong>订单可查</strong><span>下单后绑定到服务端账号</span></div>
+            <div><strong>优惠券</strong><span>注册赠券按平台规则发放</span></div>
+            <div><strong>售后留痕</strong><span>售后和提取记录可追踪</span></div>
+          </div>
+        </section>
+        <section className="merchant-form">
+          <div className={loading ? "notice loading" : "notice"}>{message}</div>
+          <label className="field">
+            <span>手机号</span>
+            <input inputMode="tel" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="输入手机号注册或登录" />
+          </label>
+          <label className="field">
+            <span>昵称</span>
+            <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="选填" />
+          </label>
+          {session ? (
+            <div className="merchant-result">
+              <strong>当前账号</strong>
+              <span>{authLabel(session)}</span>
+              <span>用户ID：{text(session.user.userId)}</span>
+            </div>
+          ) : null}
+          <div className="checkout-actions">
+            <button type="button" className="ghost" onClick={() => void guest()}>游客继续</button>
+            <button type="button" disabled={!phone.trim()} onClick={() => void submit()}>注册/登录</button>
+          </div>
+        </section>
+      </section>
+    </main>
+  );
+}
+
+function MerchantRegisterPage() {
+  const params = new URLSearchParams(window.location.search);
+  const [form, setForm] = useState<MerchantRegisterForm>({
+    inviteCode: params.get("inviteCode") ?? "",
+    name: "",
+    shopName: "",
+    contactPhone: "",
+    customerServiceWechat: ""
+  });
+  const [message, setMessage] = useState("请使用平台或上级商户发放的邀请码提交入驻。");
+  const [result, setResult] = useState<JsonRecord | undefined>();
+  const [loading, setLoading] = useState(false);
+
+  async function submit() {
+    setLoading(true);
+    try {
+      const nextResult = await api.registerMerchantByInvite({
+        inviteCode: form.inviteCode.trim(),
+        name: form.name.trim(),
+        shopName: form.shopName.trim(),
+        contactPhone: form.contactPhone.trim(),
+        customerServiceWechat: form.customerServiceWechat.trim()
+      });
+      setResult(nextResult);
+      setMessage("入驻申请已提交，平台审核和保证金确认前不可销售或代理商品。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "入驻提交失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const agent = result?.agent as JsonRecord | undefined;
+  const shop = result?.shop as JsonRecord | undefined;
+  const application = result?.application as JsonRecord | undefined;
+  const credential = result?.credential as JsonRecord | undefined;
+
+  return (
+    <main className="merchant-page">
+      <header className="merchant-header">
+        <a href="/">ToSell</a>
+        <a href={defaultShopId ? `/s/${defaultShopId}` : "/"}>返回商城</a>
+      </header>
+      <section className="merchant-register">
+        <div className="merchant-copy">
+          <span>商户入驻</span>
+          <h1>用邀请码开通自己的虚拟权益小店</h1>
+          <p>平台邀请码注册为一级商户；一级邀请码注册为二级商户；二级邀请码注册为三级商户。邀请码只绑定供货关系，收益来自商品价差。</p>
+          <div className="merchant-rules">
+            <div><strong>审核后开店</strong><span>平台审核资料和店铺信息</span></div>
+            <div><strong>保证金门槛</strong><span>未确认保证金不能选品、上架和销售</span></div>
+            <div><strong>独立店铺</strong><span>前台只展示自己的商品、客服和收款通道</span></div>
+          </div>
+        </div>
+        <section className="merchant-form">
+          <div className={loading ? "notice loading" : "notice"}>{message}</div>
+          <label className="field">
+            <span>邀请码</span>
+            <input value={form.inviteCode} onChange={(event) => setForm({ ...form, inviteCode: event.target.value })} placeholder="平台或上级商户发放的邀请码" />
+          </label>
+          <label className="field">
+            <span>商户名称</span>
+            <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="营业主体或联系人名称" />
+          </label>
+          <label className="field">
+            <span>店铺名称</span>
+            <input value={form.shopName} onChange={(event) => setForm({ ...form, shopName: event.target.value })} placeholder="请输入对外展示的店铺名称" />
+          </label>
+          <label className="field">
+            <span>联系电话</span>
+            <input inputMode="tel" value={form.contactPhone} onChange={(event) => setForm({ ...form, contactPhone: event.target.value })} placeholder="用于平台审核联系" />
+          </label>
+          <label className="field">
+            <span>客服微信</span>
+            <input value={form.customerServiceWechat} onChange={(event) => setForm({ ...form, customerServiceWechat: event.target.value })} placeholder="店铺售后客服微信" />
+          </label>
+          <button type="button" disabled={loading || !form.inviteCode.trim() || !form.name.trim()} onClick={() => void submit()}>
+            提交入驻申请
+          </button>
+          {result ? (
+            <div className="merchant-result">
+              <strong>提交成功</strong>
+              <span>申请编号：{text(application?.applicationNo)}</span>
+              <span>商户ID：{text(agent?.id)}</span>
+              <span>店铺ID：{text(shop?.id)}</span>
+              {credential ? <span>后台账号：{text(credential.account)} / 初始密码：{text(credential.initialPassword)}</span> : null}
+              <span>当前状态：{text(agent?.status)} / 保证金 {text(agent?.depositStatus)}</span>
+              <p>请等待平台后台审核，并在保证金确认后再配置商品、客服二维码和收款通道。</p>
+            </div>
+          ) : null}
+        </section>
+      </section>
+    </main>
+  );
+}
+
+function AccountBenefits(props: { coupons: JsonRecord[]; orders: JsonRecord[] }) {
+  const availableCoupons = props.coupons.filter((coupon) => text(coupon.status) === "available");
+  return (
+    <div className="account-benefits">
+      <div><strong>{availableCoupons.length}</strong><span>可用优惠券</span></div>
+      <div><strong>{props.orders.length}</strong><span>当前店铺订单</span></div>
+    </div>
   );
 }
 
@@ -701,6 +961,10 @@ function ProductVisual(props: { label: string }) {
       </div>
     </div>
   );
+}
+
+function StoreLogoVisual() {
+  return <img className="store-logo-visual" src={storeAiLogoSrc} alt="" />;
 }
 
 function NoticeItem(props: { index: string; title: string; text: string }) {

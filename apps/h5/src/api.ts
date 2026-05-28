@@ -5,6 +5,7 @@ export type AuthSession = {
   token: string;
   user: JsonRecord;
   expiresAt: number;
+  grantedCoupon?: JsonRecord;
 };
 
 async function request<T>(path: string, options: { method?: "GET" | "POST"; body?: unknown } = {}): Promise<T> {
@@ -39,6 +40,22 @@ export const api = {
   authRegister: (phone: string, displayName?: string) => request<AuthSession>("/api/auth/h5/register", {
     method: "POST",
     body: { phone, displayName }
+  }),
+  registerMerchantByInvite: (input: {
+    inviteCode: string;
+    name: string;
+    shopName?: string;
+    contactPhone?: string;
+    customerServiceWechat?: string;
+  }) => request<JsonRecord>("/api/agent/register-by-invite", {
+    method: "POST",
+    body: {
+      inviteCode: input.inviteCode,
+      name: input.name,
+      shopName: input.shopName || undefined,
+      contactPhone: input.contactPhone || undefined,
+      customerServiceWechat: input.customerServiceWechat || undefined
+    }
   }),
   currentSession,
   saveSession,

@@ -11,7 +11,8 @@ body {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -117,6 +118,27 @@ textarea {
   gap: 12px;
 }
 
+.segmented {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid #d6e1e5;
+  border-radius: 8px;
+  background: #f6f9fa;
+}
+
+.segmented button {
+  border-color: transparent;
+  background: transparent;
+  color: #42525a;
+}
+
+.segmented button.active {
+  background: #106270;
+  color: #fff;
+}
+
 .auth-error {
   margin: 0;
   padding: 10px 12px;
@@ -124,6 +146,17 @@ textarea {
   background: #fff0ec;
   border: 1px solid #ffc7b8;
   border-radius: 6px;
+}
+
+.hint-box {
+  display: grid;
+  gap: 4px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid #d6e1e5;
+  border-radius: 8px;
+  background: #f7fafb;
+  color: #42525a;
 }
 
 .shell {
@@ -371,6 +404,35 @@ textarea {
 .panel-head span {
   font-size: 13px;
   font-weight: 800;
+}
+
+.share-box {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 12px;
+  background: #f7fafb;
+  border: 1px solid #d6e3e7;
+  border-radius: 8px;
+}
+
+.share-box > span {
+  color: #106270;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.share-box > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.share-box input {
+  font-weight: 700;
+  color: #172026;
+  background: #fff;
 }
 
 .kv {
