@@ -1222,7 +1222,82 @@ code {
   .detail-image,
   .detail-image img,
   .detail-image .product-visual {
-    min-height: 320px;
+    min-height: 0;
+    height: clamp(180px, 44vw, 260px);
+    border-radius: 8px;
+  }
+
+  .detail-backdrop {
+    padding: 0;
+    background: #eaeded;
+  }
+
+  .product-detail-page {
+    width: 100%;
+    max-width: none;
+    min-height: 100vh;
+    min-height: 100dvh;
+    gap: 12px;
+    padding: 0 12px 14px;
+  }
+
+  .detail-toolbar {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin: 0 -12px;
+    padding: 10px 12px;
+    background: #fff;
+    border-bottom: 1px solid #dce7eb;
+  }
+
+  .detail-toolbar button {
+    width: 100%;
+    min-height: 40px;
+    padding: 8px 10px;
+  }
+
+  .detail-hero {
+    gap: 12px;
+    padding: 12px;
+    border-radius: 8px;
+  }
+
+  .detail-summary {
+    gap: 11px;
+  }
+
+  .detail-summary h1 {
+    font-size: 24px;
+    line-height: 1.22;
+  }
+
+  .detail-summary p {
+    font-size: 14px;
+    line-height: 1.58;
+  }
+
+  .detail-summary > strong {
+    font-size: 28px;
+  }
+
+  .detail-stats {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .detail-stats div {
+    gap: 3px;
+    padding: 10px 7px;
+    text-align: center;
+  }
+
+  .detail-content article,
+  .detail-service {
+    padding: 13px;
+    border-radius: 8px;
   }
 }
 
@@ -1546,36 +1621,144 @@ code {
   }
 
   .detail-backdrop {
-    padding: 10px;
+    padding: 0;
+    background: #eaeded;
   }
 
   .product-detail-page {
-    gap: 12px;
+    width: 100%;
+    min-height: 100vh;
+    min-height: 100dvh;
+    gap: 10px;
+    padding: 0 10px 12px;
   }
 
   .detail-toolbar {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
     gap: 8px;
-    padding: 8px 0;
+    margin: 0 -10px;
+    padding: 10px;
+    background: #fff;
+    border-bottom: 1px solid #dce7eb;
   }
 
-  .detail-hero,
+  .detail-toolbar button {
+    width: 100%;
+    min-height: 40px;
+    padding: 8px 10px;
+    font-size: 14px;
+  }
+
+  .detail-hero {
+    gap: 12px;
+    padding: 10px;
+    border-radius: 7px;
+  }
+
   .detail-content article,
   .detail-service {
-    padding: 14px;
+    padding: 12px;
+    border-radius: 7px;
   }
 
   .detail-image,
   .detail-image img,
   .detail-image .product-visual {
-    min-height: 240px;
+    min-height: 0;
+    height: clamp(168px, 52vw, 220px);
+    border-radius: 7px;
+  }
+
+  .detail-summary {
+    gap: 10px;
+  }
+
+  .detail-summary .product-tags {
+    max-height: 54px;
+    overflow: hidden;
   }
 
   .detail-summary h1 {
-    font-size: 25px;
+    font-size: 22px;
+    line-height: 1.22;
+  }
+
+  .detail-summary p {
+    font-size: 13px;
+    line-height: 1.55;
   }
 
   .detail-summary > strong {
-    font-size: 28px;
+    font-size: 26px;
+  }
+
+  .detail-stats {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-radius: 7px;
+  }
+
+  .detail-stats div {
+    gap: 3px;
+    padding: 9px 7px;
+    text-align: center;
+  }
+
+  .detail-stats span {
+    font-size: 11px;
+  }
+
+  .detail-stats b {
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+
+  .detail-specs {
+    gap: 6px;
+  }
+
+  .detail-specs span {
+    padding: 5px 7px;
+    font-size: 12px;
+  }
+
+  .detail-content {
+    gap: 10px;
+  }
+
+  .detail-content article {
+    gap: 7px;
+  }
+
+  .detail-content span,
+  .detail-service span {
+    font-size: 12px;
+  }
+
+  .detail-content ul {
+    gap: 5px;
+    padding-left: 16px;
+    font-size: 13px;
+    line-height: 1.58;
+  }
+
+  .detail-service {
+    gap: 10px;
+  }
+
+  .detail-service p {
+    font-size: 13px;
+    line-height: 1.55;
+  }
+
+  .detail-service img,
+  .detail-service .qr-empty {
+    width: 92px;
+    height: 92px;
+    justify-self: start;
   }
 
   .merchant-page {
@@ -1674,6 +1857,28 @@ code {
   .detail-image,
   .detail-image img,
   .detail-image .product-visual {
-    min-height: 210px;
+    height: 158px;
+    min-height: 0;
+  }
+
+  .product-detail-page {
+    padding: 0 8px 10px;
+  }
+
+  .detail-toolbar {
+    margin: 0 -8px;
+    padding: 8px;
+  }
+
+  .detail-hero {
+    padding: 8px;
+  }
+
+  .detail-summary h1 {
+    font-size: 20px;
+  }
+
+  .detail-summary > strong {
+    font-size: 24px;
   }
 }
