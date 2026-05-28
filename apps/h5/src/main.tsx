@@ -725,7 +725,7 @@ function ProductCard(props: { item: JsonRecord; active: boolean; onDetail: () =>
     <article className={props.active ? "product active" : "product"}>
       <div className="product-media">
         <ImageWithFallback src={productImage(props.item)} alt={productName(props.item)} fallback={<ProductVisual label={productName(props.item)} />} />
-        <span>{fulfillmentLabel(props.item)}</span>
+        <span>{productDisplayBadge(props.item)}</span>
       </div>
       <div className="product-tags">
         <span>{category}</span>
@@ -877,6 +877,10 @@ function productIntro(item?: JsonRecord): string {
 function fulfillmentLabel(item?: JsonRecord): string {
   const mode = text((productRecord(item).fulfillmentRule as JsonRecord | undefined)?.mode, "manual");
   return mode === "code_pool" ? "自动发码" : "人工发放";
+}
+
+function productDisplayBadge(item?: JsonRecord): string {
+  return text(productRecord(item).displayBadge, fulfillmentLabel(item));
 }
 
 function isAutomaticProduct(item?: JsonRecord): boolean {

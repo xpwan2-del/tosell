@@ -34,6 +34,10 @@ const productMediaInventoryMigrationSql = readFileSync(
   resolve(testDir, "../prisma/migrations/000013_product_media_inventory/migration.sql"),
   "utf8"
 );
+const storefrontDisplayMigrationSql = readFileSync(
+  resolve(testDir, "../prisma/migrations/000014_product_storefront_display/migration.sql"),
+  "utf8"
+);
 
 function modelBlock(modelName: string) {
   const match = schema.match(new RegExp(`model\\s+${modelName}\\s+\\{([\\s\\S]*?)\\n\\}`));
@@ -294,5 +298,16 @@ describe("Prisma database contract", () => {
     expect(productMediaInventoryMigrationSql).toContain('"image_url" TEXT');
     expect(productMediaInventoryMigrationSql).toContain('"detail_sections_json" JSONB');
     expect(productMediaInventoryMigrationSql).toContain("platform_products_stock_count_check");
+  });
+
+  it("persists storefront product badge and recommendation order", () => {
+    const product = modelBlock("PlatformProduct");
+
+    expect(product).toMatch(/displayBadge\s+String\?\s+@map\("display_badge"\)/);
+    expect(product).toMatch(/isRecommended\s+Boolean\s+@default\(false\)\s+@map\("is_recommended"\)/);
+    expect(product).toMatch(/displaySort\s+Int\s+@default\(0\)\s+@map\("display_sort"\)/);
+    expect(storefrontDisplayMigrationSql).toContain('"display_badge" TEXT');
+    expect(storefrontDisplayMigrationSql).toContain('"is_recommended" BOOLEAN NOT NULL DEFAULT false');
+    expect(storefrontDisplayMigrationSql).toContain("platform_products_recommended_sort_idx");
   });
 });

@@ -2458,6 +2458,11 @@ class BackendServices {
         detailSections: product.detailSections,
         stockCount: product.stockCount,
         soldCount: product.soldCount,
+        ...(agentProduct.platformProductId ? {
+          displayBadge: (product as DemoPlatformProduct).displayBadge,
+          isRecommended: (product as DemoPlatformProduct).isRecommended,
+          displaySort: (product as DemoPlatformProduct).displaySort
+        } : {}),
         fulfillmentRule: product.fulfillmentRule,
         afterSaleRule: product.afterSaleRule,
         status: (product as { status?: string; reviewStatus?: string }).status
@@ -2488,6 +2493,9 @@ class BackendServices {
         detailSections: product.detailSections,
         stockCount: product.stockCount,
         soldCount: product.soldCount,
+        displayBadge: product.displayBadge,
+        isRecommended: product.isRecommended,
+        displaySort: product.displaySort,
         fulfillmentRule: product.fulfillmentRule,
         afterSaleRule: product.afterSaleRule,
         status: product.status
@@ -3913,6 +3921,7 @@ class PrismaStateRepository {
       INSERT INTO platform_products (
         id, product_no, name, category_name, tags_json, detail, rights_desc,
         image_url, specs_json, detail_sections_json, stock_count, sold_count,
+        display_badge, is_recommended, display_sort,
         supply_price_cents, min_sale_price_cents, suggested_sale_price_cents,
         fulfillment_type, fulfillment_rule_json, after_sale_rule_json,
         extract_code_required, status, created_at, updated_at
@@ -3922,7 +3931,9 @@ class PrismaStateRepository {
         ${jsonForDb(product.tags ?? [])}::jsonb, ${product.description ?? product.subtitle ?? product.name},
         ${product.subtitle ?? product.name}, ${product.imageUrl ?? null},
         ${jsonForDb(product.specs ?? [])}::jsonb, ${jsonForDb(product.detailSections ?? [])}::jsonb,
-        ${product.stockCount ?? 0}, ${product.soldCount ?? 0}, ${product.supplyPriceCents}, ${product.minSalePriceCents},
+        ${product.stockCount ?? 0}, ${product.soldCount ?? 0}, ${product.displayBadge ?? null},
+        ${product.isRecommended ?? false}, ${product.displaySort ?? 0},
+        ${product.supplyPriceCents}, ${product.minSalePriceCents},
         ${product.suggestedSalePriceCents}, CAST(${fulfillmentModeFromRule(product.fulfillmentRule)} AS "FulfillmentType"),
         ${jsonForDb(product.fulfillmentRule)}::jsonb, ${jsonForDb(product.afterSaleRule)}::jsonb,
         ${isRecord(product.fulfillmentRule) && product.fulfillmentRule.extractCodeRequired === true},
@@ -3939,6 +3950,9 @@ class PrismaStateRepository {
         detail_sections_json = EXCLUDED.detail_sections_json,
         stock_count = EXCLUDED.stock_count,
         sold_count = EXCLUDED.sold_count,
+        display_badge = EXCLUDED.display_badge,
+        is_recommended = EXCLUDED.is_recommended,
+        display_sort = EXCLUDED.display_sort,
         supply_price_cents = EXCLUDED.supply_price_cents,
         min_sale_price_cents = EXCLUDED.min_sale_price_cents,
         suggested_sale_price_cents = EXCLUDED.suggested_sale_price_cents,
@@ -5144,6 +5158,9 @@ class PrismaStateRepository {
       detail_sections_json: unknown;
       stock_count: number;
       sold_count: number;
+      display_badge: string | null;
+      is_recommended: boolean;
+      display_sort: number;
       detail: string;
       rights_desc: string;
       supply_price_cents: bigint;
@@ -5154,7 +5171,8 @@ class PrismaStateRepository {
       status: string;
     }>>`
       SELECT id, name, category_name, tags_json, image_url, specs_json, detail_sections_json,
-             stock_count, sold_count, detail, rights_desc, supply_price_cents,
+             stock_count, sold_count, display_badge, is_recommended, display_sort,
+             detail, rights_desc, supply_price_cents,
              min_sale_price_cents, suggested_sale_price_cents, fulfillment_rule_json,
              after_sale_rule_json, status
         FROM platform_products
@@ -5170,6 +5188,9 @@ class PrismaStateRepository {
         detailSections: Array.isArray(row.detail_sections_json) ? row.detail_sections_json as ProductDetailSection[] : undefined,
         stockCount: row.stock_count,
         soldCount: row.sold_count,
+        displayBadge: row.display_badge ?? undefined,
+        isRecommended: row.is_recommended,
+        displaySort: row.display_sort,
         description: row.detail,
         subtitle: row.rights_desc,
         supplyPriceCents: row.supply_price_cents,
@@ -6348,6 +6369,9 @@ type DemoPlatformProduct = {
   detailSections?: ProductDetailSection[];
   stockCount?: number;
   soldCount?: number;
+  displayBadge?: string;
+  isRecommended?: boolean;
+  displaySort?: number;
   supplyPriceCents: bigint;
   minSalePriceCents: bigint;
   suggestedSalePriceCents: bigint;

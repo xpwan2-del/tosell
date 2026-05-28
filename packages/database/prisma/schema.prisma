@@ -805,6 +805,9 @@ model PlatformProduct {
   detailSectionsJson      Json?           @map("detail_sections_json")
   stockCount              Int             @default(0) @map("stock_count")
   soldCount               Int             @default(0) @map("sold_count")
+  displayBadge            String?         @map("display_badge")
+  isRecommended           Boolean         @default(false) @map("is_recommended")
+  displaySort             Int             @default(0) @map("display_sort")
   detail                  String
   rightsDesc              String          @map("rights_desc")
   supplyPriceCents        BigInt          @map("supply_price_cents")
