@@ -10,6 +10,8 @@
     "db:generate": "DATABASE_URL=postgresql://tosell:tosell@localhost:5432/tosell prisma generate --schema packages/database/prisma/schema.prisma",
     "db:seed": "tsx packages/database/prisma/seed.ts",
     "db:e2e-setup": "tsx packages/database/prisma/e2e-setup.ts",
+    "db:e2e-business-fixture": "tsx apps/api/src/staging-business-fixtures.ts",
+    "db:business-fixtures": "tsx apps/api/src/staging-business-fixtures.ts",
     "api:smoke:production": "tsx apps/api/src/production-p0-smoke.ts",
     "api:dev": "tsx apps/api/src/server.ts",
     "admin:dev": "vite --host 0.0.0.0 --port 5173 apps/admin",

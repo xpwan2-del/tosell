@@ -180,7 +180,7 @@ function createPersistenceDisabledServices(message: string) {
 }
 
 function isMutatingServiceMethod(name: string) {
-  return /^(add|approve|batchSelect|confirm|create|deduct|fulfill|generate|grant|mark|paymentCallback|refundCallback|register|release|reveal|review|select|set|submit|update|upsert)/.test(name);
+  return /^(add|approve|batchSelect|confirm|create|deduct|export|fulfill|generate|grant|mark|paymentCallback|refundCallback|register|release|reveal|review|select|set|submit|update|upsert)/.test(name);
 }
 
 type BackendServicesOptions = {
@@ -452,6 +452,9 @@ class BackendServices {
       announcement: shop.announcement,
       customerServiceWechat: shop.customerServiceWechat,
       customerServiceQrUrl: shop.customerServiceQrUrl,
+      customerServiceQq: shop.customerServiceQq,
+      customerServiceQqQrUrl: shop.customerServiceQqQrUrl,
+      customerServiceNote: shop.customerServiceNote,
       themeColor: shop.themeColor,
       bannerUrl: shop.bannerUrl,
       shareTitle: shop.shareTitle,
@@ -668,6 +671,12 @@ class BackendServices {
     };
   }
 
+  extractOrderCodesByToken(actor: UserActor, token: string, extractionCode: string) {
+    const order = [...this.store.orders.values()].find((candidate) => this.extractionTokenForOrder(candidate) === token);
+    if (!order) throw new ApiError(404, "EXTRACTION_TOKEN_NOT_FOUND", "extraction link is invalid or expired");
+    return this.extractOrderCodes(actor, order.orderNo, extractionCode);
+  }
+
   listUserOrders(actor: UserActor) {
     return [...this.store.orders.values()]
       .filter((order) => order.userId === actor.userId)
@@ -738,7 +747,15 @@ class BackendServices {
     return shop;
   }
 
-  updateAgentShop(actor: AgentActor, input: { name?: string; announcement?: string; customerServiceWechat?: string; customerServiceQrUrl?: string }) {
+  updateAgentShop(actor: AgentActor, input: {
+    name?: string;
+    announcement?: string;
+    customerServiceWechat?: string;
+    customerServiceQrUrl?: string;
+    customerServiceQq?: string;
+    customerServiceQqQrUrl?: string;
+    customerServiceNote?: string;
+  }) {
     const shop = this.getAgentShop(actor);
     Object.assign(shop, input);
     this.audit("agent", "shop.update", "shop", shop.id, input);
@@ -955,6 +972,7 @@ class BackendServices {
     } catch (error) {
       throw new ApiError(400, "PRICE_RULE_FAILED", getErrorMessage(error));
     }
+    const now = new Date();
     const review: DemoOwnProduct = {
       id: nextId(this.store, "own"),
       agentId: actor.agentId,
@@ -965,7 +983,9 @@ class BackendServices {
       fulfillmentRule: input.fulfillmentRule ?? { mode: "manual" },
       afterSaleRule: input.afterSaleRule ?? { platformReviewRequired: true },
       reviewStatus: "pending_review",
-      status: "pending_review"
+      status: "pending_review",
+      createdAt: now,
+      updatedAt: now
     };
     this.store.ownProducts.set(review.id, review);
     this.audit("agent", "own_product.submit", "own_product", review.id, review);
@@ -1267,11 +1287,69 @@ class BackendServices {
     return product;
   }
 
+  listAdminOwnProductReviews(actor: AdminActor, filters: {
+    reviewStatus?: string;
+    status?: string;
+    agentId?: string;
+    shopId?: string;
+    page?: number;
+    pageSize?: number;
+    limit?: number;
+    offset?: number;
+  } = {}) {
+    assertAdminPermission(actor, "product.manage");
+    const rows = [...this.store.ownProducts.values()]
+      .filter((product) => !filters.reviewStatus || product.reviewStatus === filters.reviewStatus)
+      .filter((product) => !filters.status || product.status === filters.status || product.reviewStatus === filters.status)
+      .filter((product) => !filters.agentId || product.agentId === filters.agentId)
+      .filter((product) => !filters.shopId || product.shopId === filters.shopId)
+      .sort((left, right) => {
+        if (left.reviewStatus === right.reviewStatus) return left.id.localeCompare(right.id);
+        if (left.reviewStatus === "pending_review") return -1;
+        if (right.reviewStatus === "pending_review") return 1;
+        return left.reviewStatus.localeCompare(right.reviewStatus);
+      })
+      .map((product) => {
+        const agent = this.store.agents.get(product.agentId);
+        const shop = this.store.shops.get(product.shopId);
+        return {
+          id: product.id,
+          ownProductId: product.id,
+          agentId: product.agentId,
+          shopId: product.shopId,
+          name: product.name,
+          salePriceCents: product.salePriceCents,
+          minSalePriceCents: product.minSalePriceCents,
+          fulfillmentRule: product.fulfillmentRule,
+          fulfillmentMode: isRecord(product.fulfillmentRule) ? product.fulfillmentRule.mode : undefined,
+          afterSaleRule: product.afterSaleRule,
+          reviewStatus: product.reviewStatus,
+          status: product.status,
+          createdAt: product.createdAt,
+          updatedAt: product.updatedAt,
+          agent: agent ? { id: agent.id, name: agent.name, tier: agent.tier, status: agent.status } : undefined,
+          shop: shop ? { id: shop.id, name: shop.name, status: shop.status } : undefined
+        };
+      });
+    if (!filters.page && !filters.pageSize && !filters.limit && filters.offset === undefined) return rows;
+    const pageSize = filters.pageSize ?? filters.limit ?? 20;
+    const offset = filters.offset ?? ((filters.page ?? 1) - 1) * pageSize;
+    const page = filters.page ?? Math.floor(offset / pageSize) + 1;
+    return {
+      items: rows.slice(offset, offset + pageSize),
+      total: rows.length,
+      page,
+      pageSize,
+      offset
+    };
+  }
+
   reviewOwnProduct(actor: AdminActor, ownProductId: string, input: { approved: boolean; reason?: string }) {
     assertAdminPermission(actor, "product.manage");
     const ownProduct = requireEntity(this.store.ownProducts.get(ownProductId), "RESOURCE_NOT_FOUND", "own product not found");
     ownProduct.reviewStatus = input.approved ? "approved" : "rejected";
     ownProduct.status = ownProduct.reviewStatus;
+    ownProduct.updatedAt = new Date();
     let agentProduct: DemoAgentProduct | undefined;
     if (input.approved) {
       agentProduct = {
@@ -1291,9 +1369,22 @@ class BackendServices {
     return { ownProduct, agentProduct };
   }
 
-  listAdminOrders(actor: AdminActor) {
+  listAdminOrders(actor: AdminActor, filters: { page?: number; pageSize?: number; status?: string; shopId?: string; orderNo?: string } = {}) {
     assertAdminPermission(actor, "audit.read");
-    return [...this.store.orders.values()];
+    const rows = [...this.store.orders.values()]
+      .filter((order) => !filters.status || order.status === filters.status || order.paymentStatus === filters.status || order.fulfillmentStatus === filters.status || order.refundStatus === filters.status)
+      .filter((order) => !filters.shopId || order.shopId === filters.shopId)
+      .filter((order) => !filters.orderNo || order.orderNo.includes(filters.orderNo));
+    if (!filters.page && !filters.pageSize) return rows;
+    const page = filters.page ?? 1;
+    const pageSize = filters.pageSize ?? 20;
+    const start = (page - 1) * pageSize;
+    return {
+      items: rows.slice(start, start + pageSize),
+      total: rows.length,
+      page,
+      pageSize
+    };
   }
 
   listAdminAfterSales(actor: AdminActor) {
@@ -1368,7 +1459,10 @@ class BackendServices {
     if (thirdTier) this.assertAgentDepositConfirmed(thirdTier.id, "create channel relation");
     const activeUniqueKey = thirdTier ? `third-tier:${thirdTier.id}` : `second-tier:${secondTier.id}`;
     const existing = this.store.channelRelations.find((item) => item.activeUniqueKey === activeUniqueKey && item.status === "active");
-    if (existing) return existing;
+    if (existing) {
+      this.audit(actor.role, "channel.relation.create", "channel_relation", existing.id, existing);
+      return existing;
+    }
     const relation = {
       id: nextId(this.store, "channel-rel"),
       firstTierAgentId: firstTier.id,
@@ -1434,6 +1528,11 @@ class BackendServices {
     return codes;
   }
 
+  listEmailDeliveries(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return this.store.emailDeliveries;
+  }
+
   private filterRightsCodes(filters: { productId?: string; orderNo?: string; status?: RightsCode["status"]; shopId?: string } = {}) {
     return this.store.rightsCodes.filter((code) => {
       if (filters.productId && code.productId !== filters.productId) return false;
@@ -1468,6 +1567,7 @@ class BackendServices {
       const item: RightsCode = {
         codeId: nextId(this.store, "code"),
         productId: product.id,
+        platformProductId: product.id,
         code,
         batchNo: input.batchNo ?? "manual",
         status: "available",
@@ -1477,8 +1577,61 @@ class BackendServices {
       created.push(item);
     }
     product.fulfillmentRule = { ...(isRecord(product.fulfillmentRule) ? product.fulfillmentRule : {}), mode: "code_pool" };
-    this.audit(actor.role, "rights_code.import", "platform_product", product.id, { count: created.length });
+    this.audit(actor.role, "rights_code.import", "platform_product", product.id, {
+      count: created.length,
+      batchNo: input.batchNo ?? "manual",
+      codeIds: created.map((code) => code.codeId)
+    });
     return { count: created.length, product, codes: created.map((code) => this.redactRightsCode(code)) };
+  }
+
+  listAgentRightsCodes(actor: AgentActor, filters: { agentProductId?: string; status?: RightsCode["status"] } = {}) {
+    const products = [...this.store.agentProducts.values()]
+      .filter((product) => product.agentId === actor.agentId && product.shopId === actor.shopId && product.productType === "agent_owned");
+    const allowedIds = new Set(products.map((product) => product.id));
+    return this.store.rightsCodes
+      .filter((code) => allowedIds.has(code.agentProductId ?? code.productId))
+      .filter((code) => !filters.agentProductId || code.productId === filters.agentProductId || code.agentProductId === filters.agentProductId)
+      .filter((code) => !filters.status || code.status === filters.status)
+      .map((code) => this.redactRightsCode(code));
+  }
+
+  addAgentRightsCodes(actor: AgentActor, input: { agentProductId: string; codes: string[]; batchNo?: string }) {
+    this.assertAgentDepositConfirmed(actor.agentId, "import own rights codes");
+    const agentProduct = requireEntity(this.store.agentProducts.get(input.agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
+    assertAgentScope(actor, agentProduct);
+    if (agentProduct.productType !== "agent_owned") {
+      throw new ApiError(400, "RIGHTS_CODE_PRODUCT_SCOPE_INVALID", "merchant can only import card codes for own reviewed products");
+    }
+    const ownProduct = requireEntity(this.store.ownProducts.get(required(agentProduct.ownProductReviewId, "ownProductReviewId")), "RESOURCE_NOT_FOUND", "own product not found");
+    const rule = ownProduct.fulfillmentRule;
+    if (!isRecord(rule) || rule.mode !== "code_pool") {
+      throw new ApiError(400, "RIGHTS_CODE_PRODUCT_MODE_INVALID", "own product must use automatic card-code fulfillment");
+    }
+    ownProduct.fulfillmentRule = { ...rule, mode: "code_pool", extractCodeRequired: true };
+    const uniqueCodes = [...new Set(input.codes.map((code) => code.trim()).filter(Boolean))];
+    if (uniqueCodes.length === 0) throw new ApiError(400, "RIGHTS_CODE_EMPTY", "codes are required");
+    const created: RightsCode[] = [];
+    for (const code of uniqueCodes) {
+      if (this.store.rightsCodes.some((item) => (item.agentProductId ?? item.productId) === agentProduct.id && item.code === code)) continue;
+      const item: RightsCode = {
+        codeId: nextId(this.store, "code"),
+        productId: agentProduct.id,
+        agentProductId: agentProduct.id,
+        code,
+        batchNo: input.batchNo ?? "merchant",
+        status: "available",
+        createdAt: new Date()
+      };
+      this.store.rightsCodes.push(item);
+      created.push(item);
+    }
+    this.audit("agent", "rights_code.agent_import", "agent_product", agentProduct.id, {
+      count: created.length,
+      batchNo: input.batchNo ?? "merchant",
+      codeIds: created.map((code) => code.codeId)
+    });
+    return { count: created.length, agentProduct, codes: created.map((code) => this.redactRightsCode(code)) };
   }
 
   fulfillOrder(actor: AdminActor, orderNo: string, input: { status: "success" | "failed"; attemptNo: number; evidence?: string; failReason?: string }) {
@@ -1983,6 +2136,17 @@ class BackendServices {
     };
   }
 
+  exportReconciliationSummary(actor: AdminActor) {
+    const summary = this.reconciliationSummary(actor);
+    this.audit(actor.role, "export.reconciliation_summary", "export", "reconciliation-summary", {
+      totalPaidCents: summary.totalPaidCents,
+      totalRefundedCents: summary.totalRefundedCents,
+      settlementCount: summary.settlementCount,
+      payoutCount: summary.payoutCount
+    });
+    return summary;
+  }
+
   adminSalesDashboard(actor: AdminActor) {
     assertAdminPermission(actor, "audit.read");
     const orders = [...this.store.orders.values()];
@@ -2156,6 +2320,9 @@ class BackendServices {
       name: shop.name,
       customerServiceWechat: shop.customerServiceWechat,
       customerServiceQrUrl: shop.customerServiceQrUrl,
+      customerServiceQq: shop.customerServiceQq,
+      customerServiceQqQrUrl: shop.customerServiceQqQrUrl,
+      customerServiceNote: shop.customerServiceNote,
       status: shop.status
     }));
   }
@@ -2266,6 +2433,16 @@ class BackendServices {
     return [...this.store.paymentVouchers.values()];
   }
 
+  listAgentPaymentVouchers(actor: AgentActor) {
+    this.getAgentShop(actor);
+    return [...this.store.paymentVouchers.values()]
+      .filter((voucher) => voucher.shopId === actor.shopId)
+      .filter((voucher) => {
+        const order = this.store.orders.get(voucher.orderNo);
+        return order?.agentId === actor.agentId && order.shopId === actor.shopId;
+      });
+  }
+
   confirmPaymentVoucher(actor: AdminActor, voucherId: string, input: { approved: boolean; reason?: string }) {
     assertAdminPermission(actor, "settlement.confirm");
     const voucher = requireEntity(this.store.paymentVouchers.get(voucherId), "RESOURCE_NOT_FOUND", "payment voucher not found");
@@ -2347,11 +2524,20 @@ class BackendServices {
     return shop;
   }
 
-  updateShopServiceQrCode(actor: AdminActor, shopId: string, input: { customerServiceWechat?: string; customerServiceQrUrl?: string }) {
+  updateShopServiceQrCode(actor: AdminActor, shopId: string, input: {
+    customerServiceWechat?: string;
+    customerServiceQrUrl?: string;
+    customerServiceQq?: string;
+    customerServiceQqQrUrl?: string;
+    customerServiceNote?: string;
+  }) {
     assertAdminPermission(actor, "agent.review");
     const shop = this.getShop(shopId);
     shop.customerServiceWechat = input.customerServiceWechat ?? shop.customerServiceWechat;
     shop.customerServiceQrUrl = input.customerServiceQrUrl ?? shop.customerServiceQrUrl;
+    shop.customerServiceQq = input.customerServiceQq ?? shop.customerServiceQq;
+    shop.customerServiceQqQrUrl = input.customerServiceQqQrUrl ?? shop.customerServiceQqQrUrl;
+    shop.customerServiceNote = input.customerServiceNote ?? shop.customerServiceNote;
     this.audit(actor.role, "shop.service_qrcode.update", "shop", shop.id, input);
     return shop;
   }
@@ -2485,6 +2671,9 @@ class BackendServices {
         name: shop.name,
         customerServiceWechat: shop.customerServiceWechat,
         customerServiceQrUrl: shop.customerServiceQrUrl,
+        customerServiceQq: shop.customerServiceQq,
+        customerServiceQqQrUrl: shop.customerServiceQqQrUrl,
+        customerServiceNote: shop.customerServiceNote,
         agentStatus: sellingAgent.status,
         shopStatus: shop.status,
         entrySource: input.entrySource
@@ -2574,6 +2763,9 @@ class BackendServices {
         ownerType: "platform",
         customerServiceWechat: shop.customerServiceWechat,
         customerServiceQrUrl: shop.customerServiceQrUrl,
+        customerServiceQq: shop.customerServiceQq,
+        customerServiceQqQrUrl: shop.customerServiceQqQrUrl,
+        customerServiceNote: shop.customerServiceNote,
         shopStatus: shop.status,
         entrySource: input.entrySource
       },
@@ -2769,6 +2961,9 @@ class BackendServices {
       shopName: (order.snapshot.shopSnapshot as { name?: string }).name,
       customerServiceWechat: (order.snapshot.shopSnapshot as { customerServiceWechat?: string }).customerServiceWechat,
       customerServiceQrUrl: (order.snapshot.shopSnapshot as { customerServiceQrUrl?: string }).customerServiceQrUrl,
+      customerServiceQq: (order.snapshot.shopSnapshot as { customerServiceQq?: string }).customerServiceQq,
+      customerServiceQqQrUrl: (order.snapshot.shopSnapshot as { customerServiceQqQrUrl?: string }).customerServiceQqQrUrl,
+      customerServiceNote: (order.snapshot.shopSnapshot as { customerServiceNote?: string }).customerServiceNote,
       fulfillmentMode: fulfillmentMode(order.snapshot),
       delivery: this.serializeDelivery(order, options),
       collectionChannel: order.collectionChannelSnapshot,
@@ -2800,6 +2995,7 @@ class BackendServices {
       buyerEmail: options.includeBuyerContact ? order.buyerEmail : undefined,
       extractionCodeSet: order.extractionCodeSet,
       extractable: Boolean(order.extractionCodeSet) && order.paymentStatus === "paid" && order.fulfillmentStatus === "success" && order.refundStatus === "none",
+      extractionToken: Boolean(order.extractionCodeSet) ? this.extractionTokenForOrder(order) : undefined,
       codes: !order.extractionCodeSet && options.includeBuyerContact && order.paymentStatus === "paid" && order.fulfillmentStatus === "success" && order.refundStatus === "none" ? codes : [],
       message: codes.length > 0 ? "卡密已自动发放，请使用购买时设置的提取码查看。" : "付款后系统会自动发放卡密。"
     };
@@ -3012,11 +3208,14 @@ class BackendServices {
     const shopProduct = this.store.platformShopProducts.get(order.agentProductId);
     const productId = agentProduct?.platformProductId ?? shopProduct?.platformProductId;
     const product = productId ? this.store.platformProducts.get(productId) : undefined;
-    const rule = product?.fulfillmentRule;
-    if (!isRecord(rule) || rule.mode !== "code_pool" || !product) return;
+    const ownProduct = agentProduct?.ownProductReviewId ? this.store.ownProducts.get(agentProduct.ownProductReviewId) : undefined;
+    const fulfillmentOwner = product ?? ownProduct;
+    const inventoryProductId = product?.id ?? (ownProduct && agentProduct ? agentProduct.id : undefined);
+    const rule = fulfillmentOwner?.fulfillmentRule;
+    if (!isRecord(rule) || rule.mode !== "code_pool" || !fulfillmentOwner || !inventoryProductId) return;
     const quantity = order.snapshot.quantity;
     const issuedForOrder = this.store.rightsCodes
-      .filter((item) => item.productId === product.id && item.status === "issued" && item.orderNo === order.orderNo);
+      .filter((item) => item.productId === inventoryProductId && item.status === "issued" && item.orderNo === order.orderNo);
     if (issuedForOrder.length >= quantity) {
       order.fulfillmentStatus = "success";
       order.status = "fulfilled";
@@ -3025,14 +3224,14 @@ class BackendServices {
     }
     const remainingQuantity = quantity - issuedForOrder.length;
     const codes = this.store.rightsCodes
-      .filter((item) => item.productId === product.id && item.status === "available")
+      .filter((item) => item.productId === inventoryProductId && item.status === "available")
       .slice(0, remainingQuantity);
     if (codes.length < remainingQuantity) {
       order.fulfillmentStatus = "failed";
       order.status = "fulfillment_failed";
       order.settlementStatus = "frozen";
       if (order.salesChannelType !== "platform_self_operated") {
-        this.notify(order.agentId, "stock.empty", "权益码库存不足", `${product.name} 库存不足，订单 ${order.orderNo} 已冻结结算。`);
+        this.notify(order.agentId, "stock.empty", "权益码库存不足", `${fulfillmentOwner.name} 库存不足，订单 ${order.orderNo} 已冻结结算。`);
       }
       return;
     }
@@ -3054,6 +3253,7 @@ class BackendServices {
     if (order.salesChannelType !== "platform_self_operated") {
       this.notify(order.agentId, "order.auto_fulfilled", "订单已自动履约", `${order.orderNo} 已从权益码池自动发放。`);
     }
+    this.recordEmailDelivery(order, codes);
     this.audit("system", "fulfillment.auto_code_pool", "order", order.orderNo, { codeIds: codes.map((code) => code.codeId) });
   }
 
@@ -3380,6 +3580,34 @@ class BackendServices {
     });
   }
 
+  private extractionTokenForOrder(order: DemoOrder) {
+    const secret = process.env.AUTH_TOKEN_SECRET ?? "dev-extraction-token-secret";
+    const source = `${order.orderNo}:${order.userId}:${order.extractionCodeHash ?? "no-code"}:${secret}`;
+    return `ext_${hashSecret(source).slice(0, 40)}`;
+  }
+
+  private recordEmailDelivery(order: DemoOrder, issuedCodes: RightsCode[]) {
+    if (!order.buyerEmail) return;
+    const enabled = process.env.EMAIL_DELIVERY_ENABLED === "true";
+    const item: EmailDelivery = {
+      id: nextId(this.store, "email"),
+      orderNo: order.orderNo,
+      userId: order.userId,
+      email: order.buyerEmail,
+      codeCount: issuedCodes.length,
+      status: enabled ? "sent" : "provider_not_configured",
+      reason: enabled ? undefined : "EMAIL_PROVIDER_NOT_CONFIGURED",
+      createdAt: new Date()
+    };
+    this.store.emailDeliveries.push(item);
+    this.audit("system", "email.delivery.record", "order", order.orderNo, {
+      email: item.email,
+      status: item.status,
+      codeCount: item.codeCount,
+      reason: item.reason
+    });
+  }
+
   listExtractLogs(actor: AdminActor) {
     assertAdminPermission(actor, "audit.read");
     return this.store.extractLogs;
@@ -3519,6 +3747,7 @@ class PrismaStateRepository {
       this.loadAgentsAndDeposits(store),
       this.loadShops(store),
       this.loadPlatformProducts(store),
+      this.loadOwnProductReviews(store),
       this.loadAgentProducts(store),
       this.loadCollectionChannels(store),
       this.loadRightsCodes(store),
@@ -3596,6 +3825,10 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestRightsCodeImport(tx, store));
       return;
     }
+    if (method === "addAgentRightsCodes") {
+      await this.persistInShortTransaction((tx) => this.persistLatestAgentRightsCodeImport(tx, store));
+      return;
+    }
     if (method === "submitAgentCollectionChannel") {
       await this.persistInShortTransaction((tx) => this.persistLatestCollectionChannelSubmission(tx, store));
       return;
@@ -3624,17 +3857,24 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestChannelRelationCreation(tx, store));
       return;
     }
-    if ([
-      "updatePlatformProduct",
-      "submitOwnProduct",
-      "reviewOwnProduct",
-      "batchSelectPlatformProducts",
-      "setAgentProductPrice"
-    ].includes(method)) {
-      await this.persistInShortTransaction((tx) => this.persistProducts(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistInviteAndChannelState(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistFulfillmentAndExtraction(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistRiskAuditLedger(tx, store));
+    if (method === "updatePlatformProduct") {
+      await this.persistInShortTransaction((tx) => this.persistLatestPlatformProductUpdate(tx, store));
+      return;
+    }
+    if (method === "submitOwnProduct") {
+      await this.persistInShortTransaction((tx) => this.persistLatestOwnProductSubmission(tx, store));
+      return;
+    }
+    if (method === "reviewOwnProduct") {
+      await this.persistInShortTransaction((tx) => this.persistLatestOwnProductReview(tx, store));
+      return;
+    }
+    if (method === "batchSelectPlatformProducts") {
+      await this.persistInShortTransaction((tx) => this.persistLatestPlatformProductBatchSelection(tx, store));
+      return;
+    }
+    if (method === "setAgentProductPrice") {
+      await this.persistInShortTransaction((tx) => this.persistLatestAgentProductPriceUpdate(tx, store));
       return;
     }
     if ([
@@ -3691,6 +3931,13 @@ class PrismaStateRepository {
     if (method === "revealRightsCodesPlaintext") {
       await this.persistInShortTransaction((tx) => {
         const audit = this.latestAuditLog(store, ["rights_code.secret.read"]);
+        return this.persistAuditLogs(tx, audit ? [audit] : []);
+      });
+      return;
+    }
+    if (method === "exportReconciliationSummary") {
+      await this.persistInShortTransaction((tx) => {
+        const audit = this.latestAuditLog(store, ["export.reconciliation_summary"]);
         return this.persistAuditLogs(tx, audit ? [audit] : []);
       });
       return;
@@ -3982,7 +4229,8 @@ class PrismaStateRepository {
     await tx.$executeRaw`
       INSERT INTO shops (
         id, owner_type, agent_id, merchant_id, shop_no, name, announcement,
-        customer_service_qr_url, collection_account_name, collection_qr_url,
+        customer_service_wechat, customer_service_qr_url, customer_service_qq,
+        customer_service_qq_qr_url, customer_service_note, collection_account_name, collection_qr_url,
         collection_note, theme_color, banner_url, share_title, share_path,
         status, risk_status, creation_source, created_by_admin_id, created_at, updated_at
       )
@@ -3990,7 +4238,9 @@ class PrismaStateRepository {
         ${shop.id}, CAST(${shop.ownerType ?? "agent"} AS "ShopOwnerType"),
         ${shop.ownerType === "platform" ? null : shop.agentId ?? null}, NULL,
         ${shop.id}, ${shop.name}, ${shop.announcement ?? null},
-        ${shop.customerServiceQrUrl ?? null}, ${shop.collectionAccountName ?? null},
+        ${shop.customerServiceWechat ?? null}, ${shop.customerServiceQrUrl ?? null},
+        ${shop.customerServiceQq ?? null}, ${shop.customerServiceQqQrUrl ?? null},
+        ${shop.customerServiceNote ?? null}, ${shop.collectionAccountName ?? null},
         ${shop.collectionQrUrl ?? null}, ${shop.collectionNote ?? null},
         ${shop.themeColor ?? null}, ${shop.bannerUrl ?? null}, ${shop.shareTitle ?? null},
         ${`/shops/${shop.id}`}, CAST(${mapShopStatus(shop.status)} AS "ShopStatus"),
@@ -4001,7 +4251,11 @@ class PrismaStateRepository {
       ON CONFLICT (id) DO UPDATE SET
         name = EXCLUDED.name,
         announcement = EXCLUDED.announcement,
+        customer_service_wechat = EXCLUDED.customer_service_wechat,
         customer_service_qr_url = EXCLUDED.customer_service_qr_url,
+        customer_service_qq = EXCLUDED.customer_service_qq,
+        customer_service_qq_qr_url = EXCLUDED.customer_service_qq_qr_url,
+        customer_service_note = EXCLUDED.customer_service_note,
         collection_account_name = EXCLUDED.collection_account_name,
         collection_qr_url = EXCLUDED.collection_qr_url,
         collection_note = EXCLUDED.collection_note,
@@ -4076,11 +4330,15 @@ class PrismaStateRepository {
     const ledger = [...store.ledgerEntries]
       .reverse()
       .find((item) => item.agentId === agent.id && item.entryType === "DEPOSIT_CONFIRMED");
+    const relations = store.channelRelations.filter((item) =>
+      item.secondTierAgentId === agent.id || item.thirdTierAgentId === agent.id
+    );
 
     await this.persistAgent(tx, agent);
     if (shop) await this.persistShop(tx, shop);
     await this.persistDepositAccount(tx, agent.id, account);
     if (transaction) await this.persistDepositTransaction(tx, transaction);
+    for (const relation of relations) await this.persistChannelRelation(tx, relation);
     await this.persistLedgerEntries(tx, ledger ? [ledger] : []);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
@@ -4099,15 +4357,54 @@ class PrismaStateRepository {
     const productId = audit ? stringValue(audit.targetId) : undefined;
     const product = productId ? store.platformProducts.get(productId) : undefined;
     if (!product) throw new Error("rights code import missing current product");
+    const auditAfter = isRecord(audit?.after) ? audit.after : {};
+    const importedCodeIds = Array.isArray(auditAfter.codeIds)
+      ? auditAfter.codeIds.filter((value): value is string => typeof value === "string" && value.length > 0)
+      : [];
+    const batchNo = stringValue(auditAfter.batchNo);
     const importedAt = dateValue(audit?.createdAt) ?? new Date(0);
     const codes = store.rightsCodes.filter((code) =>
       code.productId === product.id
       && code.status === "available"
       && !code.orderNo
-      && code.createdAt >= importedAt
+      && (
+        importedCodeIds.length > 0
+          ? importedCodeIds.includes(code.codeId)
+          : batchNo
+            ? code.batchNo === batchNo
+            : code.createdAt >= importedAt
+      )
     );
     await this.persistPlatformProduct(tx, product);
-    for (const code of codes) await this.persistAvailableRightsCode(tx, code);
+    for (const code of codes) await this.persistAvailableRightsCode(tx, code, store);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestAgentRightsCodeImport(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["rights_code.agent_import"]);
+    const agentProductId = audit ? stringValue(audit.targetId) : undefined;
+    const agentProduct = agentProductId ? store.agentProducts.get(agentProductId) : undefined;
+    if (!agentProduct) throw new Error("agent rights code import missing current product");
+    const auditAfter = isRecord(audit?.after) ? audit.after : {};
+    const importedCodeIds = Array.isArray(auditAfter.codeIds)
+      ? auditAfter.codeIds.filter((value): value is string => typeof value === "string" && value.length > 0)
+      : [];
+    const batchNo = stringValue(auditAfter.batchNo);
+    const importedAt = dateValue(audit?.createdAt) ?? new Date(0);
+    const codes = store.rightsCodes.filter((code) =>
+      (code.agentProductId ?? code.productId) === agentProduct.id
+      && code.status === "available"
+      && !code.orderNo
+      && (
+        importedCodeIds.length > 0
+          ? importedCodeIds.includes(code.codeId)
+          : batchNo
+            ? code.batchNo === batchNo
+            : code.createdAt >= importedAt
+      )
+    );
+    await this.persistAgentProductWithDependencies(tx, store, agentProduct);
+    for (const code of codes) await this.persistAvailableRightsCode(tx, code, store);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
@@ -4147,17 +4444,63 @@ class PrismaStateRepository {
     if (!agentProduct || agentProduct.productType !== "platform" || !agentProduct.platformProductId) {
       throw new Error("platform product selection missing current agent product");
     }
-    const agent = store.agents.get(agentProduct.agentId);
-    const shop = store.shops.get(agentProduct.shopId);
-    const product = store.platformProducts.get(agentProduct.platformProductId);
-    if (!agent) throw new Error("platform product selection missing current agent");
-    if (!shop) throw new Error("platform product selection missing current shop");
-    if (!product) throw new Error("platform product selection missing current platform product");
+    await this.persistAgentProductWithDependencies(tx, store, agentProduct);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestPlatformProductUpdate(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["platform_product.update"]);
+    const productId = audit ? stringValue(audit.targetId) : undefined;
+    const product = productId ? store.platformProducts.get(productId) : undefined;
+    if (!product) throw new Error("platform product update missing current product");
+    await this.persistPlatformProduct(tx, product);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestOwnProductSubmission(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["own_product.submit"]);
+    const ownProductId = audit ? stringValue(audit.targetId) : undefined;
+    const ownProduct = ownProductId ? store.ownProducts.get(ownProductId) : undefined;
+    if (!ownProduct) throw new Error("own product submission missing current product");
+    const agent = store.agents.get(ownProduct.agentId);
+    const shop = store.shops.get(ownProduct.shopId);
+    if (!agent) throw new Error("own product submission missing current agent");
+    if (!shop) throw new Error("own product submission missing current shop");
     await this.persistAgent(tx, agent);
     await this.persistMerchantAccountForAgent(tx, agent);
     await this.persistShop(tx, shop);
-    await this.persistPlatformProduct(tx, product);
-    await this.persistAgentProduct(tx, agentProduct);
+    await this.persistOwnProductReview(tx, ownProduct);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestOwnProductReview(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["own_product.review"]);
+    const ownProductId = audit ? stringValue(audit.targetId) : undefined;
+    const ownProduct = ownProductId ? store.ownProducts.get(ownProductId) : undefined;
+    if (!ownProduct) throw new Error("own product review missing current product");
+    await this.persistOwnProductReview(tx, ownProduct);
+    const agentProduct = [...store.agentProducts.values()]
+      .find((product) => product.ownProductReviewId === ownProduct.id);
+    if (agentProduct) await this.persistAgentProductWithDependencies(tx, store, agentProduct);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestPlatformProductBatchSelection(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["agent_product.batch_select_platform"]);
+    const shopId = audit ? stringValue(audit.targetId) : undefined;
+    if (!shopId) throw new Error("platform product batch selection missing current shop");
+    const products = [...store.agentProducts.values()]
+      .filter((product) => product.shopId === shopId && product.productType === "platform");
+    for (const product of products) await this.persistAgentProductWithDependencies(tx, store, product);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestAgentProductPriceUpdate(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["agent_product.price_update"]);
+    const agentProductId = audit ? stringValue(audit.targetId) : undefined;
+    const agentProduct = agentProductId ? store.agentProducts.get(agentProductId) : undefined;
+    if (!agentProduct) throw new Error("agent product price update missing current product");
+    await this.persistAgentProductWithDependencies(tx, store, agentProduct);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
@@ -4416,7 +4759,8 @@ class PrismaStateRepository {
       await tx.$executeRaw`
         INSERT INTO shops (
           id, owner_type, agent_id, merchant_id, shop_no, name, announcement,
-          customer_service_qr_url, collection_account_name, collection_qr_url,
+          customer_service_wechat, customer_service_qr_url, customer_service_qq,
+          customer_service_qq_qr_url, customer_service_note, collection_account_name, collection_qr_url,
           collection_note, theme_color, banner_url, share_title, share_path,
           status, risk_status, creation_source, created_by_admin_id, created_at, updated_at
         )
@@ -4424,7 +4768,9 @@ class PrismaStateRepository {
           ${shop.id}, CAST(${shop.ownerType ?? "agent"} AS "ShopOwnerType"),
           ${shop.ownerType === "platform" ? null : shop.agentId ?? null}, NULL,
           ${shop.id}, ${shop.name}, ${shop.announcement ?? null},
-          ${shop.customerServiceQrUrl ?? null}, ${shop.collectionAccountName ?? null},
+          ${shop.customerServiceWechat ?? null}, ${shop.customerServiceQrUrl ?? null},
+          ${shop.customerServiceQq ?? null}, ${shop.customerServiceQqQrUrl ?? null},
+          ${shop.customerServiceNote ?? null}, ${shop.collectionAccountName ?? null},
           ${shop.collectionQrUrl ?? null}, ${shop.collectionNote ?? null},
           ${shop.themeColor ?? null}, ${shop.bannerUrl ?? null}, ${shop.shareTitle ?? null},
           ${`/shops/${shop.id}`}, CAST(${mapShopStatus(shop.status)} AS "ShopStatus"),
@@ -4435,7 +4781,11 @@ class PrismaStateRepository {
         ON CONFLICT (id) DO UPDATE SET
           name = EXCLUDED.name,
           announcement = EXCLUDED.announcement,
+          customer_service_wechat = EXCLUDED.customer_service_wechat,
           customer_service_qr_url = EXCLUDED.customer_service_qr_url,
+          customer_service_qq = EXCLUDED.customer_service_qq,
+          customer_service_qq_qr_url = EXCLUDED.customer_service_qq_qr_url,
+          customer_service_note = EXCLUDED.customer_service_note,
           collection_account_name = EXCLUDED.collection_account_name,
           collection_qr_url = EXCLUDED.collection_qr_url,
           collection_note = EXCLUDED.collection_note,
@@ -4472,33 +4822,62 @@ class PrismaStateRepository {
     }
 
     for (const ownProduct of store.ownProducts.values()) {
-      await tx.$executeRaw`
-        INSERT INTO agent_product_reviews (
-          id, agent_id, shop_id, name, detail_json, sale_price_cents,
-          after_sale_rule_json, fulfillment_rule_json, status, reject_reason,
-          risk_reason, reviewed_by, reviewed_at, created_at, updated_at
-        )
-        VALUES (
-          ${ownProduct.id}, ${ownProduct.agentId}, ${ownProduct.shopId}, ${ownProduct.name},
-          ${jsonForDb(ownProduct)}::jsonb, ${ownProduct.salePriceCents},
-          ${jsonForDb(ownProduct.afterSaleRule)}::jsonb, ${jsonForDb(ownProduct.fulfillmentRule)}::jsonb,
-          CAST(${mapReviewStatus(ownProduct.reviewStatus)} AS "ReviewStatus"), NULL, NULL, NULL,
-          ${ownProduct.reviewStatus === "approved" ? new Date() : null}, now(), now()
-        )
-        ON CONFLICT (id) DO UPDATE SET
-          name = EXCLUDED.name,
-          detail_json = EXCLUDED.detail_json,
-          sale_price_cents = EXCLUDED.sale_price_cents,
-          after_sale_rule_json = EXCLUDED.after_sale_rule_json,
-          fulfillment_rule_json = EXCLUDED.fulfillment_rule_json,
-          status = EXCLUDED.status,
-          updated_at = now()
-      `;
+      await this.persistOwnProductReview(tx, ownProduct);
     }
 
     for (const product of store.agentProducts.values()) {
       await this.persistAgentProduct(tx, product);
     }
+  }
+
+  private async persistAgentProductWithDependencies(tx: PrismaTx, store: MemoryStore, product: DemoAgentProduct) {
+    const agent = store.agents.get(product.agentId);
+    const shop = store.shops.get(product.shopId);
+    if (!agent) throw new Error("agent product persistence missing current agent");
+    if (!shop) throw new Error("agent product persistence missing current shop");
+    await this.persistAgent(tx, agent);
+    await this.persistMerchantAccountForAgent(tx, agent);
+    await this.persistShop(tx, shop);
+
+    if (product.productType === "platform" && product.platformProductId) {
+      const platformProduct = store.platformProducts.get(product.platformProductId);
+      if (!platformProduct) throw new Error("agent product persistence missing current platform product");
+      await this.persistPlatformProduct(tx, platformProduct);
+    }
+
+    if (product.productType === "agent_owned" && product.ownProductReviewId) {
+      const ownProduct = store.ownProducts.get(product.ownProductReviewId);
+      if (!ownProduct) throw new Error("agent product persistence missing current own product review");
+      await this.persistOwnProductReview(tx, ownProduct);
+    }
+
+    await this.persistAgentProduct(tx, product);
+  }
+
+  private async persistOwnProductReview(tx: PrismaTx, ownProduct: DemoOwnProduct) {
+    await tx.$executeRaw`
+      INSERT INTO agent_product_reviews (
+        id, agent_id, shop_id, name, detail_json, sale_price_cents,
+        after_sale_rule_json, fulfillment_rule_json, status, reject_reason,
+        risk_reason, reviewed_by, reviewed_at, created_at, updated_at
+      )
+      VALUES (
+        ${ownProduct.id}, ${ownProduct.agentId}, ${ownProduct.shopId}, ${ownProduct.name},
+        ${jsonForDb(ownProduct)}::jsonb, ${ownProduct.salePriceCents},
+        ${jsonForDb(ownProduct.afterSaleRule)}::jsonb, ${jsonForDb(ownProduct.fulfillmentRule)}::jsonb,
+        CAST(${mapReviewStatus(ownProduct.reviewStatus)} AS "ReviewStatus"), NULL, NULL, NULL,
+        ${ownProduct.reviewStatus === "approved" ? ownProduct.updatedAt ?? new Date() : null},
+        ${ownProduct.createdAt ?? new Date()}, ${ownProduct.updatedAt ?? new Date()}
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        name = EXCLUDED.name,
+        detail_json = EXCLUDED.detail_json,
+        sale_price_cents = EXCLUDED.sale_price_cents,
+        after_sale_rule_json = EXCLUDED.after_sale_rule_json,
+        fulfillment_rule_json = EXCLUDED.fulfillment_rule_json,
+        status = EXCLUDED.status,
+        updated_at = EXCLUDED.updated_at
+    `;
   }
 
   private async persistAgentProduct(tx: PrismaTx, product: DemoAgentProduct) {
@@ -4608,14 +4987,16 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistAvailableRightsCode(tx: PrismaTx, code: RightsCode) {
+  private async persistAvailableRightsCode(tx: PrismaTx, code: RightsCode, store: MemoryStore) {
+    const platformProductId = code.platformProductId ?? (store.platformProducts.has(code.productId) ? code.productId : null);
+    const agentProductId = code.agentProductId ?? (store.agentProducts.has(code.productId) ? code.productId : null);
     await tx.$executeRaw`
       INSERT INTO rights_codes (
-        id, product_id, code_ciphertext, batch_no, status, order_id,
+        id, product_id, agent_product_id, code_ciphertext, batch_no, status, order_id,
         issue_key, issued_at, created_at, updated_at
       )
       VALUES (
-        ${code.codeId}, ${code.productId}, ${code.code}, ${code.batchNo},
+        ${code.codeId}, ${platformProductId}, ${agentProductId}, ${code.code}, ${code.batchNo},
         CAST('available' AS "RightsCodeStatus"), NULL, NULL, NULL, ${code.createdAt}, now()
       )
       ON CONFLICT (id) DO UPDATE SET
@@ -5128,13 +5509,15 @@ class PrismaStateRepository {
   private async persistIssuedRightsCodesForOrder(tx: PrismaTx, store: MemoryStore, order: DemoOrder) {
     const codes = store.rightsCodes.filter((code) => code.orderNo === order.orderNo && code.status === "issued");
     for (const code of codes) {
+      const platformProductId = code.platformProductId ?? (store.platformProducts.has(code.productId) ? code.productId : null);
+      const agentProductId = code.agentProductId ?? (store.agentProducts.has(code.productId) ? code.productId : null);
       await tx.$executeRaw`
         INSERT INTO rights_codes (
-          id, product_id, code_ciphertext, batch_no, status, order_id,
+          id, product_id, agent_product_id, code_ciphertext, batch_no, status, order_id,
           issue_key, issued_at, created_at, updated_at
         )
         VALUES (
-          ${code.codeId}, ${code.productId}, ${code.code}, ${code.batchNo},
+          ${code.codeId}, ${platformProductId}, ${agentProductId}, ${code.code}, ${code.batchNo},
           CAST('issued' AS "RightsCodeStatus"),
           (SELECT id FROM orders WHERE order_no = ${order.orderNo}),
           ${code.issueKey ?? null}, ${code.issuedAt ?? new Date()}, ${code.createdAt}, now()
@@ -5254,13 +5637,15 @@ class PrismaStateRepository {
 
   private async persistFulfillmentAndExtraction(tx: PrismaTx, store: MemoryStore) {
     for (const code of store.rightsCodes) {
+      const platformProductId = code.platformProductId ?? (store.platformProducts.has(code.productId) ? code.productId : null);
+      const agentProductId = code.agentProductId ?? (store.agentProducts.has(code.productId) ? code.productId : null);
       await tx.$executeRaw`
         INSERT INTO rights_codes (
-          id, product_id, code_ciphertext, batch_no, status, order_id,
+          id, product_id, agent_product_id, code_ciphertext, batch_no, status, order_id,
           issue_key, issued_at, created_at, updated_at
         )
         VALUES (
-          ${code.codeId}, ${code.productId}, ${code.code}, ${code.batchNo},
+          ${code.codeId}, ${platformProductId}, ${agentProductId}, ${code.code}, ${code.batchNo},
           CAST(${code.status} AS "RightsCodeStatus"),
           ${code.orderNo ? stableDbId("order", code.orderNo) : null},
           ${code.issueKey ?? null}, ${code.issuedAt ?? null}, ${code.createdAt}, now()
@@ -5758,6 +6143,9 @@ class PrismaStateRepository {
       announcement: string | null;
       customer_service_wechat: string | null;
       customer_service_qr_url: string | null;
+      customer_service_qq: string | null;
+      customer_service_qq_qr_url: string | null;
+      customer_service_note: string | null;
       collection_account_name: string | null;
       collection_qr_url: string | null;
       collection_note: string | null;
@@ -5766,8 +6154,10 @@ class PrismaStateRepository {
       share_title: string | null;
     }>>`
       SELECT s.id, s.owner_type, s.agent_id, s.merchant_id, s.name, s.status, s.risk_status, s.announcement,
-             cs.wechat_id AS customer_service_wechat,
-             customer_service_qr_url, collection_account_name, collection_qr_url, collection_note,
+             COALESCE(s.customer_service_wechat, cs.wechat_id) AS customer_service_wechat,
+             COALESCE(s.customer_service_qr_url, cs.qr_code_url) AS customer_service_qr_url,
+             s.customer_service_qq, s.customer_service_qq_qr_url, s.customer_service_note,
+             collection_account_name, collection_qr_url, collection_note,
              theme_color, banner_url, share_title
         FROM shops s
         LEFT JOIN LATERAL (
@@ -5789,6 +6179,9 @@ class PrismaStateRepository {
         announcement: row.announcement ?? undefined,
         customerServiceWechat: row.customer_service_wechat ?? undefined,
         customerServiceQrUrl: row.customer_service_qr_url ?? undefined,
+        customerServiceQq: row.customer_service_qq ?? undefined,
+        customerServiceQqQrUrl: row.customer_service_qq_qr_url ?? undefined,
+        customerServiceNote: row.customer_service_note ?? undefined,
         collectionAccountName: row.collection_account_name ?? undefined,
         collectionQrUrl: row.collection_qr_url ?? undefined,
         collectionNote: row.collection_note ?? undefined,
@@ -5851,6 +6244,53 @@ class PrismaStateRepository {
         fulfillmentRule: row.fulfillment_rule_json,
         afterSaleRule: row.after_sale_rule_json,
         status: row.status
+      });
+    }
+  }
+
+  private async loadOwnProductReviews(store: MemoryStore) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      agent_id: string;
+      shop_id: string;
+      name: string;
+      detail_json: unknown;
+      sale_price_cents: bigint;
+      after_sale_rule_json: unknown;
+      fulfillment_rule_json: unknown;
+      status: string;
+      created_at: Date;
+      updated_at: Date;
+    }>>`
+      SELECT id, agent_id, shop_id, name, detail_json, sale_price_cents,
+             after_sale_rule_json, fulfillment_rule_json, status, created_at, updated_at
+        FROM agent_product_reviews
+    `;
+    for (const row of rows) {
+      const detail = decodeStoreValue(row.detail_json);
+      store.ownProducts.set(row.id, {
+        id: row.id,
+        agentId: row.agent_id,
+        shopId: row.shop_id,
+        name: row.name,
+        category: isRecord(detail) ? stringValue(detail.category) : undefined,
+        tags: isRecord(detail) && Array.isArray(detail.tags) ? detail.tags as string[] : undefined,
+        subtitle: isRecord(detail) ? stringValue(detail.subtitle) : undefined,
+        description: isRecord(detail) ? stringValue(detail.description) : undefined,
+        usageGuide: isRecord(detail) ? stringValue(detail.usageGuide) : undefined,
+        imageUrl: isRecord(detail) ? stringValue(detail.imageUrl) : undefined,
+        specs: isRecord(detail) && Array.isArray(detail.specs) ? detail.specs as string[] : undefined,
+        detailSections: isRecord(detail) && Array.isArray(detail.detailSections) ? detail.detailSections as ProductDetailSection[] : undefined,
+        stockCount: isRecord(detail) && typeof detail.stockCount === "number" ? detail.stockCount : undefined,
+        soldCount: isRecord(detail) && typeof detail.soldCount === "number" ? detail.soldCount : undefined,
+        salePriceCents: row.sale_price_cents,
+        minSalePriceCents: isRecord(detail) ? bigintValue(detail.minSalePriceCents) || undefined : undefined,
+        fulfillmentRule: decodeStoreValue(row.fulfillment_rule_json),
+        afterSaleRule: decodeStoreValue(row.after_sale_rule_json),
+        reviewStatus: row.status,
+        status: row.status,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
       });
     }
   }
@@ -5959,7 +6399,8 @@ class PrismaStateRepository {
   private async loadRightsCodes(store: MemoryStore) {
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
-      product_id: string;
+      product_id: string | null;
+      agent_product_id: string | null;
       code_ciphertext: string;
       batch_no: string;
       status: RightsCode["status"];
@@ -5968,12 +6409,14 @@ class PrismaStateRepository {
       issued_at: Date | null;
       created_at: Date;
     }>>`
-      SELECT id, product_id, code_ciphertext, batch_no, status, order_id, issue_key, issued_at, created_at
+      SELECT id, product_id, agent_product_id, code_ciphertext, batch_no, status, order_id, issue_key, issued_at, created_at
         FROM rights_codes
     `;
     store.rightsCodes = rows.map((row) => ({
       codeId: row.id,
-      productId: row.product_id,
+      productId: row.product_id ?? row.agent_product_id ?? row.id,
+      platformProductId: row.product_id ?? undefined,
+      agentProductId: row.agent_product_id ?? undefined,
       code: row.code_ciphertext,
       batchNo: row.batch_no,
       status: row.status,
@@ -6739,6 +7182,7 @@ function createEmptyMemoryStore(): MemoryStore {
     inviteCodes: new Map(),
     collectionChannels: new Map(),
     extractLogs: [],
+    emailDeliveries: [],
     paymentChannelConfigs: [
       { channel: "mock", enabled: true, feeBps: 50, fixedFeeCents: 0n, statusNote: "dev_only", updatedAt: new Date() },
       { channel: "wechat_miniprogram", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
@@ -6788,6 +7232,7 @@ const storeArrayKeys = [
   "channelRelations",
   "channelProductOffers",
   "extractLogs",
+  "emailDeliveries",
   "paymentChannelConfigs"
 ] as const;
 
@@ -6918,6 +7363,7 @@ function seedMemoryCatalog(store: MemoryStore) {
       store.rightsCodes.push({
         codeId: `code-${item.demoId}-${index + 1}`,
         productId: item.demoId,
+        platformProductId: item.demoId,
         code,
         batchNo: `seed-${item.productNo.toLowerCase()}`,
         status: "available",
@@ -7005,6 +7451,9 @@ type DemoShop = {
   announcement?: string;
   customerServiceWechat?: string;
   customerServiceQrUrl?: string;
+  customerServiceQq?: string;
+  customerServiceQqQrUrl?: string;
+  customerServiceNote?: string;
   collectionAccountName?: string;
   collectionQrUrl?: string;
   collectionNote?: string;
@@ -7060,6 +7509,8 @@ type DemoOwnProduct = {
   afterSaleRule: unknown;
   reviewStatus: string;
   status: string;
+  createdAt?: Date;
+  updatedAt?: Date;
 };
 
 type ProductDetailSection = {
@@ -7112,6 +7563,9 @@ type PlatformSelfOperatedSnapshot = Omit<ReturnType<typeof buildOrderSnapshot>, 
     ownerType: "platform";
     customerServiceWechat?: string;
     customerServiceQrUrl?: string;
+    customerServiceQq?: string;
+    customerServiceQqQrUrl?: string;
+    customerServiceNote?: string;
     shopStatus: string;
     entrySource?: string;
   };
@@ -7243,6 +7697,8 @@ type LedgerEntry = {
 type RightsCode = {
   codeId: string;
   productId: string;
+  platformProductId?: string;
+  agentProductId?: string;
   code: string;
   batchNo: string;
   status: "available" | "issued" | "voided";
@@ -7250,6 +7706,17 @@ type RightsCode = {
   issueKey?: string;
   createdAt: Date;
   issuedAt?: Date;
+};
+
+type EmailDelivery = {
+  id: string;
+  orderNo: string;
+  userId: string;
+  email: string;
+  codeCount: number;
+  status: "sent" | "provider_not_configured" | "failed";
+  reason?: string;
+  createdAt: Date;
 };
 
 type NotificationItem = {
@@ -7439,6 +7906,7 @@ type MemoryStore = {
   inviteCodes: Map<string, InviteCode>;
   collectionChannels: Map<string, CollectionChannel>;
   extractLogs: Array<Record<string, unknown>>;
+  emailDeliveries: EmailDelivery[];
   paymentChannelConfigs: PaymentChannelConfig[];
   pendingIncomeByAgent: Map<string, bigint>;
   payableIncomeByAgent: Map<string, bigint>;

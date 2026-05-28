@@ -753,7 +753,11 @@ model Shop {
   name                  String
   logoUrl               String?                 @map("logo_url")
   announcement          String?
+  customerServiceWechat String?                 @map("customer_service_wechat")
   customerServiceQrUrl  String?                 @map("customer_service_qr_url")
+  customerServiceQq     String?                 @map("customer_service_qq")
+  customerServiceQqQrUrl String?                @map("customer_service_qq_qr_url")
+  customerServiceNote   String?                 @map("customer_service_note")
   collectionAccountName String?                 @map("collection_account_name")
   collectionQrUrl       String?                 @map("collection_qr_url")
   collectionNote        String?                 @map("collection_note")
@@ -923,7 +927,8 @@ model PlatformShopProduct {
 
 model RightsCode {
   id             String           @id @default(cuid())
-  productId      String           @map("product_id")
+  productId      String?          @map("product_id")
+  agentProductId String?          @map("agent_product_id")
   codeCiphertext String           @map("code_ciphertext")
   batchNo        String           @map("batch_no")
   status         RightsCodeStatus @default(available)
@@ -934,12 +939,15 @@ model RightsCode {
   createdAt      DateTime         @default(now()) @map("created_at")
   updatedAt      DateTime         @updatedAt @map("updated_at")
 
-  product    PlatformProduct          @relation(fields: [productId], references: [id])
-  order      Order?                   @relation(fields: [orderId], references: [id])
-  accessLogs CodePlaintextAccessLog[]
+  product      PlatformProduct?        @relation(fields: [productId], references: [id])
+  agentProduct AgentProduct?           @relation(fields: [agentProductId], references: [id])
+  order        Order?                  @relation(fields: [orderId], references: [id])
+  accessLogs   CodePlaintextAccessLog[]
 
   @@unique([productId, codeCiphertext])
+  @@unique([agentProductId, codeCiphertext])
   @@index([productId, status])
+  @@index([agentProductId, status])
   @@index([batchNo])
   @@map("rights_codes")
 }
@@ -1021,6 +1029,7 @@ model AgentProduct {
   platformProduct PlatformProduct?    @relation(fields: [platformProductId], references: [id])
   ownReview       AgentProductReview? @relation(fields: [ownProductReviewId], references: [id])
   orderItems      OrderItem[]
+  rightsCodes     RightsCode[]
 
   @@unique([shopId, productType, platformProductId])
   @@index([agentId, status])

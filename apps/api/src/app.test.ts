@@ -447,6 +447,40 @@ describe.sequential("api", () => {
     expect(submitted.statusCode).toBe(200);
     expect(submitted.json().reviewStatus).toBe("pending_review");
 
+    const unauthenticatedQueue = await app.inject({ method: "GET", url: "/api/admin/agent-products/reviews" });
+    expect(unauthenticatedQueue.statusCode).toBe(401);
+
+    const forbiddenQueue = await app.inject({
+      method: "GET",
+      url: "/api/admin/agent-products/reviews",
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" }
+    });
+    expect(forbiddenQueue.statusCode).toBe(403);
+
+    const pendingQueue = await app.inject({
+      method: "GET",
+      url: "/api/admin/agent-products/reviews?reviewStatus=pending_review&agentId=agent-1&shopId=shop-1&page=1&pageSize=10",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
+    expect(pendingQueue.statusCode).toBe(200);
+    expect(pendingQueue.json()).toMatchObject({ page: 1, pageSize: 10 });
+    expect(pendingQueue.json().items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: submitted.json().id,
+        ownProductId: submitted.json().id,
+        agentId: "agent-1",
+        shopId: "shop-1",
+        name: "代理自有课程权益",
+        salePriceCents: "19900",
+        minSalePriceCents: "9900",
+        fulfillmentMode: "manual",
+        reviewStatus: "pending_review",
+        status: "pending_review",
+        agent: expect.objectContaining({ id: "agent-1", name: "测试代理 A" }),
+        shop: expect.objectContaining({ id: "shop-1" })
+      })
+    ]));
+
     const reviewed = await app.inject({
       method: "POST",
       url: `/api/admin/agent-products/reviews/${submitted.json().id}/review`,
@@ -455,6 +489,21 @@ describe.sequential("api", () => {
     });
     expect(reviewed.statusCode).toBe(200);
     expect(reviewed.json().agentProduct.productType).toBe("agent_owned");
+
+    const approvedQueue = await app.inject({
+      method: "GET",
+      url: `/api/admin/agent-products/reviews?status=listed&agentId=agent-1&limit=5&offset=0`,
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
+    expect(approvedQueue.statusCode).toBe(200);
+    expect(approvedQueue.json().items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: submitted.json().id,
+        ownProductId: submitted.json().id,
+        reviewStatus: "approved",
+        status: "listed"
+      })
+    ]));
 
     const created = await app.inject({
       method: "POST",
@@ -733,11 +782,29 @@ describe.sequential("api", () => {
       url: "/api/agent/shop",
       headers: agentHeaders,
       payload: {
-        customerServiceQrUrl: "https://example.test/qr-agent-a-new.png"
+        customerServiceQrUrl: "https://example.test/qr-agent-a-new.png",
+        customerServiceQq: "123456789",
+        customerServiceQqQrUrl: "https://example.test/qq-agent-a-new.png",
+        customerServiceNote: "工作日 10:00-18:00"
       }
     });
     expect(shopUpdate.statusCode).toBe(200);
     expect(shopUpdate.json().customerServiceQrUrl).toBe("https://example.test/qr-agent-a-new.png");
+    expect(shopUpdate.json()).toMatchObject({
+      customerServiceQq: "123456789",
+      customerServiceQqQrUrl: "https://example.test/qq-agent-a-new.png",
+      customerServiceNote: "工作日 10:00-18:00"
+    });
+    const publicShop = await app.inject({ method: "GET", url: "/api/user/shops/shop-1" });
+    expect(publicShop.statusCode).toBe(200);
+    expect(publicShop.json()).toMatchObject({
+      customerServiceQrUrl: "https://example.test/qr-agent-a-new.png",
+      customerServiceQq: "123456789",
+      customerServiceQqQrUrl: "https://example.test/qq-agent-a-new.png",
+      customerServiceNote: "工作日 10:00-18:00"
+    });
+    expect(publicShop.json()).not.toHaveProperty("onlineCustomerServiceUrl");
+    expect(publicShop.json()).not.toHaveProperty("onlineChatUrl");
 
     const batch = await app.inject({
       method: "POST",
@@ -887,10 +954,20 @@ describe.sequential("api", () => {
       method: "PATCH",
       url: "/api/admin/shops/shop-1/service-qrcode",
       headers: operatorHeaders,
-      payload: { customerServiceQrUrl: "https://example.test/admin-qr.png" }
+      payload: {
+        customerServiceQrUrl: "https://example.test/admin-qr.png",
+        customerServiceQq: "987654321",
+        customerServiceQqQrUrl: "https://example.test/admin-qq.png",
+        customerServiceNote: "售前售后请备注订单号"
+      }
     });
     expect(updatedQr.statusCode).toBe(200);
     expect(updatedQr.json().customerServiceQrUrl).toBe("https://example.test/admin-qr.png");
+    expect(updatedQr.json()).toMatchObject({
+      customerServiceQq: "987654321",
+      customerServiceQqQrUrl: "https://example.test/admin-qq.png",
+      customerServiceNote: "售前售后请备注订单号"
+    });
 
     const channelReview = await app.inject({
       method: "POST",
@@ -1418,10 +1495,20 @@ describe.sequential("api", () => {
       fulfillmentStatus: "success",
       delivery: {
         mode: "automatic",
-        buyerEmail: "buyer@example.com"
+        buyerEmail: "buyer@example.com",
+        extractionToken: expect.stringMatching(/^ext_/)
       }
     });
     expect(detail.json().delivery.codes).toEqual([]);
+
+    const tokenExtracted = await app.inject({
+      method: "POST",
+      url: `/api/user/extractions/${detail.json().delivery.extractionToken}`,
+      headers: { "x-user-id": "user-v2" },
+      payload: { extractionCode: "123456" }
+    });
+    expect(tokenExtracted.statusCode).toBe(200);
+    expect(tokenExtracted.json().codes).toHaveLength(1);
 
     const extracted = await app.inject({
       method: "POST",
@@ -1442,6 +1529,21 @@ describe.sequential("api", () => {
     expect(list.json()[0].delivery.buyerEmail).toBeUndefined();
     expect(JSON.stringify(list.json())).not.toContain("V2-CODE-001");
     expect(JSON.stringify(list.json())).not.toContain("buyer@example.com");
+
+    const emailDeliveries = await app.inject({
+      method: "GET",
+      url: "/api/admin/email-deliveries",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
+    expect(emailDeliveries.statusCode).toBe(200);
+    expect(emailDeliveries.json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        orderNo: order.json().orderNo,
+        email: "buyer@example.com",
+        codeCount: 1,
+        status: "provider_not_configured"
+      })
+    ]));
 
     const risk = await app.inject({
       method: "GET",
@@ -1494,6 +1596,93 @@ describe.sequential("api", () => {
     expect(locked.statusCode).toBe(423);
     expect(JSON.stringify(logs.json())).toContain("extract-lock-user");
     expect(JSON.stringify(logs.json())).toContain("locked");
+  });
+
+  it("lets merchants import card-code inventory only for their own automatic products", async () => {
+    const app = buildApp();
+    const agentHeaders = { "x-agent-id": "agent-1", "x-shop-id": "shop-1" };
+    const adminHeaders = { "x-admin-id": "operator-1", "x-admin-role": "operator" };
+
+    const own = await app.inject({
+      method: "POST",
+      url: "/api/agent/products/own",
+      headers: agentHeaders,
+      payload: {
+        name: "商户自有自动卡密",
+        salePriceCents: "8800",
+        minSalePriceCents: "1000",
+        fulfillmentMode: "code_pool"
+      }
+    });
+    expect(own.statusCode).toBe(200);
+
+    const review = await app.inject({
+      method: "POST",
+      url: `/api/admin/agent-products/reviews/${own.json().id}/review`,
+      headers: adminHeaders,
+      payload: { approved: true, reason: "自动发码商品资料通过" }
+    });
+    expect(review.statusCode).toBe(200);
+    const agentProductId = review.json().agentProduct.id;
+
+    const rejectedPlatformImport = await app.inject({
+      method: "POST",
+      url: "/api/agent/rights-codes/import",
+      headers: agentHeaders,
+      payload: { agentProductId: "ap-code", batchNo: "bad-scope", codes: ["NOPE-001"] }
+    });
+    expect(rejectedPlatformImport.statusCode).toBe(400);
+    expect(rejectedPlatformImport.json().code).toBe("RIGHTS_CODE_PRODUCT_SCOPE_INVALID");
+
+    const imported = await app.inject({
+      method: "POST",
+      url: "/api/agent/rights-codes/import",
+      headers: agentHeaders,
+      payload: { agentProductId, batchNo: "own-batch", codes: ["OWN-CODE-001"] }
+    });
+    expect(imported.statusCode).toBe(200);
+    expect(imported.json()).toMatchObject({ count: 1 });
+    expect(JSON.stringify(imported.json())).not.toContain("OWN-CODE-001");
+
+    const inventory = await app.inject({
+      method: "GET",
+      url: `/api/agent/rights-codes?agentProductId=${agentProductId}`,
+      headers: agentHeaders
+    });
+    expect(inventory.statusCode).toBe(200);
+    expect(inventory.json()[0]).toMatchObject({ productId: agentProductId, codePreview: "OW***01" });
+    expect(JSON.stringify(inventory.json())).not.toContain("OWN-CODE-001");
+
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "merchant-own-buyer" },
+      payload: { shopId: "shop-1", agentProductId, clientPaidAmountCents: "8800", extractionCode: "778899" }
+    });
+    expect(order.statusCode).toBe(200);
+
+    const payment = await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: { channel: "mock", channelTradeNo: "trade-own-code", orderNo: order.json().orderNo, amountCents: "8800" }
+    });
+    expect(payment.statusCode).toBe(200);
+
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/user/orders/${order.json().orderNo}`,
+      headers: { "x-user-id": "merchant-own-buyer" }
+    });
+    expect(detail.json().delivery.extractionToken).toMatch(/^ext_/);
+
+    const extracted = await app.inject({
+      method: "POST",
+      url: `/api/user/extractions/${detail.json().delivery.extractionToken}`,
+      headers: { "x-user-id": "merchant-own-buyer" },
+      payload: { extractionCode: "778899" }
+    });
+    expect(extracted.statusCode).toBe(200);
+    expect(extracted.json().codes[0].code).toBe("OWN-CODE-001");
   });
 
   it("allows repeated extraction codes on different orders and locks attempts per order", async () => {
@@ -1688,6 +1877,101 @@ describe.sequential("api", () => {
       delivery: { mode: "automatic", buyerEmail: "offline@example.com" }
     });
     expect(detail.json().delivery.codes).toEqual([]);
+  });
+
+  it("scopes payment vouchers to the selling merchant and lets finance approve them", async () => {
+    const app = buildApp();
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "voucher-user" },
+      payload: {
+        shopId: "shop-1",
+        agentProductId: "ap-1",
+        clientPaidAmountCents: "15000"
+      }
+    });
+    const voucher = await app.inject({
+      method: "POST",
+      url: `/api/user/orders/${order.json().orderNo}/payment-vouchers`,
+      headers: { "x-user-id": "voucher-user" },
+      payload: {
+        channel: "alipay_wap",
+        payerName: "验收付款人",
+        voucherUrl: "https://example.test/voucher.png",
+        note: "页面级验收付款凭证"
+      }
+    });
+    const ownList = await app.inject({
+      method: "GET",
+      url: "/api/agent/payment-vouchers",
+      headers: { "x-agent-id": "agent-1", "x-shop-id": "shop-1" }
+    });
+    const crossList = await app.inject({
+      method: "GET",
+      url: "/api/agent/payment-vouchers",
+      headers: { "x-agent-id": "agent-2", "x-shop-id": "shop-2" }
+    });
+    const reviewed = await app.inject({
+      method: "POST",
+      url: `/api/admin/payment-vouchers/${voucher.json().id}/review`,
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" },
+      payload: { approved: true, reason: "凭证有效" }
+    });
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/user/orders/${order.json().orderNo}`,
+      headers: { "x-user-id": "voucher-user" }
+    });
+
+    expect(voucher.statusCode).toBe(200);
+    expect(ownList.json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: voucher.json().id, orderNo: order.json().orderNo, status: "pending_review" })
+    ]));
+    expect(crossList.json()).toEqual([]);
+    expect(reviewed.statusCode).toBe(200);
+    expect(reviewed.json()).toMatchObject({ status: "approved" });
+    expect(detail.json()).toMatchObject({ paymentStatus: "paid" });
+  });
+
+  it("audits reconciliation exports and supports admin order pagination filters", async () => {
+    const app = buildApp();
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "export-user-1" },
+      payload: { shopId: "shop-1", agentProductId: "ap-1", clientPaidAmountCents: "15000" }
+    });
+    await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "export-user-2" },
+      payload: { shopId: "shop-1", agentProductId: "ap-1", clientPaidAmountCents: "15000" }
+    });
+    const page = await app.inject({
+      method: "GET",
+      url: "/api/admin/orders?page=1&pageSize=1&shopId=shop-1&status=pending_payment_confirmation",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
+    const exported = await app.inject({
+      method: "GET",
+      url: "/api/exports/reconciliation-summary",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
+    const audit = await app.inject({
+      method: "GET",
+      url: "/api/admin/audit-logs",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
+
+    expect(page.statusCode).toBe(200);
+    expect(page.json()).toMatchObject({ page: 1, pageSize: 1 });
+    expect(page.json().total).toBeGreaterThanOrEqual(2);
+    expect(page.json().items).toHaveLength(1);
+    expect(page.json().items[0].orderNo).toBe(first.json().orderNo);
+    expect(exported.statusCode).toBe(200);
+    expect(exported.json()).toHaveProperty("totalPaidCents");
+    expect(JSON.stringify(audit.json())).toContain("export.reconciliation_summary");
   });
 
   it("refuses production business service when persistence is not configured", async () => {

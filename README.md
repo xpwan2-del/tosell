@@ -28,6 +28,7 @@
 - [H5 与三级以内渠道供货开发计划](docs/12-h5-and-three-tier-channel-plan.md)
 - [虚拟商城竞品借鉴与三级代理口径](docs/13-virtual-commerce-reference.md)
 - [H5 生产化重整计划](docs/14-h5-production-realignment-plan.md)
+- [实现偏差审计与补齐清单](docs/15-implementation-alignment-audit.md)
 
 历史参考，不作为 P0 主开发依据：
 

@@ -122,20 +122,8 @@ export function buildApp() {
     };
   });
 
-  const wechatMiniProgramLogin = async (request: FastifyRequest) => {
-    if (isProductionRuntime()) {
-      throw new ApiError(410, "MINIPROGRAM_LOGIN_DISABLED", "WeChat mini-program login is not a P0 production entry");
-    }
-    const body = z.object({
-      code: z.string().min(1),
-      nickname: z.string().max(40).optional()
-    }).parse(request.body);
-    const userId = `wx-mini-${body.code.slice(0, 16)}`;
-    return createAuthSession({
-      userId,
-      identityType: "wechat_miniprogram",
-      displayName: body.nickname ?? "微信用户"
-    });
+  const wechatMiniProgramLogin = async () => {
+    throw new ApiError(410, "MINIPROGRAM_LOGIN_DISABLED", "微信小程序登录已不作为 P0 交付入口，请使用 H5 注册/登录。");
   };
 
   app.post("/api/auth/wechat-miniprogram/login", wechatMiniProgramLogin);
@@ -249,6 +237,12 @@ export function buildApp() {
     return serializeBigInt(services.extractOrderCodes(getUserActor(request), orderNo, body.extractionCode));
   });
 
+  app.post("/api/user/extractions/:token", async (request) => {
+    const { token } = z.object({ token: z.string().min(20) }).parse(request.params);
+    const body = z.object({ extractionCode: extractionCodeSchema }).parse(request.body);
+    return serializeBigInt(services.extractOrderCodesByToken(getUserActor(request), token, body.extractionCode));
+  });
+
   app.post("/api/user/after-sales", async (request) => {
     const body = z.object({
       orderNo: z.string(),
@@ -299,7 +293,10 @@ export function buildApp() {
       name: z.string().optional(),
       announcement: z.string().optional(),
       customerServiceWechat: z.string().optional(),
-      customerServiceQrUrl: z.string().optional()
+      customerServiceQrUrl: z.string().optional(),
+      customerServiceQq: z.string().optional(),
+      customerServiceQqQrUrl: z.string().optional(),
+      customerServiceNote: z.string().optional()
     }).parse(request.body);
     return services.updateAgentShop(getAgentActor(request), body);
   });
@@ -355,8 +352,28 @@ export function buildApp() {
     }).parse(request.body);
     return serializeBigInt(services.submitOwnProduct(getAgentActor(request), {
       ...body,
-      fulfillmentRule: { mode: body.fulfillmentMode ?? "manual" }
+      fulfillmentRule: {
+        mode: body.fulfillmentMode ?? "manual",
+        ...(body.fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {})
+      }
     }));
+  });
+
+  app.get("/api/agent/rights-codes", async (request) => {
+    const query = z.object({
+      agentProductId: z.string().optional(),
+      status: z.enum(["available", "issued", "voided"]).optional()
+    }).parse(request.query);
+    return serializeBigInt(services.listAgentRightsCodes(getAgentActor(request), query));
+  });
+
+  app.post("/api/agent/rights-codes/import", async (request) => {
+    const body = z.object({
+      agentProductId: z.string(),
+      codes: z.array(z.string()),
+      batchNo: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.addAgentRightsCodes(getAgentActor(request), body));
   });
 
   app.post("/api/agent/products/platform", async (request) => {
@@ -388,6 +405,7 @@ export function buildApp() {
   });
 
   app.get("/api/agent/orders", async (request) => serializeBigInt(services.listAgentOrders(getAgentActor(request))));
+  app.get("/api/agent/payment-vouchers", async (request) => serializeBigInt(services.listAgentPaymentVouchers(getAgentActor(request))));
   app.get("/api/agent/orders/:orderNo", async (request) => {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
     return serializeBigInt(services.getAgentOrder(getAgentActor(request), orderNo));
@@ -574,6 +592,10 @@ export function buildApp() {
     return serializeBigInt(services.revealRightsCodesPlaintext(getAdminActor(request), query));
   });
 
+  app.get("/api/admin/email-deliveries", async (request) => {
+    return serializeBigInt(services.listEmailDeliveries(getAdminActor(request)));
+  });
+
   app.post("/api/admin/rights-codes/import", async (request) => {
     const body = z.object({
       productId: z.string(),
@@ -583,13 +605,36 @@ export function buildApp() {
     return serializeBigInt(services.addRightsCodes(getAdminActor(request), body));
   });
 
+  app.get("/api/admin/agent-products/reviews", async (request) => {
+    const query = z.object({
+      reviewStatus: z.string().optional(),
+      status: z.string().optional(),
+      agentId: z.string().optional(),
+      shopId: z.string().optional(),
+      page: z.coerce.number().int().positive().optional(),
+      pageSize: z.coerce.number().int().positive().max(100).optional(),
+      limit: z.coerce.number().int().positive().max(100).optional(),
+      offset: z.coerce.number().int().nonnegative().optional()
+    }).parse(request.query);
+    return serializeBigInt(services.listAdminOwnProductReviews(getAdminActor(request), query));
+  });
+
   app.post("/api/admin/agent-products/reviews/:ownProductId/review", async (request) => {
     const { ownProductId } = z.object({ ownProductId: z.string() }).parse(request.params);
     const body = z.object({ approved: z.boolean(), reason: z.string().optional() }).parse(request.body);
     return serializeBigInt(services.reviewOwnProduct(getAdminActor(request), ownProductId, body));
   });
 
-  app.get("/api/admin/orders", async (request) => serializeBigInt(services.listAdminOrders(getAdminActor(request))));
+  app.get("/api/admin/orders", async (request) => {
+    const query = z.object({
+      page: z.coerce.number().int().positive().optional(),
+      pageSize: z.coerce.number().int().positive().max(100).optional(),
+      status: z.string().optional(),
+      shopId: z.string().optional(),
+      orderNo: z.string().optional()
+    }).parse(request.query);
+    return serializeBigInt(services.listAdminOrders(getAdminActor(request), query));
+  });
   app.post("/api/admin/orders/:orderNo/offline-payment", async (request) => {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
     const body = z.object({
@@ -748,7 +793,10 @@ export function buildApp() {
     const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
     const body = z.object({
       customerServiceWechat: z.string().optional(),
-      customerServiceQrUrl: z.string().optional()
+      customerServiceQrUrl: z.string().optional(),
+      customerServiceQq: z.string().optional(),
+      customerServiceQqQrUrl: z.string().optional(),
+      customerServiceNote: z.string().optional()
     }).parse(request.body);
     return serializeBigInt(services.updateShopServiceQrCode(getAdminActor(request), shopId, body));
   });
@@ -788,7 +836,7 @@ export function buildApp() {
     return serializeBigInt(services.refundCallback(body));
   });
 
-  app.get("/api/exports/reconciliation-summary", async (request) => serializeBigInt(services.reconciliationSummary(getAdminActor(request))));
+  app.get("/api/exports/reconciliation-summary", async (request) => serializeBigInt(services.exportReconciliationSummary(getAdminActor(request))));
 
   return app;
 }

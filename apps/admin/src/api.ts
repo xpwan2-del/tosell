@@ -155,6 +155,17 @@ export const api = {
   paymentConfigStatus: () => request<JsonRecord[]>("/api/admin/payment-config/status", {
     headers: adminHeaders()
   }),
+  paymentVouchers: () => request<JsonRecord[]>("/api/admin/payment-vouchers", {
+    headers: adminHeaders()
+  }),
+  agentPaymentVouchers: () => request<JsonRecord[]>("/api/agent/payment-vouchers", {
+    headers: agentHeaders()
+  }),
+  reviewPaymentVoucher: (voucherId: string, approved: boolean, reason: string) => request<JsonRecord>(`/api/admin/payment-vouchers/${encodeURIComponent(voucherId)}/review`, {
+    method: "POST",
+    headers: adminHeaders(),
+    body: { approved, reason: reason || undefined }
+  }),
   paymentConfigCheck: () => request<JsonRecord>("/api/admin/payment-config/check", {
     method: "POST",
     headers: adminHeaders()
@@ -521,6 +532,13 @@ export const api = {
   rightsCodes: () => request<JsonRecord[]>("/api/admin/rights-codes", {
     headers: adminHeaders()
   }).then((rows) => rows.map(stripRightsCodePlaintext)),
+  agentRightsCodes: (agentProductId?: string) => {
+    const params = new URLSearchParams();
+    if (agentProductId) params.set("agentProductId", agentProductId);
+    return request<JsonRecord[]>(`/api/agent/rights-codes${params.size ? `?${params.toString()}` : ""}`, {
+      headers: agentHeaders()
+    }).then((rows) => rows.map(stripRightsCodePlaintext));
+  },
   rightsCodesPlaintext: () => request<JsonRecord[]>("/api/admin/rights-codes/plaintext", {
     headers: adminHeaders()
   }),
@@ -533,6 +551,15 @@ export const api = {
       codes: input.codes
     }
   }),
+  importAgentRightsCodes: (input: { agentProductId: string; batchNo: string; codes: string[] }) => request<JsonRecord>("/api/agent/rights-codes/import", {
+    method: "POST",
+    headers: agentHeaders(),
+    body: {
+      agentProductId: input.agentProductId,
+      batchNo: input.batchNo,
+      codes: input.codes
+    }
+  }),
   notifications: () => request<JsonRecord[]>("/api/agent/notifications", {
     headers: agentHeaders()
   }),
@@ -541,6 +568,9 @@ export const api = {
   }),
   ownProducts: () => request<JsonRecord[]>("/api/agent/products/own", {
     headers: agentHeaders()
+  }),
+  adminOwnProductReviews: () => request<JsonRecord[]>("/api/admin/agent-products/reviews", {
+    headers: adminHeaders()
   }),
   submitOwnProduct: (input: { name: string; salePriceCents: string; minSalePriceCents: string; fulfillmentMode: string }) => request<JsonRecord>("/api/agent/products/own", {
     method: "POST",
@@ -585,6 +615,9 @@ export const api = {
     headers: agentHeaders()
   }),
   agentClawbacks: () => request<JsonRecord[]>("/api/agent/clawbacks", {
+    headers: agentHeaders()
+  }),
+  agentDepositTransactions: () => request<JsonRecord[]>("/api/agent/deposit-transactions", {
     headers: agentHeaders()
   })
 };

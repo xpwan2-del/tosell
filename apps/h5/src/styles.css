@@ -336,10 +336,33 @@ code {
 
 .tabs button,
 .ghost,
+.ghost-link,
 .icon-button {
   background: #fff;
   color: var(--link);
   border-color: #b9c9d0;
+}
+
+.ghost-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 38px;
+  padding: 8px 12px;
+  border: 1px solid #b9c9d0;
+  border-radius: 8px;
+  text-decoration: none;
+}
+
+.extract-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+}
+
+.extract-panel {
+  width: min(520px, 100%);
+  margin: 0;
 }
 
 .tabs button.active {
@@ -450,6 +473,18 @@ code {
   gap: 8px;
 }
 
+.service small,
+.detail-service small {
+  color: #66777c;
+  line-height: 1.55;
+}
+
+.service-qr-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .service img,
 .qr-empty {
   width: 116px;
@@ -487,6 +522,13 @@ code {
 
 .section-head {
   margin: 26px 0 12px;
+}
+
+.order-query {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  gap: 8px;
+  margin: 12px 0 4px;
 }
 
 .section-head h2,
@@ -854,6 +896,14 @@ code {
   gap: 6px;
 }
 
+.collection-box select {
+  width: min(260px, 100%);
+  padding: 8px 10px;
+  border: 1px solid #d7c48b;
+  border-radius: 6px;
+  background: #fff;
+}
+
 .collection-box small {
   color: #6f5b1d;
   line-height: 1.55;
@@ -871,6 +921,11 @@ code {
   background: #f6faf9;
   border: 1px solid #d7e6e3;
   border-radius: 8px;
+}
+
+.delivery-box.unavailable {
+  background: #fff3f0;
+  border-color: #f0b8a8;
 }
 
 .delivery-box code {
@@ -1478,6 +1533,10 @@ code {
 
   .section-head {
     margin: 20px 0 10px;
+  }
+
+  .order-query {
+    grid-template-columns: 1fr;
   }
 
   .section-head h2,

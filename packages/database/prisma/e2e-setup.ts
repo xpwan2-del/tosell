@@ -1,8 +1,6 @@
 import { createHash } from "node:crypto";
 import { Prisma, PrismaClient } from "@prisma/client";
 
-const prisma = new PrismaClient();
-
 const permissions = [
   "agent.review",
   "product.manage",
@@ -37,34 +35,40 @@ const paymentChannels = [
   "mock"
 ] as const;
 
+const DB_RETRY_ATTEMPTS = Number(process.env.E2E_SETUP_DB_RETRY_ATTEMPTS ?? 5);
+const DB_RETRY_BASE_DELAY_MS = Number(process.env.E2E_SETUP_DB_RETRY_BASE_DELAY_MS ?? 750);
+
 async function main() {
   assertEnvironment();
 
+  await withFreshPrismaRetry("db:e2e-setup", setup);
+}
+
+async function setup(prisma: PrismaClient) {
   const username = process.env.ADMIN_USERNAME!;
   const passwordHash = adminPasswordHash();
   const now = new Date();
 
-  const [admin, role] = await Promise.all([
-    prisma.adminUser.upsert({
-      where: { username },
-      update: {
-        passwordHash,
-        displayName: process.env.ADMIN_DISPLAY_NAME ?? "Production E2E Admin",
-        status: "active"
-      },
-      create: {
-        username,
-        passwordHash,
-        displayName: process.env.ADMIN_DISPLAY_NAME ?? "Production E2E Admin",
-        status: "active"
-      }
-    }),
-    prisma.role.upsert({
-      where: { code: "admin" },
-      update: { name: "Administrator" },
-      create: { code: "admin", name: "Administrator" }
-    })
-  ]);
+  const admin = await prisma.adminUser.upsert({
+    where: { username },
+    update: {
+      passwordHash,
+      displayName: process.env.ADMIN_DISPLAY_NAME ?? "Production E2E Admin",
+      status: "active"
+    },
+    create: {
+      username,
+      passwordHash,
+      displayName: process.env.ADMIN_DISPLAY_NAME ?? "Production E2E Admin",
+      status: "active"
+    }
+  });
+
+  const role = await prisma.role.upsert({
+    where: { code: "admin" },
+    update: { name: "Administrator" },
+    create: { code: "admin", name: "Administrator" }
+  });
 
   await prisma.permission.createMany({
     data: permissions.map((code) => ({ code, name: code })),
@@ -89,8 +93,8 @@ async function main() {
     skipDuplicates: true
   });
 
-  await Promise.all(paymentChannels.map((channel) => (
-    prisma.paymentChannelConfig.upsert({
+  for (const channel of paymentChannels) {
+    await prisma.paymentChannelConfig.upsert({
       where: { channel },
       update: {
         enabled: false,
@@ -108,8 +112,8 @@ async function main() {
         statusNote: channel === "mock" ? "disabled_in_production_e2e" : "pending_merchant_configuration",
         updatedAt: now
       }
-    })
-  )));
+    });
+  }
 
   await prisma.auditLog.upsert({
     where: { idempotencyKey: "e2e-setup:admin-rbac-payment-config" },
@@ -139,6 +143,54 @@ async function main() {
   });
 }
 
+async function withFreshPrismaRetry<T>(label: string, action: (client: PrismaClient) => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= DB_RETRY_ATTEMPTS; attempt += 1) {
+    const client = new PrismaClient();
+    try {
+      const result = await action(client);
+      if (attempt > 1) {
+        console.error(`${label} recovered after transient database error on attempt ${attempt}`);
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (!isTransientDatabaseError(error) || attempt >= DB_RETRY_ATTEMPTS) throw error;
+      console.error(`${label} transient database error on attempt ${attempt}; retrying`);
+      await sleep(DB_RETRY_BASE_DELAY_MS * attempt);
+    } finally {
+      await client.$disconnect().catch(() => undefined);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`${label} failed`);
+}
+
+function isTransientDatabaseError(error: unknown) {
+  const candidate = error as { code?: unknown; message?: unknown };
+  const code = typeof candidate?.code === "string" ? candidate.code : undefined;
+  const message = typeof candidate?.message === "string" ? candidate.message : "";
+  return Boolean(code && ["P1001", "P1002", "P1017", "P2024", "P2028"].includes(code))
+    || [
+      "Transaction API error",
+      "Transaction not found",
+      "Can't reach database server",
+      "Timed out fetching a new connection",
+      "Timed out trying to acquire",
+      "Connection terminated",
+      "connection closed",
+      "closed the connection",
+      "server closed the connection",
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "pooler",
+      "pool timeout"
+    ].some((fragment) => message.includes(fragment));
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function assertEnvironment() {
   if (!process.env.DATABASE_URL) {
     throw new Error("DATABASE_URL is required for controlled E2E setup");
@@ -160,11 +212,8 @@ function adminPasswordHash() {
 }
 
 main()
-  .then(async () => {
-    await prisma.$disconnect();
-  })
+  .then(() => undefined)
   .catch(async (error) => {
     console.error(error instanceof Error ? error.message : "E2E setup failed");
-    await prisma.$disconnect();
     process.exit(1);
   });

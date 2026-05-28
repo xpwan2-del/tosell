@@ -507,6 +507,25 @@ textarea {
   border-radius: 8px;
 }
 
+.table-tools,
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  color: #66757f;
+  font-size: 13px;
+}
+
+.table-tools input {
+  max-width: 260px;
+}
+
+.pager {
+  justify-content: flex-end;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

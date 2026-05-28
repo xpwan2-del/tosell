@@ -20,7 +20,7 @@ type MerchantRegisterForm = {
 
 const orderTabs = ["全部", "待支付", "已支付", "售后"] as const;
 type OrderTab = (typeof orderTabs)[number];
-const defaultShopId = import.meta.env.VITE_DEFAULT_SHOP_ID ?? "shop-1";
+const defaultShopId = import.meta.env.VITE_DEFAULT_SHOP_ID ?? "";
 const storeAiLogoSrc = "/brand/ai-store-logo.png";
 
 function currentShopId() {
@@ -29,7 +29,14 @@ function currentShopId() {
   return match?.[1] ?? new URLSearchParams(window.location.search).get("shopId") ?? defaultShopId;
 }
 
+function shopHref(shopId?: string) {
+  return shopId ? `/s/${shopId}` : "/";
+}
+
 function App() {
+  if (window.location.pathname.startsWith("/extract")) {
+    return <ExtractionPage />;
+  }
   if (window.location.pathname.startsWith("/user/register")) {
     return <UserRegisterPage />;
   }
@@ -37,7 +44,12 @@ function App() {
     return <MerchantRegisterPage />;
   }
 
-  const [shopId, setShopId] = useState(currentShopId());
+  const initialShopId = currentShopId();
+  if (!initialShopId) {
+    return <ShopLinkRequiredPage />;
+  }
+
+  const [shopId, setShopId] = useState(initialShopId);
   const [shop, setShop] = useState<JsonRecord>({});
   const [products, setProducts] = useState<JsonRecord[]>([]);
   const [collectionChannels, setCollectionChannels] = useState<JsonRecord[]>([]);
@@ -48,6 +60,8 @@ function App() {
   const [checkout, setCheckout] = useState<CheckoutState | undefined>();
   const [selectedOrder, setSelectedOrder] = useState<JsonRecord | undefined>();
   const [afterSaleOrder, setAfterSaleOrder] = useState<JsonRecord | undefined>();
+  const [paymentVoucherOrder, setPaymentVoucherOrder] = useState<JsonRecord | undefined>();
+  const [selectedCollectionChannelId, setSelectedCollectionChannelId] = useState("");
   const [orderTab, setOrderTab] = useState<OrderTab>("全部");
   const [message, setMessage] = useState("正在打开店铺");
   const [loading, setLoading] = useState(false);
@@ -65,6 +79,13 @@ function App() {
   const [showNotice, setShowNotice] = useState(() => localStorage.getItem("tosell_notice_ack") !== "true");
   const [loginPhone, setLoginPhone] = useState("");
   const [loginName, setLoginName] = useState("");
+  const [orderQuery, setOrderQuery] = useState("");
+  const [paymentVoucherForm, setPaymentVoucherForm] = useState({
+    channel: "",
+    payerName: "",
+    voucherUrl: "",
+    note: ""
+  });
 
   const theme = useMemo(() => ({ "--brand": text(shop.themeColor, "#106270") }) as React.CSSProperties, [shop.themeColor]);
   const featured = products[0];
@@ -102,6 +123,7 @@ function App() {
       setShop(nextShop);
       setProducts(nextProducts);
       setCollectionChannels(nextCollectionChannels);
+      setSelectedCollectionChannelId((current) => nextCollectionChannels.some((item) => text(item.id) === current) ? current : text(nextCollectionChannels[0]?.id, ""));
       setSelectedProduct((current) => current ?? nextProducts[0]);
       const mergedOrders = mergeOrders(readCachedOrders(targetShopId), nextOrders.filter((order) => belongsToShop(order, targetShopId)));
       setOrders(mergedOrders);
@@ -183,6 +205,8 @@ function App() {
       setCheckout(undefined);
       setSelectedOrder(undefined);
       setAfterSaleOrder(undefined);
+      setPaymentVoucherOrder(undefined);
+      setSelectedCollectionChannelId("");
       setExtractOrder(undefined);
       setExtractResult(undefined);
       setOrders(readCachedOrders(targetShopId).filter((order) => belongsToShop(order, targetShopId)));
@@ -199,16 +223,35 @@ function App() {
     try {
       setLoading(true);
       const productId = text(product.id);
-      const coupons = await api.coupons(shopId, productId);
+      const [detail, coupons] = await Promise.all([
+        api.product(productId),
+        api.coupons(shopId, productId)
+      ]);
       const couponId = text(coupons.find((coupon) => text(coupon.status) === "available" && coupon.applicable !== false)?.id, "");
       const quote = await api.quote(shopId, productId, couponId || undefined);
-      setSelectedProduct(product);
-      setCheckout({ product, quote, coupons, couponId: couponId || undefined });
+      setSelectedProduct(detail);
+      setCheckout({ product: detail, quote, coupons, couponId: couponId || undefined });
       setExtractionCode("");
       setBuyerEmail("");
       setMessage("请确认订单信息");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "报价失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function openProductDetail(product: JsonRecord) {
+    try {
+      setLoading(true);
+      const detail = await api.product(text(product.id));
+      setSelectedProduct(detail);
+      setDetailProduct(detail);
+      setMessage("商品详情已加载");
+    } catch (error) {
+      setSelectedProduct(product);
+      setDetailProduct(product);
+      setMessage(error instanceof Error ? error.message : "商品详情加载失败");
     } finally {
       setLoading(false);
     }
@@ -232,6 +275,7 @@ function App() {
   async function submitOrder() {
     if (!checkout) return;
     if (!await ensureAuth()) return;
+    if (loading) return;
     try {
       setLoading(true);
       const order = await api.createOrder(
@@ -242,7 +286,7 @@ function App() {
           extractionCode: requiresProductExtractionCode(checkout.product) ? extractionCode : undefined,
           couponId: checkout.couponId,
           buyerEmail: buyerEmail.trim() || undefined,
-          collectionChannelId: text(collectionChannels[0]?.id, "")
+          collectionChannelId: selectedCollectionChannelId || text(collectionChannels[0]?.id, "")
         }
       );
       updateOrders((current) => upsertOrder(current, order));
@@ -261,8 +305,75 @@ function App() {
     setMessage(`订单 ${text(order.orderNo)} 待收款确认，请使用当前店铺收款通道付款。`);
   }
 
+  function openPaymentVoucher(order: JsonRecord) {
+    const channel = inferPaymentVoucherChannel(selectedCollectionChannel(collectionChannels, selectedCollectionChannelId));
+    setPaymentVoucherForm({
+      channel,
+      payerName: "",
+      voucherUrl: "",
+      note: ""
+    });
+    setPaymentVoucherOrder(order);
+  }
+
+  async function submitPaymentVoucher() {
+    if (!paymentVoucherOrder) return;
+    if (!paymentVoucherForm.voucherUrl.trim() && !paymentVoucherForm.note.trim()) {
+      setMessage("请填写付款凭证 URL 或备注，便于后台核验。");
+      return;
+    }
+    try {
+      setLoading(true);
+      const voucher = await api.submitPaymentVoucher(text(paymentVoucherOrder.orderNo), {
+        channel: paymentVoucherForm.channel || undefined,
+        payerName: paymentVoucherForm.payerName.trim() || undefined,
+        voucherUrl: paymentVoucherForm.voucherUrl.trim() || undefined,
+        note: paymentVoucherForm.note.trim() || undefined
+      });
+      updateOrders((current) => upsertOrder(current, {
+        ...paymentVoucherOrder,
+        paymentVoucherStatus: text(voucher.status, "pending_review"),
+        paymentVoucherId: text(voucher.id, "")
+      }));
+      setPaymentVoucherOrder(undefined);
+      setMessage(`付款凭证已提交：${text(voucher.id, "待审核")}`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "付款凭证提交失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function findOrder() {
+    const orderNo = orderQuery.trim();
+    if (!orderNo) {
+      setMessage("请输入订单号。");
+      return;
+    }
+    try {
+      setLoading(true);
+      const order = await api.order(orderNo);
+      if (!belongsToShop(order, shopId)) {
+        setMessage("该订单不属于当前店铺。");
+        return;
+      }
+      updateOrders((current) => upsertOrder(current, order));
+      setSelectedOrder(order);
+      setMessage("订单已找回。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "订单找回失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function afterSale() {
     if (!afterSaleOrder) return;
+    if (loading) return;
+    if (text(afterSaleOrder.refundStatus, "none") !== "none") {
+      setMessage("该订单已进入售后或退款流程，不能重复申请。");
+      return;
+    }
     try {
       setLoading(true);
       await api.createAfterSale(text(afterSaleOrder.orderNo), orderPaidAmount(afterSaleOrder), `${afterSaleReason}：${afterSaleDescription}`);
@@ -278,6 +389,11 @@ function App() {
 
   async function submitExtract() {
     if (!extractOrder) return;
+    if (loading) return;
+    if (text(extractOrder.refundStatus, "none") !== "none") {
+      setMessage("订单已进入售后或退款流程，不能查看卡密。");
+      return;
+    }
     try {
       setLoading(true);
       const result = await api.extractOrder(text(extractOrder.orderNo), extractInput.trim());
@@ -360,12 +476,7 @@ function App() {
           </section>
 
           <section className="service">
-            <div>
-              <strong>客服微信</strong>
-              <span>{text(shop.customerServiceWechat, "未配置")}</span>
-              <button type="button" className="ghost" onClick={() => void navigator.clipboard?.writeText(text(shop.customerServiceWechat, ""))}>复制微信</button>
-            </div>
-            <ImageWithFallback src={text(shop.customerServiceQrUrl)} alt="客服二维码" fallback={<div className="qr-empty">客服二维码</div>} />
+            <ServiceContact shop={shop} />
           </section>
         </aside>
       </section>
@@ -399,10 +510,7 @@ function App() {
             key={text(item.id)}
             item={item}
             active={text(item.id) === text(activeProduct?.id)}
-            onDetail={() => {
-              setSelectedProduct(item);
-              setDetailProduct(item);
-            }}
+            onDetail={() => void openProductDetail(item)}
             onBuy={() => void startCheckout(item)}
           />
         ))}
@@ -418,6 +526,11 @@ function App() {
             {orderTabs.map((tab) => <button type="button" className={orderTab === tab ? "active" : ""} key={tab} onClick={() => setOrderTab(tab)}>{tab}</button>)}
           </div>
         </div>
+        <div className="order-query">
+          <input value={orderQuery} onChange={(event) => setOrderQuery(event.target.value)} placeholder="输入订单号找回当前账号订单" />
+          <button type="button" className="ghost" disabled={loading || !orderQuery.trim()} onClick={() => void findOrder()}>找回订单</button>
+          <button type="button" className="ghost" disabled={loading} onClick={() => void load(shopId)}>刷新状态</button>
+        </div>
         {filteredOrders.length === 0 ? <p className="empty">暂无订单</p> : filteredOrders.slice(0, 8).map((order) => (
           <article className="order" key={text(order.orderNo)}>
             <button type="button" className="order-main" onClick={() => setSelectedOrder(order)}>
@@ -427,6 +540,7 @@ function App() {
             <em>{statusLabel(order)}</em>
             <strong>{cents(orderPaidAmount(order))}</strong>
             {text(order.paymentStatus) === "unpaid" ? <button type="button" onClick={() => showCollection(order)}>收款信息</button> : null}
+            {text(order.paymentStatus) === "unpaid" ? <button type="button" onClick={() => openPaymentVoucher(order)}>提交凭证</button> : null}
             {text(order.paymentStatus) === "paid" && text(order.refundStatus, "none") === "none" ? (
               <button type="button" onClick={() => setAfterSaleOrder(order)}>申请售后</button>
             ) : null}
@@ -451,12 +565,7 @@ function App() {
         </section>
 
         <section className="service">
-          <div>
-            <strong>客服微信</strong>
-            <span>{text(shop.customerServiceWechat, "未配置")}</span>
-            <button type="button" className="ghost" onClick={() => void navigator.clipboard?.writeText(text(shop.customerServiceWechat, ""))}>复制微信</button>
-          </div>
-          <ImageWithFallback src={text(shop.customerServiceQrUrl)} alt="客服二维码" fallback={<div className="qr-empty">客服二维码</div>} />
+          <ServiceContact shop={shop} />
         </section>
       </aside>
 
@@ -517,10 +626,10 @@ function App() {
             <p>{requiresProductExtractionCode(checkout.product)
               ? "后台确认收款并发码后，请使用购买时设置的提取码查看。"
               : "本商品由客服人工交付，后台确认收款后请添加店铺客服领取卡密或账号。"}</p>
-            <CollectionBox channels={collectionChannels} orderAmountCents={orderPayableAmount(checkout.quote)} />
+            <CollectionBox channels={collectionChannels} orderAmountCents={orderPayableAmount(checkout.quote)} selectedChannelId={selectedCollectionChannelId} onSelect={setSelectedCollectionChannelId} />
             <div className="checkout-actions">
               <button type="button" className="ghost" onClick={() => setCheckout(undefined)}>再看看</button>
-              <button type="button" disabled={collectionChannels.length === 0 || (requiresProductExtractionCode(checkout.product) && extractionCode.trim().length < 4)} onClick={() => void submitOrder()}>提交订单</button>
+              <button type="button" disabled={loading || collectionChannels.length === 0 || (requiresProductExtractionCode(checkout.product) && extractionCode.trim().length < 4)} onClick={() => void submitOrder()}>提交订单</button>
             </div>
           </section>
         </div>
@@ -598,14 +707,65 @@ function App() {
             <div className="checkout-row"><span>实付金额</span><strong>{cents(orderPaidAmount(selectedOrder))}</strong></div>
             <div className="checkout-row"><span>支付状态</span><strong>{statusLabel(selectedOrder)}</strong></div>
             <div className="checkout-row"><span>履约方式</span><strong>{text(selectedOrder.fulfillmentStatus, "待处理")}</strong></div>
-            {text(selectedOrder.paymentStatus) === "unpaid" ? <CollectionBox channels={collectionChannels} orderAmountCents={orderPaidAmount(selectedOrder)} /> : null}
-            <DeliveryBlock order={selectedOrder} onExtract={() => {
+            {text(selectedOrder.paymentStatus) === "unpaid" ? <CollectionBox channels={collectionChannels} orderAmountCents={orderPaidAmount(selectedOrder)} selectedChannelId={selectedCollectionChannelId} onSelect={setSelectedCollectionChannelId} /> : null}
+            {text(selectedOrder.paymentStatus) === "unpaid" ? (
+              <div className="checkout-actions">
+                <button type="button" onClick={() => openPaymentVoucher(selectedOrder)}>提交付款凭证</button>
+              </div>
+            ) : null}
+            {text(selectedOrder.paymentVoucherStatus, "") ? <div className="checkout-row"><span>凭证状态</span><strong>{text(selectedOrder.paymentVoucherStatus)}</strong></div> : null}
+            <DeliveryBlock order={selectedOrder} onExtract={(token) => {
+              if (token) {
+                window.location.href = `/extract?token=${encodeURIComponent(token)}&shopId=${encodeURIComponent(shopId)}`;
+                return;
+              }
               setExtractOrder(selectedOrder);
               setExtractInput("");
               setExtractResult(undefined);
             }} />
-            <div className="checkout-row"><span>客服微信</span><strong>{text(selectedOrder.customerServiceWechat, text(shop.customerServiceWechat, "未配置"))}</strong></div>
+            <ServiceContact shop={shop} compact />
             <p>虚拟权益订单会保留支付、履约和售后记录；遇到问题请联系店铺客服。</p>
+          </section>
+        </div>
+      ) : null}
+
+      {paymentVoucherOrder ? (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="提交付款凭证">
+          <section className="checkout">
+            <div className="checkout-head">
+              <div>
+                <span>付款凭证</span>
+                <h2>{text(paymentVoucherOrder.orderNo)}</h2>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setPaymentVoucherOrder(undefined)}>关闭</button>
+            </div>
+            <div className="checkout-row"><span>订单金额</span><strong>{cents(orderPaidAmount(paymentVoucherOrder))}</strong></div>
+            <label className="field">
+              <span>付款通道</span>
+              <select value={paymentVoucherForm.channel} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, channel: event.target.value })}>
+                <option value="">按收款码核验</option>
+                <option value="alipay_wap">支付宝</option>
+                <option value="wechat_h5">微信 H5</option>
+                <option value="wechat_h5_jsapi">微信 JSAPI</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>付款人</span>
+              <input value={paymentVoucherForm.payerName} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, payerName: event.target.value })} placeholder="选填，付款账号名或姓名" />
+            </label>
+            <label className="field">
+              <span>凭证 URL</span>
+              <input value={paymentVoucherForm.voucherUrl} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, voucherUrl: event.target.value })} placeholder="付款截图或凭证链接" />
+            </label>
+            <label className="field">
+              <span>备注</span>
+              <textarea value={paymentVoucherForm.note} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, note: event.target.value })} rows={3} placeholder="付款时间、账号尾号或其他核验信息" />
+            </label>
+            <p>订单金额以后端生成为准；提交后由商户或平台后台确认收款。</p>
+            <div className="checkout-actions">
+              <button type="button" className="ghost" onClick={() => setPaymentVoucherOrder(undefined)}>取消</button>
+              <button type="button" disabled={loading || (!paymentVoucherForm.voucherUrl.trim() && !paymentVoucherForm.note.trim())} onClick={() => void submitPaymentVoucher()}>提交凭证</button>
+            </div>
           </section>
         </div>
       ) : null}
@@ -632,7 +792,7 @@ function App() {
             {extractResult ? <ExtractResult result={extractResult} /> : null}
             <div className="checkout-actions">
               <button type="button" className="ghost" onClick={() => setExtractOrder(undefined)}>返回订单</button>
-              <button type="button" disabled={extractInput.trim().length < 4} onClick={() => void submitExtract()}>提取</button>
+              <button type="button" disabled={loading || extractInput.trim().length < 4 || text(extractOrder.refundStatus, "none") !== "none"} onClick={() => void submitExtract()}>提取</button>
             </div>
           </section>
         </div>
@@ -664,7 +824,7 @@ function App() {
             </label>
             <div className="checkout-actions">
               <button type="button" className="ghost" onClick={() => setAfterSaleOrder(undefined)}>取消</button>
-              <button type="button" onClick={() => void afterSale()}>提交售后</button>
+              <button type="button" disabled={loading || text(afterSaleOrder.refundStatus, "none") !== "none"} onClick={() => void afterSale()}>提交售后</button>
             </div>
           </section>
         </div>
@@ -679,7 +839,7 @@ function UserRegisterPage() {
   const [message, setMessage] = useState("手机号注册后，订单、优惠券、售后和卡密提取记录会绑定到当前账号。");
   const [session, setSession] = useState<AuthSession | undefined>(() => api.currentSession());
   const [loading, setLoading] = useState(false);
-  const backHref = defaultShopId ? `/s/${defaultShopId}` : "/";
+  const backHref = shopHref(defaultShopId);
 
   async function submit() {
     const nextPhone = phone.trim();
@@ -758,6 +918,80 @@ function UserRegisterPage() {
   );
 }
 
+function ShopLinkRequiredPage() {
+  return (
+    <main className="merchant-page">
+      <header className="merchant-header">
+        <a href="/">ToSell</a>
+        <a href="/merchant/register">商户入驻</a>
+      </header>
+      <section className="user-register-page">
+        <section className="merchant-copy">
+          <span>店铺链接</span>
+          <h1>请通过商户店铺分享地址访问</h1>
+          <p>生产环境不会默认进入测试店铺。每个商户都有自己的独立 H5 店铺地址，请使用商户分享链接打开。</p>
+        </section>
+      </section>
+    </main>
+  );
+}
+
+function ExtractionPage() {
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get("token") ?? "";
+  const shopId = params.get("shopId") ?? defaultShopId;
+  const [extractionCode, setExtractionCode] = useState("");
+  const [result, setResult] = useState<JsonRecord | undefined>();
+  const [message, setMessage] = useState(token ? "输入购买时设置的提取码查看卡密。" : "提取链接无效，请从订单详情重新进入。");
+  const [loading, setLoading] = useState(false);
+
+  async function submit() {
+    if (!token) return;
+    setLoading(true);
+    try {
+      const next = await api.extractWithToken(token, extractionCode.trim());
+      setResult(next);
+      setMessage("卡密提取成功，请妥善保存。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "卡密提取失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <main className="page extract-page">
+      <section className="checkout extract-panel">
+        <div className="checkout-head">
+          <div>
+            <span>卡密提取</span>
+            <h2>输入购买密码</h2>
+          </div>
+          <a className="ghost-link" href={`${shopHref(shopId)}#orders`}>返回订单</a>
+        </div>
+        <p>{message}</p>
+        <label className="field">
+          <span>提取码</span>
+          <input
+            inputMode="numeric"
+            value={extractionCode}
+            onChange={(event) => setExtractionCode(event.target.value.replace(/\D/g, "").slice(0, 12))}
+            placeholder="输入购买时设置的纯数字提取码"
+            autoFocus
+          />
+        </label>
+        {result ? <ExtractResult result={result} /> : null}
+        <div className="checkout-actions">
+          <a className="ghost-link" href={`${shopHref(shopId)}#orders`}>返回店铺</a>
+          <button type="button" disabled={!token || loading || extractionCode.trim().length < 4} onClick={() => void submit()}>
+            {loading ? "提取中" : "提取卡密"}
+          </button>
+        </div>
+      </section>
+    </main>
+  );
+}
+
 function MerchantRegisterPage() {
   const params = new URLSearchParams(window.location.search);
   const [form, setForm] = useState<MerchantRegisterForm>({
@@ -799,7 +1033,7 @@ function MerchantRegisterPage() {
     <main className="merchant-page">
       <header className="merchant-header">
         <a href="/">ToSell</a>
-        <a href={defaultShopId ? `/s/${defaultShopId}` : "/"}>返回商城</a>
+        <a href={shopHref(defaultShopId)}>返回商城</a>
       </header>
       <section className="merchant-register">
         <div className="merchant-copy">
@@ -864,8 +1098,33 @@ function AccountBenefits(props: { coupons: JsonRecord[]; orders: JsonRecord[] })
   );
 }
 
-function CollectionBox(props: { channels: JsonRecord[]; orderAmountCents: string }) {
-  const channel = props.channels[0];
+function ServiceContact(props: { shop: JsonRecord; compact?: boolean }) {
+  const wechat = text(props.shop.customerServiceWechat, "未配置");
+  const wechatQr = text(props.shop.customerServiceQrUrl, "");
+  const qq = text(props.shop.customerServiceQq, text(props.shop.customerServiceQQ, text(props.shop.qq, "")));
+  const qqQr = text(props.shop.customerServiceQqQrUrl, text(props.shop.customerServiceQQQrUrl, text(props.shop.qqQrUrl, "")));
+  const note = text(props.shop.customerServiceNote, text(props.shop.customerServiceDescription, text(props.shop.serviceNote, "")));
+  return (
+    <>
+      <div>
+        <strong>客服微信</strong>
+        <span>{wechat}</span>
+        {wechat !== "未配置" ? <button type="button" className="ghost" onClick={() => void navigator.clipboard?.writeText(wechat)}>复制微信</button> : null}
+        {qq ? <><strong>客服 QQ</strong><span>{qq}</span><button type="button" className="ghost" onClick={() => void navigator.clipboard?.writeText(qq)}>复制 QQ</button></> : null}
+        {note ? <small>{note}</small> : null}
+      </div>
+      {!props.compact ? (
+        <div className="service-qr-grid">
+          <ImageWithFallback src={wechatQr} alt="微信客服二维码" fallback={<div className="qr-empty">微信二维码</div>} />
+          {qqQr ? <ImageWithFallback src={qqQr} alt="QQ 客服二维码" fallback={<div className="qr-empty">QQ 二维码</div>} /> : null}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function CollectionBox(props: { channels: JsonRecord[]; orderAmountCents: string; selectedChannelId?: string; onSelect?: (channelId: string) => void }) {
+  const channel = selectedCollectionChannel(props.channels, props.selectedChannelId);
   const hasQr = Boolean(usableImageSrc(text(channel?.qrUrl, "")));
   if (!channel) {
     return (
@@ -884,6 +1143,11 @@ function CollectionBox(props: { channels: JsonRecord[]; orderAmountCents: string
         <strong>店铺收款通道</strong>
         <span>{text(channel.displayName, "商户收款")} / {text(channel.accountName, "未填写账户名")}</span>
         <small>请按订单金额付款，付款后等待商家或平台后台确认收款。</small>
+        {props.channels.length > 1 ? (
+          <select value={text(channel.id, "")} onChange={(event) => props.onSelect?.(event.target.value)} aria-label="选择收款通道">
+            {props.channels.map((item) => <option key={text(item.id)} value={text(item.id)}>{text(item.displayName, "商户收款")}</option>)}
+          </select>
+        ) : null}
       </div>
       <strong className="collection-amount">{cents(props.orderAmountCents)}</strong>
       {hasQr ? (
@@ -908,16 +1172,25 @@ function ExtractResult(props: { result: JsonRecord }) {
   );
 }
 
-function DeliveryBlock(props: { order: JsonRecord; onExtract: () => void }) {
+function DeliveryBlock(props: { order: JsonRecord; onExtract: (token?: string) => void }) {
   const delivery = props.order.delivery as JsonRecord | undefined;
   const codes = Array.isArray(delivery?.codes) ? delivery.codes as JsonRecord[] : [];
+  const extractionToken = text(delivery?.extractionToken, "");
+  if (text(props.order.refundStatus, "none") !== "none") {
+    return (
+      <div className="delivery-box unavailable">
+        <strong>卡密不可查看</strong>
+        <span>订单已进入售后或退款流程，卡密提取入口已关闭。</span>
+      </div>
+    );
+  }
   if (text(delivery?.mode) === "automatic") {
     return (
       <div className="delivery-box">
         <strong>自动卡密</strong>
         <span>{text(delivery?.message, "付款后自动发放卡密")}</span>
         {delivery?.extractionCodeSet ? <small>已设置提取码</small> : null}
-        {delivery?.extractable && delivery?.extractionCodeSet ? <button type="button" onClick={props.onExtract}>提取卡密</button> : null}
+        {delivery?.extractable && delivery?.extractionCodeSet ? <button type="button" onClick={() => props.onExtract(extractionToken || undefined)}>提取卡密</button> : null}
         {codes.length > 0 ? codes.map((item) => (
           <code key={text(item.codeId, text(item.code))}>{text(item.code)}</code>
         )) : null}
@@ -1063,12 +1336,7 @@ function ProductDetailPage(props: { product: JsonRecord; shop: JsonRecord; onClo
         </section>
 
         <section className="detail-service">
-          <div>
-            <span>店铺客服</span>
-            <strong>{text(props.shop.customerServiceWechat, "未配置")}</strong>
-            <p>购买前如需确认商品规格、库存或售后范围，可以先联系本店客服。</p>
-          </div>
-          <ImageWithFallback src={text(props.shop.customerServiceQrUrl)} alt="客服二维码" fallback={<div className="qr-empty">客服二维码</div>} />
+          <ServiceContact shop={props.shop} />
         </section>
       </section>
     </div>
@@ -1182,6 +1450,17 @@ function orderPayableAmount(quote: JsonRecord): string {
   return text(quote.buyerPaidAmountCents, text(quote.paidAmountCents, "0"));
 }
 
+function inferPaymentVoucherChannel(channel?: JsonRecord): string {
+  const type = text(channel?.channelType, "").toLowerCase();
+  if (type.includes("alipay")) return "alipay_wap";
+  if (type.includes("wechat")) return "wechat_h5";
+  return "";
+}
+
+function selectedCollectionChannel(channels: JsonRecord[], selectedChannelId?: string): JsonRecord | undefined {
+  return channels.find((item) => text(item.id) === selectedChannelId) ?? channels[0];
+}
+
 function orderProductName(order: JsonRecord): string {
   const snapshot = order.snapshot as JsonRecord | undefined;
   const productSnapshot = snapshot?.productSnapshot as JsonRecord | undefined;
@@ -1189,7 +1468,9 @@ function orderProductName(order: JsonRecord): string {
 }
 
 function statusLabel(order: JsonRecord): string {
-  if (text(order.refundStatus, "none") !== "none") return "售后处理中";
+  const refundStatus = text(order.refundStatus, "none");
+  if (["refunded", "success", "succeeded"].includes(refundStatus)) return "已退款";
+  if (refundStatus !== "none") return "售后处理中";
   if (text(order.paymentStatus) === "paid") return "已支付";
   return "待支付";
 }
