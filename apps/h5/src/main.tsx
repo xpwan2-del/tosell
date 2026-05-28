@@ -716,6 +716,11 @@ function NoticeItem(props: { index: string; title: string; text: string }) {
 }
 
 function ProductCard(props: { item: JsonRecord; active: boolean; onDetail: () => void; onBuy: () => void }) {
+  const category = text(productRecord(props.item).category, text(props.item.productType) === "platform_self_operated" ? "官方精选" : "店铺精选");
+  const tags = productTags(props.item)
+    .filter((tag) => tag !== category)
+    .slice(0, 2);
+
   return (
     <article className={props.active ? "product active" : "product"}>
       <div className="product-media">
@@ -723,13 +728,12 @@ function ProductCard(props: { item: JsonRecord; active: boolean; onDetail: () =>
         <span>{fulfillmentLabel(props.item)}</span>
       </div>
       <div className="product-tags">
-        <span>{text(productRecord(props.item).category, text(props.item.productType) === "platform_self_operated" ? "官方精选" : "店铺精选")}</span>
-        {productTags(props.item).slice(0, 2).map((tag) => <span key={tag}>{tag}</span>)}
+        <span>{category}</span>
+        {tags.map((tag) => <span key={tag}>{tag}</span>)}
         <span>库存 {productStock(props.item)}</span>
         <span>销量 {productSales(props.item)}</span>
       </div>
       <h2>{productName(props.item)}</h2>
-      <p>{productIntro(props.item)}</p>
       <strong>{cents(props.item.salePriceCents)}</strong>
       <div className="product-actions">
         <button type="button" className="ghost" onClick={props.onDetail}>详情</button>

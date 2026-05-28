@@ -472,7 +472,7 @@ dl {
 .product {
   display: grid;
   gap: 12px;
-  min-height: 330px;
+  min-height: 292px;
   position: relative;
   padding: 18px;
   background: #fff;
