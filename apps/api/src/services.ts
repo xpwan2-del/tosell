@@ -5090,6 +5090,7 @@ class PrismaStateRepository {
       status: string;
       risk_status: string;
       announcement: string | null;
+      customer_service_wechat: string | null;
       customer_service_qr_url: string | null;
       collection_account_name: string | null;
       collection_qr_url: string | null;
@@ -5098,10 +5099,18 @@ class PrismaStateRepository {
       banner_url: string | null;
       share_title: string | null;
     }>>`
-      SELECT id, owner_type, agent_id, merchant_id, name, status, risk_status, announcement,
+      SELECT s.id, s.owner_type, s.agent_id, s.merchant_id, s.name, s.status, s.risk_status, s.announcement,
+             cs.wechat_id AS customer_service_wechat,
              customer_service_qr_url, collection_account_name, collection_qr_url, collection_note,
              theme_color, banner_url, share_title
-        FROM shops
+        FROM shops s
+        LEFT JOIN LATERAL (
+          SELECT wechat_id, qr_code_url
+            FROM shop_customer_service_bindings
+           WHERE shop_id = s.id AND status = 'active' AND review_status = 'approved'
+           ORDER BY updated_at DESC
+           LIMIT 1
+        ) cs ON TRUE
     `;
     for (const row of rows) {
       store.shops.set(row.id, {
@@ -5112,6 +5121,7 @@ class PrismaStateRepository {
         status: row.status,
         riskStatus: row.risk_status,
         announcement: row.announcement ?? undefined,
+        customerServiceWechat: row.customer_service_wechat ?? undefined,
         customerServiceQrUrl: row.customer_service_qr_url ?? undefined,
         collectionAccountName: row.collection_account_name ?? undefined,
         collectionQrUrl: row.collection_qr_url ?? undefined,
