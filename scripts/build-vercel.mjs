@@ -12,6 +12,7 @@ async function run(command, args) {
 
 await rm("apps/h5/dist", { recursive: true, force: true });
 await rm("apps/admin/dist", { recursive: true, force: true });
+await run("npx", ["prisma", "generate", "--schema", "packages/database/prisma/schema.prisma"]);
 await run("npm", ["--workspace", "@tosell/h5", "run", "build"]);
 await run("npm", ["--workspace", "@tosell/admin", "run", "build"]);
 await rm("apps/h5/dist/admin", { recursive: true, force: true });

@@ -30,6 +30,10 @@ const threeTierChannelMigrationSql = readFileSync(
   resolve(testDir, "../prisma/migrations/000008_three_tier_channel_foundation/migration.sql"),
   "utf8"
 );
+const productMediaInventoryMigrationSql = readFileSync(
+  resolve(testDir, "../prisma/migrations/000013_product_media_inventory/migration.sql"),
+  "utf8"
+);
 
 function modelBlock(modelName: string) {
   const match = schema.match(new RegExp(`model\\s+${modelName}\\s+\\{([\\s\\S]*?)\\n\\}`));
@@ -277,5 +281,18 @@ describe("Prisma database contract", () => {
     expect(threeTierChannelMigrationSql).toContain("third_tier_agent_id");
     expect(threeTierChannelMigrationSql).toContain("third_tier_pending_income");
     expect(threeTierChannelMigrationSql).toContain("third_tier_bear_cents");
+  });
+
+  it("persists product media, detail sections, and display inventory in the product table", () => {
+    const product = modelBlock("PlatformProduct");
+
+    expect(product).toMatch(/imageUrl\s+String\?\s+@map\("image_url"\)/);
+    expect(product).toMatch(/specsJson\s+Json\?\s+@map\("specs_json"\)/);
+    expect(product).toMatch(/detailSectionsJson\s+Json\?\s+@map\("detail_sections_json"\)/);
+    expect(product).toMatch(/stockCount\s+Int\s+@default\(0\)\s+@map\("stock_count"\)/);
+    expect(product).toMatch(/soldCount\s+Int\s+@default\(0\)\s+@map\("sold_count"\)/);
+    expect(productMediaInventoryMigrationSql).toContain('"image_url" TEXT');
+    expect(productMediaInventoryMigrationSql).toContain('"detail_sections_json" JSONB');
+    expect(productMediaInventoryMigrationSql).toContain("platform_products_stock_count_check");
   });
 });

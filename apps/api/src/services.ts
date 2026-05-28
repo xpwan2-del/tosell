@@ -3912,6 +3912,7 @@ class PrismaStateRepository {
     await tx.$executeRaw`
       INSERT INTO platform_products (
         id, product_no, name, category_name, tags_json, detail, rights_desc,
+        image_url, specs_json, detail_sections_json, stock_count, sold_count,
         supply_price_cents, min_sale_price_cents, suggested_sale_price_cents,
         fulfillment_type, fulfillment_rule_json, after_sale_rule_json,
         extract_code_required, status, created_at, updated_at
@@ -3919,7 +3920,9 @@ class PrismaStateRepository {
       VALUES (
         ${product.id}, ${product.id}, ${product.name}, ${product.category ?? null},
         ${jsonForDb(product.tags ?? [])}::jsonb, ${product.description ?? product.subtitle ?? product.name},
-        ${product.subtitle ?? product.name}, ${product.supplyPriceCents}, ${product.minSalePriceCents},
+        ${product.subtitle ?? product.name}, ${product.imageUrl ?? null},
+        ${jsonForDb(product.specs ?? [])}::jsonb, ${jsonForDb(product.detailSections ?? [])}::jsonb,
+        ${product.stockCount ?? 0}, ${product.soldCount ?? 0}, ${product.supplyPriceCents}, ${product.minSalePriceCents},
         ${product.suggestedSalePriceCents}, CAST(${fulfillmentModeFromRule(product.fulfillmentRule)} AS "FulfillmentType"),
         ${jsonForDb(product.fulfillmentRule)}::jsonb, ${jsonForDb(product.afterSaleRule)}::jsonb,
         ${isRecord(product.fulfillmentRule) && product.fulfillmentRule.extractCodeRequired === true},
@@ -3931,6 +3934,11 @@ class PrismaStateRepository {
         tags_json = EXCLUDED.tags_json,
         detail = EXCLUDED.detail,
         rights_desc = EXCLUDED.rights_desc,
+        image_url = EXCLUDED.image_url,
+        specs_json = EXCLUDED.specs_json,
+        detail_sections_json = EXCLUDED.detail_sections_json,
+        stock_count = EXCLUDED.stock_count,
+        sold_count = EXCLUDED.sold_count,
         supply_price_cents = EXCLUDED.supply_price_cents,
         min_sale_price_cents = EXCLUDED.min_sale_price_cents,
         suggested_sale_price_cents = EXCLUDED.suggested_sale_price_cents,
@@ -5121,6 +5129,11 @@ class PrismaStateRepository {
       name: string;
       category_name: string | null;
       tags_json: unknown;
+      image_url: string | null;
+      specs_json: unknown;
+      detail_sections_json: unknown;
+      stock_count: number;
+      sold_count: number;
       detail: string;
       rights_desc: string;
       supply_price_cents: bigint;
@@ -5130,7 +5143,8 @@ class PrismaStateRepository {
       after_sale_rule_json: unknown;
       status: string;
     }>>`
-      SELECT id, name, category_name, tags_json, detail, rights_desc, supply_price_cents,
+      SELECT id, name, category_name, tags_json, image_url, specs_json, detail_sections_json,
+             stock_count, sold_count, detail, rights_desc, supply_price_cents,
              min_sale_price_cents, suggested_sale_price_cents, fulfillment_rule_json,
              after_sale_rule_json, status
         FROM platform_products
@@ -5141,6 +5155,11 @@ class PrismaStateRepository {
         name: row.name,
         category: row.category_name ?? undefined,
         tags: Array.isArray(row.tags_json) ? row.tags_json as string[] : undefined,
+        imageUrl: row.image_url ?? undefined,
+        specs: Array.isArray(row.specs_json) ? row.specs_json as string[] : undefined,
+        detailSections: Array.isArray(row.detail_sections_json) ? row.detail_sections_json as ProductDetailSection[] : undefined,
+        stockCount: row.stock_count,
+        soldCount: row.sold_count,
         description: row.detail,
         subtitle: row.rights_desc,
         supplyPriceCents: row.supply_price_cents,

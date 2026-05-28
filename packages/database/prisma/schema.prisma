@@ -800,6 +800,11 @@ model PlatformProduct {
   categoryId              String?         @map("category_id")
   categoryName            String?         @map("category_name")
   tagsJson                Json?           @map("tags_json")
+  imageUrl                String?         @map("image_url")
+  specsJson               Json?           @map("specs_json")
+  detailSectionsJson      Json?           @map("detail_sections_json")
+  stockCount              Int             @default(0) @map("stock_count")
+  soldCount               Int             @default(0) @map("sold_count")
   detail                  String
   rightsDesc              String          @map("rights_desc")
   supplyPriceCents        BigInt          @map("supply_price_cents")
