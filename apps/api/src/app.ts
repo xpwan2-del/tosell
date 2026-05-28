@@ -1,5 +1,6 @@
 import cors from "@fastify/cors";
 import Fastify, { type FastifyRequest } from "fastify";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { isSettlementCandidate } from "../../../packages/core/src/index.js";
 import {
@@ -13,6 +14,21 @@ import {
 const bigintString = z.union([z.string(), z.number(), z.bigint()]).transform((value) => BigInt(value));
 const adminRole = z.enum(["operator", "finance", "admin"]);
 const paymentChannel = z.enum(["wechat_miniprogram", "wechat_h5_jsapi", "wechat_h5", "alipay_wap", "mock"]);
+const collectionChannelType = z.enum([
+  "alipay_personal_qr",
+  "alipay_merchant_qr",
+  "alipay_merchant_link",
+  "wechat_personal_qr",
+  "wechat_merchant_qr",
+  "wechat_merchant_link"
+]);
+const emailSchema = z.string().email().max(160);
+const extractionCodeSchema = z.string().regex(/^\d{4,12}$/).max(12);
+const agentTierSchema = z.enum(["first_tier", "second_tier", "third_tier"]);
+const productDetailSectionSchema = z.object({
+  title: z.string().min(1).max(60),
+  items: z.array(z.string().min(1).max(240)).max(12)
+});
 
 export function buildApp() {
   const app = Fastify({ logger: false });
@@ -32,7 +48,78 @@ export function buildApp() {
   app.get("/health", async () => services.health());
   app.get("/api/health", async () => services.health());
 
+  app.post("/api/auth/h5/guest", async () => {
+    const userId = `h5-guest-${cryptoRandomId()}`;
+    return createAuthSession({ userId, identityType: "h5_guest", displayName: "游客用户" });
+  });
+
+  app.post("/api/auth/h5/register", async (request) => {
+    const body = z.object({
+      phone: z.string().min(6).max(30),
+      displayName: z.string().min(1).max(40).optional()
+    }).parse(request.body);
+    const normalizedPhone = body.phone.replace(/[^\d+]/g, "");
+    const userId = `h5-phone-${normalizedPhone}`;
+    const session = createAuthSession({
+      userId,
+      identityType: "h5_phone",
+      displayName: body.displayName ?? `用户${normalizedPhone.slice(-4)}`,
+      phone: normalizedPhone
+    });
+    const grantedCoupon = await services.grantRegistrationCoupon(userId);
+    return serializeBigInt({
+      ...session,
+      grantedCoupon
+    });
+  });
+
+  app.get("/api/auth/me", async (request) => {
+    const actor = getUserActor(request);
+    return { user: { userId: actor.userId } };
+  });
+
+  app.post("/api/auth/admin/login", async (request) => {
+    const body = z.object({
+      username: z.string().min(1).max(80),
+      password: z.string().min(1).max(200)
+    }).parse(request.body);
+    return createAdminAuthSession(await services.loginAdmin(body));
+  });
+
+  app.get("/api/auth/admin/session", async (request) => {
+    const actor = getAdminActor(request);
+    return {
+      admin: {
+        adminId: actor.adminId,
+        adminRole: actor.role
+      }
+    };
+  });
+
+  const wechatMiniProgramLogin = async (request: FastifyRequest) => {
+    if (isProductionRuntime()) {
+      throw new ApiError(410, "MINIPROGRAM_LOGIN_DISABLED", "WeChat mini-program login is not a P0 production entry");
+    }
+    const body = z.object({
+      code: z.string().min(1),
+      nickname: z.string().max(40).optional()
+    }).parse(request.body);
+    const userId = `wx-mini-${body.code.slice(0, 16)}`;
+    return createAuthSession({
+      userId,
+      identityType: "wechat_miniprogram",
+      displayName: body.nickname ?? "微信用户"
+    });
+  };
+
+  app.post("/api/auth/wechat-miniprogram/login", wechatMiniProgramLogin);
+  app.post("/api/auth/wechat/miniprogram/login", wechatMiniProgramLogin);
+
   app.get("/api/user/shops/:shopId", async (request) => {
+    const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
+    return services.getPublicShop(shopId);
+  });
+  app.get("/api/h5/shops/:shopId", async (request) => {
     const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
     return services.getPublicShop(shopId);
   });
@@ -41,17 +128,39 @@ export function buildApp() {
     const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
     return serializeBigInt(services.listShopProducts(shopId));
   });
+  app.get("/api/h5/shops/:shopId/products", async (request) => {
+    const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
+    return serializeBigInt(services.listShopProducts(shopId));
+  });
+
+  app.get("/api/user/shops/:shopId/collection-channels", async (request) => {
+    const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
+    return serializeBigInt(services.listPublicCollectionChannels(shopId));
+  });
+  app.get("/api/h5/shops/:shopId/collection-channels", async (request) => {
+    const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
+    return serializeBigInt(services.listPublicCollectionChannels(shopId));
+  });
 
   app.get("/api/user/products/:agentProductId", async (request) => {
     const { agentProductId } = z.object({ agentProductId: z.string() }).parse(request.params);
     return serializeBigInt(services.getAgentProduct(agentProductId));
   });
 
+  app.get("/api/user/coupons", async (request) => {
+    const query = z.object({
+      shopId: z.string().optional(),
+      agentProductId: z.string().optional()
+    }).parse(request.query);
+    return serializeBigInt(services.listUserCoupons(getUserActor(request), query));
+  });
+
   app.post("/api/user/orders/quote", async (request) => {
     const body = z.object({
       shopId: z.string(),
       agentProductId: z.string(),
-      quantity: z.number().int().positive().optional()
+      quantity: z.number().int().positive().optional(),
+      couponId: z.string().optional()
     }).parse(request.body);
     try {
       return serializeBigInt(services.quoteOrder(getUserActor(request), body));
@@ -68,6 +177,10 @@ export function buildApp() {
       shopId: z.string(),
       agentProductId: z.string(),
       quantity: z.number().int().positive().optional(),
+      buyerEmail: emailSchema.optional(),
+      extractionCode: extractionCodeSchema.optional(),
+      couponId: z.string().optional(),
+      collectionChannelId: z.string().optional(),
       clientPaidAmountCents: bigintString.optional()
     }).parse(request.body);
     try {
@@ -78,6 +191,23 @@ export function buildApp() {
     }
   });
 
+  app.post("/api/user/orders/:orderNo/payments", async (request) => {
+    const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
+    const body = z.object({ channel: paymentChannel }).parse(request.body);
+    return serializeBigInt(services.createPaymentIntent(getUserActor(request), orderNo, body));
+  });
+
+  app.post("/api/user/orders/:orderNo/payment-vouchers", async (request) => {
+    const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
+    const body = z.object({
+      channel: paymentChannel.optional(),
+      payerName: z.string().optional(),
+      voucherUrl: z.string().optional(),
+      note: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.createPaymentVoucher(getUserActor(request), orderNo, body));
+  });
+
   app.get("/api/user/orders", async (request) => {
     return serializeBigInt(services.listUserOrders(getUserActor(request)));
   });
@@ -85,6 +215,12 @@ export function buildApp() {
   app.get("/api/user/orders/:orderNo", async (request) => {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
     return serializeBigInt(services.getUserOrder(getUserActor(request), orderNo));
+  });
+
+  app.post("/api/user/orders/:orderNo/extract", async (request) => {
+    const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
+    const body = z.object({ extractionCode: extractionCodeSchema }).parse(request.body);
+    return serializeBigInt(services.extractOrderCodes(getUserActor(request), orderNo, body.extractionCode));
   });
 
   app.post("/api/user/after-sales", async (request) => {
@@ -100,9 +236,31 @@ export function buildApp() {
   app.post("/api/agent/applications", async (request) => {
     const body = z.object({
       contactPhone: z.string(),
-      customerServiceWechat: z.string()
+      customerServiceWechat: z.string(),
+      inviteCode: z.string().optional()
     }).parse(request.body);
     return services.submitAgentApplication(getAgentActor(request), body);
+  });
+
+  app.post("/api/agent/register-by-invite", async (request) => {
+    const body = z.object({
+      inviteCode: z.string().min(1).max(80),
+      name: z.string().min(1).max(80),
+      contactPhone: z.string().max(40).optional(),
+      customerServiceWechat: z.string().max(80).optional(),
+      shopName: z.string().max(80).optional()
+    }).parse(request.body);
+    return serializeBigInt(services.registerAgentByInvite(body));
+  });
+
+  app.get("/api/agent/invite-codes", async (request) => serializeBigInt(services.listInviteCodes(getAgentActor(request))));
+  app.post("/api/agent/invite-codes", async (request) => {
+    const body = z.object({
+      code: z.string().min(1).max(80).optional(),
+      maxUses: z.number().int().positive().optional(),
+      expiresAt: z.string().datetime().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.createAgentInviteCode(getAgentActor(request), body));
   });
 
   app.get("/api/agent/shop", async (request) => services.getAgentShop(getAgentActor(request)));
@@ -117,6 +275,31 @@ export function buildApp() {
       customerServiceQrUrl: z.string().optional()
     }).parse(request.body);
     return services.updateAgentShop(getAgentActor(request), body);
+  });
+
+  app.patch("/api/agent/shop/collection", async (request) => {
+    const body = z.object({
+      collectionAccountName: z.string().optional(),
+      collectionQrUrl: z.string().optional(),
+      collectionNote: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.updateAgentShopCollection(getAgentActor(request), body));
+  });
+
+  app.get("/api/agent/collection-channels", async (request) => serializeBigInt(services.listAgentCollectionChannels(getAgentActor(request))));
+  app.post("/api/agent/collection-channels", async (request) => {
+    const body = z.object({
+      channelType: collectionChannelType,
+      displayName: z.string().min(1).max(80),
+      accountName: z.string().max(120).optional(),
+      qrUrl: z.string().url().optional(),
+      paymentUrl: z.string().url().optional(),
+      isDefault: z.boolean().optional(),
+      sortOrder: z.number().int().optional(),
+      dailyLimitCents: bigintString.optional(),
+      singleOrderLimitCents: bigintString.optional()
+    }).parse(request.body);
+    return serializeBigInt(services.submitAgentCollectionChannel(getAgentActor(request), body));
   });
 
   app.patch("/api/agent/shop/decor", async (request) => {
@@ -138,7 +321,7 @@ export function buildApp() {
 
   app.post("/api/agent/products/own", async (request) => {
     const body = z.object({
-      name: z.string(),
+      name: z.string().trim().min(1),
       salePriceCents: bigintString,
       minSalePriceCents: bigintString.optional(),
       fulfillmentMode: z.string().optional()
@@ -168,6 +351,15 @@ export function buildApp() {
   });
 
   app.get("/api/agent/orders", async (request) => serializeBigInt(services.listAgentOrders(getAgentActor(request))));
+  app.post("/api/agent/orders/:orderNo/confirm-payment", async (request) => {
+    const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
+    const body = z.object({
+      amountCents: bigintString,
+      voucherUrl: z.string().optional(),
+      note: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.confirmAgentOfflinePayment(getAgentActor(request), orderNo, body));
+  });
   app.get("/api/agent/settlements", async (request) => serializeBigInt(services.listAgentSettlements(getAgentActor(request))));
   app.get("/api/agent/clawbacks", async (request) => serializeBigInt(services.listAgentClawbacks(getAgentActor(request))));
   app.get("/api/agent/deposit-transactions", async (request) => serializeBigInt(services.listAgentDepositTransactions(getAgentActor(request))));
@@ -193,6 +385,31 @@ export function buildApp() {
     return services.reviewAgent(getAdminActor(request), agentId, body);
   });
   app.get("/api/admin/agent-applications", async (request) => serializeBigInt(services.listAgentApplications(getAdminActor(request))));
+  app.post("/api/admin/agents/manual", async (request) => {
+    const body = z.object({
+      name: z.string().min(1),
+      targetTier: agentTierSchema.optional(),
+      contactPhone: z.string().optional(),
+      shopName: z.string().optional(),
+      customerServiceWechat: z.string().optional(),
+      initialPassword: z.string().optional(),
+      depositRequiredAmountCents: bigintString.optional(),
+      depositPaid: z.boolean().optional(),
+      depositAmountCents: bigintString.optional()
+    }).parse(request.body);
+    return serializeBigInt(services.createAgentByAdmin(getAdminActor(request), body));
+  });
+
+  app.get("/api/admin/invite-codes", async (request) => serializeBigInt(services.listInviteCodes(getAdminActor(request))));
+  app.post("/api/admin/invite-codes", async (request) => {
+    const body = z.object({
+      code: z.string().min(1).max(80).optional(),
+      targetTier: agentTierSchema.optional(),
+      maxUses: z.number().int().positive().optional(),
+      expiresAt: z.string().datetime().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.createPlatformInviteCode(getAdminActor(request), body));
+  });
 
   app.post("/api/admin/deposits/:agentId/confirm", async (request) => {
     const { agentId } = z.object({ agentId: z.string() }).parse(request.params);
@@ -214,11 +431,25 @@ export function buildApp() {
   app.post("/api/admin/products", async (request) => {
     const body = z.object({
       name: z.string(),
+      category: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+      subtitle: z.string().optional(),
+      description: z.string().optional(),
+      usageGuide: z.string().optional(),
+      imageUrl: z.string().optional(),
+      specs: z.array(z.string().min(1).max(60)).max(12).optional(),
+      detailSections: z.array(productDetailSectionSchema).max(8).optional(),
+      stockCount: z.number().int().nonnegative().optional(),
+      soldCount: z.number().int().nonnegative().optional(),
       supplyPriceCents: bigintString,
       minSalePriceCents: bigintString,
-      suggestedSalePriceCents: bigintString
+      suggestedSalePriceCents: bigintString,
+      fulfillmentMode: z.enum(["manual", "code_pool"]).optional()
     }).parse(request.body);
-    return serializeBigInt(services.createPlatformProduct(getAdminActor(request), body));
+    return serializeBigInt(services.createPlatformProduct(getAdminActor(request), {
+      ...body,
+      fulfillmentRule: { mode: body.fulfillmentMode ?? "manual" }
+    }));
   });
   app.get("/api/admin/products", async (request) => serializeBigInt(services.listAdminPlatformProducts(getAdminActor(request))));
   app.patch("/api/admin/products/:productId", async (request) => {
@@ -244,9 +475,32 @@ export function buildApp() {
     return serializeBigInt(services.upsertPlatformShopProduct(getAdminActor(request), body));
   });
 
+  app.get("/api/admin/coupons", async (request) => serializeBigInt(services.listAdminCoupons(getAdminActor(request))));
+  app.post("/api/admin/coupons", async (request) => {
+    const body = z.object({
+      name: z.string().min(1).max(80),
+      discountCents: bigintString,
+      productIds: z.array(z.string()).optional(),
+      validDays: z.number().int().positive().optional(),
+      grantOnFirstRegister: z.boolean().optional(),
+      status: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.createCouponTemplate(getAdminActor(request), body));
+  });
+  app.patch("/api/admin/coupons/:couponId/status", async (request) => {
+    const { couponId } = z.object({ couponId: z.string() }).parse(request.params);
+    const body = z.object({ status: z.string() }).parse(request.body);
+    return serializeBigInt(services.updateCouponTemplateStatus(getAdminActor(request), couponId, body));
+  });
+
   app.get("/api/admin/rights-codes", async (request) => {
-    const query = z.object({ productId: z.string().optional() }).parse(request.query);
-    return serializeBigInt(services.listRightsCodes(getAdminActor(request), query.productId));
+    const query = z.object({
+      productId: z.string().optional(),
+      orderNo: z.string().optional(),
+      shopId: z.string().optional(),
+      status: z.enum(["available", "issued", "voided"]).optional()
+    }).parse(request.query);
+    return serializeBigInt(services.listRightsCodes(getAdminActor(request), query));
   });
 
   app.post("/api/admin/rights-codes/import", async (request) => {
@@ -265,6 +519,15 @@ export function buildApp() {
   });
 
   app.get("/api/admin/orders", async (request) => serializeBigInt(services.listAdminOrders(getAdminActor(request))));
+  app.post("/api/admin/orders/:orderNo/offline-payment", async (request) => {
+    const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
+    const body = z.object({
+      amountCents: bigintString,
+      voucherUrl: z.string().optional(),
+      note: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.confirmOfflinePayment(getAdminActor(request), orderNo, body));
+  });
   app.get("/api/admin/after-sales", async (request) => serializeBigInt(services.listAdminAfterSales(getAdminActor(request))));
   app.get("/api/admin/refunds", async (request) => serializeBigInt(services.listAdminRefunds(getAdminActor(request))));
   app.get("/api/admin/settlements", async (request) => serializeBigInt(services.listAdminSettlements(getAdminActor(request))));
@@ -279,6 +542,7 @@ export function buildApp() {
     const body = z.object({
       firstTierAgentId: z.string(),
       secondTierAgentId: z.string(),
+      thirdTierAgentId: z.string().optional(),
       reason: z.string().optional()
     }).parse(request.body);
     return serializeBigInt(services.createChannelRelation(getAdminActor(request), body));
@@ -381,8 +645,24 @@ export function buildApp() {
 
   app.get("/api/admin/audit-logs", async (request) => serializeBigInt(services.listAuditLogs(getAdminActor(request))));
   app.get("/api/admin/ledger-entries", async (request) => serializeBigInt(services.listLedgerEntries(getAdminActor(request))));
+  app.get("/api/admin/sales-dashboard", async (request) => serializeBigInt(services.adminSalesDashboard(getAdminActor(request))));
   app.get("/api/admin/risk-dashboard", async (request) => serializeBigInt(services.adminRiskDashboard(getAdminActor(request))));
   app.get("/api/admin/service-qrcodes", async (request) => serializeBigInt(services.listServiceQrCodes(getAdminActor(request))));
+  app.get("/api/admin/collection-channels", async (request) => serializeBigInt(services.listCollectionChannels(getAdminActor(request))));
+  app.post("/api/admin/collection-channels/:channelId/review", async (request) => {
+    const { channelId } = z.object({ channelId: z.string() }).parse(request.params);
+    const body = z.object({ approved: z.boolean(), reason: z.string().optional() }).parse(request.body);
+    return serializeBigInt(services.reviewCollectionChannel(getAdminActor(request), channelId, body));
+  });
+  app.patch("/api/admin/shops/:shopId/collection", async (request) => {
+    const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
+    const body = z.object({
+      collectionAccountName: z.string().optional(),
+      collectionQrUrl: z.string().optional(),
+      collectionNote: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.updateShopCollection(getAdminActor(request), shopId, body));
+  });
   app.patch("/api/admin/shops/:shopId/service-qrcode", async (request) => {
     const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
     const body = z.object({
@@ -407,6 +687,15 @@ export function buildApp() {
     getAdminActor(request);
     return services.paymentOnboardingGuide();
   });
+
+  app.get("/api/admin/payment-vouchers", async (request) => serializeBigInt(services.listPaymentVouchers(getAdminActor(request))));
+  app.post("/api/admin/payment-vouchers/:voucherId/review", async (request) => {
+    const { voucherId } = z.object({ voucherId: z.string() }).parse(request.params);
+    const body = z.object({ approved: z.boolean(), reason: z.string().optional() }).parse(request.body);
+    return serializeBigInt(services.confirmPaymentVoucher(getAdminActor(request), voucherId, body));
+  });
+
+  app.get("/api/admin/order-extract-logs", async (request) => serializeBigInt(services.listExtractLogs(getAdminActor(request))));
 
   app.post("/api/callbacks/payments/mock", async (request) => {
     const body = z.object({ channel: z.string().default("mock"), channelTradeNo: z.string(), orderNo: z.string(), amountCents: bigintString }).parse(request.body);
@@ -438,10 +727,14 @@ function refundAllocationSchema() {
 }
 
 function getUserActor(request: FastifyRequest): UserActor {
+  if (hasBearerToken(request)) return parseSignedActor(request, "user");
+  if (!allowDemoAuth()) return parseSignedActor(request, "user");
   return { role: "user", userId: requiredHeader(request, "x-user-id") };
 }
 
 function getAgentActor(request: FastifyRequest): AgentActor {
+  if (hasBearerToken(request)) return parseSignedActor(request, "agent");
+  if (!allowDemoAuth()) return parseSignedActor(request, "agent");
   return {
     role: "agent",
     agentId: requiredHeader(request, "x-agent-id"),
@@ -450,10 +743,137 @@ function getAgentActor(request: FastifyRequest): AgentActor {
 }
 
 function getAdminActor(request: FastifyRequest): AdminActor {
+  if (hasBearerToken(request)) return parseSignedActor(request, "admin");
+  if (!allowDemoAuth()) return parseSignedActor(request, "admin");
   return {
     role: adminRole.parse(requiredHeader(request, "x-admin-role")),
     adminId: requiredHeader(request, "x-admin-id")
   } as AdminActor;
+}
+
+function createAuthSession(input: {
+  userId: string;
+  identityType: "h5_guest" | "h5_phone" | "wechat_miniprogram";
+  displayName: string;
+  phone?: string;
+}) {
+  const expiresAt = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30;
+  const token = signToken({
+    role: "user",
+    userId: input.userId,
+    identityType: input.identityType,
+    exp: expiresAt
+  });
+  return {
+    token,
+    expiresAt,
+    user: {
+      userId: input.userId,
+      identityType: input.identityType,
+      displayName: input.displayName,
+      phone: input.phone
+    }
+  };
+}
+
+function createAdminAuthSession(input: {
+  adminId: string;
+  username: string;
+  role: "operator" | "finance" | "admin";
+  displayName: string;
+}) {
+  const expiresAt = Math.floor(Date.now() / 1000) + 60 * 60 * 12;
+  const token = signToken({
+    role: "admin",
+    adminId: input.adminId,
+    adminRole: input.role,
+    exp: expiresAt
+  });
+  return {
+    token,
+    expiresAt,
+    admin: {
+      adminId: input.adminId,
+      username: input.username,
+      adminRole: input.role,
+      displayName: input.displayName
+    }
+  };
+}
+
+function signToken(payload: Record<string, unknown>): string {
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = createHmac("sha256", authTokenSecret()).update(body).digest("base64url");
+  return `${body}.${signature}`;
+}
+
+function hasBearerToken(request: FastifyRequest): boolean {
+  const authorization = request.headers.authorization;
+  return typeof authorization === "string" && authorization.startsWith("Bearer ");
+}
+
+function allowDemoAuth(): boolean {
+  if (isProductionRuntime()) return false;
+  const configured = process.env.ALLOW_DEMO_AUTH ?? process.env.DEMO_AUTH_ENABLED;
+  if (configured !== undefined) return configured === "true";
+  return true;
+}
+
+function isProductionRuntime(): boolean {
+  return process.env.APP_ENV === "production"
+    || process.env.NODE_ENV === "production"
+    || process.env.VERCEL_ENV === "production";
+}
+
+function parseSignedActor<T extends UserActor | AgentActor | AdminActor>(
+  request: FastifyRequest,
+  expectedRole: T["role"]
+): T {
+  const secret = authTokenSecret();
+  const authorization = request.headers.authorization;
+  const token = typeof authorization === "string" && authorization.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length)
+    : "";
+  if (!token) throw new ApiError(401, "AUTH_REQUIRED", "missing bearer token");
+  const [payloadPart, signaturePart] = token.split(".");
+  if (!payloadPart || !signaturePart) throw new ApiError(401, "AUTH_INVALID", "invalid bearer token");
+  const expected = createHmac("sha256", secret).update(payloadPart).digest("base64url");
+  if (!safeEqual(expected, signaturePart)) throw new ApiError(401, "AUTH_INVALID", "invalid bearer token signature");
+  const payload = JSON.parse(Buffer.from(payloadPart, "base64url").toString("utf8")) as Record<string, unknown>;
+  if (payload.role !== expectedRole) throw new ApiError(403, "AUTH_ROLE_MISMATCH", "token role does not match route");
+  if (typeof payload.exp === "number" && payload.exp < Math.floor(Date.now() / 1000)) {
+    throw new ApiError(401, "AUTH_EXPIRED", "bearer token expired");
+  }
+  if (expectedRole === "user" && typeof payload.userId === "string") return { role: "user", userId: payload.userId } as T;
+  if (expectedRole === "agent" && typeof payload.agentId === "string" && typeof payload.shopId === "string") {
+    return { role: "agent", agentId: payload.agentId, shopId: payload.shopId } as T;
+  }
+  if (expectedRole === "admin" && typeof payload.adminId === "string") {
+    return {
+      role: adminRole.parse(payload.adminRole ?? payload.roleCode ?? "operator"),
+      adminId: payload.adminId
+    } as T;
+  }
+  throw new ApiError(401, "AUTH_INVALID", "token is missing required actor fields");
+}
+
+function authTokenSecret(): string {
+  const secret = process.env.AUTH_TOKEN_SECRET;
+  if (secret) return secret;
+  if (isProductionRuntime()) {
+    throw new ApiError(503, "AUTH_NOT_CONFIGURED", "AUTH_TOKEN_SECRET is required in production");
+  }
+  return "tosell-dev-auth-secret";
+}
+
+function cryptoRandomId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 function requiredHeader(request: FastifyRequest, name: string): string {
@@ -465,6 +885,9 @@ function requiredHeader(request: FastifyRequest, name: string): string {
 }
 
 function serializeBigInt(value: unknown): unknown {
+  if (value && typeof (value as PromiseLike<unknown>).then === "function") {
+    return Promise.resolve(value).then((resolved) => serializeBigInt(resolved));
+  }
   return JSON.parse(JSON.stringify(value, (_key, nested) => (
     typeof nested === "bigint" ? nested.toString() : nested
   )));

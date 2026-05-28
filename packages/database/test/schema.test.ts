@@ -26,6 +26,10 @@ const productionChannelMigrationSql = readFileSync(
   resolve(testDir, "../prisma/migrations/000005_production_channel_foundation/migration.sql"),
   "utf8"
 );
+const threeTierChannelMigrationSql = readFileSync(
+  resolve(testDir, "../prisma/migrations/000008_three_tier_channel_foundation/migration.sql"),
+  "utf8"
+);
 
 function modelBlock(modelName: string) {
   const match = schema.match(new RegExp(`model\\s+${modelName}\\s+\\{([\\s\\S]*?)\\n\\}`));
@@ -228,8 +232,10 @@ describe("Prisma database contract", () => {
     expect(schema).toContain("platform_self_operated");
     expect(schema).toContain("single_agent");
     expect(schema).toContain("two_tier");
+    expect(schema).toContain("three_tier");
     expect(schema).toContain("first_tier");
     expect(schema).toContain("second_tier");
+    expect(schema).toContain("third_tier");
     expect(shop).toMatch(/ownerType\s+ShopOwnerType\s+@default\(agent\)\s+@map\("owner_type"\)/);
     expect(shop).toMatch(/agentId\s+String\?\s+@unique\s+@map\("agent_id"\)/);
     expect(shop).toMatch(/customerServiceQrUrl\s+String\?\s+@map\("customer_service_qr_url"\)/);
@@ -241,7 +247,7 @@ describe("Prisma database contract", () => {
     expect(platformSelfOperatedMigrationSql).toContain("settlement_items_order_id_settlement_role_key");
   });
 
-  it("adds production foundation for H5 identities and controlled two-tier supply", () => {
+  it("adds production foundation for H5 identities and controlled three-tier supply", () => {
     expect(modelBlock("User")).toContain("identities");
     expect(modelBlock("UserIdentity")).toMatch(/@@unique\(\[identityType,\s*provider,\s*externalId\]\)/);
     expect(modelBlock("PlatformShopProduct")).toMatch(/fulfillmentCostCents\s+BigInt\s+@default\(0\)\s+@map\("fulfillment_cost_cents"\)/);
@@ -250,8 +256,13 @@ describe("Prisma database contract", () => {
     expect(modelBlock("ChannelProductOffer")).toMatch(/resellSupplyPriceCents\s+BigInt\s+@map\("resell_supply_price_cents"\)/);
     expect(modelBlock("Order")).toMatch(/firstTierAgentId\s+String\?\s+@map\("first_tier_agent_id"\)/);
     expect(modelBlock("Order")).toMatch(/secondTierAgentId\s+String\?\s+@map\("second_tier_agent_id"\)/);
+    expect(modelBlock("Order")).toMatch(/thirdTierAgentId\s+String\?\s+@map\("third_tier_agent_id"\)/);
+    expect(modelBlock("ChannelRelation")).toMatch(/thirdTierAgentId\s+String\?\s+@map\("third_tier_agent_id"\)/);
     expect(modelBlock("OrderAmountSnapshot")).toContain("platformSupplyPriceCents");
     expect(modelBlock("OrderAmountSnapshot")).toContain("firstTierIncomeCents");
+    expect(modelBlock("OrderAmountSnapshot")).toContain("secondTierSupplyPriceCents");
+    expect(modelBlock("OrderAmountSnapshot")).toContain("thirdTierIncomeCents");
+    expect(modelBlock("AfterSale")).toContain("thirdTierBearCents");
     expect(modelBlock("Payment")).toMatch(/channel\s+PaymentChannel/);
     expect(modelBlock("PaymentChannelConfig")).toMatch(/channel\s+PaymentChannel\s+@unique/);
     expect(productionChannelMigrationSql).toContain('CREATE TABLE "user_identities"');
@@ -263,5 +274,8 @@ describe("Prisma database contract", () => {
     expect(productionChannelMigrationSql).toContain("channel_relations_active_unique_key_set");
     expect(productionChannelMigrationSql).toContain("channel_product_offers_supply_price_check");
     expect(productionChannelMigrationSql).toContain("resell supply price cannot be below platform supply price");
+    expect(threeTierChannelMigrationSql).toContain("third_tier_agent_id");
+    expect(threeTierChannelMigrationSql).toContain("third_tier_pending_income");
+    expect(threeTierChannelMigrationSql).toContain("third_tier_bear_cents");
   });
 });

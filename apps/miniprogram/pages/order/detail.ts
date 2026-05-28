@@ -16,7 +16,9 @@ Page({
       fulfillmentStatus: "",
       refundStatus: "",
       settlementStatus: "",
-      entitlement: "履约成功后显示权益凭证"
+      entitlement: "履约成功后显示权益凭证",
+      entitlementCodes: [] as string[],
+      deliveryMessage: "付款后按商品规则发放"
     }
   },
   onLoad(this: any, query: Record<string, string | undefined>) {
@@ -27,6 +29,10 @@ Page({
     this.setData({ loading: true, error: "" });
     try {
       const order = await api.order(this.data.orderNo);
+      const delivery = order.delivery as Record<string, unknown> | undefined;
+      const codes = Array.isArray(delivery?.codes)
+        ? delivery.codes.map((item) => text((item as Record<string, unknown>).code)).filter(Boolean)
+        : [];
       this.setData({
         paidAmount: cents(order.paidAmountCents),
         refundCents: text(order.paidAmountCents, this.data.refundCents),
@@ -36,7 +42,9 @@ Page({
           paymentStatus: text(order.paymentStatus),
           fulfillmentStatus: text(order.fulfillmentStatus),
           refundStatus: text(order.refundStatus),
-          entitlement: order.fulfillmentStatus === "success" ? "权益已发放，请联系客服核验凭证" : "履约成功后显示权益凭证"
+          entitlement: codes.length > 0 ? "卡密已自动发放" : text(delivery?.message, order.fulfillmentStatus === "success" ? "权益已发放，请联系客服核验凭证" : "履约成功后显示权益凭证"),
+          entitlementCodes: codes,
+          deliveryMessage: text(delivery?.message, "付款后按商品规则发放")
         }
       });
     } catch (error) {

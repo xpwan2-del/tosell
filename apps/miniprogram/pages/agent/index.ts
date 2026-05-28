@@ -8,7 +8,7 @@ Page({
     contactPhone: "13800000000",
     customerServiceWechat: "agent_a_service",
     customerServiceQrUrl: "https://example.test/qr-agent-a.png",
-    shopName: "测试代理 A 小店",
+    shopName: "云享数码权益店",
     announcement: "购买后按商品规则发放权益",
     selectedPlatformProductId: "prod-1",
     selectedAgentProductId: "ap-1",

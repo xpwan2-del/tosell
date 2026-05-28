@@ -1,8 +1,16 @@
 import { Prisma, PrismaClient } from "@prisma/client";
+import {
+  virtualCatalogProducts,
+  virtualShopSeed
+} from "../src/virtual-catalog.js";
 
 const prisma = new PrismaClient();
 
 async function main() {
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("Refusing to seed production. Production business data must be created through DB-backed APIs/admin workflows.");
+  }
+
   const fulfilledAt = new Date("2026-05-24T00:00:00.000Z");
   const settleableAt = new Date("2026-05-25T00:00:00.000Z");
   const paidAt = new Date("2026-05-24T00:10:00.000Z");
@@ -39,13 +47,29 @@ async function main() {
   const shop = await prisma.shop.upsert({
     where: { shopNo: "SHOP000001" },
     update: {
+      name: virtualShopSeed.name,
+      announcement: virtualShopSeed.announcement,
+      customerServiceQrUrl: "https://example.test/qr-agent-a.png",
+      collectionAccountName: virtualShopSeed.collectionAccountName,
+      collectionQrUrl: "https://example.test/pay-agent-a.png",
+      collectionNote: virtualShopSeed.collectionNote,
+      themeColor: virtualShopSeed.themeColor,
+      bannerUrl: virtualShopSeed.bannerUrl,
+      shareTitle: virtualShopSeed.shareTitle,
       status: "open"
     },
     create: {
       agentId: agent.id,
       shopNo: "SHOP000001",
-      name: "测试代理小店",
-      announcement: "测试商品仅用于开发环境",
+      name: virtualShopSeed.name,
+      announcement: virtualShopSeed.announcement,
+      customerServiceQrUrl: "https://example.test/qr-agent-a.png",
+      collectionAccountName: virtualShopSeed.collectionAccountName,
+      collectionQrUrl: "https://example.test/pay-agent-a.png",
+      collectionNote: virtualShopSeed.collectionNote,
+      themeColor: virtualShopSeed.themeColor,
+      bannerUrl: virtualShopSeed.bannerUrl,
+      shareTitle: virtualShopSeed.shareTitle,
       sharePath: "/pages/shop/index?shopNo=SHOP000001",
       status: "open"
     }
@@ -58,55 +82,15 @@ async function main() {
     await prisma.shopCustomerServiceBinding.create({
       data: {
       shopId: shop.id,
-      wechatId: "dev_service_wechat",
-      status: "active",
-      reviewStatus: "approved"
+        wechatId: virtualShopSeed.customerServiceWechat,
+        qrCodeUrl: "https://example.test/qr-agent-a.png",
+        status: "active",
+        reviewStatus: "approved"
       }
     });
   }
 
-  const product = await prisma.platformProduct.upsert({
-    where: { productNo: "P000001" },
-    update: {
-      status: "active"
-    },
-    create: {
-      productNo: "P000001",
-      name: "测试虚拟权益",
-      detail: "开发环境测试平台商品",
-      rightsDesc: "测试权益说明",
-      supplyPriceCents: 10_000n,
-      minSalePriceCents: 12_000n,
-      suggestedSalePriceCents: 15_000n,
-      fulfillmentType: "manual",
-      fulfillmentRuleJson: { mode: "manual", evidenceRequired: true },
-      afterSaleRuleJson: { refundBeforeFulfillment: true },
-      status: "active"
-    }
-  });
-
-  const agentProduct = await prisma.agentProduct.upsert({
-    where: {
-      shopId_productType_platformProductId: {
-        shopId: shop.id,
-        productType: "platform",
-        platformProductId: product.id
-      }
-    },
-    update: {
-      salePriceCents: 15_000n,
-      status: "listed"
-    },
-    create: {
-      agentId: agent.id,
-      shopId: shop.id,
-      productType: "platform",
-      platformProductId: product.id,
-      salePriceCents: 15_000n,
-      status: "listed",
-      listedAt: new Date()
-    }
-  });
+  const { product, agentProduct } = await seedVirtualCatalog(agent.id, shop.id);
 
   const depositAccount = await prisma.depositAccount.upsert({
     where: { agentId: agent.id },
@@ -514,6 +498,115 @@ async function main() {
       ip: "127.0.0.1"
     }
   });
+}
+
+async function seedVirtualCatalog(agentId: string, shopId: string) {
+  await prisma.shopProductGroup.deleteMany({ where: { shopId } });
+  const seeded: Array<{
+    product: Awaited<ReturnType<typeof prisma.platformProduct.upsert>>;
+    agentProduct: Awaited<ReturnType<typeof prisma.agentProduct.upsert>>;
+  }> = [];
+
+  for (const item of virtualCatalogProducts) {
+    const fulfillmentRuleJson = {
+      mode: item.fulfillmentMode,
+      imageUrl: item.imageUrl,
+      usageGuide: item.usageGuide,
+      specs: item.specs,
+      detailSections: item.detailSections,
+      stockCount: item.stockCount,
+      soldCount: item.soldCount
+    };
+    const product = await prisma.platformProduct.upsert({
+      where: { productNo: item.productNo },
+      update: {
+        name: item.name,
+        categoryName: item.category,
+        tagsJson: item.tags,
+        detail: item.description,
+        rightsDesc: item.subtitle,
+        supplyPriceCents: item.supplyPriceCents,
+        minSalePriceCents: item.minSalePriceCents,
+        suggestedSalePriceCents: item.suggestedSalePriceCents,
+        fulfillmentType: item.fulfillmentMode === "code_pool" ? "automatic" : "manual",
+        fulfillmentRuleJson,
+        afterSaleRuleJson: { refundBeforeFulfillment: true },
+        status: "active"
+      },
+      create: {
+        productNo: item.productNo,
+        name: item.name,
+        categoryName: item.category,
+        tagsJson: item.tags,
+        detail: item.description,
+        rightsDesc: item.subtitle,
+        supplyPriceCents: item.supplyPriceCents,
+        minSalePriceCents: item.minSalePriceCents,
+        suggestedSalePriceCents: item.suggestedSalePriceCents,
+        fulfillmentType: item.fulfillmentMode === "code_pool" ? "automatic" : "manual",
+        fulfillmentRuleJson,
+        afterSaleRuleJson: { refundBeforeFulfillment: true },
+        status: "active"
+      }
+    });
+
+    const agentProduct = await prisma.agentProduct.upsert({
+      where: {
+        shopId_productType_platformProductId: {
+          shopId,
+          productType: "platform",
+          platformProductId: product.id
+        }
+      },
+      update: {
+        salePriceCents: item.agentSalePriceCents,
+        status: "listed"
+      },
+      create: {
+        agentId,
+        shopId,
+        productType: "platform",
+        platformProductId: product.id,
+        salePriceCents: item.agentSalePriceCents,
+        status: "listed",
+        listedAt: new Date()
+      }
+    });
+
+    for (const code of item.rightsCodes ?? []) {
+      await prisma.rightsCode.upsert({
+        where: {
+          productId_codeCiphertext: {
+            productId: product.id,
+            codeCiphertext: `dev:${code}`
+          }
+        },
+        update: { status: "available" },
+        create: {
+          productId: product.id,
+          codeCiphertext: `dev:${code}`,
+          batchNo: `seed-${item.productNo.toLowerCase()}`,
+          status: "available",
+          importedById: "seed"
+        }
+      });
+    }
+
+    seeded.push({ product, agentProduct });
+  }
+
+  for (const [index, group] of virtualShopSeed.productGroups.entries()) {
+    await prisma.shopProductGroup.create({
+      data: {
+        shopId,
+        name: group.name,
+        sortOrder: index + 1,
+        agentProductIds: group.agentProductIds
+      }
+    });
+  }
+
+  return seeded[0];
 }
 
 async function ensureAgentApplication(agentId: string, userId: string) {

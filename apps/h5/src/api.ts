@@ -1,14 +1,21 @@
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV ? "http://localhost:3000" : "");
 
 export type JsonRecord = Record<string, unknown>;
+export type AuthSession = {
+  token: string;
+  user: JsonRecord;
+  expiresAt: number;
+};
 
 async function request<T>(path: string, options: { method?: "GET" | "POST"; body?: unknown } = {}): Promise<T> {
+  const token = path.startsWith("/api/auth/") ? "" : await authToken();
+  const headers: Record<string, string> = {
+    ...(token ? { authorization: `Bearer ${token}` } : { "x-user-id": h5UserId() })
+  };
+  if (options.body !== undefined) headers["content-type"] = "application/json";
   const response = await fetch(`${API_BASE_URL}${path}`, {
     method: options.method ?? "GET",
-    headers: {
-      "content-type": "application/json",
-      "x-user-id": h5UserId()
-    },
+    headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body)
   });
   const data = await response.json().catch(() => ({}));
@@ -28,23 +35,36 @@ function h5UserId(): string {
 
 export const api = {
   baseUrl: API_BASE_URL,
+  authGuest: () => request<AuthSession>("/api/auth/h5/guest", { method: "POST" }),
+  authRegister: (phone: string, displayName?: string) => request<AuthSession>("/api/auth/h5/register", {
+    method: "POST",
+    body: { phone, displayName }
+  }),
+  currentSession,
+  saveSession,
+  logout,
   shop: (shopId: string) => request<JsonRecord>(`/api/user/shops/${shopId}`),
   products: (shopId: string) => request<JsonRecord[]>(`/api/user/shops/${shopId}/products`),
-  quote: (shopId: string, productId: string) => request<JsonRecord>("/api/user/orders/quote", {
+  collectionChannels: (shopId: string) => request<JsonRecord[]>(`/api/user/shops/${shopId}/collection-channels`),
+  coupons: (shopId: string, productId?: string) => {
+    const params = new URLSearchParams({ shopId });
+    if (productId) params.set("agentProductId", productId);
+    return request<JsonRecord[]>(`/api/user/coupons?${params.toString()}`);
+  },
+  quote: (shopId: string, productId: string, couponId?: string) => request<JsonRecord>("/api/user/orders/quote", {
     method: "POST",
-    body: { shopId, agentProductId: productId }
+    body: { shopId, agentProductId: productId, couponId }
   }),
-  createOrder: (shopId: string, productId: string, clientPaidAmountCents: string) => request<JsonRecord>("/api/user/orders", {
-    method: "POST",
-    body: { shopId, agentProductId: productId, clientPaidAmountCents }
-  }),
-  mockPayment: (orderNo: string, amountCents: string) => request<JsonRecord>("/api/callbacks/payments/mock", {
+  createOrder: (shopId: string, productId: string, clientPaidAmountCents: string, input: { extractionCode?: string; couponId?: string; buyerEmail?: string; collectionChannelId?: string } = {}) => request<JsonRecord>("/api/user/orders", {
     method: "POST",
     body: {
-      channel: "mock",
-      channelTradeNo: `h5-pay-${orderNo}-${Date.now()}`,
-      orderNo,
-      amountCents
+      shopId,
+      agentProductId: productId,
+      clientPaidAmountCents,
+      extractionCode: input.extractionCode || undefined,
+      couponId: input.couponId || undefined,
+      buyerEmail: input.buyerEmail || undefined,
+      collectionChannelId: input.collectionChannelId || undefined
     }
   }),
   createAfterSale: (orderNo: string, requestedRefundCents: string, description = "H5 用户售后申请") => request<JsonRecord>("/api/user/after-sales", {
@@ -57,7 +77,42 @@ export const api = {
     }
   }),
   orders: () => request<JsonRecord[]>("/api/user/orders")
+  ,
+  order: (orderNo: string) => request<JsonRecord>(`/api/user/orders/${orderNo}`),
+  extractOrder: (orderNo: string, extractionCode: string) => request<JsonRecord>(`/api/user/orders/${orderNo}/extract`, {
+    method: "POST",
+    body: { extractionCode }
+  })
 };
+
+async function authToken(): Promise<string> {
+  const session = currentSession();
+  if (session?.token && session.expiresAt * 1000 > Date.now() + 60_000) return session.token;
+  const guest = await request<AuthSession>("/api/auth/h5/guest", { method: "POST" });
+  saveSession(guest);
+  return guest.token;
+}
+
+function currentSession(): AuthSession | undefined {
+  try {
+    const raw = localStorage.getItem("tosell_h5_auth");
+    if (!raw) return undefined;
+    const parsed = JSON.parse(raw) as AuthSession;
+    return parsed?.token ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function saveSession(session: AuthSession) {
+  localStorage.setItem("tosell_h5_auth", JSON.stringify(session));
+  const userId = typeof session.user.userId === "string" ? session.user.userId : "";
+  if (userId) localStorage.setItem("tosell_h5_user_id", userId);
+}
+
+function logout() {
+  localStorage.removeItem("tosell_h5_auth");
+}
 
 export function cents(value: unknown): string {
   return `¥${(Number(value ?? 0) / 100).toFixed(2)}`;

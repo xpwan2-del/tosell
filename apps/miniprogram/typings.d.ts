@@ -1,11 +1,15 @@
 declare const wx: {
+  login(input: {
+    success(result: { code?: string }): void;
+    fail?(error: { errMsg: string }): void;
+  }): void;
   request<T = unknown>(input: {
     url: string;
     method?: "GET" | "POST" | "PATCH";
     header?: Record<string, string>;
     data?: unknown;
     success(result: { statusCode: number; data: T }): void;
-    fail(error: { errMsg: string }): void;
+    fail?(error: { errMsg: string }): void;
   }): void;
   setClipboardData(input: { data: string }): void;
   navigateTo(input: { url: string }): void;

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { createHmac } from "node:crypto";
 import { buildApp } from "./app.ts";
 
-describe("api", () => {
+describe.sequential("api", () => {
   it("quotes platform product amounts on backend", async () => {
     const app = buildApp();
     const response = await app.inject({
@@ -230,7 +231,7 @@ describe("api", () => {
     expect(created.json()).toMatchObject({
       paidAmountCents: "15000",
       salePriceCents: "15000",
-      productName: "测试虚拟权益"
+      productName: "ChatGPT Plus 成品号月卡"
     });
     expect(JSON.stringify(created.json())).not.toMatch(/supplyAmountCents|serviceFeeCents|agentExpectedIncomeCents|settlementStatus/);
 
@@ -758,7 +759,7 @@ describe("api", () => {
       headers: agentHeaders
     });
     expect(dashboard.statusCode).toBe(200);
-    expect(dashboard.json()).toMatchObject({ activeProductCount: 2 });
+    expect(dashboard.json()).toMatchObject({ activeProductCount: 8 });
 
     const notifications = await app.inject({
       method: "GET",
@@ -919,7 +920,7 @@ describe("api", () => {
 
     const paymentCheck = await app.inject({ method: "POST", url: "/api/admin/payment-config/check", headers: operatorHeaders });
     expect(paymentCheck.statusCode).toBe(200);
-    expect(paymentCheck.json()).toMatchObject({ mockReady: true, productionReady: false });
+    expect(paymentCheck.json()).toMatchObject({ mockReady: true, productionReady: false, demoAuthEnabled: true });
 
     const freeze = await app.inject({
       method: "POST",
@@ -1031,6 +1032,181 @@ describe("api", () => {
     expect(JSON.stringify(ledger.json())).not.toMatch(/commission|rebate|返佣|团队奖|三级/);
   });
 
+  it("runs controlled three-tier supply by price spread and blocks fourth-tier creation", async () => {
+    const app = buildApp();
+    const financeHeaders = { "x-admin-id": "finance-1", "x-admin-role": "finance" };
+    const operatorHeaders = { "x-admin-id": "operator-1", "x-admin-role": "operator" };
+
+    const invalidThirdTierOffer = await app.inject({
+      method: "POST",
+      url: "/api/admin/channels/offers",
+      headers: operatorHeaders,
+      payload: {
+        channelRelationId: "channel-rel-2",
+        platformProductId: "prod-1",
+        resellSupplyPriceCents: "10500"
+      }
+    });
+    expect(invalidThirdTierOffer.statusCode).toBe(400);
+
+    const fourthTierAttempt = await app.inject({
+      method: "POST",
+      url: "/api/admin/channels/relations",
+      headers: operatorHeaders,
+      payload: {
+        firstTierAgentId: "agent-2",
+        secondTierAgentId: "agent-3",
+        thirdTierAgentId: "agent-new"
+      }
+    });
+    expect(fourthTierAttempt.statusCode).toBe(400);
+
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "three-tier-user" },
+      payload: { shopId: "shop-3", agentProductId: "ap-3", clientPaidAmountCents: "15000" }
+    });
+    expect(order.statusCode).toBe(200);
+    expect(order.json()).toMatchObject({ salesChannelType: "three_tier", paidAmountCents: "15000" });
+    expect(JSON.stringify(order.json())).not.toMatch(/firstTierIncomeCents|secondTierIncomeCents|thirdTierIncomeCents|resellSupplyPriceCents|commission|返佣/);
+
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: {
+        channel: "mock",
+        channelTradeNo: "trade-three-tier",
+        orderNo: order.json().orderNo,
+        amountCents: "15000"
+      }
+    });
+    await app.inject({
+      method: "POST",
+      url: `/api/admin/fulfillment/${order.json().orderNo}`,
+      headers: operatorHeaders,
+      payload: { status: "success", attemptNo: 1, evidence: "three-tier-manual" }
+    });
+
+    const firstTierSettlement = await app.inject({
+      method: "POST",
+      url: "/api/admin/settlements/generate",
+      headers: financeHeaders,
+      payload: { agentId: "agent-1", now: "2030-01-01T00:00:00.000Z", batchNo: "three-tier-first" }
+    });
+    expect(firstTierSettlement.statusCode).toBe(200);
+    expect(firstTierSettlement.json().items[0]).toMatchObject({ settlementRole: "first_tier", agentIncomeCents: "1000" });
+
+    const secondTierSettlement = await app.inject({
+      method: "POST",
+      url: "/api/admin/settlements/generate",
+      headers: financeHeaders,
+      payload: { agentId: "agent-2", now: "2030-01-01T00:00:00.000Z", batchNo: "three-tier-second" }
+    });
+    expect(secondTierSettlement.statusCode).toBe(200);
+    expect(secondTierSettlement.json().items[0]).toMatchObject({ settlementRole: "second_tier", agentIncomeCents: "2000" });
+
+    const thirdTierSettlement = await app.inject({
+      method: "POST",
+      url: "/api/admin/settlements/generate",
+      headers: financeHeaders,
+      payload: { agentId: "agent-3", now: "2030-01-01T00:00:00.000Z", batchNo: "three-tier-third" }
+    });
+    expect(thirdTierSettlement.statusCode).toBe(200);
+    expect(thirdTierSettlement.json().items[0]).toMatchObject({ settlementRole: "third_tier", agentIncomeCents: "1925" });
+  });
+
+  it("enforces tiered price visibility on merchant product and order APIs", async () => {
+    const app = buildApp();
+    const secondProducts = await app.inject({
+      method: "GET",
+      url: "/api/agent/products",
+      headers: { "x-agent-id": "agent-2", "x-shop-id": "shop-2" }
+    });
+    const thirdProducts = await app.inject({
+      method: "GET",
+      url: "/api/agent/products",
+      headers: { "x-agent-id": "agent-3", "x-shop-id": "shop-3" }
+    });
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "tier-visibility-user" },
+      payload: { shopId: "shop-3", agentProductId: "ap-3", clientPaidAmountCents: "15000" }
+    });
+    const secondOrders = await app.inject({
+      method: "GET",
+      url: "/api/agent/orders",
+      headers: { "x-agent-id": "agent-2", "x-shop-id": "shop-2" }
+    });
+    const thirdOrders = await app.inject({
+      method: "GET",
+      url: "/api/agent/orders",
+      headers: { "x-agent-id": "agent-3", "x-shop-id": "shop-3" }
+    });
+
+    expect(order.statusCode).toBe(200);
+    expect(JSON.stringify(secondProducts.json())).not.toMatch(/platformSupplyPriceCents|supplyPriceCents/);
+    expect(JSON.stringify(thirdProducts.json())).not.toMatch(/platformSupplyPriceCents|firstTierSupplyPriceCents|supplyPriceCents/);
+    expect(JSON.stringify(secondOrders.json())).not.toMatch(/platformSupplyPriceCents/);
+    expect(JSON.stringify(thirdOrders.json())).not.toMatch(/platformSupplyPriceCents|firstTierSupplyPriceCents/);
+  });
+
+  it("lists only active shop collection channels and lets the selling merchant confirm collection idempotently", async () => {
+    const app = buildApp();
+    const channels = await app.inject({ method: "GET", url: "/api/h5/shops/shop-1/collection-channels" });
+    expect(channels.statusCode).toBe(200);
+    expect(channels.json()[0]).toMatchObject({ id: "collection-shop-1", channelType: "alipay_personal_qr" });
+    expect(JSON.stringify(channels.json())).not.toMatch(/mock/i);
+
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "agent-confirm-user" },
+      payload: {
+        shopId: "shop-1",
+        agentProductId: "ap-1",
+        collectionChannelId: "collection-shop-1",
+        clientPaidAmountCents: "15000"
+      }
+    });
+    const first = await app.inject({
+      method: "POST",
+      url: `/api/agent/orders/${order.json().orderNo}/confirm-payment`,
+      headers: { "x-agent-id": "agent-1", "x-shop-id": "shop-1" },
+      payload: { amountCents: "15000", voucherUrl: "manual://agent-confirm/1" }
+    });
+    const duplicate = await app.inject({
+      method: "POST",
+      url: `/api/agent/orders/${order.json().orderNo}/confirm-payment`,
+      headers: { "x-agent-id": "agent-1", "x-shop-id": "shop-1" },
+      payload: { amountCents: "15000", voucherUrl: "manual://agent-confirm/1" }
+    });
+
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({ status: "processed" });
+    expect(duplicate.json()).toMatchObject({ status: "duplicate" });
+  });
+
+  it("rejects admin manual creation for non-first-tier merchants and writes audit", async () => {
+    const app = buildApp();
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/api/admin/agents/manual",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: { name: "错误二级商户", targetTier: "second_tier" }
+    });
+    const audit = await app.inject({
+      method: "GET",
+      url: "/api/admin/audit-logs",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
+
+    expect(rejected.statusCode).toBe(400);
+    expect(rejected.json().code).toBe("ADMIN_CREATE_FIRST_TIER_ONLY");
+    expect(JSON.stringify(audit.json())).toContain("agent.admin_create_rejected_non_first_tier");
+  });
+
   it("protects internal platform product pricing behind agent auth", async () => {
     const app = buildApp();
     const response = await app.inject({
@@ -1092,7 +1268,7 @@ describe("api", () => {
       method: "POST",
       url: "/api/user/orders",
       headers: { "x-user-id": "user-v2" },
-      payload: { shopId: "shop-1", agentProductId: "ap-code", clientPaidAmountCents: "4900" }
+      payload: { shopId: "shop-1", agentProductId: "ap-code", clientPaidAmountCents: "4900", buyerEmail: "buyer@example.com", extractionCode: "123456" }
     });
     expect(order.statusCode).toBe(200);
 
@@ -1113,7 +1289,35 @@ describe("api", () => {
       url: `/api/user/orders/${order.json().orderNo}`,
       headers: { "x-user-id": "user-v2" }
     });
-    expect(detail.json()).toMatchObject({ status: "fulfilled", fulfillmentStatus: "success" });
+    expect(detail.json()).toMatchObject({
+      status: "fulfilled",
+      fulfillmentStatus: "success",
+      delivery: {
+        mode: "automatic",
+        buyerEmail: "buyer@example.com"
+      }
+    });
+    expect(detail.json().delivery.codes).toEqual([]);
+
+    const extracted = await app.inject({
+      method: "POST",
+      url: `/api/user/orders/${order.json().orderNo}/extract`,
+      headers: { "x-user-id": "user-v2" },
+      payload: { extractionCode: "123456" }
+    });
+    expect(extracted.statusCode).toBe(200);
+    expect(extracted.json().codes).toHaveLength(1);
+
+    const list = await app.inject({
+      method: "GET",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-v2" }
+    });
+    expect(list.json()[0].delivery.codes).toEqual([]);
+    expect(list.json()[0].buyerEmail).toBeUndefined();
+    expect(list.json()[0].delivery.buyerEmail).toBeUndefined();
+    expect(JSON.stringify(list.json())).not.toContain("V2-CODE-001");
+    expect(JSON.stringify(list.json())).not.toContain("buyer@example.com");
 
     const risk = await app.inject({
       method: "GET",
@@ -1122,6 +1326,377 @@ describe("api", () => {
     });
     expect(risk.statusCode).toBe(200);
     expect(risk.json()).toHaveProperty("lowStockProducts");
+  });
+
+  it("locks card extraction after three wrong codes and records extract logs", async () => {
+    const app = buildApp();
+    await app.inject({
+      method: "POST",
+      url: "/api/admin/rights-codes/import",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: { productId: "prod-code", batchNo: "lock-test", codes: ["LOCK-CODE-001"] }
+    });
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "extract-lock-user" },
+      payload: { shopId: "shop-1", agentProductId: "ap-code", clientPaidAmountCents: "4900", extractionCode: "567890" }
+    });
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: { channel: "mock", channelTradeNo: "trade-extract-lock", orderNo: order.json().orderNo, amountCents: "4900" }
+    });
+    for (let index = 0; index < 3; index += 1) {
+      await app.inject({
+        method: "POST",
+        url: `/api/user/orders/${order.json().orderNo}/extract`,
+        headers: { "x-user-id": "extract-lock-user" },
+        payload: { extractionCode: "111111" }
+      });
+    }
+    const locked = await app.inject({
+      method: "POST",
+      url: `/api/user/orders/${order.json().orderNo}/extract`,
+      headers: { "x-user-id": "extract-lock-user" },
+      payload: { extractionCode: "567890" }
+    });
+    const logs = await app.inject({
+      method: "GET",
+      url: "/api/admin/order-extract-logs",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
+
+    expect(locked.statusCode).toBe(423);
+    expect(JSON.stringify(logs.json())).toContain("extract-lock-user");
+    expect(JSON.stringify(logs.json())).toContain("locked");
+  });
+
+  it("allows repeated extraction codes on different orders and locks attempts per order", async () => {
+    const app = buildApp();
+    await app.inject({
+      method: "POST",
+      url: "/api/admin/rights-codes/import",
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: { productId: "prod-code", batchNo: "repeat-code-test", codes: ["REPEAT-CODE-001", "REPEAT-CODE-002"] }
+    });
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "repeat-extract-user" },
+      payload: { shopId: "shop-1", agentProductId: "ap-code", clientPaidAmountCents: "4900", extractionCode: "246810" }
+    });
+    const second = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "repeat-extract-user" },
+      payload: { shopId: "shop-1", agentProductId: "ap-code", clientPaidAmountCents: "4900", extractionCode: "246810" }
+    });
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: { channel: "mock", channelTradeNo: "trade-repeat-extract-1", orderNo: first.json().orderNo, amountCents: "4900" }
+    });
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: { channel: "mock", channelTradeNo: "trade-repeat-extract-2", orderNo: second.json().orderNo, amountCents: "4900" }
+    });
+    for (let index = 0; index < 3; index += 1) {
+      await app.inject({
+        method: "POST",
+        url: `/api/user/orders/${first.json().orderNo}/extract`,
+        headers: { "x-user-id": "repeat-extract-user" },
+        payload: { extractionCode: "000000" }
+      });
+    }
+    const firstLocked = await app.inject({
+      method: "POST",
+      url: `/api/user/orders/${first.json().orderNo}/extract`,
+      headers: { "x-user-id": "repeat-extract-user" },
+      payload: { extractionCode: "246810" }
+    });
+    const secondExtracted = await app.inject({
+      method: "POST",
+      url: `/api/user/orders/${second.json().orderNo}/extract`,
+      headers: { "x-user-id": "repeat-extract-user" },
+      payload: { extractionCode: "246810" }
+    });
+
+    expect(firstLocked.statusCode).toBe(423);
+    expect(secondExtracted.statusCode).toBe(200);
+    expect(secondExtracted.json().codes).toHaveLength(1);
+  });
+
+  it("requires extraction code but keeps buyer email optional for automatic card-code orders", async () => {
+    const app = buildApp();
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-email-required" },
+      payload: { shopId: "shop-1", agentProductId: "ap-code", clientPaidAmountCents: "4900" }
+    });
+    const optionalEmail = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "user-email-optional" },
+      payload: { shopId: "shop-1", agentProductId: "ap-code", clientPaidAmountCents: "4900", extractionCode: "234567" }
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe("EXTRACTION_CODE_REQUIRED");
+    expect(optionalEmail.statusCode).toBe(200);
+    expect(optionalEmail.json().buyerEmail).toBeUndefined();
+  });
+
+  it("grants first-register coupons and applies one platform coupon without changing price-spread basis", async () => {
+    const app = buildApp();
+    const auth = await app.inject({
+      method: "POST",
+      url: "/api/auth/h5/register",
+      payload: { phone: "13812345678", displayName: "券用户" }
+    });
+    const couponId = auth.json().grantedCoupon.id;
+    const quote = await app.inject({
+      method: "POST",
+      url: "/api/user/orders/quote",
+      headers: { "x-user-id": "h5-phone-13812345678" },
+      payload: { shopId: "shop-1", agentProductId: "ap-1", couponId }
+    });
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "h5-phone-13812345678" },
+      payload: { shopId: "shop-1", agentProductId: "ap-1", couponId, clientPaidAmountCents: "14500" }
+    });
+    const agentOrders = await app.inject({
+      method: "GET",
+      url: "/api/agent/orders",
+      headers: { "x-agent-id": "agent-1", "x-shop-id": "shop-1" }
+    });
+
+    expect(auth.statusCode).toBe(200);
+    expect(quote.json()).toMatchObject({
+      paidAmountCents: "14500",
+      buyerPaidAmountCents: "14500",
+      settlementBasisAmountCents: "15000",
+      couponDiscountCents: "500"
+    });
+    expect(order.statusCode).toBe(200);
+    expect(order.json()).toMatchObject({
+      paidAmountCents: "14500",
+      buyerPaidAmountCents: "14500",
+      settlementBasisAmountCents: "15000",
+      couponDiscountCents: "500"
+    });
+    const wrongCollectionAmount = await app.inject({
+      method: "POST",
+      url: `/api/agent/orders/${order.json().orderNo}/confirm-payment`,
+      headers: { "x-agent-id": "agent-1", "x-shop-id": "shop-1" },
+      payload: { amountCents: order.json().settlementBasisAmountCents, voucherUrl: "manual://coupon/wrong-basis" }
+    });
+    const collection = await app.inject({
+      method: "POST",
+      url: `/api/agent/orders/${order.json().orderNo}/confirm-payment`,
+      headers: { "x-agent-id": "agent-1", "x-shop-id": "shop-1" },
+      payload: { amountCents: order.json().buyerPaidAmountCents, voucherUrl: "manual://coupon/buyer-paid" }
+    });
+    expect(agentOrders.json().find((item: { orderNo: string }) => item.orderNo === order.json().orderNo)).toMatchObject({
+      paidAmountCents: "14500",
+      buyerPaidAmountCents: "14500",
+      settlementBasisAmountCents: "15000"
+    });
+    expect(wrongCollectionAmount.statusCode).toBe(400);
+    expect(wrongCollectionAmount.json().code).toBe("AMOUNT_MISMATCH");
+    expect(collection.statusCode).toBe(200);
+    expect(collection.json()).toMatchObject({ status: "processed" });
+  });
+
+  it("lets the back office confirm offline collection and trigger automatic delivery without real payment", async () => {
+    const app = buildApp();
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "offline-user" },
+      payload: {
+        shopId: "shop-1",
+        agentProductId: "ap-code",
+        clientPaidAmountCents: "4900",
+        buyerEmail: "offline@example.com",
+        extractionCode: "345678"
+      }
+    });
+
+    const confirmed = await app.inject({
+      method: "POST",
+      url: `/api/admin/orders/${order.json().orderNo}/offline-payment`,
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: {
+        amountCents: "4900",
+        voucherUrl: "manual://offline-payment/test-1",
+        note: "线下收款确认"
+      }
+    });
+    const duplicate = await app.inject({
+      method: "POST",
+      url: `/api/admin/orders/${order.json().orderNo}/offline-payment`,
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" },
+      payload: {
+        amountCents: "4900",
+        voucherUrl: "manual://offline-payment/test-1"
+      }
+    });
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/user/orders/${order.json().orderNo}`,
+      headers: { "x-user-id": "offline-user" }
+    });
+
+    expect(confirmed.statusCode).toBe(200);
+    expect(confirmed.json()).toMatchObject({ status: "processed" });
+    expect(duplicate.json()).toMatchObject({ status: "duplicate" });
+    expect(detail.json()).toMatchObject({
+      paymentStatus: "paid",
+      fulfillmentStatus: "success",
+      delivery: { mode: "automatic", buyerEmail: "offline@example.com" }
+    });
+    expect(detail.json().delivery.codes).toEqual([]);
+  });
+
+  it("refuses production business service when persistence is not configured", async () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalMock = process.env.MOCK_PAYMENT_ENABLED;
+    const originalSecret = process.env.AUTH_TOKEN_SECRET;
+    const originalDemoAuth = process.env.ALLOW_DEMO_AUTH;
+    process.env.NODE_ENV = "production";
+    process.env.AUTH_TOKEN_SECRET = "test-production-secret";
+    process.env.ALLOW_DEMO_AUTH = "true";
+    process.env.MOCK_PAYMENT_ENABLED = "true";
+    try {
+      const app = buildApp();
+      const health = await app.inject({ method: "GET", url: "/api/health" });
+      const business = await app.inject({ method: "GET", url: "/api/user/shops/shop-1" });
+
+      expect(health.statusCode).toBe(200);
+      expect(health.json()).toMatchObject({ ok: false, runtime: "production", code: "PERSISTENCE_NOT_CONFIGURED" });
+      expect(business.statusCode).toBe(503);
+      expect(business.json().code).toBe("PERSISTENCE_NOT_CONFIGURED");
+    } finally {
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+      if (originalMock === undefined) delete process.env.MOCK_PAYMENT_ENABLED;
+      else process.env.MOCK_PAYMENT_ENABLED = originalMock;
+      if (originalSecret === undefined) delete process.env.AUTH_TOKEN_SECRET;
+      else process.env.AUTH_TOKEN_SECRET = originalSecret;
+      if (originalDemoAuth === undefined) delete process.env.ALLOW_DEMO_AUTH;
+      else process.env.ALLOW_DEMO_AUTH = originalDemoAuth;
+    }
+  });
+
+  it("wires production to Prisma mode, disables mini-program login, and issues admin bearer sessions", async () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalDatabaseUrl = process.env.DATABASE_URL;
+    const originalSecret = process.env.AUTH_TOKEN_SECRET;
+    const originalAdminUser = process.env.ADMIN_USERNAME;
+    const originalAdminPassword = process.env.ADMIN_PASSWORD;
+    const originalAdminId = process.env.ADMIN_ID;
+    const originalAdminRole = process.env.ADMIN_ROLE;
+    process.env.NODE_ENV = "production";
+    process.env.DATABASE_URL = "postgresql://tosell:tosell@localhost:5432/tosell";
+    process.env.AUTH_TOKEN_SECRET = "test-production-secret";
+    process.env.ADMIN_USERNAME = "admin";
+    process.env.ADMIN_PASSWORD = "secret";
+    process.env.ADMIN_ID = "admin-prod";
+    process.env.ADMIN_ROLE = "admin";
+    try {
+      const app = buildApp();
+      const health = await app.inject({ method: "GET", url: "/api/health" });
+      const mini = await app.inject({
+        method: "POST",
+        url: "/api/auth/wechat-miniprogram/login",
+        payload: { code: "wx-code" }
+      });
+      const legacyMini = await app.inject({
+        method: "POST",
+        url: "/api/auth/wechat/miniprogram/login",
+        payload: { code: "wx-code" }
+      });
+      const login = await app.inject({
+        method: "POST",
+        url: "/api/auth/admin/login",
+        payload: { username: "admin", password: "secret" }
+      });
+      const session = await app.inject({
+        method: "GET",
+        url: "/api/auth/admin/session",
+        headers: { authorization: `Bearer ${login.json().token}` }
+      });
+      const headerOnlySession = await app.inject({
+        method: "GET",
+        url: "/api/auth/admin/session",
+        headers: { "x-admin-id": "admin-prod", "x-admin-role": "admin" }
+      });
+
+      expect(health.statusCode).toBe(200);
+      expect(health.json()).toMatchObject({ ok: true, runtime: "production", persistenceMode: "prisma", databaseConfigured: true });
+      expect(mini.statusCode).toBe(410);
+      expect(mini.json().code).toBe("MINIPROGRAM_LOGIN_DISABLED");
+      expect(legacyMini.statusCode).toBe(410);
+      expect(legacyMini.json().code).toBe("MINIPROGRAM_LOGIN_DISABLED");
+      expect(login.statusCode).toBe(200);
+      expect(login.json().admin).toMatchObject({ adminId: "admin-prod", adminRole: "admin" });
+      expect(session.statusCode).toBe(200);
+      expect(session.json().admin).toMatchObject({ adminId: "admin-prod", adminRole: "admin" });
+      expect(headerOnlySession.statusCode).toBe(401);
+      expect(headerOnlySession.json().code).toBe("AUTH_REQUIRED");
+    } finally {
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+      if (originalDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = originalDatabaseUrl;
+      if (originalSecret === undefined) delete process.env.AUTH_TOKEN_SECRET;
+      else process.env.AUTH_TOKEN_SECRET = originalSecret;
+      if (originalAdminUser === undefined) delete process.env.ADMIN_USERNAME;
+      else process.env.ADMIN_USERNAME = originalAdminUser;
+      if (originalAdminPassword === undefined) delete process.env.ADMIN_PASSWORD;
+      else process.env.ADMIN_PASSWORD = originalAdminPassword;
+      if (originalAdminId === undefined) delete process.env.ADMIN_ID;
+      else process.env.ADMIN_ID = originalAdminId;
+      if (originalAdminRole === undefined) delete process.env.ADMIN_ROLE;
+      else process.env.ADMIN_ROLE = originalAdminRole;
+    }
+  });
+
+  it("does not return a successful H5 register session when production coupon persistence fails", async () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalDatabaseUrl = process.env.DATABASE_URL;
+    const originalSecret = process.env.AUTH_TOKEN_SECRET;
+    process.env.NODE_ENV = "production";
+    process.env.DATABASE_URL = "postgresql://tosell:tosell@localhost:5432/tosell";
+    process.env.AUTH_TOKEN_SECRET = "test-production-secret";
+    try {
+      const app = buildApp();
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/auth/h5/register",
+        payload: { phone: "13800009999", displayName: "生产注册失败测试" }
+      });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json().code).toBe("DATABASE_UNAVAILABLE");
+      expect(response.body).not.toContain("\"token\"");
+      expect(response.body).not.toContain("grantedCoupon");
+    } finally {
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+      if (originalDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = originalDatabaseUrl;
+      if (originalSecret === undefined) delete process.env.AUTH_TOKEN_SECRET;
+      else process.env.AUTH_TOKEN_SECRET = originalSecret;
+    }
   });
 
   it("auto-fulfills one rights code per purchased quantity", async () => {
@@ -1141,7 +1716,7 @@ describe("api", () => {
       method: "POST",
       url: "/api/user/orders",
       headers: { "x-user-id": "user-qty" },
-      payload: { shopId: "shop-1", agentProductId: "ap-code", quantity: 2, clientPaidAmountCents: "9800" }
+      payload: { shopId: "shop-1", agentProductId: "ap-code", quantity: 2, clientPaidAmountCents: "9800", buyerEmail: "qty@example.com", extractionCode: "456789" }
     });
     await app.inject({
       method: "POST",
@@ -1159,8 +1734,106 @@ describe("api", () => {
       url: "/api/admin/rights-codes?productId=prod-code",
       headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
     });
+    const orderCodes = await app.inject({
+      method: "GET",
+      url: `/api/admin/rights-codes?productId=prod-code&orderNo=${order.json().orderNo}&status=issued`,
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
 
     const issuedForOrder = codes.json().filter((code: { orderNo?: string }) => code.orderNo === order.json().orderNo);
     expect(issuedForOrder).toHaveLength(2);
+    expect(orderCodes.json()).toHaveLength(2);
+  });
+
+  it("registers first, second, and third-tier merchants through formal invite-code APIs and rejects fourth tier", async () => {
+    const app = buildApp();
+    const adminHeaders = { "x-admin-id": "operator-1", "x-admin-role": "operator" };
+    const financeHeaders = { "x-admin-id": "finance-1", "x-admin-role": "finance" };
+
+    const firstInvite = await app.inject({
+      method: "POST",
+      url: "/api/admin/invite-codes",
+      headers: adminHeaders,
+      payload: { code: "P0-FIRST-E2E" }
+    });
+    expect(firstInvite.statusCode).toBe(200);
+    expect(firstInvite.json()).toMatchObject({ code: "P0-FIRST-E2E", targetTier: "first_tier" });
+
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/agent/register-by-invite",
+      payload: { inviteCode: "P0-FIRST-E2E", name: "一级正式 API 商户", shopName: "一级正式 API 店" }
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().agent).toMatchObject({ tier: "first_tier", status: "pending_review" });
+    const firstAgentId = first.json().agent.id;
+    const firstShopId = first.json().shop.id;
+
+    await app.inject({ method: "POST", url: `/api/admin/agents/${firstAgentId}/review`, headers: adminHeaders, payload: { approved: true } });
+    await app.inject({ method: "POST", url: `/api/admin/deposits/${firstAgentId}/confirm`, headers: financeHeaders, payload: { amountCents: "50000", voucherUrl: "manual://deposit/first-e2e" } });
+
+    const secondInvite = await app.inject({
+      method: "POST",
+      url: "/api/agent/invite-codes",
+      headers: { "x-agent-id": firstAgentId, "x-shop-id": firstShopId },
+      payload: { code: "P0-SECOND-E2E" }
+    });
+    expect(secondInvite.statusCode).toBe(200);
+    expect(secondInvite.json()).toMatchObject({ code: "P0-SECOND-E2E", targetTier: "second_tier" });
+
+    const second = await app.inject({
+      method: "POST",
+      url: "/api/agent/register-by-invite",
+      payload: { inviteCode: "P0-SECOND-E2E", name: "二级正式 API 商户", shopName: "二级正式 API 店" }
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json().agent).toMatchObject({ tier: "second_tier", parentAgentId: firstAgentId, status: "pending_review" });
+    const secondAgentId = second.json().agent.id;
+    const secondShopId = second.json().shop.id;
+
+    await app.inject({ method: "POST", url: `/api/admin/agents/${secondAgentId}/review`, headers: adminHeaders, payload: { approved: true } });
+    await app.inject({ method: "POST", url: `/api/admin/deposits/${secondAgentId}/confirm`, headers: financeHeaders, payload: { amountCents: "50000", voucherUrl: "manual://deposit/second-e2e" } });
+
+    const thirdInvite = await app.inject({
+      method: "POST",
+      url: "/api/agent/invite-codes",
+      headers: { "x-agent-id": secondAgentId, "x-shop-id": secondShopId },
+      payload: { code: "P0-THIRD-E2E" }
+    });
+    expect(thirdInvite.statusCode).toBe(200);
+    expect(thirdInvite.json()).toMatchObject({ code: "P0-THIRD-E2E", targetTier: "third_tier" });
+
+    const third = await app.inject({
+      method: "POST",
+      url: "/api/agent/register-by-invite",
+      payload: { inviteCode: "P0-THIRD-E2E", name: "三级正式 API 商户", shopName: "三级正式 API 店" }
+    });
+    expect(third.statusCode).toBe(200);
+    expect(third.json().agent).toMatchObject({ tier: "third_tier", parentAgentId: secondAgentId, status: "pending_review" });
+    const thirdAgentId = third.json().agent.id;
+    const thirdShopId = third.json().shop.id;
+
+    await app.inject({ method: "POST", url: `/api/admin/agents/${thirdAgentId}/review`, headers: adminHeaders, payload: { approved: true } });
+    await app.inject({ method: "POST", url: `/api/admin/deposits/${thirdAgentId}/confirm`, headers: financeHeaders, payload: { amountCents: "50000", voucherUrl: "manual://deposit/third-e2e" } });
+
+    const fourth = await app.inject({
+      method: "POST",
+      url: "/api/agent/invite-codes",
+      headers: { "x-agent-id": thirdAgentId, "x-shop-id": thirdShopId },
+      payload: { code: "P0-FOURTH-E2E" }
+    });
+    const invites = await app.inject({ method: "GET", url: "/api/admin/invite-codes", headers: adminHeaders });
+
+    expect(fourth.statusCode).toBe(400);
+    expect(fourth.json().code).toBe("FOURTH_TIER_FORBIDDEN");
+    expect(JSON.stringify(invites.json())).toContain("P0-FIRST-E2E");
+    expect(JSON.stringify(invites.json())).toContain("P0-SECOND-E2E");
+    expect(JSON.stringify(invites.json())).toContain("P0-THIRD-E2E");
   });
 });
+
+function signedBearer(payload: Record<string, unknown>, secret: string) {
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = createHmac("sha256", secret).update(body).digest("base64url");
+  return `Bearer ${body}.${signature}`;
+}

@@ -3,6 +3,7 @@
 .ccb/ccbd/
 .ccb/shared-cache/
 .ccb/workspaces/
+.ccb/history/
 .ccb/runtime-root.json
 .ccb/runtime-root-ref.json
 .ccb/agents/*/agent.json

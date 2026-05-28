@@ -10,6 +10,7 @@ type RequestOptions = {
 type AppShape = {
   globalData: {
     apiBaseUrl: string;
+    authToken: string;
     userId: string;
     agentId: string;
     shopId: string;
@@ -34,7 +35,7 @@ function headers(mode: Mode): Record<string, string> {
   }
   return {
     "content-type": "application/json",
-    "x-user-id": app.globalData.userId
+    ...(app.globalData.authToken ? { authorization: `Bearer ${app.globalData.authToken}` } : { "x-user-id": app.globalData.userId })
   };
 }
 
@@ -77,9 +78,13 @@ export const api = {
     method: "POST",
     body: { shopId, agentProductId }
   }),
-  createOrder: (shopId: string, agentProductId: string, clientPaidAmountCents?: string) => request<Record<string, unknown>>("/api/user/orders", {
+  createOrder: (shopId: string, agentProductId: string, clientPaidAmountCents?: string, extractionCode?: string) => request<Record<string, unknown>>("/api/user/orders", {
     method: "POST",
-    body: { shopId, agentProductId, clientPaidAmountCents }
+    body: { shopId, agentProductId, clientPaidAmountCents, extractionCode }
+  }),
+  createPaymentIntent: (orderNo: string, channel = "mock") => request<Record<string, unknown>>(`/api/user/orders/${orderNo}/payments`, {
+    method: "POST",
+    body: { channel }
   }),
   mockPayment: (orderNo: string, amountCents: string) => request<Record<string, unknown>>("/api/callbacks/payments/mock", {
     method: "POST",

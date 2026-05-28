@@ -9,6 +9,10 @@
     <text>售后状态：{{order.refundStatus}}</text>
     <text>实付金额：¥{{paidAmount}}</text>
     <text>权益：{{order.entitlement}}</text>
+    <text>{{order.deliveryMessage}}</text>
+    <block wx:for="{{order.entitlementCodes}}" wx:key="*this">
+      <text class="code">卡密：{{item}}</text>
+    </block>
     <input placeholder="退款金额，单位分" value="{{refundCents}}" bindinput="onRefundCentsInput" />
     <input placeholder="售后原因代码" value="{{refundReasonCode}}" bindinput="onRefundReasonInput" />
     <input placeholder="售后说明" value="{{refundDescription}}" bindinput="onRefundDescriptionInput" />

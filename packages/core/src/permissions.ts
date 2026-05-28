@@ -45,6 +45,7 @@ export function hasAdminPermission(actor: Actor, permission: AdminPermission): b
       "product.manage",
       "after_sale.arbitrate",
       "risk.freeze",
+      "settlement.confirm",
       "audit.read"
     ].includes(permission);
   }

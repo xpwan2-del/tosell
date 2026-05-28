@@ -7,6 +7,7 @@ Page({
     loading: false,
     error: "",
     quote: {} as Record<string, unknown>,
+    extractionCode: "",
     product: {
       id: "",
       name: "",
@@ -47,9 +48,17 @@ Page({
       this.setData({ loading: false });
     }
   },
+  onExtractionCodeInput(this: any, event: WechatMiniprogram.InputEvent) {
+    this.setData({ extractionCode: String(event.detail.value).replace(/\D/g, "").slice(0, 12) });
+  },
   async createOrder(this: any) {
     try {
-      const order = await api.createOrder(this.data.shopId, this.data.productId, text(this.data.quote.paidAmountCents));
+      const order = await api.createOrder(
+        this.data.shopId,
+        this.data.productId,
+        text(this.data.quote.paidAmountCents),
+        this.data.product.fulfillmentType === "code_pool" ? this.data.extractionCode : undefined
+      );
       wx.navigateTo({ url: `/pages/payment/result?orderNo=${order.orderNo}` });
     } catch (error) {
       wx.showToast({ title: error instanceof Error ? error.message : "下单失败", icon: "none" });

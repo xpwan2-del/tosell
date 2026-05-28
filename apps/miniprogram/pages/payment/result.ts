@@ -39,6 +39,8 @@ Page({
   async simulatePayment(this: any) {
     try {
       const amountCents = String(Math.round(Number(this.data.paidAmount) * 100));
+      const intent = await api.createPaymentIntent(this.data.orderNo, "mock");
+      if (text(intent.status) !== "ready") throw new Error(text(intent.message, "当前支付渠道未配置"));
       const result = await api.mockPayment(this.data.orderNo, amountCents);
       this.setData({ paymentResult: text(result.status, "processed") });
       wx.showToast({ title: "支付回调已处理", icon: "none" });

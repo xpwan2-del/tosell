@@ -1,399 +1,243 @@
 # 管理后台、后端模块与数据库账务设计
 
-本文是 V1 开发依据文档，覆盖平台后台页面、后端领域服务、数据库核心实体、金额字段、账务流水、唯一约束、索引、事务边界和审计要求。
+本文是 P0 开发依据，覆盖 H5 虚拟商品小店的平台后台、商户后台、后端领域服务、数据库核心实体、金额字段、逐级价格隔离、账务流水、唯一约束、事务边界和审计要求。
 
 ## 1. 开发硬约束
 
-1. 数据库和后端是本项目核心，所有金额、状态、结算、退款、保证金和账务处理以后端落库为准。
-2. 前端不得成为最终金额依据，前端传入的价格、服务费、收益、退款金额、结算金额必须由后端重新计算或校验。
+1. 数据库和后端是本项目核心，所有金额、状态、库存、卡密、收款、供货应付/服务费、退款、保证金和账务处理以后端落库为准。
+2. 前端不得成为最终金额依据，前端传入的价格、服务费、收益、退款金额、清算金额必须由后端重新计算或校验。
 3. 金额统一使用 `BIGINT amount_cents`，默认币种 `CNY`，禁止浮点。
-4. 服务费率 V1 固化为 `service_fee_bps=50`，即 0.5%；计算后四舍五入到分，并写入订单快照。
+4. 服务费率 P0 默认为 `service_fee_bps=50`，即 0.5%；计算后四舍五入到分，并写入订单快照。
 5. `ledger_entries` 是不可变审计流水，不允许物理删除，不允许原地修改金额；冲正只能新增反向流水。
-6. 单层订单保持 `settlement_items.order_id` 唯一；两级渠道订单必须改为 `order_id + settlement_role` 唯一，防止同一订单同一结算角色重复结算。
-7. 支付、退款、履约、结算、追扣、保证金交易必须有幂等键和唯一约束。
-8. 代理侧所有查询必须以后端认证主体派生 `agent_id/shop_id`，不能信任前端传参。
+6. 单层订单保持 `clearing_items.order_id` 唯一；多级渠道订单必须使用 `order_id + clearing_role` 唯一。
+7. 支付确认、真实支付回调、退款、履约、供货清算、追扣、保证金交易必须有幂等键和唯一约束。
+8. 商户侧所有查询必须以后端认证主体派生 `merchant_id/shop_id`，不能信任前端传参。
 9. 数据库、API、页面、导出不得出现邀请奖励、团队业绩、代理等级、返佣比例、团队订单奖励等设计。
-10. 受控两级渠道只允许平台供货 -> 一级渠道商 -> 二级渠道商 -> 消费者，禁止三级渠道。
-11. 渠道收益必须按供货价差计算，不得按招募人数、团队订单或返佣比例计算。
-12. 平台自营店是平台自己的销售渠道，不属于一级渠道商，不参与一级/二级渠道结算。
+10. 受控代理价差供货最多允许到三级：平台供货 -> 一级商户 -> 二级商户 -> 三级商户 -> 消费者，禁止四级渠道。
+11. 平台自营店是平台自己的销售渠道，不属于一级商户，不参与渠道供货清算。
+12. 商户使用自己的收款码/链接收款，P0 不做平台代收后 T+1 给商户打款；数据库只记录收款确认、供货应付、服务费、追扣和清算凭证。
+13. 商品资料可以向下级开放，越级供货价格不能向下级泄露。
 
-## 2. 平台后台 V1 模块
+## 2. 平台后台 P0 模块
 
-### 2.1 基础看板
+1. 基础看板：GMV、订单数、退款率、履约成功率、平台服务费、商户收益、冻结金额。
+2. 商户审核：入驻资料、邀请码来源、上级关系、保证金、店铺状态。
+3. 后台手工开店：创建一级商户、创建店铺、生成初始账号密码、记录交付状态和审计日志。
+4. 保证金管理：确认缴纳、扣减、冻结、退还登记。
+5. 平台商品库：商品名称、分类、图片、详情、供货价、最低价、建议价、履约方式、售后规则。
+6. 自有商品审核：商户自提商品资料、价格、履约说明、售后说明、风险原因。
+7. 库存与卡密：码池导入、库存扣减、自动发码、手工交付记录。
+8. 收款通道审核：支付宝个人码、支付宝商户码/链接、微信个人码、微信商户码/链接。
+9. 邀请码与渠道关系：平台/一级/二级邀请码、层级绑定、禁止四级。
+10. 选品与转供价：平台给一级的供货价、一级给二级的转供价、二级给三级的转供价。
+11. 订单管理：订单快照、收款状态、履约状态、退款状态、清算状态、风控状态。
+12. 售后仲裁：责任归属、退款金额、平台/一级/二级/三级承担金额。
+13. 供货清算与服务费：供货应付、服务费账单、清算明细、线下清算凭证、追扣。
+14. 风控冻结：订单、店铺、商品、商户、收款通道和清算限制。
+15. 审计日志：敏感操作前后值、原因、操作者、request_id、IP。
+16. 平台自营：自营店、自营商品、自营订单、自营履约、自营收入成本对账。
 
-字段：GMV、订单数、退款率、履约成功率、平台服务费、代理收益、活跃代理数、冻结金额。
+## 3. 商户后台 P0 模块
 
-操作：按日期、代理、商品筛选；跳转订单、售后、结算明细。
+1. 店铺配置：名称、Logo、公告、客服二维码、分享链接。
+2. 收款通道：提交二维码/链接、查看审核状态、设置默认通道。
+3. 商品选品：查看自己可见商品和自己可见上游供货价。
+4. 商品上架：设置最终售价，导入或查看库存卡密。
+5. 下级供货：一级给二级开放商品并设置一级转供价；二级给三级开放商品并设置二级转供价。
+6. 订单和履约：确认收款、自动发码、手工交付、售后处理。
+7. 供货清算和追扣：查看自己的可见收益、冻结、供货应付/服务费账单和追扣原因。
 
-### 2.2 代理审核
+商户后台不得显示无关商户数据。二级不得显示平台给一级的供货价；三级不得显示一级转供价和平台供货价。
 
-字段：代理申请资料、联系人、联系方式、客服微信、售后说明、审核状态、拒绝原因、保证金状态、店铺状态。
+## 4. 后端领域模块
 
-操作：审核通过、审核拒绝、补充备注、冻结店铺、禁用店铺。
+1. Auth/RBAC：H5 买家、商户账号、平台账号、角色权限、菜单权限、数据权限。
+2. Merchant/Shop：入驻申请、审核、保证金状态联动、店铺资料、客服二维码、冻结、禁用。
+3. Product/MerchantProduct：平台商品库、商户选品、自有商品审核、上下架、风控下架。
+4. VirtualInventory：卡密导入、库存扣减、权益发放、商品级提取码配置、提取锁定、邮箱发码、退款后禁看。
+5. Pricing：后端价格校验、最低限价校验、上游供货价校验、服务费计算、收益预估、订单金额快照。
+6. ChannelSupply：邀请码、渠道关系、转供商品、转供价、逐级价格隔离、供货链快照。
+7. Order：订单创建、归属固化、订单状态机、超时关闭、订单查询与权限隔离。
+8. CollectionChannel：收款通道提交、审核、启用、禁用、订单通道快照。
+9. PaymentConfirmation：收款确认、真实回调预留、金额校验、幂等入账、支付成功触发履约。
+10. Fulfillment：自动/人工履约、履约尝试、权益发放、补发、撤销、重复发放拦截。
+11. Coupon：注册赠券、商品适用、有效期、作废、不可叠加。
+12. AfterSale/Refund：售后申请、冻结供货应付/服务费账单、责任归属、退款审批、退款拆账。
+13. Clearing/Reconciliation：供货应付、服务费账单、清算明细唯一约束、线下清算凭证、追扣对账。
+14. Deposit：保证金账户、缴纳确认、扣减、冻结、退还、余额不足限制。
+15. RiskFreeze：订单冻结、店铺冻结、限制供货/清算、禁用、解冻后重新判断清算资格。
+16. Ledger/Audit：不可变账务流水、操作审计、冲正流水、敏感操作留痕。
+17. Reconciliation/Export：订单、收款、退款、供货应付、服务费、追扣、保证金、ledger 对账导出。
 
-要求：审核动作必须写 `audit_logs`。
+## 5. 核心数据库实体
 
-### 2.3 保证金管理
+### 5.1 账号、商户、店铺
 
-字段：应缴金额、可用金额、冻结金额、扣减金额、状态、关联订单/售后/投诉/追扣、凭证。
+`users`：H5 买家身份，包含 `id`、`phone`、`email`、`status`、`created_at`、`updated_at`。
 
-操作：确认缴纳、扣减、冻结、退还登记。
+`merchant_accounts`：商户登录账号，包含 `id`、`merchant_id`、`phone`、`email`、`password_hash`、`initial_password_reset_required`、`credential_delivery_status`、`status`、`last_login_at`。
 
-要求：任何保证金变化必须写 `deposit_transactions` 和 `ledger_entries`，不得只更新余额。
+`admin_users`、`roles`、`permissions`、`admin_user_roles`、`role_permissions`：平台后台 RBAC。
 
-### 2.4 平台商品库
+`merchants`：`id`、`merchant_no`、`name`、`tier`、`parent_merchant_id`、`root_first_tier_merchant_id`、`creation_source`、`created_by_admin_id`、`status`、`risk_status`、`deposit_status`、`approved_at`。
 
-字段：商品名称、分类、详情、权益说明、供货价、最低销售价、建议销售价、履约方式、履约规则、售后规则、上下架状态。
+`merchant_applications`：`id`、`merchant_id`、`invite_code_id`、`application_source`、`identity_info_json`、`contact_info_json`、`customer_service_wechat`、`status`、`reject_reason`、`reviewed_by`、`reviewed_at`。
 
-操作：创建、编辑、上架、下架、调整价格、查看历史。
-
-要求：商品价格变化不得影响历史订单快照。
-
-### 2.5 代理商品审核
-
-字段：代理、店铺、自有商品资料、售价、履约说明、售后说明、风险原因、审核状态。
-
-操作：审核通过、审核拒绝、风险下架。
-
-要求：未审核通过的自有商品不得出现在用户端售卖。
-
-### 2.6 订单管理
-
-字段：订单号、用户、代理、店铺、商品、订单快照、支付状态、履约状态、退款状态、结算状态、风控状态。
-
-操作：查询、备注、冻结、解冻、查看全链路记录。
-
-要求：订单冻结期间不得进入结算。
-
-### 2.7 履约管理
-
-字段：待履约订单、发放方式、权益凭证、失败原因、尝试次数、权益状态。
-
-操作：人工发放、重试、补发、撤销。
-
-要求：重复发放必须被幂等拦截，发放和补发必须写凭证。
-
-### 2.8 售后仲裁
-
-字段：售后原因、用户凭证、订单实付、责任归属、退款金额、平台承担金额、代理承担金额、一级承担金额、二级承担金额、服务费退还金额、服务费承担方。
-
-操作：审核、拒绝、平台介入、创建退款、记录裁决。
-
-要求：退款金额累计不得超过用户实付金额，责任归属必须记录。
-
-### 2.9 结算管理
-
-字段：可结算订单、冻结订单、结算单、结算明细、人工打款状态、打款凭证。
-
-操作：生成结算单、确认结算、导出打款文件、回填人工打款。
-
-要求：结算单金额必须等于结算明细汇总，同一订单不得重复结算。
-
-### 2.10 风控冻结
-
-字段：目标类型、目标 ID、代理、店铺、订单、商品、冻结原因、影响范围、状态。
-
-操作：冻结、解冻、限制结算、禁用店铺、下架商品。
-
-要求：冻结和解冻必须写审计，解冻后重新判断结算资格。
-
-### 2.11 审计日志
-
-字段：操作人、角色、动作、目标、前后值、原因、时间、request_id、IP。
-
-操作：查询、导出、追踪敏感操作。
-
-必须审计：退款裁决、退款金额确认、保证金扣减/退还、结算单生成/确认、人工打款回填、订单/店铺冻结解冻、店铺禁用、商品风险下架、后台价格调整、权限变更。
-
-### 2.12 H5 与渠道供货管理
-
-字段：H5 店铺域名、渠道层级、一级渠道授权状态、二级渠道审核状态、可转供商品、一级转供价、最终销售价、供货链订单快照、一级/二级结算状态。
-
-操作：审核一级开通二级能力、审核二级入驻、关闭渠道授权、配置或审核转供价、查询供货链订单、生成一级/二级结算明细。
-
-要求：二级不得继续创建三级；转供价调整必须写审计；历史订单不得受后续转供价变化影响。
-
-### 2.13 平台自营管理
-
-字段：平台自营店、平台自营商品、自营售价、履约成本、支付通道费、平台自营毛收益、自营订单、自营售后、自营对账状态。
-
-操作：配置平台自营店、上架/下架自营商品、调整自营售价、查看自营订单、处理自营售后、查看自营看板和对账。
-
-要求：平台自营订单不生成渠道结算项，但必须进入平台收入、成本、退款、ledger 和对账。
-
-## 3. 后端领域模块
-
-1. Auth/RBAC：微信登录、后台账号、角色权限、菜单权限、数据权限、敏感操作授权。
-2. Agent/Shop：代理入驻申请、审核、保证金状态联动、店铺资料、客服微信、冻结、禁用。
-3. Product/AgentProduct：平台商品库、代理选品、代理自有商品提交审核、上下架、风控下架。
-4. Pricing：后端价格校验、最低限价校验、服务费计算、代理收益预估、订单金额快照。
-5. Order：订单创建、归属固化、订单状态机、超时关闭、订单查询与代理隔离。
-6. PaymentCallback：微信支付单、支付回调验签、金额校验、幂等入账、支付成功触发履约。
-7. Fulfillment：自动/人工履约、履约尝试、权益发放、补发、撤销、重复发放拦截。
-8. AfterSale/Refund：售后申请、冻结结算、责任归属、退款审批、退款回调、退款拆账。
-9. Settlement：T+1 可结算筛选、结算单生成、结算明细唯一约束、人工打款确认。
-10. Deposit：保证金账户、缴纳确认、扣减、冻结、退还、余额不足限制。
-11. RiskFreeze：订单冻结、店铺冻结、限制结算、禁用、解冻后重新判断结算资格。
-12. Ledger/Audit：不可变账务流水、操作审计、冲正流水、敏感操作留痕。
-13. Reconciliation/Export：订单、支付、退款、结算、人工打款、保证金、ledger 对账导出。
-14. ChannelSupply：渠道授权、渠道关系、转供商品、转供价、供货链快照、一级/二级结算。
-15. H5Frontend：H5 店铺、H5 用户身份、H5 订单和售后入口。
-16. PaymentChannel：微信小程序、微信内 H5 JSAPI、微信外 H5、支付宝手机网站、mock 支付统一模型。
-17. PlatformSelfOperated：平台自营店、自营商品、自营订单、自营履约、自营售后、自营对账。
-
-## 4. 核心数据库实体
-
-### 4.1 用户、代理、店铺
-
-`users`：`id`、`openid`、`unionid`、`phone`、`status`、`created_at`、`updated_at`。
-
-`agents`：`id`、`user_id`、`agent_no`、`name`、`contact_phone`、`status`、`risk_status`、`deposit_status`、`approved_at`。
-
-`agent_applications`：`id`、`agent_id`、`user_id`、`identity_info_json`、`contact_info_json`、`customer_service_wechat`、`status`、`reject_reason`、`reviewed_by`、`reviewed_at`。
-
-`shops`：`id`、`owner_type`、`agent_id`、`shop_no`、`name`、`logo_url`、`announcement`、`share_path`、`status`、`risk_status`。
-
-`owner_type` 枚举：`platform`、`agent`。平台自营店使用 `owner_type=platform`，渠道店使用 `owner_type=agent`。
+`shops`：`id`、`owner_type`、`merchant_id`、`shop_no`、`slug`、`domain`、`name`、`logo_url`、`announcement`、`status`、`risk_status`。
 
 `shop_customer_service_bindings`：`id`、`shop_id`、`wechat_id`、`qr_code_url`、`status`、`review_status`、`reviewed_by`。
 
-### 4.1.1 渠道关系与 H5 身份
+### 5.2 邀请码与渠道关系
 
-`channel_authorizations`：`id`、`agent_id`、`status`、`allow_second_tier`、`reviewed_by`、`reviewed_at`、`closed_at`、`reason`、`created_at`。
+`merchant_invite_codes`：`id`、`code`、`issuer_type`、`issuer_merchant_id`、`target_tier`、`status`、`max_uses`、`used_count`、`expires_at`、`created_by`、`created_at`。
 
-`channel_relations`：`id`、`first_tier_agent_id`、`second_tier_agent_id`、`status`、`created_by`、`created_at`、`closed_at`。唯一约束：`second_tier_agent_id` 只能绑定一个有效一级渠道商。
+规则：
 
-`h5_users`：`id`、`phone`、`wechat_unionid`、`status`、`created_at`、`updated_at`。
+1. 平台邀请码 `target_tier=1`。
+2. 一级邀请码 `target_tier=2`。
+3. 二级邀请码 `target_tier=3`。
+4. 三级不得生成邀请码。
+5. 邀请码不产生奖励和佣金。
 
-`shop_domains`：`id`、`shop_id`、`domain`、`path_slug`、`status`、`created_at`、`updated_at`。
+`channel_relations`：`id`、`root_first_tier_merchant_id`、`parent_merchant_id`、`child_merchant_id`、`parent_tier`、`child_tier`、`invite_code_id`、`status`、`created_at`、`closed_at`。
 
-### 4.2 保证金
+唯一约束：`child_merchant_id` 同一时间只能有一个有效上级；`child_tier <= 3`。
 
-`deposit_accounts`：`id`、`agent_id`、`required_amount_cents`、`available_amount_cents`、`frozen_amount_cents`、`deducted_amount_cents`、`status`。
+### 5.3 保证金
 
-`deposit_transactions`：`id`、`agent_id`、`account_id`、`type`、`amount_cents`、`balance_before_cents`、`balance_after_cents`、`reason_code`、`related_type`、`related_id`、`voucher_url`、`idempotency_key`、`operator_id`、`created_at`。
+保证金相关表必须支持后台人工确认。
 
-### 4.3 商品
+`deposit_accounts`：`id`、`merchant_id`、`status`、`required_amount_cents`、`confirmed_amount_cents`、`available_amount_cents`、`frozen_amount_cents`、`deducted_amount_cents`、`confirmed_at`、`confirmed_by`、`proof_url`、`remark`、`created_at`、`updated_at`。
 
-`platform_products`：`id`、`product_no`、`name`、`category_id`、`detail`、`rights_desc`、`supply_price_cents`、`min_sale_price_cents`、`suggested_sale_price_cents`、`fulfillment_type`、`fulfillment_rule_json`、`after_sale_rule_json`、`status`。
+`deposit_transactions`：`id`、`merchant_id`、`account_id`、`type`、`amount_cents`、`status`、`balance_before_cents`、`balance_after_cents`、`reason_code`、`source_type`、`source_id`、`related_type`、`related_id`、`proof_url`、`idempotency_key`、`operator_id`、`confirmed_by`、`confirmed_at`、`remark`、`created_at`。
 
-`agent_products`：`id`、`agent_id`、`shop_id`、`product_type`、`platform_product_id`、`own_product_review_id`、`sale_price_cents`、`status`、`listed_at`、`delisted_at`。
+规则：`deposit_status != paid` 的商户不得销售、不得选品上架、不得代理平台商品、不得代理上级商户商品、不得配置转供价。所有后台人工确认保证金操作必须写 `deposit_transactions`、`ledger_entries` 和 `audit_logs`。
 
-`agent_product_reviews`：`id`、`agent_id`、`shop_id`、`name`、`detail_json`、`sale_price_cents`、`after_sale_rule_json`、`fulfillment_rule_json`、`status`、`risk_reason`、`reviewed_by`、`reviewed_at`。
+### 5.4 商品、选品与价格
 
-`channel_product_offers`：`id`、`first_tier_agent_id`、`second_tier_agent_id`、`platform_product_id`、`resell_supply_price_cents`、`min_sale_price_cents`、`status`、`created_at`、`updated_at`。
+`platform_products`：`id`、`product_no`、`name`、`category_id`、`cover_url`、`images_json`、`detail_json`、`rights_desc`、`supply_price_cents`、`min_sale_price_cents`、`suggested_sale_price_cents`、`fulfillment_type`、`after_sale_rule_json`、`status`。
 
-约束：`resell_supply_price_cents` 不得低于平台供货价；二级最终售价不得低于 `resell_supply_price_cents` 和平台限制价。
+`merchant_products`：`id`、`merchant_id`、`shop_id`、`product_type`、`platform_product_id`、`own_product_review_id`、`sale_price_cents`、`status`、`listed_at`、`delisted_at`。
 
-### 4.4 订单与快照
+`merchant_product_reviews`：`id`、`merchant_id`、`shop_id`、`name`、`detail_json`、`sale_price_cents`、`after_sale_rule_json`、`fulfillment_rule_json`、`status`、`risk_reason`、`reviewed_by`、`reviewed_at`。
 
-`orders`：`id`、`order_no`、`sales_channel_type`、`buyer_type`、`user_id`、`mini_user_id`、`h5_user_id`、`unified_user_id`、`agent_id`、`shop_id`、`platform_shop_id`、`status`、`payment_status`、`fulfillment_status`、`refund_status`、`settlement_status`、`risk_status`、`paid_amount_cents`、`created_at`、`paid_at`。
+`channel_product_offers`：`id`、`supplier_merchant_id`、`buyer_merchant_id`、`supplier_tier`、`buyer_tier`、`platform_product_id`、`visible_product_snapshot_json`、`upstream_supply_price_cents`、`transfer_supply_price_cents`、`min_sale_price_cents`、`status`、`created_at`、`updated_at`。
 
-`sales_channel_type` 枚举：`platform_self_operated`、`single_agent`、`two_tier`。
+价格字段解释：
 
-买家身份规则：小程序订单写 `buyer_type=mini_program` 和 `mini_user_id/user_id`；H5 订单写 `buyer_type=h5` 和 `h5_user_id`；如果后续完成手机号或 unionid 合并，可写 `unified_user_id`。订单、售后和权益查询必须从登录态派生对应买家身份。
+1. 平台给一级：一级看到 `platform_products.supply_price_cents`。
+2. 一级给二级：二级只看到 `channel_product_offers.transfer_supply_price_cents`，该记录的 `supplier_tier=1`、`buyer_tier=2`。
+3. 二级给三级：三级只看到 `channel_product_offers.transfer_supply_price_cents`，该记录的 `supplier_tier=2`、`buyer_tier=3`。
+4. `upstream_supply_price_cents` 是服务端校验与结算字段，不得原样返回给下游。
 
-`order_items`：`id`、`order_id`、`agent_product_id`、`product_type`、`product_id_snapshot`、`product_name_snapshot`、`sale_price_cents`、`quantity`、`supply_price_cents`、`service_fee_cents`、`agent_income_cents`。
+约束：一级转供价不得低于平台供货价；二级转供价不得低于一级转供价；最终售价不得低于销售方上游供货价、平台最低限价和上级限制价。
 
-`order_amount_snapshots`：`order_id`、`service_fee_bps`、`paid_amount_cents`、`supply_amount_cents`、`service_fee_cents`、`agent_expected_income_cents`、`platform_product_snapshot_json`、`shop_snapshot_json`、`pricing_snapshot_json`。
+### 5.5 库存、卡密与优惠券
 
-订单快照必须固化：`agent_id`、`shop_id`、店铺名称、客服微信、用户入口来源、商品 ID 与版本、商品名称、商品类型、履约规则、售后规则、销售价、实付金额、平台供货价、最低限价、服务费率、服务费金额、代理预计收益、创建时代理/店铺状态。
+`virtual_code_batches`：`id`、`product_id`、`merchant_product_id`、`batch_no`、`total_count`、`available_count`、`status`、`created_by`、`created_at`。
 
-两级渠道订单快照必须额外固化：`first_tier_agent_id`、`second_tier_agent_id`、`first_tier_shop_id`、`second_tier_shop_id`、`platform_supply_price_cents`、`resell_supply_price_cents`、`final_sale_price_cents`、`first_tier_margin_cents`、`second_tier_margin_cents`、`service_fee_bearer`、`channel_relation_id`、`channel_authorization_snapshot_json`。
+`virtual_codes`：`id`、`batch_id`、`code_ciphertext`、`status`、`order_id`、`issued_at`、`refunded_at`、`created_at`。
 
-平台自营订单快照必须额外固化：`platform_shop_id`、`final_sale_price_cents`、`fulfillment_cost_cents`、`payment_channel_fee_cents`、`platform_self_operated_gross_margin_cents`。
+`order_extract_secrets`：`id`、`order_id`、`secret_hash`、`failed_attempts`、`locked_until`、`created_at`、`updated_at`。
 
-### 4.5 支付、履约、权益
+`order_extract_logs`：`id`、`order_id`、`user_id`、`attempt_result`、`failure_reason`、`failed_attempts_after`、`locked_until`、`ip_hash`、`user_agent`、`created_at`。每次成功提取、失败提取、锁定拒绝、退款后拒绝都必须记录。
 
-`payments`：`id`、`payment_no`、`order_id`、`user_id`、`channel`、`channel_trade_no`、`amount_cents`、`status`、`paid_at`。
+`coupon_templates`：`id`、`name`、`grant_type`、`discount_type`、`discount_amount_cents`、`min_order_amount_cents`、`scope_type`、`scope_json`、`total_grant_limit`、`per_user_limit`、`valid_from`、`valid_to`、`status`、`created_by`、`created_at`、`updated_at`。
 
-`payment_callbacks`：`id`、`payment_id`、`channel_event_id`、`raw_payload_json`、`processed_status`、`idempotency_key`、`created_at`。
+`coupon_grant_records`：`id`、`template_id`、`user_id`、`grant_reason`、`granted_by`、`granted_at`、`source_event_id`。
 
-`fulfillment_records`：`id`、`order_id`、`order_item_id`、`agent_id`、`fulfillment_type`、`status`、`success_at`、`fail_reason`。
+`user_coupons`：`id`、`user_id`、`template_id`、`status`、`claimed_at`、`used_at`、`voided_at`、`void_reason`、`order_id`、`expires_at`。
 
-`fulfillment_attempts`：`id`、`fulfillment_id`、`attempt_no`、`idempotency_key`、`operator_id`、`request_json`、`result_json`、`status`。
+`coupon_usage_records`：`id`、`user_coupon_id`、`order_id`、`pre_coupon_sale_amount_cents`、`coupon_discount_cents`、`buyer_paid_amount_cents`、`platform_coupon_subsidy_cents`、`used_at`、`voided_after_refund_at`。
 
-`entitlements`：`id`、`order_id`、`order_item_id`、`user_id`、`rights_code`、`rights_payload_json`、`status`、`issued_at`、`revoked_at`。
+### 5.6 收款与订单
 
-### 4.6 售后与退款
+`shop_collection_channels`：`id`、`shop_id`、`merchant_id`、`owner_type`、`channel_type`、`display_name`、`account_name`、`qr_url`、`payment_url`、`status`、`review_status`、`reviewed_by`、`reviewed_at`、`reject_reason`、`is_default`、`sort_order`、`daily_limit_cents`、`single_order_limit_cents`、`created_at`、`updated_at`。
 
-`after_sales`：`id`、`after_sale_no`、`order_id`、`buyer_type`、`user_id`、`mini_user_id`、`h5_user_id`、`agent_id`、`shop_id`、`status`、`reason_code`、`responsibility`、`requested_refund_cents`、`approved_refund_cents`、`platform_bear_cents`、`agent_bear_cents`、`first_tier_bear_cents`、`second_tier_bear_cents`、`service_fee_refund_cents`、`service_fee_bearer`。
+`orders`：`id`、`order_no`、`sales_channel_type`、`buyer_type`、`user_id`、`merchant_id`、`shop_id`、`platform_shop_id`、`status`、`payment_status`、`fulfillment_status`、`refund_status`、`settlement_status`、`risk_status`、`buyer_email_snapshot`、`pre_coupon_sale_amount_cents`、`coupon_discount_cents`、`buyer_paid_amount_cents`、`platform_coupon_subsidy_cents`、`paid_amount_cents`、`created_at`、`paid_at`。
 
-`responsibility` 枚举：`platform`、`agent`、`first_tier`、`second_tier`、`user`、`mixed`。单层订单可使用 `agent`；两级渠道订单必须使用 `first_tier`、`second_tier` 或 `mixed`，不得只写模糊的 `agent`。
+`order_items`：`id`、`order_id`、`merchant_product_id`、`product_type`、`product_id_snapshot`、`product_name_snapshot`、`sale_price_cents`、`pre_coupon_sale_amount_cents`、`coupon_discount_cents`、`buyer_paid_amount_cents`、`platform_coupon_subsidy_cents`、`quantity`、`supply_price_cents`、`service_fee_cents`、`merchant_income_cents`。
 
-`refunds`：`id`、`refund_no`、`after_sale_id`、`order_id`、`payment_id`、`amount_cents`、`status`、`channel_refund_no`、`idempotency_key`、`created_at`。
+`order_amount_snapshots`：`order_id`、`service_fee_bps`、`pre_coupon_sale_amount_cents`、`coupon_discount_cents`、`buyer_paid_amount_cents`、`platform_coupon_subsidy_cents`、`coupon_id`、`user_coupon_id`、`coupon_refund_policy`、`settlement_basis_amount_cents`、`paid_amount_cents`、`supply_amount_cents`、`service_fee_cents`、`merchant_expected_income_cents`、`product_snapshot_json`、`shop_snapshot_json`、`pricing_snapshot_json`。
 
-`refund_callbacks`：`id`、`refund_id`、`channel_event_id`、`raw_payload_json`、`processed_status`、`idempotency_key`。
+多级订单快照必须额外固化完整结算依据：`first_tier_merchant_id`、`second_tier_merchant_id`、`third_tier_merchant_id`、`platform_supply_price_cents`、`first_tier_supply_price_cents`、`second_tier_supply_price_cents`、`final_sale_price_cents`、`first_tier_margin_cents`、`second_tier_margin_cents`、`third_tier_margin_cents`、`service_fee_bearer`、`channel_relation_chain_json`。
 
-退款拆账必须记录：退款总额、累计已退金额、平台承担金额、代理承担金额、一级承担金额、二级承担金额、服务费退还金额、服务费承担方、责任归属、是否已结算、是否生成追扣、关联售后单、关联退款渠道流水。
+注意：完整快照可在数据库保存，但 API 响应必须按角色脱敏。
 
-部分退款累计金额不得超过用户实付金额。同一订单多次售后、部分退款、退款失败重试都必须有独立单据和 ledger 事件。
+`payments`：`id`、`payment_no`、`order_id`、`user_id`、`collection_channel_id`、`channel_snapshot_json`、`amount_cents`、`status`、`confirmed_by`、`confirmed_at`、`idempotency_key`。
 
-### 4.7 结算、人工打款、追扣
+### 5.7 售后、供货清算、账务和审计
 
-`settlement_sheets`：`id`、`settlement_no`、`agent_id`、`period_start`、`period_end`、`status`、`total_order_count`、`total_paid_cents`、`total_service_fee_cents`、`total_agent_income_cents`、`created_by`、`confirmed_by`。
+`after_sales`：`id`、`after_sale_no`、`order_id`、`buyer_type`、`user_id`、`merchant_id`、`shop_id`、`status`、`reason_code`、`responsibility`、`requested_refund_cents`、`approved_refund_cents`、`platform_bear_cents`、`merchant_bear_cents`、`first_tier_bear_cents`、`second_tier_bear_cents`、`third_tier_bear_cents`、`service_fee_refund_cents`、`service_fee_bearer`。
 
-`settlement_items`：`id`、`settlement_id`、`order_id`、`agent_id`、`shop_id`、`paid_amount_cents`、`supply_amount_cents`、`service_fee_cents`、`agent_income_cents`、`deducted_cents`、`settle_amount_cents`、`fulfilled_at`。
+`clearing_sheets`：`id`、`clearing_no`、`merchant_id`、`period_start`、`period_end`、`status`、`total_order_count`、`total_paid_cents`、`total_service_fee_cents`、`total_supply_payable_cents`、`total_margin_cents`、`total_clawback_cents`、`created_by`、`confirmed_by`。
 
-两级渠道结算建议扩展：`settlement_role`、`first_tier_agent_id`、`second_tier_agent_id`、`platform_supply_price_cents`、`resell_supply_price_cents`、`final_sale_price_cents`、`first_tier_margin_cents`、`second_tier_margin_cents`。
+`clearing_items`：`id`、`clearing_id`、`order_id`、`merchant_id`、`shop_id`、`clearing_role`、`settlement_basis_amount_cents`、`pre_coupon_sale_amount_cents`、`coupon_discount_cents`、`platform_coupon_subsidy_cents`、`buyer_paid_amount_cents`、`paid_amount_cents`、`supply_amount_cents`、`service_fee_cents`、`merchant_margin_cents`、`supply_payable_cents`、`deducted_cents`、`clear_amount_cents`、`fulfilled_at`。
 
-唯一约束：单层订单可使用 `order_id` 唯一；两级渠道必须使用 `order_id + settlement_role` 唯一，其中 `settlement_role` 至少包含 `single_agent`、`first_tier`、`second_tier`。
+清算项必须以 `settlement_basis_amount_cents` 作为价差和服务费默认计算基准。`paid_amount_cents` / `buyer_paid_amount_cents` 只表示买家实际付款和收款确认金额，用于退款上限、实收统计和对账，不得直接替代供货价差结算基准。平台券相关字段必须进入清算快照，确保平台补贴不侵蚀商户价差。
 
-平台自营订单不插入渠道结算明细；平台自营订单进入平台收入、履约成本、支付通道费、退款和 ledger 对账。
+`clearing_confirmations`：`id`、`clearing_id`、`merchant_id`、`confirmation_type`、`amount_cents`、`proof_url`、`remark`、`confirmed_by`、`confirmed_at`。用于记录线下供货应付/服务费清算凭证，不是平台代收后给商户打款。
 
-`manual_payouts`：`id`、`settlement_id`、`agent_id`、`amount_cents`、`payee_info_snapshot_json`、`payout_method`、`payout_voucher_url`、`status`、`paid_by`、`paid_at`。
+`clawbacks`、`ledger_entries`、`risk_freezes`、`complaints`、`audit_logs`：保持不可变、可追溯、可审计。
 
-`clawbacks`：`id`、`clawback_no`、`agent_id`、`source_type`、`source_id`、`order_id`、`amount_cents`、`status`、`deduct_from`、`reason_code`、`idempotency_key`。
+## 6. 逐级价格响应规则
 
-结算明细必须记录：订单号、代理、店铺、履约成功时间、进入可结算时间、用户实付、供货价、服务费、代理收益、退款扣减、风控/投诉冻结状态、最终结算金额、关联 ledger entry。
+后端必须提供响应整形层，不允许前端自行隐藏敏感字段。
 
-### 4.8 账务、风控、投诉、审计、权限
-
-`ledger_entries`：见第 5 节。
-
-`risk_freezes`：`id`、`target_type`、`target_id`、`agent_id`、`freeze_type`、`status`、`reason_code`、`reason_text`、`created_by`、`released_by`、`created_at`。
-
-`complaints`：`id`、`order_id`、`agent_id`、`user_id`、`status`、`complaint_type`、`responsibility`、`resolution_json`。
-
-`audit_logs`：`id`、`actor_type`、`actor_id`、`action`、`target_type`、`target_id`、`before_json`、`after_json`、`reason`、`idempotency_key`、`request_id`、`ip`、`created_at`。
-
-权限表：`admin_users`、`roles`、`permissions`、`admin_user_roles`、`role_permissions`。
-
-## 5. Ledger 设计口径
-
-`ledger_entries` 关键字段：
-
-`id`、`ledger_no`、`agent_id`、`shop_id`、`subject_type`、`subject_id`、`account_type`、`entry_type`、`direction`、`amount_cents`、`currency`、`source_type`、`source_id`、`order_id`、`settlement_id`、`refund_id`、`clawback_id`、`deposit_transaction_id`、`idempotency_key`、`balance_before_cents`、`balance_after_cents`、`created_at`。
-
-建议 `account_type`：
-
-1. `agent_pending_income`
-2. `agent_frozen_income`
-3. `agent_payable_income`
-4. `agent_paid_income`
-5. `agent_clawback_receivable`
-6. `agent_deposit_available`
-7. `agent_deposit_frozen`
-8. `platform_service_fee_income`
-9. `platform_refund_cost`
-
-建议 `entry_type`：
-
-1. `ORDER_AGENT_INCOME_PENDING`
-2. `ORDER_SERVICE_FEE_ACCRUAL`
-3. `REFUND_AGENT_BEAR`
-4. `REFUND_PLATFORM_BEAR`
-5. `SERVICE_FEE_REFUND`
-6. `SETTLEMENT_LOCK`
-7. `SETTLEMENT_PAYOUT`
-8. `CLAWBACK_CREATE`
-9. `CLAWBACK_DEDUCT_PENDING`
-10. `CLAWBACK_DEDUCT_PAYOUT`
-11. `CLAWBACK_DEDUCT_DEPOSIT`
-12. `DEPOSIT_PAY`
-13. `DEPOSIT_DEDUCT`
-14. `DEPOSIT_REFUND`
-15. `RISK_FREEZE`
-16. `RISK_UNFREEZE`
-17. `MANUAL_ADJUST`
-
-所有 ledger 事件必须能关联来源单据。人工调整必须有原因、操作人和审批记录。
-
-## 6. 关键唯一约束与索引
-
-1. `users.openid` 唯一。
-2. `agents.user_id` 唯一，`agents.agent_no` 唯一。
-3. `shops.agent_id` 唯一，`shops.shop_no` 唯一。
-4. `agent_products(shop_id, product_type, platform_product_id)` 唯一，避免同店重复上架同一平台商品。
-5. `orders.order_no` 唯一。
-6. `orders(agent_id, created_at)`、`orders(shop_id, status)`、`orders(user_id, created_at)` 建索引。
-7. `payments.payment_no` 唯一，`payments.channel_trade_no` 唯一。
-8. `payment_callbacks.channel_event_id` 或 `payment_callbacks.idempotency_key` 唯一。
-9. `refunds.refund_no` 唯一，`refunds.idempotency_key` 唯一。
-10. `refund_callbacks.channel_event_id` 唯一。
-11. `fulfillment_attempts.idempotency_key` 唯一。
-12. `entitlements(order_item_id, rights_code)` 唯一或业务唯一。
-13. `settlement_items.order_id` 单层唯一；两级渠道改为 `settlement_items(order_id, settlement_role)` 唯一。
-14. `clawbacks.idempotency_key` 唯一。
-15. `deposit_transactions.idempotency_key` 唯一。
-16. `ledger_entries.idempotency_key` 唯一。
-17. `ledger_entries(agent_id, created_at)`、`ledger_entries(source_type, source_id)`、`ledger_entries(order_id)` 建索引。
-18. `risk_freezes(target_type, target_id, freeze_type, status)` 对 active 状态做唯一约束。
-19. `audit_logs.idempotency_key` 唯一，或至少 `actor/action/target/request_id` 唯一。
-
-## 7. 关键事务边界
-
-### 7.1 创建订单
-
-校验代理已审核、保证金满足销售条件、店铺营业、商品上架、售价不低于最低限价、无禁止销售风控；写订单、订单项、金额快照、商品和规则快照。
-
-### 7.2 支付成功回调
-
-验签；校验渠道金额等于订单金额；锁定订单和支付记录；写 payment callback；更新订单已支付；写代理待结算收益和服务费 ledger；触发一次履约。
-
-### 7.3 履约成功/失败
-
-锁定履约记录；按幂等键写 attempt；成功生成权益并更新履约成功；失败记录原因并保持不可结算。
-
-### 7.4 退款申请与退款回调
-
-创建售后单并立即冻结订单结算状态。退款成功回调锁定 refund/order，更新退款状态，按责任写退款 ledger；未结算则扣减待结算收益，已结算则生成追扣。
-
-### 7.5 结算单生成
-
-按 `agent_id` 和结算窗口选择可结算订单，排除退款中、投诉中、风控冻结；加锁插入 `settlement_items`。单层依赖 `settlement_items.order_id` 唯一防重复；两级渠道依赖 `settlement_items(order_id, settlement_role)` 唯一防重复。
-
-### 7.6 人工打款确认
-
-锁定结算单；写 `manual_payouts`、打款凭证和 payout ledger；结算单变为已打款/已结算。
-
-### 7.7 已结算后追扣
-
-创建 `clawbacks`；按未结算收益、待打款收益、保证金顺序扣减；每一步写 ledger；不足时限制店铺销售、限制结算或暂停人工打款。
-
-### 7.8 保证金扣减/退还
-
-锁定 `deposit_account`；写 `deposit_transactions` 和 ledger；更新余额；不足时触发店铺或结算限制。
-
-### 7.9 风控冻结/解冻
-
-写 `risk_freezes`；同步订单、店铺或结算限制；写审计日志；解冻后重新进入可结算判断。
-
-## 8. 幂等键
-
-1. 支付回调：`pay:{channel}:{channel_trade_no}`
-2. 退款回调：`refund:{channel}:{channel_refund_no}`
-3. 履约尝试：`fulfill:{order_item_id}:{attempt_no}` 或外部请求号
-4. 权益发放：`entitlement:{order_item_id}:{rights_code}`
-5. 结算生成：`settlement:{agent_id}:{period_start}:{period_end}:{batch_no}`
-6. 追扣：`clawback:{source_type}:{source_id}:{agent_id}`
-7. 保证金交易：`deposit:{type}:{source_type}:{source_id}:{agent_id}`
-8. 审计事件：`audit:{request_id}` 或 `audit:{actor}:{action}:{target}:{request_id}`
-
-## 9. V1 必做与后置
-
-V1 必做：
-
-1. 订单快照、金额快照。
-2. 支付和退款幂等回调。
-3. 履约尝试与权益记录。
-4. 售后责任拆账。
-5. 结算单、结算明细唯一约束、人工打款记录。
-6. 已结算后追扣。
-7. 保证金账户与交易。
-8. `ledger_entries`。
-9. `risk_freezes`、`complaints`、`audit_logs`。
-10. RBAC。
-11. 代理数据隔离索引。
+| 访问角色 | 可返回价格 | 禁止返回 |
+| --- | --- | --- |
+| 平台后台 | 平台供货价、一级转供价、二级转供价、最终售价、各级差价 | 无，但需 RBAC |
+| 一级商户 | 平台给自己的供货价、自己设置的一级转供价、自己店铺售价 | 无关一级数据 |
+| 二级商户 | 一级给自己的转供价、自己设置的二级转供价、自己店铺售价 | 平台给一级的供货价 |
+| 三级商户 | 二级给自己的转供价、自己店铺售价 | 平台供货价、一级转供价 |
+| H5 买家 | 最终销售价、优惠后实付 | 所有供货价、转供价、差价、服务费、清算金额 |
+
+该规则适用于商品列表、商品详情、选品 API、订单详情、清算列表、导出文件、后台表格和浏览器网络响应。
+
+## 7. 关键唯一约束与索引
+
+1. `merchant_invite_codes.code` 唯一。
+2. `channel_relations(child_merchant_id, status)` 对 active 状态唯一。
+3. `shops.slug` 唯一，`shops.domain` 可选唯一。
+4. `merchant_products(shop_id, product_type, platform_product_id)` 唯一。
+5. `channel_product_offers(buyer_merchant_id, platform_product_id, status)` 对 active 状态唯一。
+6. `orders.order_no` 唯一。
+7. `payments.payment_no` 唯一，`payments.idempotency_key` 唯一。
+8. `virtual_codes(order_id)` 对已发放状态建索引。
+9. `clearing_items(order_id, clearing_role)` 唯一。
+10. `ledger_entries.idempotency_key` 唯一。
+11. `risk_freezes(target_type, target_id, freeze_type, status)` 对 active 状态唯一。
+12. `audit_logs.request_id` 或 `audit_logs(actor/action/target/request_id)` 唯一。
+
+## 8. 关键事务边界
+
+1. 创建订单：校验店铺、销售商户保证金确认状态、商户、商品、库存、价格、优惠券、收款通道和风控；销售商户 `deposit_status != paid` 时后端硬拒绝创建可支付订单；通过后写订单、快照、支付记录。
+2. 确认收款：锁定订单和支付记录；校验金额；写账务流水；触发履约；幂等处理。
+3. 自动发码：锁定可用卡密；分配给订单；写权益和履约记录；重复请求不得重复发码。
+4. 提取卡密：校验提取码、锁定状态、退款状态和订单归属；错误次数服务端累计。
+5. 退款：创建售后并冻结供货应付/服务费账单；退款完成后禁看卡密；按责任写 ledger 和追扣。
+6. 供货清算：按商户和窗口加锁筛选可清算订单；多级订单按 `order_id + clearing_role` 防重复。
+7. 清算凭证：锁定清算单；写线下收款/补款凭证、ledger 和审计日志，不做平台代收后商户打款。
+8. 转供价调整：校验层级、上游价格、最低价；写审计；不影响历史订单快照。
+9. 邀请码使用：锁定邀请码；校验目标层级和有效期；创建商户关系；拒绝四级。
+
+## 9. P0 必做与后置
+
+P0 必做：
+
+1. 数据库生产化和核心实体。
+2. 商户收款通道。
+3. 商品、库存、卡密、订单、售后、供货清算/服务费对账。
+4. 邀请码、渠道关系、转供价、逐级价格隔离。
+5. 平台后台、商户后台和 H5 前台共用 API。
+6. RBAC、审计、账务流水和越权测试。
 
 后置：
 
-1. 自动提现。
-2. 多供应商结算。
+1. 商户自助提现。
+2. 真实支付自动回调和真实退款。
 3. 完整复式总账。
 4. 自动风控评分。
-5. 复杂营销优惠。
-6. 代理销售额度动态模型。
-7. 高级 BI。
-8. 多履约供应商路由。
-9. 开放平台 API。
+5. 复杂营销。
+6. 高级 BI。
+7. 多履约供应商路由。
