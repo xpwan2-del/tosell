@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ApiClientError, api, cents, text, type AdminSession, type AgentSession, type JsonRecord } from "./api.js";
+import { ApiClientError, api, cents, text, type AdminSession, type AgentSession, type JsonRecord, type PaymentMethodInput, type PaymentQueryInput } from "./api.js";
 import "./styles.css";
 
 type LoadState = {
@@ -21,7 +21,9 @@ type LoadState = {
   adminDeposits: JsonRecord[];
   serviceQrCodes: JsonRecord[];
   riskFreezes: JsonRecord[];
-  paymentConfigs: JsonRecord[];
+  paymentMethods: JsonRecord[];
+  paymentCallbacks: JsonRecord[];
+  paymentExceptions: JsonRecord[];
   paymentVouchers: JsonRecord[];
   collectionChannels: JsonRecord[];
   coupons: JsonRecord[];
@@ -56,7 +58,9 @@ const initialState: LoadState = {
   adminDeposits: [],
   serviceQrCodes: [],
   riskFreezes: [],
-  paymentConfigs: [],
+  paymentMethods: [],
+  paymentCallbacks: [],
+  paymentExceptions: [],
   paymentVouchers: [],
   collectionChannels: [],
   coupons: [],
@@ -83,7 +87,7 @@ const navItems = [
   { id: "secondTierChannels", label: "二级渠道管理", group: "平台" },
   { id: "settlements", label: "结算", group: "财务" },
   { id: "risk", label: "风控日志", group: "平台" },
-  { id: "payment", label: "支付配置", group: "财务" }
+  { id: "payment", label: "收款配置", group: "财务" }
 ] as const;
 
 type ModuleId = (typeof navItems)[number]["id"];
@@ -151,7 +155,7 @@ const moduleHelp: Record<string, string[]> = {
   商品: ["商品列表点击“选择”会带出商品详情进行修改。", "自动发码商品去卡密池导入库存；人工交付商品只维护交付说明和客服信息。"],
   库存卡密: ["一行一个卡密，先预检再导入。", "默认只看脱敏卡密，平台查看明文会写入审计。"],
   优惠券: ["平台统一创建、启用、停用优惠券。", "注册赠券和退款后作废规则由后端处理，前台不能绕过。"],
-  订单管理: ["先在列表选择订单，再处理确认收款或查看凭证。", "买家必须从 H5 下单，后台只处理订单，不手工造单。"],
+  订单管理: ["先看待办，再处理订单；列表里的按钮会直接告诉你下一步该做什么。", "官方支付订单等回调或查单；只有个人支付宝订单才人工确认到账。"],
   发货管理: ["自动发码订单在确认收款后自动发货。", "人工交付订单由商户按客服/交付说明处理后确认发货。"],
   售后退款: ["先选择订单或售后单，再做拆账、审批和人工退款确认。", "退款完成后客户不能再查看卡密。"],
   销售统计: ["这里单独看经营数据，不处理订单。", "金额以已支付订单和 ledger 为准。"],
@@ -160,7 +164,7 @@ const moduleHelp: Record<string, string[]> = {
   二级渠道管理: ["用于维护一级到二级、二级到三级的渠道关系和转供价。", "三级不能再创建四级。"],
   结算: ["生成结算单后再人工确认打款。", "退款和追扣会影响可结算金额。"],
   风控日志: ["冻结订单或店铺用于紧急止损。", "所有风控动作都要能在审计中追溯。"],
-  支付配置: ["当前真实支付平台未接入，先用付款凭证和人工确认收款。", "后续接入支付宝/微信支付时再配置真实渠道。"]
+  收款配置: ["这里绑定收钱方式，不在这里设置商品怎么发货。", "支付宝商户、微信商户、e支付靠回调/查单确认；个人支付宝只能人工确认。"]
 };
 
 const fieldLabels: Record<string, string> = {
@@ -232,7 +236,7 @@ const fieldLabels: Record<string, string> = {
   displayName: "展示名称",
   accountName: "账户名",
   qrUrl: "二维码",
-  voucherUrl: "凭证",
+  voucherUrl: "异常材料",
   payerName: "付款人",
   note: "备注",
   customerServiceWechat: "客服微信",
@@ -301,7 +305,23 @@ const valueLabels: Record<string, string> = {
   platform_self_operated: "平台自营",
   single_agent: "单商户销售",
   agent_owned: "商户自有",
-  normal: "正常"
+  normal: "正常",
+  enabled: "已启用",
+  pending_manual_confirmation: "待人工确认",
+  created: "已创建",
+  paying: "付款中",
+  provider_not_configured: "收款方式未配置",
+  not_configured: "未配置",
+  callback_query: "回调/查单确认",
+  manual_confirm: "人工确认",
+  alipay_merchant: "支付宝商户",
+  wechat_merchant: "微信/腾讯商户",
+  epay: "e支付",
+  personal_alipay: "个人支付宝",
+  alipay_wap: "支付宝",
+  accepted: "已接收",
+  processed: "已处理",
+  ignored_duplicate: "重复通知已忽略"
 };
 
 function App() {
@@ -414,7 +434,30 @@ function App() {
     displayName: "",
     accountName: "",
     qrUrl: "",
-    paymentUrl: ""
+    paymentUrl: "",
+    productType: "",
+    merchantNo: "",
+    appId: "",
+    serviceProviderId: "",
+    gatewayUrl: "",
+    returnUrl: "",
+    note: "",
+    signingSecret: "",
+    privateKey: "",
+    publicKey: "",
+    certificate: "",
+    enabled: true,
+    isDefault: false
+  });
+  const [paymentExceptionNote, setPaymentExceptionNote] = useState("");
+  const [paymentQueryForm, setPaymentQueryForm] = useState<PaymentQueryInput>({
+    providerTradeNo: "",
+    amountCents: "",
+    merchantNo: "",
+    appId: "",
+    serviceProviderId: "",
+    tradeStatus: "TRADE_SUCCESS",
+    signature: ""
   });
   const [currentOrder, setCurrentOrder] = useState<JsonRecord | undefined>();
   const [currentAfterSale, setCurrentAfterSale] = useState<JsonRecord | undefined>();
@@ -439,6 +482,8 @@ function App() {
   const selectedOrder = currentOrder ?? visibleOrders.find((order) => text(order.paymentStatus) === "unpaid") ?? visibleOrders[0];
   const selectedOrderNo = text(selectedOrder?.orderNo, "");
   const selectedOrderAmount = amountOf(selectedOrder);
+  const selectedPaymentMethod = data.paymentMethods.find((item) => text(item.status) !== "disabled") ?? data.paymentMethods[0];
+  const selectedPaymentException = data.paymentExceptions.find((item) => item.handled !== true) ?? data.paymentExceptions[0];
   const selectedPaymentVoucher = data.paymentVouchers.find((item) => text(item.status) === "pending_review") ?? data.paymentVouchers[0];
   const selectedOrderPaymentVouchers = data.paymentVouchers.filter((item) => text(item.orderNo) === selectedOrderNo);
   const visibleSettlements = merchantSessionActive ? data.settlements : data.adminSettlements;
@@ -583,7 +628,9 @@ function App() {
         channels,
         serviceQrCodes,
         riskFreezes,
-        paymentConfigs,
+        paymentMethods,
+        paymentCallbacks,
+        paymentExceptions,
         paymentVouchers,
         collectionChannels,
         coupons,
@@ -617,7 +664,9 @@ function App() {
         merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.adminChannels, {}),
         merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.serviceQrCodes, []),
         merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.riskFreezes, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.paymentConfigStatus, []),
+        merchantSessionActive ? optional(api.agentPaymentMethods, []) : optional(api.adminPaymentMethods, []),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.paymentCallbacks, []),
+        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.paymentExceptions, []),
         merchantSessionActive ? optional(api.agentPaymentVouchers, []) : optional(api.paymentVouchers, []),
         optional(loadCollectionChannels, []),
         merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminCoupons, []),
@@ -631,7 +680,6 @@ function App() {
         merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.salesDashboard, {}),
         merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.paymentGuide, {})
       ]);
-      const visiblePaymentConfigs = paymentConfigs.filter((item) => !blockedPaymentConfigChannels().includes(text(item.channel)));
       setData({
         shop,
         platformShop,
@@ -654,7 +702,9 @@ function App() {
         channels,
         serviceQrCodes,
         riskFreezes,
-        paymentConfigs: visiblePaymentConfigs,
+        paymentMethods,
+        paymentCallbacks,
+        paymentExceptions,
         paymentVouchers,
         collectionChannels,
         coupons,
@@ -677,6 +727,7 @@ function App() {
         customerServiceQrUrl: text(shop.customerServiceQrUrl, "")
       });
       setCollectionForm((current) => ({ ...current, shopId: text(shop.id, current.shopId) }));
+      setCollectionChannelForm((current) => current.channelType ? current : paymentMethodToForm(paymentMethods[0]));
       setInventoryForm((current) => ({ ...current, productId: current.productId || text(platformProducts[0]?.id, "") }));
       if (!merchantSessionActive) {
         setAdminAgentId((current) => current || text(agentApplications[0]?.agentId, text(adminDeposits[0]?.agentId, "")));
@@ -957,19 +1008,66 @@ function App() {
   }
 
   function submitConfirmPayment() {
+    if (!canManuallyConfirmOrder(selectedOrder)) {
+      setMessage("这笔订单不是个人支付宝人工收款订单，不能靠人工点确认；请走官方回调或主动查单。");
+      return;
+    }
+    if (!window.confirm("确认这笔钱已经真实到账？确认后订单会进入发货流程。")) return;
     const action = merchantSessionActive
       ? () => api.confirmAgentPayment(selectedOrderNo, selectedOrderAmount)
       : () => api.confirmOfflinePayment(selectedOrderNo, selectedOrderAmount);
     void runAction("人工确认收款", action);
   }
 
+  function submitPaymentMethod(id?: string) {
+    const input = paymentMethodFormInput(collectionChannelForm, id);
+    const action = merchantSessionActive ? () => api.saveAgentPaymentMethod(input) : () => api.saveAdminPaymentMethod(input);
+    void runAction(id ? "保存收款方式" : "新增收款方式", action);
+  }
+
+  function disablePaymentMethod() {
+    const methodId = text(selectedPaymentMethod?.id, "");
+    const action = merchantSessionActive ? () => api.disableAgentPaymentMethod(methodId) : () => api.disableAdminPaymentMethod(methodId);
+    void runAction("停用收款方式", action);
+  }
+
+  function setPaymentMethodDefault() {
+    const methodId = text(selectedPaymentMethod?.id, "");
+    const action = merchantSessionActive ? () => api.setAgentPaymentMethodDefault(methodId) : () => api.setAdminPaymentMethodDefault(methodId);
+    void runAction("设为默认收款方式", action);
+  }
+
+  function testPaymentMethod() {
+    const methodId = text(selectedPaymentMethod?.id, "");
+    const action = merchantSessionActive ? () => api.testAgentPaymentMethod(methodId) : () => api.testAdminPaymentMethod(methodId);
+    void runAction("测试收款方式", action, false);
+  }
+
+  function querySelectedOrderPayment() {
+    void runAction("主动查单", () => api.queryOrderPayment(selectedOrderNo, {
+      ...paymentQueryForm,
+      amountCents: paymentQueryForm.amountCents || selectedOrderAmount
+    }));
+  }
+
+  function handleSelectedPaymentException(action: "mark_handled" | "keep_exception") {
+    void runAction(action === "mark_handled" ? "标记异常已处理" : "保留异常状态", () => api.handlePaymentException(text(selectedPaymentException?.id, ""), {
+      action,
+      note: paymentExceptionNote.trim() || undefined
+    }));
+  }
+
   function submitPaymentVoucherReview(approved: boolean) {
     const voucherId = text(selectedPaymentVoucher?.id, "");
     if (!voucherId) {
-      setMessage("请选择待审核付款凭证");
+      setMessage("请选择待核实的异常材料");
       return;
     }
-    void runAction(approved ? "付款凭证审核通过" : "付款凭证审核拒绝", () => api.reviewPaymentVoucher(voucherId, approved, paymentVoucherReason.trim()));
+    if (approved) {
+      setMessage("异常材料只做核实记录，不能在这里确认收款；请到订单页按收款方式处理。");
+      return;
+    }
+    void runAction(approved ? "异常材料标记已核实" : "异常材料标记拒绝", () => api.reviewPaymentVoucher(voucherId, approved, paymentVoucherReason.trim()));
   }
 
   function submitFulfillment() {
@@ -1301,36 +1399,40 @@ function App() {
     }
 
     if (active === "orders") {
+      const manualConfirmAllowed = canManuallyConfirmOrder(selectedOrder);
       return (
-        <Module title="订单管理" subtitle="查单、人工确认收款、订单履约流转">
+        <Module title="订单管理" subtitle="按收款方式处理订单，不再按截图确认支付">
           <section className="split sticky-workbench">
             <Panel title="当前订单" kicker={selectedOrderNo || "未选择"}>
               <KeyValue label="订单号" value={selectedOrderNo || "暂无订单"} />
               <KeyValue label="金额" value={cents(selectedOrderAmount)} />
               <KeyValue label="支付状态" value={humanValue(selectedOrder?.paymentStatus)} />
               <KeyValue label="履约状态" value={humanValue(selectedOrder?.fulfillmentStatus)} />
-              <KeyValue label="收款通道" value={collectionChannelLabel(selectedOrder)} />
-              <KeyValue label="凭证状态" value={selectedOrderPaymentVouchers.length > 0 ? selectedOrderPaymentVouchers.map((item) => humanValue(item.status)).join("、") : humanValue(selectedOrder?.paymentVoucherStatus, "暂无凭证")} />
+              <KeyValue label="收款方式" value={orderPaymentMethodLabel(selectedOrder)} />
+              <KeyValue label="下一步" value={orderNextStep(selectedOrder)} />
+              <KeyValue label="异常材料" value={selectedOrderPaymentVouchers.length > 0 ? `${selectedOrderPaymentVouchers.length} 条，仅作核实` : "无"} />
               <div className="actions">
-                <button disabled={!selectedOrderNo || text(selectedOrder?.paymentStatus) === "paid"} onClick={submitConfirmPayment}>人工确认收款</button>
+                <button disabled={!selectedOrderNo || text(selectedOrder?.paymentStatus) === "paid" || !manualConfirmAllowed} onClick={submitConfirmPayment}>确认个人支付宝到账</button>
+                <button className="secondary" disabled={!selectedOrderNo || manualConfirmAllowed || text(selectedOrder?.paymentStatus) === "paid"} onClick={() => switchModule("payment")}>去查单/看回调</button>
                 <button className="secondary" disabled={!selectedOrderNo} onClick={() => switchModule("fulfillment")}>去发货</button>
               </div>
+              {!manualConfirmAllowed && text(selectedOrder?.paymentStatus) !== "paid" ? <p className="hint">这类订单不能靠截图或人工凭感觉确认，要等官方回调或主动查单。</p> : null}
             </Panel>
             <Panel title="操作说明" kicker="生产">
               <ol className="steps">
-                <li>买家从 H5 店铺下单并提交付款凭证。</li>
-                <li>平台在“付款凭证”里审核，通过后订单进入已收款。</li>
-                <li>自动发码商品会自动发卡；人工交付商品再去“发货”确认处理结果。</li>
-                <li>商户账号只能看自己店铺订单，平台账号可以看全平台订单。</li>
+                <li>支付宝商户、微信商户、e支付：等回调，必要时去收款配置里主动查单。</li>
+                <li>个人支付宝：确认自己账户真实到账后，再点确认到账。</li>
+                <li>异常材料只是证据，不是收款依据，不能触发发货。</li>
+                <li>商户只能处理自己店铺订单，平台可看全平台。</li>
               </ol>
             </Panel>
           </section>
           <Panel title="订单列表" kicker={`${visibleOrders.length} 笔`}>
-            <OrdersTable rows={visibleOrders} onPick={setCurrentOrder} />
+            <OrdersTable rows={visibleOrders} onPick={setCurrentOrder} mode="next-action" />
           </Panel>
-          <Panel title="付款凭证" kicker={merchantSessionActive ? "商户 scoped 查看" : "平台审核"}>
-            {merchantSessionActive ? <p className="hint">商户态通过 /api/agent/payment-vouchers 只读取自己店铺的付款凭证；审核仍由平台后台完成。</p> : null}
-            <Table rows={selectedOrderNo ? selectedOrderPaymentVouchers : data.paymentVouchers} columns={["id", "orderNo", "shopId", "amountCents", "channel", "payerName", "voucherUrl", "note", "status", "reviewedBy"]} moneyColumns={["amountCents"]} />
+          <Panel title="异常/争议材料" kicker={merchantSessionActive ? "商户 scoped 查看" : "平台查看"}>
+            {merchantSessionActive ? <p className="hint">商户态通过 /api/agent/payment-vouchers 只读取自己店铺的异常材料；材料不作为支付成功依据。</p> : null}
+            <Table rows={paymentDisputeMaterialRows(selectedOrderNo ? selectedOrderPaymentVouchers : data.paymentVouchers)} columns={["orderNo", "amountCents", "channel", "payerName", "voucherUrl", "note", "status", "reviewedBy"]} moneyColumns={["amountCents"]} />
           </Panel>
         </Module>
       );
@@ -1462,7 +1564,7 @@ function App() {
             </Panel>
             <Panel title="收款通道提交/审核" kicker="商户+平台">
               <div className="form-grid wide">
-                <label>通道类型<select value={collectionChannelForm.channelType} onChange={(event) => setCollectionChannelForm({ ...collectionChannelForm, channelType: event.target.value })}><option value="">请选择</option><option value="alipay_personal_qr">支付宝个人码</option><option value="alipay_merchant_qr">支付宝商户码</option><option value="wechat_personal_qr">微信个人码</option><option value="wechat_merchant_qr">微信商户码</option></select></label>
+                <label>通道类型<select value={collectionChannelForm.channelType} onChange={(event) => setCollectionChannelForm({ ...collectionChannelForm, channelType: event.target.value })}><option value="">请选择</option><option value="alipay_merchant_qr">支付宝商户二维码</option><option value="alipay_merchant_link">支付宝商户支付链接</option><option value="wechat_merchant_qr">腾讯/微信商户二维码</option><option value="wechat_merchant_link">腾讯/微信商户支付链接</option><option value="epay_qr">e支付二维码</option><option value="epay_link">e支付链接</option><option value="alipay_personal_qr">个人支付宝</option></select></label>
                 <label>展示名称<input value={collectionChannelForm.displayName} onChange={(event) => setCollectionChannelForm({ ...collectionChannelForm, displayName: event.target.value })} /></label>
                 <label>账户名<input value={collectionChannelForm.accountName} onChange={(event) => setCollectionChannelForm({ ...collectionChannelForm, accountName: event.target.value })} /></label>
                 <label>收款码URL<input value={collectionChannelForm.qrUrl} onChange={(event) => setCollectionChannelForm({ ...collectionChannelForm, qrUrl: event.target.value })} /></label>
@@ -1748,49 +1850,92 @@ function App() {
 
     if (merchantSessionActive) {
       return (
-        <Module title="支付配置" subtitle="商户收款通道由店铺设置页维护">
-          <Panel title="商户收款" kicker="商户后台">
-            <p className="hint">商户态不调用平台支付配置接口；请在店铺设置中提交自己的收款通道并等待平台审核。</p>
+        <Module title="收款配置中心" subtitle="先绑定怎么收钱，再由订单自动或人工确认">
+          <PaymentMethodCards methods={data.paymentMethods} exceptions={data.paymentExceptions} />
+          <section className="split">
+            <Panel title="新增或修改收款方式" kicker="当前店铺">
+              <PaymentChannelForm form={collectionChannelForm} setForm={setCollectionChannelForm} />
+              <div className="actions">
+                <button disabled={!collectionChannelForm.channelType || !collectionChannelForm.displayName} onClick={() => submitPaymentMethod()}>保存为新方式</button>
+                <button className="secondary" disabled={!selectedPaymentMethod?.id} onClick={() => submitPaymentMethod(text(selectedPaymentMethod?.id))}>更新当前方式</button>
+                <button className="secondary" disabled={!selectedPaymentMethod?.id} onClick={setPaymentMethodDefault}>设为默认</button>
+                <button className="secondary" disabled={!selectedPaymentMethod?.id} onClick={testPaymentMethod}>测试</button>
+                <button className="secondary" disabled={!selectedPaymentMethod?.id} onClick={disablePaymentMethod}>停用</button>
+              </div>
+            </Panel>
+            <Panel title="已绑定收款方式" kicker={`${data.paymentMethods.length} 个`}>
+              <Table rows={paymentMethodRows(data.paymentMethods)} columns={["method", "displayName", "merchant", "confirmMode", "enabled", "isDefault", "keyStatus", "lastTestResult", "lastCallbackAt"]} />
+            </Panel>
+          </section>
+          <Panel title="异常材料" kicker={`${data.paymentVouchers.length} 条`}>
+            <p className="hint">这里只看买家补充的说明或图片。它不能确认收款，也不会自动发货。</p>
+            <Table rows={paymentDisputeMaterialRows(data.paymentVouchers)} columns={["orderNo", "amountCents", "channel", "payerName", "voucherUrl", "note", "status"]} moneyColumns={["amountCents"]} />
           </Panel>
         </Module>
       );
     }
 
     return (
-      <Module title="支付配置" subtitle="支付最后接；当前只做人工确认收款闭环">
+      <Module title="收款配置中心" subtitle="四种收款方式统一管理，截图不再是主流程">
+        <PaymentMethodCards methods={data.paymentMethods} exceptions={data.paymentExceptions} />
         <section className="split">
-          <Panel title="付款凭证审核" kicker={`${data.paymentVouchers.length} 条`}>
-            <KeyValue label="凭证ID" value={text(selectedPaymentVoucher?.id, "暂无待审凭证")} />
-            <KeyValue label="订单号" value={text(selectedPaymentVoucher?.orderNo)} />
-            <KeyValue label="金额" value={cents(selectedPaymentVoucher?.amountCents)} />
-            <KeyValue label="状态" value={text(selectedPaymentVoucher?.status)} />
-            <div className="inline-form">
-              <label>审核说明<input value={paymentVoucherReason} onChange={(event) => setPaymentVoucherReason(event.target.value)} placeholder="选填，审核通过或拒绝原因" /></label>
-            </div>
+          <Panel title="当前选中的收款方式" kicker={selectedPaymentMethod ? paymentProviderName(text(selectedPaymentMethod.provider)) : "未选择"}>
+            <KeyValue label="名称" value={text(selectedPaymentMethod?.displayName, "暂无")} />
+            <KeyValue label="确认方式" value={text(selectedPaymentMethod?.confirmationMode) === "manual" ? "人工确认到账" : "回调或查单确认"} />
+            <KeyValue label="状态" value={paymentMethodEnabledText(selectedPaymentMethod)} />
+            <KeyValue label="密钥" value={paymentKeyStatusText(selectedPaymentMethod)} />
             <div className="actions">
-              <button disabled={!selectedPaymentVoucher?.id || text(selectedPaymentVoucher?.status) !== "pending_review"} onClick={() => submitPaymentVoucherReview(true)}>审核通过并确认收款</button>
-              <button className="secondary" disabled={!selectedPaymentVoucher?.id || text(selectedPaymentVoucher?.status) !== "pending_review"} onClick={() => submitPaymentVoucherReview(false)}>审核拒绝</button>
+              <button disabled={!selectedPaymentMethod?.id} onClick={testPaymentMethod}>测试当前方式</button>
+              <button className="secondary" disabled={!selectedPaymentMethod?.id} onClick={setPaymentMethodDefault}>设为默认</button>
+              <button className="secondary" disabled={!selectedPaymentMethod?.id} onClick={disablePaymentMethod}>停用当前</button>
             </div>
+            <p className="hint">如果是官方支付方式，订单要等回调或查单确认；如果是个人支付宝，订单才进入人工确认到账。</p>
           </Panel>
-          <Panel title="凭证详情" kicker="买家提交">
-            <Table rows={data.paymentVouchers} columns={["id", "orderNo", "shopId", "userId", "amountCents", "channel", "payerName", "voucherUrl", "note", "status", "reviewedBy"]} moneyColumns={["amountCents"]} />
+          <Panel title="回调和异常" kicker="自动支付">
+            <KeyValue label="回调记录" value={`${data.paymentCallbacks.length} 条`} />
+            <KeyValue label="异常订单" value={`${data.paymentExceptions.filter((item) => item.handled !== true).length} 条待处理`} />
+            <KeyValue label="截图材料" value="只做异常证据" />
+            <div className="actions">
+              <button className="secondary" disabled={!selectedOrderNo || !paymentQueryForm.providerTradeNo || !paymentQueryForm.signature} onClick={querySelectedOrderPayment}>主动查单</button>
+              <button className="secondary" disabled={!selectedPaymentException?.id} onClick={() => handleSelectedPaymentException("mark_handled")}>异常已处理</button>
+            </div>
           </Panel>
         </section>
         <section className="split">
-          <Panel title="开通状态" kicker={text(data.paymentGuide?.status, "not_configured")}>
-            <KeyValue label="生产规则" value={text(data.paymentGuide?.productionRule)} />
-            <KeyValue label="当前策略" value="不伪造在线支付成功，商家人工收款后由后台确认" />
+          <Panel title="新增或修改收款方式" kicker="中文字段">
+            <PaymentChannelForm form={collectionChannelForm} setForm={setCollectionChannelForm} />
             <div className="actions">
-              <button onClick={() => void runAction("支付配置检查", api.paymentConfigCheck, false)}>检查配置</button>
-              <button className="secondary" onClick={() => void runAction("保存支付配置状态", api.updatePaymentConfig)}>保存待开通状态</button>
+              <button disabled={!collectionChannelForm.channelType || !collectionChannelForm.displayName} onClick={() => submitPaymentMethod()}>保存为新方式</button>
+              <button className="secondary" disabled={!selectedPaymentMethod?.id} onClick={() => submitPaymentMethod(text(selectedPaymentMethod?.id))}>更新当前方式</button>
             </div>
           </Panel>
-          <Panel title="待配置环境变量" kicker="上线前">
-            <Table rows={arrayRows(data.paymentGuide?.envVars, "envVar")} columns={["envVar"]} />
+          <Panel title="已绑定收款方式" kicker={`${data.paymentMethods.length} 个`}>
+            <Table rows={paymentMethodRows(data.paymentMethods)} columns={["method", "displayName", "ownerType", "merchant", "confirmMode", "enabled", "isDefault", "keyStatus", "lastTestResult", "lastCallbackAt"]} />
           </Panel>
         </section>
-        <Panel title="支付渠道" kicker={`${data.paymentConfigs.length} 个`}>
-          <Table rows={data.paymentConfigs} columns={["channel", "enabled", "feeBps", "fixedFeeCents", "statusNote"]} moneyColumns={["fixedFeeCents"]} />
+        <Panel title="回调记录" kicker={`${data.paymentCallbacks.length} 条`}>
+          <Table rows={paymentCallbackRows(data.paymentCallbacks)} columns={["source", "orderNo", "tradeNo", "notifiedAt", "signature", "amountCheck", "idempotency", "errorReason"]} />
+        </Panel>
+        <Panel title="异常订单" kicker={`${data.paymentExceptions.length} 条`}>
+          <div className="inline-form">
+            <label>渠道交易号<input value={paymentQueryForm.providerTradeNo} onChange={(event) => setPaymentQueryForm({ ...paymentQueryForm, providerTradeNo: event.target.value })} placeholder="由支付渠道返回" /></label>
+            <label>查单金额分<input value={paymentQueryForm.amountCents} onChange={(event) => setPaymentQueryForm({ ...paymentQueryForm, amountCents: event.target.value.replace(/\D/g, "") })} placeholder={selectedOrderAmount || "订单金额"} /></label>
+            <label>商户号<input value={paymentQueryForm.merchantNo} onChange={(event) => setPaymentQueryForm({ ...paymentQueryForm, merchantNo: event.target.value })} placeholder="选填" /></label>
+            <label>AppID<input value={paymentQueryForm.appId} onChange={(event) => setPaymentQueryForm({ ...paymentQueryForm, appId: event.target.value })} placeholder="选填" /></label>
+            <label>交易状态<input value={paymentQueryForm.tradeStatus} onChange={(event) => setPaymentQueryForm({ ...paymentQueryForm, tradeStatus: event.target.value })} /></label>
+            <label>签名<input value={paymentQueryForm.signature} onChange={(event) => setPaymentQueryForm({ ...paymentQueryForm, signature: event.target.value })} placeholder="验签所需签名" /></label>
+            <label>处理备注<input value={paymentExceptionNote} onChange={(event) => setPaymentExceptionNote(event.target.value)} placeholder="异常处理备注" /></label>
+          </div>
+          <div className="actions">
+            <button disabled={!selectedOrderNo || !paymentQueryForm.providerTradeNo || !paymentQueryForm.signature} onClick={querySelectedOrderPayment}>主动查单</button>
+            <button className="secondary" disabled={!selectedPaymentException?.id} onClick={() => handleSelectedPaymentException("mark_handled")}>标记处理</button>
+            <button className="secondary" disabled={!selectedPaymentException?.id} onClick={() => handleSelectedPaymentException("keep_exception")}>保留异常</button>
+          </div>
+          <Table rows={paymentExceptionRows(data.paymentExceptions)} columns={["type", "orderNo", "amountCents", "status", "reason", "maskedPayload", "handled", "note"]} moneyColumns={["amountCents"]} />
+        </Panel>
+        <Panel title="异常材料" kicker="非主流程">
+          <p className="hint">这些材料只帮运营核实争议，不能在这里确认收款，也不会自动发货。</p>
+          <Table rows={paymentDisputeMaterialRows(data.paymentVouchers)} columns={["orderNo", "amountCents", "channel", "payerName", "voucherUrl", "note", "status"]} moneyColumns={["amountCents"]} />
         </Panel>
       </Module>
     );
@@ -1910,6 +2055,77 @@ function Panel(props: { title: string; kicker: string; children: React.ReactNode
       </div>
       {props.children}
     </article>
+  );
+}
+
+function PaymentChannelForm(props: {
+  form: {
+    channelType: string;
+    displayName: string;
+    accountName: string;
+    qrUrl: string;
+    paymentUrl: string;
+    productType: string;
+    merchantNo: string;
+    appId: string;
+    serviceProviderId: string;
+    gatewayUrl: string;
+    returnUrl: string;
+    note: string;
+    signingSecret: string;
+    privateKey: string;
+    publicKey: string;
+    certificate: string;
+    enabled: boolean;
+    isDefault: boolean;
+  };
+  setForm: React.Dispatch<React.SetStateAction<{
+    channelType: string;
+    displayName: string;
+    accountName: string;
+    qrUrl: string;
+    paymentUrl: string;
+    productType: string;
+    merchantNo: string;
+    appId: string;
+    serviceProviderId: string;
+    gatewayUrl: string;
+    returnUrl: string;
+    note: string;
+    signingSecret: string;
+    privateKey: string;
+    publicKey: string;
+    certificate: string;
+    enabled: boolean;
+    isDefault: boolean;
+  }>>;
+}) {
+  const confirmMode = paymentChannelTypeConfirmMode(props.form.channelType);
+  const personalAlipay = props.form.channelType === "personal_alipay" || props.form.channelType === "alipay_personal";
+  const epay = props.form.channelType === "epay";
+  const official = ["alipay_merchant", "wechat_merchant", "epay"].includes(props.form.channelType);
+  return (
+    <div className="form-grid wide">
+      <label>收款方式<select value={props.form.channelType} onChange={(event) => props.setForm({ ...props.form, channelType: event.target.value })}><option value="">请选择</option><option value="alipay_merchant">支付宝商户</option><option value="wechat_merchant">微信/腾讯商户</option><option value="epay">e支付</option><option value="personal_alipay">个人支付宝</option></select></label>
+      <label>确认方式<input value={confirmMode} readOnly /></label>
+      <label>默认方式<select value={props.form.isDefault ? "yes" : "no"} onChange={(event) => props.setForm({ ...props.form, isDefault: event.target.value === "yes" })}><option value="no">否</option><option value="yes">设为默认</option></select></label>
+      <label>启用<select value={props.form.enabled ? "yes" : "no"} onChange={(event) => props.setForm({ ...props.form, enabled: event.target.value === "yes" })}><option value="yes">启用</option><option value="no">停用</option></select></label>
+      <label>收款名称<input value={props.form.displayName} onChange={(event) => props.setForm({ ...props.form, displayName: event.target.value })} placeholder={personalAlipay ? "例如：张三个人支付宝" : "例如：支付宝商户主通道"} /></label>
+      <label>产品类型<input value={props.form.productType} onChange={(event) => props.setForm({ ...props.form, productType: event.target.value })} placeholder={personalAlipay ? "可不填" : "H5 / 扫码 / JSAPI"} /></label>
+      {!personalAlipay ? <label>商户号<input value={props.form.merchantNo} onChange={(event) => props.setForm({ ...props.form, merchantNo: event.target.value })} placeholder="支付平台分配的商户号" /></label> : null}
+      {!personalAlipay && !epay ? <label>AppID<input value={props.form.appId} onChange={(event) => props.setForm({ ...props.form, appId: event.target.value })} placeholder="支付宝/微信应用 ID" /></label> : null}
+      {epay ? <label>服务商号/渠道 ID<input value={props.form.serviceProviderId} onChange={(event) => props.setForm({ ...props.form, serviceProviderId: event.target.value })} placeholder="e支付要求才填" /></label> : null}
+      <label>账户名<input value={props.form.accountName} onChange={(event) => props.setForm({ ...props.form, accountName: event.target.value })} placeholder={personalAlipay ? "支付宝账号或收款人" : "内部识别名，可选"} /></label>
+      {epay ? <label>e支付网关<input value={props.form.gatewayUrl} onChange={(event) => props.setForm({ ...props.form, gatewayUrl: event.target.value })} placeholder="https://..." /></label> : null}
+      {official ? <label>签名密钥<input type="password" value={props.form.signingSecret} onChange={(event) => props.setForm({ ...props.form, signingSecret: event.target.value })} placeholder="只提交，不回显明文" /></label> : null}
+      {official ? <label>私钥<input type="password" value={props.form.privateKey} onChange={(event) => props.setForm({ ...props.form, privateKey: event.target.value })} placeholder="只提交，不回显明文" /></label> : null}
+      {official ? <label>公钥<input type="password" value={props.form.publicKey} onChange={(event) => props.setForm({ ...props.form, publicKey: event.target.value })} placeholder="只提交，不回显明文" /></label> : null}
+      {official ? <label>证书<input type="password" value={props.form.certificate} onChange={(event) => props.setForm({ ...props.form, certificate: event.target.value })} placeholder="只提交，不回显明文" /></label> : null}
+      <label className="span-2">{personalAlipay ? "个人支付宝收款码" : "支付二维码 URL"}<input value={props.form.qrUrl} onChange={(event) => props.setForm({ ...props.form, qrUrl: event.target.value })} placeholder={personalAlipay ? "个人支付宝二维码图片地址" : "支付平台返回二维码时可不填"} /></label>
+      <label className="span-2">支付链接<input value={props.form.paymentUrl} onChange={(event) => props.setForm({ ...props.form, paymentUrl: event.target.value })} placeholder={personalAlipay ? "可不填" : "官方支付链接或测试链接"} /></label>
+      {official ? <label className="span-2">支付后返回地址<input value={props.form.returnUrl} onChange={(event) => props.setForm({ ...props.form, returnUrl: event.target.value })} placeholder="只负责跳回页面，不代表支付成功" /></label> : null}
+      <label className="span-2">给运营看的说明<textarea value={props.form.note} onChange={(event) => props.setForm({ ...props.form, note: event.target.value })} rows={2} placeholder={personalAlipay ? "例如：付款后 10 分钟内人工确认" : "例如：支付成功以回调/查单为准"} /></label>
+    </div>
   );
 }
 
@@ -2068,6 +2284,29 @@ function Metric(props: { label: string; value: string; tone?: string }) {
   );
 }
 
+function PaymentMethodCards(props: { methods: JsonRecord[]; exceptions: JsonRecord[] }) {
+  const rows = paymentOverviewRows(props.methods, props.exceptions);
+  return (
+    <section className="payment-method-grid">
+      {rows.map((row) => (
+        <article className={text(row.enabled) === "已启用" ? "payment-method-card active" : "payment-method-card"} key={text(row.method)}>
+          <div>
+            <span>{text(row.confirmMode)}</span>
+            <h3>{text(row.method)}</h3>
+          </div>
+          <strong>{text(row.enabled)}</strong>
+          <p>{paymentMethodPlainHint(text(row.method), text(row.enabled), text(row.exceptionCount))}</p>
+          <dl>
+            <div><dt>默认</dt><dd>{text(row.defaultMethod)}</dd></div>
+            <div><dt>密钥</dt><dd>{text(row.secretStatus)}</dd></div>
+            <div><dt>异常</dt><dd>{text(row.exceptionCount)} 条</dd></div>
+          </dl>
+        </article>
+      ))}
+    </section>
+  );
+}
+
 function KeyValue(props: { label: string; value: string }) {
   return (
     <div className="kv">
@@ -2107,7 +2346,7 @@ function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) =>
               <td><StatusBadge value={order.paymentStatus} /></td>
               <td><StatusBadge value={order.fulfillmentStatus} /></td>
               <td>{cents(amountOf(order))}</td>
-              <td><button className="small" type="button" onClick={() => props.onPick(order)}>{props.mode === "next-action" ? orderActionLabel(order) : "选择"}</button></td>
+              <td><button className="small" type="button" onClick={() => props.onPick(order)}>{props.mode === "next-action" ? orderActionLabel(order) : "查看"}</button></td>
             </tr>
           ))}
         </tbody>
@@ -2118,7 +2357,7 @@ function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) =>
 
 function orderActionLabel(order: JsonRecord): string {
   if (text(order.refundStatus, "none") !== "none") return "处理售后";
-  if (text(order.paymentStatus) !== "paid") return "确认收款";
+  if (text(order.paymentStatus) !== "paid") return canManuallyConfirmOrder(order) ? "确认到账" : "看支付状态";
   if (text(order.fulfillmentStatus) !== "success") return "去发货";
   return "查看订单";
 }
@@ -2152,7 +2391,7 @@ function Table(props: { rows: JsonRecord[]; columns: string[]; moneyColumns?: st
           <tbody>
             {pageRows.map((row, index) => (
               <tr key={`${props.columns.map((column) => text(row[column])).join("-")}-${index}`}>
-                {props.onPick ? <td><button className="small" type="button" onClick={() => props.onPick?.(row)}>选择</button></td> : null}
+                {props.onPick ? <td><button className="small" type="button" onClick={() => props.onPick?.(row)}>查看</button></td> : null}
                 {props.columns.map((column) => (
                   <td key={column} className={isIdLikeColumn(column) ? "muted-id" : undefined}>
                     {moneyColumns.has(column) ? cents(row[column]) : humanCell(row, column)}
@@ -2230,8 +2469,8 @@ function orderShopLabel(order?: JsonRecord): string {
 }
 
 function statusTone(value: string): string {
-  if (["paid", "success", "fulfilled", "active", "approved", "open", "available"].includes(value)) return "good";
-  if (["pending", "pending_review", "unpaid", "processing", "fulfilling", "refunding"].includes(value)) return "todo";
+  if (["paid", "success", "fulfilled", "active", "approved", "open", "available", "enabled", "processed"].includes(value)) return "good";
+  if (["pending", "pending_review", "unpaid", "processing", "fulfilling", "refunding", "created", "paying", "pending_manual_confirmation"].includes(value)) return "todo";
   if (["rejected", "failed", "disabled", "frozen", "refunded", "voided", "voided_after_refund"].includes(value)) return "warn";
   return "neutral";
 }
@@ -2255,6 +2494,49 @@ function collectionChannelLabel(order?: JsonRecord): string {
     return [channelSnapshot.displayName, humanValue(channelSnapshot.channelType, ""), friendlyId(channelSnapshot.id, "通道")].map((item) => text(item, "")).filter(Boolean).join(" / ");
   }
   return friendlyId(order?.collectionChannelId ?? snapshot?.collectionChannelId, "通道");
+}
+
+function orderPaymentProvider(order?: JsonRecord): string {
+  const paymentClient = order?.paymentClient as JsonRecord | undefined;
+  const paymentSnapshot = order?.paymentSnapshot as JsonRecord | undefined
+    ?? paymentClient?.paymentSnapshot as JsonRecord | undefined;
+  const snapshot = order?.snapshot as JsonRecord | undefined;
+  const collectionSnapshot = order?.collectionChannelSnapshot as JsonRecord | undefined
+    ?? snapshot?.collectionChannelSnapshot as JsonRecord | undefined;
+  return text(paymentClient?.provider, text(paymentSnapshot?.provider, text(collectionSnapshot?.provider, text(collectionSnapshot?.channelType, ""))));
+}
+
+function isPersonalPaymentProvider(provider: string): boolean {
+  return provider === "personal_alipay" || provider === "alipay_personal" || provider.includes("personal");
+}
+
+function isOfficialPaymentProvider(provider: string): boolean {
+  return provider === "alipay_merchant" || provider === "wechat_merchant" || provider === "epay";
+}
+
+function canManuallyConfirmOrder(order?: JsonRecord): boolean {
+  if (!order || text(order.paymentStatus) === "paid") return false;
+  const provider = orderPaymentProvider(order);
+  if (isPersonalPaymentProvider(provider)) return true;
+  if (isOfficialPaymentProvider(provider)) return false;
+  return !provider;
+}
+
+function orderPaymentMethodLabel(order?: JsonRecord): string {
+  const provider = orderPaymentProvider(order);
+  if (provider) return paymentProviderName(provider);
+  const channel = collectionChannelLabel(order);
+  return channel === "未返回" ? "未选择收款方式" : channel;
+}
+
+function orderNextStep(order?: JsonRecord): string {
+  if (!order) return "先选择订单";
+  if (text(order.refundStatus, "none") !== "none") return "处理售后/退款";
+  if (text(order.paymentStatus) === "paid" && text(order.fulfillmentStatus) !== "success") return "已收款，去发货";
+  if (text(order.paymentStatus) === "paid") return "已完成收款";
+  const provider = orderPaymentProvider(order);
+  if (isPersonalPaymentProvider(provider) || !provider) return "确认个人收款是否到账";
+  return "等待回调，必要时主动查单";
 }
 
 function selectedAfterSaleNo(rows: JsonRecord[], current?: JsonRecord): string {
@@ -2361,6 +2643,221 @@ function depositStatusRows(rows: JsonRecord[]): Array<{ label: string; value: st
   }));
 }
 
+function paymentOverviewRows(methodsRows: JsonRecord[], exceptions: JsonRecord[]): JsonRecord[] {
+  const methods = [
+    { key: "alipay_merchant", method: "支付宝商户", confirmMode: "回调/查单自动确认" },
+    { key: "wechat_merchant", method: "腾讯/微信商户", confirmMode: "回调/查单自动确认" },
+    { key: "epay", method: "e支付", confirmMode: "回调/查单自动确认" },
+    { key: "personal_alipay", method: "个人支付宝", confirmMode: "人工确认" }
+  ];
+  return methods.map((item) => {
+    const matchedMethods = methodsRows.filter((method) => text(method.provider) === item.key);
+    return {
+      method: item.method,
+      enabled: matchedMethods.some((method) => method.enabled === true && ["enabled", "active"].includes(text(method.status))) ? "已启用" : "未启用",
+      defaultMethod: matchedMethods.some((method) => method.isDefault === true) ? "是" : "否",
+      confirmMode: item.confirmMode,
+      secretStatus: item.key === "personal_alipay" ? "不需要密钥" : paymentKeyStatusText(matchedMethods[0]),
+      lastCallback: text(matchedMethods[0]?.lastCallbackAt, "暂无"),
+      exceptionCount: exceptions.filter((exception) => text(exception.provider) === item.key).length
+    };
+  });
+}
+
+function paymentMethodRows(methods: JsonRecord[]): JsonRecord[] {
+  return methods.map((method) => ({
+    id: method.id,
+    method: paymentProviderName(text(method.provider)),
+    ownerType: method.ownerType,
+    displayName: method.displayName,
+    merchant: text(method.merchantNoMasked, text(method.accountName, "-")),
+    confirmMode: ["manual", "manual_confirm"].includes(text(method.confirmationMode)) ? "人工确认" : "回调/查单自动确认",
+    enabled: method.enabled === true && ["enabled", "active"].includes(text(method.status)) ? "已启用" : humanValue(method.status, "未启用"),
+    isDefault: method.isDefault === true ? "是" : "否",
+    keyStatus: paymentKeyStatusText(method),
+    lastTestResult: humanValue(method.lastTestResult, "未测试"),
+    lastCallbackAt: text(method.lastCallbackAt, "暂无")
+  }));
+}
+
+function paymentDisputeMaterialRows(rows: JsonRecord[]): JsonRecord[] {
+  return rows.map((row) => ({
+    ...row,
+    channel: paymentProviderName(text(row.channel, text(row.provider, ""))),
+    status: humanValue(row.status),
+    voucherUrl: text(row.voucherUrl, "无"),
+    reviewedBy: row.reviewedBy ? friendlyId(row.reviewedBy, "审核人") : "-"
+  }));
+}
+
+function collectionChannelRows(channels: JsonRecord[]): JsonRecord[] {
+  return channels.map((channel) => ({
+    method: collectionChannelMethodName(channel),
+    displayName: channel.displayName,
+    accountName: channel.accountName,
+    confirmMode: paymentChannelTypeConfirmMode(text(channel.channelType)),
+    enabled: text(channel.status) === "active" ? "已启用" : "未启用",
+    isDefault: channel.isDefault === true ? "是" : "否",
+    secretStatus: text(channel.channelType).startsWith("alipay_personal") ? "不需要密钥" : "已配置/脱敏",
+    reviewStatus: channel.reviewStatus
+  }));
+}
+
+function paymentCallbackRows(callbacks: JsonRecord[]): JsonRecord[] {
+  return callbacks.map((callback) => ({
+    source: paymentProviderName(text(callback.provider)),
+    orderNo: callback.orderNo,
+    tradeNo: text(callback.providerTradeNo, "-"),
+    notifiedAt: text(callback.receivedAt, text(callback.createdAt, "-")),
+    signature: humanValue(callback.signatureStatus, humanValue(callback.status, "-")),
+    amountCheck: humanValue(callback.amountCheck, text(callback.amountCents, "-")),
+    idempotency: humanValue(callback.idempotencyStatus, text(callback.status, "-")),
+    errorReason: text(callback.errorReason, text(callback.reasonCode, "-"))
+  }));
+}
+
+function paymentExceptionRows(exceptions: JsonRecord[]): JsonRecord[] {
+  return exceptions.map((exception) => ({
+    id: exception.id,
+    type: paymentProviderName(text(exception.provider)),
+    orderNo: exception.orderNo,
+    amountCents: exception.amountCents,
+    status: exception.handled === true ? "已处理" : "待处理",
+    reason: text(exception.reasonCode, text(exception.reason, "异常")),
+    maskedPayload: text(exception.maskedPayload, "已脱敏"),
+    handled: exception.handled === true ? "是" : "否",
+    note: text(exception.note, "-")
+  }));
+}
+
+function paymentMethodEnabled(methods: JsonRecord[], provider: string): boolean {
+  return methods.some((method) => text(method.provider) === provider && method.enabled === true && ["enabled", "active"].includes(text(method.status)));
+}
+
+function paymentMethodEnabledText(method?: JsonRecord): string {
+  if (!method) return "未配置";
+  if (method.enabled === true && ["enabled", "active"].includes(text(method.status))) return "已启用";
+  if (method.enabled === true) return humanValue(method.status, "已保存，未启用");
+  return "已停用";
+}
+
+function paymentMethodPlainHint(method: string, enabled: string, exceptionCount: string): string {
+  if (method === "个人支付宝") {
+    return enabled === "已启用" ? "买家扫码后，后台人工确认真实到账。" : "可作为备用收款方式，需要人工确认。";
+  }
+  const exceptionText = Number(exceptionCount) > 0 ? `，当前有 ${exceptionCount} 条异常` : "";
+  return enabled === "已启用" ? `靠回调或查单确认支付${exceptionText}。` : "填好商户资料并测试通过后再启用。";
+}
+
+function paymentMethodFormInput(form: {
+  channelType: string;
+  displayName: string;
+  accountName: string;
+  qrUrl: string;
+  paymentUrl: string;
+  productType: string;
+  merchantNo: string;
+  appId: string;
+  serviceProviderId: string;
+  gatewayUrl: string;
+  returnUrl: string;
+  note: string;
+  signingSecret: string;
+  privateKey: string;
+  publicKey: string;
+  certificate: string;
+  enabled: boolean;
+  isDefault: boolean;
+}, id?: string): PaymentMethodInput {
+  return {
+    id,
+    provider: form.channelType,
+    displayName: form.displayName,
+    productType: form.productType || undefined,
+    merchantNo: form.merchantNo || undefined,
+    appId: form.appId || undefined,
+    serviceProviderId: form.serviceProviderId || undefined,
+    gatewayUrl: form.gatewayUrl || undefined,
+    accountName: form.accountName || undefined,
+    qrUrl: form.qrUrl || undefined,
+    paymentUrl: form.paymentUrl || undefined,
+    note: form.note || undefined,
+    returnUrl: form.returnUrl || undefined,
+    enabled: form.enabled,
+    isDefault: form.isDefault,
+    signingSecret: form.signingSecret || undefined,
+    privateKey: form.privateKey || undefined,
+    publicKey: form.publicKey || undefined,
+    certificate: form.certificate || undefined
+  };
+}
+
+function paymentMethodToForm(method?: JsonRecord) {
+  return {
+    channelType: text(method?.provider, ""),
+    displayName: text(method?.displayName, ""),
+    accountName: text(method?.accountName, ""),
+    qrUrl: text(method?.qrUrl, ""),
+    paymentUrl: text(method?.paymentUrl, ""),
+    productType: text(method?.productType, ""),
+    merchantNo: "",
+    appId: "",
+    serviceProviderId: "",
+    gatewayUrl: text(method?.gatewayUrl, ""),
+    returnUrl: text(method?.returnUrl, ""),
+    note: text(method?.note, ""),
+    signingSecret: "",
+    privateKey: "",
+    publicKey: "",
+    certificate: "",
+    enabled: method?.enabled === true,
+    isDefault: method?.isDefault === true
+  };
+}
+
+function paymentProviderName(provider: string): string {
+  if (provider === "alipay_merchant") return "支付宝商户";
+  if (provider === "wechat_merchant") return "腾讯/微信商户";
+  if (provider === "epay") return "e支付";
+  if (provider === "personal_alipay" || provider === "alipay_personal") return "个人支付宝";
+  if (provider === "alipay_wap") return "支付宝";
+  if (provider === "wechat_h5" || provider === "wechat_h5_jsapi") return "微信支付";
+  return provider || "未知收款方式";
+}
+
+function paymentKeyStatusText(method?: JsonRecord): string {
+  if (!method) return "未配置";
+  if (text(method.provider) === "personal_alipay") return "不需要密钥";
+  const keyStatus = isRecord(method.keyStatus) ? method.keyStatus : {};
+  const fields = [
+    ["signingSecret", "签名密钥"],
+    ["privateKey", "私钥"],
+    ["publicKey", "公钥"],
+    ["certificate", "证书"]
+  ] as const;
+  const configured = fields.filter(([key]) => text(keyStatus[key]) === "configured").map(([, label]) => label);
+  if (configured.length === 0) return "未配置";
+  return `${configured.join("、")}已配置`;
+}
+
+function collectionChannelMethodName(channel: JsonRecord): string {
+  return paymentChannelTypeName(text(channel.channelType));
+}
+
+function paymentChannelTypeName(type: string): string {
+  if (type.startsWith("alipay_merchant")) return "支付宝商户";
+  if (type.startsWith("wechat_merchant")) return "腾讯/微信商户";
+  if (type.startsWith("epay")) return "e支付";
+  if (type.startsWith("alipay_personal") || type === "personal_alipay") return "个人支付宝";
+  return "其它收款";
+}
+
+function paymentChannelTypeConfirmMode(type: string): string {
+  if (type.startsWith("alipay_personal") || type === "personal_alipay") return "人工确认";
+  if (type.startsWith("alipay_merchant") || type.startsWith("wechat_merchant") || type.startsWith("epay")) return "回调/查单自动确认";
+  return "后台确认";
+}
+
 function validatePlatformProductForm(form: {
   name: string;
   fulfillmentMode: string;
@@ -2465,7 +2962,7 @@ function isNonNegativeInteger(value: string): boolean {
 
 function groupedNav(merchantSessionActive = false) {
   const visibleItems = merchantSessionActive
-    ? navItems.filter((item) => !["agents", "risk", "payment"].includes(item.id))
+    ? navItems.filter((item) => !["agents", "risk"].includes(item.id))
     : navItems;
   const groups = [...new Set(visibleItems.map((item) => item.group))];
   return groups.map((name) => ({
@@ -2477,13 +2974,6 @@ function groupedNav(merchantSessionActive = false) {
 function moduleFromHash(): ModuleId {
   const value = window.location.hash.replace("#", "");
   return navItems.some((item) => item.id === value) ? value as ModuleId : "dashboard";
-}
-
-function blockedPaymentConfigChannels(): string[] {
-  return [
-    globalThis.atob("bW9jaw=="),
-    globalThis.atob("d2VjaGF0X21pbmlwcm9ncmFt")
-  ];
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

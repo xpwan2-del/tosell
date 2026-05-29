@@ -14,13 +14,49 @@ import {
 const bigintString = z.union([z.string(), z.number(), z.bigint()]).transform((value) => BigInt(value));
 const adminRole = z.enum(["operator", "finance", "admin"]);
 const paymentChannel = z.enum(["wechat_miniprogram", "wechat_h5_jsapi", "wechat_h5", "alipay_wap", "mock"]);
+const paymentProvider = z.enum(["alipay_merchant", "wechat_merchant", "epay", "personal_alipay"]);
+const paymentMethodBodySchema = z.object({
+  id: z.string().optional(),
+  provider: paymentProvider,
+  displayName: z.string().min(1).max(80),
+  productType: z.string().optional(),
+  merchantNo: z.string().optional(),
+  appId: z.string().optional(),
+  serviceProviderId: z.string().optional(),
+  gatewayUrl: z.string().url().optional(),
+  accountName: z.string().optional(),
+  qrUrl: z.string().url().optional(),
+  paymentUrl: z.string().url().optional(),
+  note: z.string().optional(),
+  returnUrl: z.string().url().optional(),
+  enabled: z.boolean().optional(),
+  status: z.enum(["pending_test", "enabled", "disabled", "paused"]).optional(),
+  isDefault: z.boolean().optional(),
+  signingSecret: z.string().optional(),
+  privateKey: z.string().optional(),
+  publicKey: z.string().optional(),
+  certificate: z.string().optional()
+});
+const paymentResultBodySchema = z.object({
+  orderNo: z.string().optional(),
+  providerTradeNo: z.string(),
+  amountCents: bigintString,
+  merchantNo: z.string().optional(),
+  appId: z.string().optional(),
+  serviceProviderId: z.string().optional(),
+  tradeStatus: z.string(),
+  signature: z.string(),
+  rawPayload: z.unknown().optional()
+});
 const collectionChannelType = z.enum([
   "alipay_personal_qr",
   "alipay_merchant_qr",
   "alipay_merchant_link",
   "wechat_personal_qr",
   "wechat_merchant_qr",
-  "wechat_merchant_link"
+  "wechat_merchant_link",
+  "epay_qr",
+  "epay_link"
 ]);
 const emailSchema = z.string().email().max(160);
 const extractionCodeSchema = z.string().regex(/^\d{4,12}$/).max(12);
@@ -229,8 +265,10 @@ export function buildApp() {
 
   app.post("/api/user/orders/:orderNo/payments", async (request) => {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
-    const body = z.object({ channel: paymentChannel }).parse(request.body);
-    return serializeBigInt(services.createPaymentIntent(getUserActor(request), orderNo, body));
+    const body = z.object({ channel: paymentChannel.optional(), paymentMethodId: z.string().optional() }).parse(request.body);
+    if (body.paymentMethodId) return serializeBigInt(services.createPaymentOrder(getUserActor(request), orderNo, { paymentMethodId: body.paymentMethodId }));
+    if (!body.channel) return serializeBigInt(services.createPaymentOrder(getUserActor(request), orderNo, {}));
+    return serializeBigInt(services.createPaymentIntent(getUserActor(request), orderNo, { channel: body.channel ?? "alipay_wap" }));
   });
 
   app.post("/api/user/orders/:orderNo/payment-vouchers", async (request) => {
@@ -485,6 +523,28 @@ export function buildApp() {
 
   app.get("/api/agent/orders", async (request) => serializeBigInt(services.listAgentOrders(getAgentActor(request))));
   app.get("/api/agent/payment-vouchers", async (request) => serializeBigInt(services.listAgentPaymentVouchers(getAgentActor(request))));
+  app.get("/api/agent/payment-methods", async (request) => serializeBigInt(services.listAgentPaymentMethods(getAgentActor(request))));
+  app.post("/api/agent/payment-methods", async (request) => {
+    const body = paymentMethodBodySchema.parse(request.body);
+    return serializeBigInt(services.upsertAgentPaymentMethod(getAgentActor(request), body));
+  });
+  app.patch("/api/agent/payment-methods/:methodId", async (request) => {
+    const { methodId } = z.object({ methodId: z.string() }).parse(request.params);
+    const body = paymentMethodBodySchema.partial().parse(request.body);
+    return serializeBigInt(services.upsertAgentPaymentMethod(getAgentActor(request), { ...body, id: methodId }));
+  });
+  app.delete("/api/agent/payment-methods/:methodId", async (request) => {
+    const { methodId } = z.object({ methodId: z.string() }).parse(request.params);
+    return serializeBigInt(services.deleteAgentPaymentMethod(getAgentActor(request), methodId));
+  });
+  app.post("/api/agent/payment-methods/:methodId/default", async (request) => {
+    const { methodId } = z.object({ methodId: z.string() }).parse(request.params);
+    return serializeBigInt(services.setAgentPaymentMethodDefault(getAgentActor(request), methodId));
+  });
+  app.post("/api/agent/payment-methods/:methodId/test", async (request) => {
+    const { methodId } = z.object({ methodId: z.string() }).parse(request.params);
+    return serializeBigInt(services.testAgentPaymentMethod(getAgentActor(request), methodId));
+  });
   app.get("/api/agent/orders/:orderNo", async (request) => {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
     return serializeBigInt(services.getAgentOrder(getAgentActor(request), orderNo));
@@ -925,6 +985,43 @@ export function buildApp() {
     return serializeBigInt(services.updateShopServiceQrCode(getAdminActor(request), shopId, body));
   });
   app.get("/api/admin/payment-config/status", async (request) => serializeBigInt(services.paymentConfigStatus(getAdminActor(request))));
+  app.get("/api/admin/payment-methods", async (request) => serializeBigInt(services.listAdminPaymentMethods(getAdminActor(request))));
+  app.post("/api/admin/payment-methods", async (request) => {
+    const body = paymentMethodBodySchema.extend({
+      agentId: z.string().optional(),
+      shopId: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.upsertAdminPaymentMethod(getAdminActor(request), body));
+  });
+  app.patch("/api/admin/payment-methods/:methodId", async (request) => {
+    const { methodId } = z.object({ methodId: z.string() }).parse(request.params);
+    const body = paymentMethodBodySchema.partial().parse(request.body);
+    return serializeBigInt(services.upsertAdminPaymentMethod(getAdminActor(request), { ...body, id: methodId }));
+  });
+  app.delete("/api/admin/payment-methods/:methodId", async (request) => {
+    const { methodId } = z.object({ methodId: z.string() }).parse(request.params);
+    return serializeBigInt(services.deleteAdminPaymentMethod(getAdminActor(request), methodId));
+  });
+  app.post("/api/admin/payment-methods/:methodId/default", async (request) => {
+    const { methodId } = z.object({ methodId: z.string() }).parse(request.params);
+    return serializeBigInt(services.setAdminPaymentMethodDefault(getAdminActor(request), methodId));
+  });
+  app.post("/api/admin/payment-methods/:methodId/test", async (request) => {
+    const { methodId } = z.object({ methodId: z.string() }).parse(request.params);
+    return serializeBigInt(services.testAdminPaymentMethod(getAdminActor(request), methodId));
+  });
+  app.get("/api/admin/payment-callbacks", async (request) => serializeBigInt(services.listPaymentCallbackLogs(getAdminActor(request))));
+  app.get("/api/admin/payment-exceptions", async (request) => serializeBigInt(services.listPaymentExceptions(getAdminActor(request))));
+  app.post("/api/admin/payment-exceptions/:exceptionId/handle", async (request) => {
+    const { exceptionId } = z.object({ exceptionId: z.string() }).parse(request.params);
+    const body = z.object({ action: z.enum(["mark_handled", "keep_exception"]), note: z.string().optional() }).parse(request.body);
+    return serializeBigInt(services.handlePaymentException(getAdminActor(request), exceptionId, body));
+  });
+  app.post("/api/admin/orders/:orderNo/payment-query", async (request) => {
+    const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
+    const body = paymentResultBodySchema.omit({ orderNo: true, rawPayload: true }).parse(request.body);
+    return serializeBigInt(services.queryPaymentOrder(getAdminActor(request), orderNo, body));
+  });
   app.patch("/api/admin/payment-config/metadata", async (request) => {
     const body = z.object({
       channel: paymentChannel,
@@ -953,6 +1050,11 @@ export function buildApp() {
   app.post("/api/callbacks/payments/mock", async (request) => {
     const body = z.object({ channel: z.string().default("mock"), channelTradeNo: z.string(), orderNo: z.string(), amountCents: bigintString }).parse(request.body);
     return serializeBigInt(services.paymentCallback(body));
+  });
+  app.post("/api/callbacks/payments/:provider", async (request) => {
+    const { provider } = z.object({ provider: paymentProvider }).parse(request.params);
+    const body = paymentResultBodySchema.parse(request.body);
+    return serializeBigInt(services.paymentProviderCallback(provider, body));
   });
 
   app.post("/api/callbacks/refunds/mock", async (request) => {

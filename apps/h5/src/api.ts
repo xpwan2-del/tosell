@@ -85,6 +85,10 @@ export const api = {
       collectionChannelId: input.collectionChannelId || undefined
     }
   }),
+  createPayment: (orderNo: string) => request<JsonRecord>(`/api/user/orders/${encodeURIComponent(orderNo)}/payments`, {
+    method: "POST",
+    body: {}
+  }),
   createAfterSale: (orderNo: string, requestedRefundCents: string, description = "H5 用户售后申请") => request<JsonRecord>("/api/user/after-sales", {
     method: "POST",
     body: {

@@ -386,6 +386,79 @@ textarea {
   font-size: 22px;
 }
 
+.payment-method-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.payment-method-card {
+  display: grid;
+  gap: 10px;
+  min-height: 190px;
+  padding: 16px;
+  background: #fff;
+  border: 1px solid #dfe7eb;
+  border-top: 3px solid #cbd7dc;
+  border-radius: 8px;
+}
+
+.payment-method-card.active {
+  border-top-color: #106270;
+}
+
+.payment-method-card h3 {
+  margin: 4px 0 0;
+  font-size: 18px;
+}
+
+.payment-method-card span,
+.payment-method-card dt {
+  color: #66757f;
+  font-size: 12px;
+}
+
+.payment-method-card > strong {
+  width: fit-content;
+  padding: 4px 9px;
+  color: #0f5e3b;
+  background: #e9f8ef;
+  border: 1px solid #bfe9cf;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.payment-method-card:not(.active) > strong {
+  color: #6f4b00;
+  background: #fff6dc;
+  border-color: #f3df9d;
+}
+
+.payment-method-card p {
+  min-height: 44px;
+  margin: 0;
+  color: #42525a;
+  line-height: 1.55;
+}
+
+.payment-method-card dl {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.payment-method-card dl div {
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  gap: 8px;
+}
+
+.payment-method-card dd {
+  margin: 0;
+  color: #172026;
+  overflow-wrap: anywhere;
+}
+
 .work-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -743,6 +816,10 @@ th {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
+  .payment-method-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .work-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -774,6 +851,7 @@ th {
   }
 
   .metric-grid,
+  .payment-method-grid,
   .work-grid,
   .split,
   .form-grid,

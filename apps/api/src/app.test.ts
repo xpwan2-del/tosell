@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { buildApp } from "./app.ts";
 
 describe.sequential("api", () => {
@@ -2216,8 +2216,226 @@ describe.sequential("api", () => {
     ]));
     expect(crossList.json()).toEqual([]);
     expect(reviewed.statusCode).toBe(200);
-    expect(reviewed.json()).toMatchObject({ status: "approved" });
-    expect(detail.json()).toMatchObject({ paymentStatus: "paid" });
+    expect(reviewed.json()).toMatchObject({ status: "approved", disputeMaterialOnly: true });
+    expect(detail.json()).toMatchObject({ paymentStatus: "unpaid", fulfillmentStatus: "not_started" });
+  });
+
+  it("manages scoped payment methods, verifies callbacks and queries, and keeps vouchers out of payment confirmation", async () => {
+    const app = buildApp();
+    const adminHeaders = { "x-admin-id": "admin-1", "x-admin-role": "admin" };
+    const agentHeaders = { "x-agent-id": "agent-1", "x-shop-id": "shop-1" };
+    const secret = "merchant-secret-001";
+    const sign = (provider: string, orderNo: string, amountCents: string, tradeNo: string, merchantNo: string) => {
+      const key = `sha256:${createHash("sha256").update(secret).digest("hex")}`;
+      return createHmac("sha256", key).update(`${provider}|${orderNo}|${amountCents}|${tradeNo}|${merchantNo}`).digest("hex");
+    };
+
+    const alipay = await app.inject({
+      method: "POST",
+      url: "/api/admin/payment-methods",
+      headers: adminHeaders,
+      payload: {
+        provider: "alipay_merchant",
+        displayName: "平台支付宝商户",
+        productType: "qr",
+        merchantNo: "ali-mch-10001",
+        appId: "ali-app-10001",
+        signingSecret: secret,
+        privateKey: "-----BEGIN PRIVATE KEY-----secret-----END PRIVATE KEY-----",
+        publicKey: "alipay-public-secret",
+        enabled: true,
+        isDefault: true,
+        returnUrl: "https://h5.example.test/orders"
+      }
+    });
+    expect(alipay.statusCode).toBe(200);
+    expect(JSON.stringify(alipay.json())).not.toContain(secret);
+    expect(alipay.json()).toMatchObject({
+      provider: "alipay_merchant",
+      confirmationMode: "automatic",
+      keyStatus: expect.objectContaining({ signingSecret: "configured", privateKey: "configured", publicKey: "configured" })
+    });
+
+    const wechat = await app.inject({
+      method: "POST",
+      url: "/api/admin/payment-methods",
+      headers: adminHeaders,
+      payload: {
+        provider: "wechat_merchant",
+        displayName: "平台腾讯微信商户",
+        productType: "native",
+        merchantNo: "wx-mch-10001",
+        appId: "wx-app-10001",
+        signingSecret: "wx-secret",
+        certificate: "wx-cert-secret",
+        enabled: true
+      }
+    });
+    expect(wechat.statusCode).toBe(200);
+    expect(JSON.stringify(wechat.json())).not.toContain("wx-secret");
+
+    const epay = await app.inject({
+      method: "POST",
+      url: "/api/admin/payment-methods",
+      headers: adminHeaders,
+      payload: {
+        provider: "epay",
+        displayName: "平台 e支付",
+        merchantNo: "epay-mch-10001",
+        gatewayUrl: "https://epay.example.test/gateway",
+        signingSecret: "epay-secret",
+        enabled: true
+      }
+    });
+    expect(epay.statusCode).toBe(200);
+    expect(JSON.stringify(epay.json())).not.toContain("epay-secret");
+
+    const personal = await app.inject({
+      method: "POST",
+      url: "/api/agent/payment-methods",
+      headers: agentHeaders,
+      payload: {
+        provider: "personal_alipay",
+        displayName: "商户个人支付宝",
+        accountName: "agent-alipay@example.test",
+        qrUrl: "https://example.test/personal-alipay.png",
+        note: "个人支付宝仅人工确认收款",
+        enabled: true,
+        isDefault: true
+      }
+    });
+    expect(personal.statusCode).toBe(200);
+    expect(personal.json()).toMatchObject({ provider: "personal_alipay", confirmationMode: "manual", isDefault: true });
+
+    const crossDefault = await app.inject({
+      method: "POST",
+      url: `/api/agent/payment-methods/${personal.json().id}/default`,
+      headers: { "x-agent-id": "agent-2", "x-shop-id": "shop-2" }
+    });
+    expect(crossDefault.statusCode).toBe(403);
+
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "pay-user" },
+      payload: { shopId: "shop-1", agentProductId: "ap-code", clientPaidAmountCents: "4900", purchasePassword: "246810" }
+    });
+    expect(order.statusCode).toBe(200);
+    const manualPayment = await app.inject({
+      method: "POST",
+      url: `/api/user/orders/${order.json().orderNo}/payments`,
+      headers: { "x-user-id": "pay-user" },
+      payload: { paymentMethodId: personal.json().id }
+    });
+    expect(manualPayment.statusCode).toBe(200);
+    expect(manualPayment.json()).toMatchObject({
+      status: "pending_manual_confirmation",
+      provider: "personal_alipay",
+      message: expect.stringContaining("人工确认")
+    });
+
+    const manualConfirm = await app.inject({
+      method: "POST",
+      url: `/api/agent/orders/${order.json().orderNo}/confirm-payment`,
+      headers: agentHeaders,
+      payload: { amountCents: "4900", note: "个人支付宝到账" }
+    });
+    expect(manualConfirm.statusCode).toBe(200);
+    expect(manualConfirm.json().order).toMatchObject({ paymentStatus: "paid", fulfillmentStatus: "success" });
+
+    const autoOrder = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "auto-pay-user" },
+      payload: { shopId: "shop-1", agentProductId: "ap-code", clientPaidAmountCents: "4900", purchasePassword: "135790" }
+    });
+    const createdPayment = await app.inject({
+      method: "POST",
+      url: `/api/user/orders/${autoOrder.json().orderNo}/payments`,
+      headers: { "x-user-id": "auto-pay-user" },
+      payload: { paymentMethodId: alipay.json().id }
+    });
+    expect(createdPayment.statusCode).toBe(200);
+    expect(createdPayment.json()).toMatchObject({
+      status: "created",
+      provider: "alipay_merchant",
+      paymentParams: expect.objectContaining({ qrCodeUrl: expect.any(String), returnUrl: "https://h5.example.test/orders" })
+    });
+
+    const badSignature = await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/alipay_merchant",
+      payload: {
+        orderNo: autoOrder.json().orderNo,
+        providerTradeNo: "ali-trade-1",
+        amountCents: "4900",
+        merchantNo: "ali-mch-10001",
+        appId: "ali-app-10001",
+        tradeStatus: "TRADE_SUCCESS",
+        signature: "bad"
+      }
+    });
+    expect(badSignature.statusCode).toBe(400);
+    expect(badSignature.json().code).toBe("PAYMENT_CALLBACK_SIGNATURE_INVALID");
+
+    const mismatch = await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/alipay_merchant",
+      payload: {
+        orderNo: autoOrder.json().orderNo,
+        providerTradeNo: "ali-trade-mismatch",
+        amountCents: "4800",
+        merchantNo: "ali-mch-10001",
+        appId: "ali-app-10001",
+        tradeStatus: "TRADE_SUCCESS",
+        signature: sign("alipay_merchant", autoOrder.json().orderNo, "4800", "ali-trade-mismatch", "ali-mch-10001")
+      }
+    });
+    expect(mismatch.statusCode).toBe(200);
+    expect(mismatch.json()).toMatchObject({ status: "exception", exception: expect.objectContaining({ reasonCode: "AMOUNT_MISMATCH" }) });
+
+    const paidByQuery = await app.inject({
+      method: "POST",
+      url: `/api/admin/orders/${autoOrder.json().orderNo}/payment-query`,
+      headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" },
+      payload: {
+        providerTradeNo: "ali-trade-success",
+        amountCents: "4900",
+        merchantNo: "ali-mch-10001",
+        appId: "ali-app-10001",
+        tradeStatus: "TRADE_SUCCESS",
+        signature: sign("alipay_merchant", autoOrder.json().orderNo, "4900", "ali-trade-success", "ali-mch-10001")
+      }
+    });
+    expect(paidByQuery.statusCode).toBe(200);
+    expect(paidByQuery.json().status).toBe("processed");
+    expect(paidByQuery.json().order).toMatchObject({ paymentStatus: "paid", fulfillmentStatus: "success" });
+
+    const duplicateCallback = await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/alipay_merchant",
+      payload: {
+        orderNo: autoOrder.json().orderNo,
+        providerTradeNo: "ali-trade-success",
+        amountCents: "4900",
+        merchantNo: "ali-mch-10001",
+        appId: "ali-app-10001",
+        tradeStatus: "TRADE_SUCCESS",
+        signature: sign("alipay_merchant", autoOrder.json().orderNo, "4900", "ali-trade-success", "ali-mch-10001")
+      }
+    });
+    expect(duplicateCallback.statusCode).toBe(200);
+    expect(duplicateCallback.json().status).toBe("duplicate");
+
+    const callbacks = await app.inject({ method: "GET", url: "/api/admin/payment-callbacks", headers: adminHeaders });
+    const exceptions = await app.inject({ method: "GET", url: "/api/admin/payment-exceptions", headers: adminHeaders });
+    expect(callbacks.json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ provider: "alipay_merchant", status: "rejected" })
+    ]));
+    expect(exceptions.json()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ reasonCode: "SIGNATURE_INVALID" }),
+      expect.objectContaining({ reasonCode: "AMOUNT_MISMATCH" })
+    ]));
   });
 
   it("audits reconciliation exports and supports admin order pagination filters", async () => {

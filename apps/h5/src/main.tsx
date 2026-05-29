@@ -53,6 +53,7 @@ function App() {
   const [shop, setShop] = useState<JsonRecord>({});
   const [products, setProducts] = useState<JsonRecord[]>([]);
   const [collectionChannels, setCollectionChannels] = useState<JsonRecord[]>([]);
+  const [orderPayments, setOrderPayments] = useState<Record<string, JsonRecord>>({});
   const [userCoupons, setUserCoupons] = useState<JsonRecord[]>([]);
   const [orders, setOrders] = useState<JsonRecord[]>(() => readCachedOrders(currentShopId()));
   const [selectedProduct, setSelectedProduct] = useState<JsonRecord | undefined>();
@@ -60,7 +61,7 @@ function App() {
   const [checkout, setCheckout] = useState<CheckoutState | undefined>();
   const [selectedOrder, setSelectedOrder] = useState<JsonRecord | undefined>();
   const [afterSaleOrder, setAfterSaleOrder] = useState<JsonRecord | undefined>();
-  const [paymentVoucherOrder, setPaymentVoucherOrder] = useState<JsonRecord | undefined>();
+  const [supportMaterialOrder, setSupportMaterialOrder] = useState<JsonRecord | undefined>();
   const [selectedCollectionChannelId, setSelectedCollectionChannelId] = useState("");
   const [orderTab, setOrderTab] = useState<OrderTab>("全部");
   const [message, setMessage] = useState("正在打开店铺");
@@ -205,7 +206,7 @@ function App() {
       setCheckout(undefined);
       setSelectedOrder(undefined);
       setAfterSaleOrder(undefined);
-      setPaymentVoucherOrder(undefined);
+      setSupportMaterialOrder(undefined);
       setSelectedCollectionChannelId("");
       setExtractOrder(undefined);
       setExtractResult(undefined);
@@ -289,10 +290,22 @@ function App() {
           collectionChannelId: selectedCollectionChannelId || text(collectionChannels[0]?.id, "")
         }
       );
-      updateOrders((current) => upsertOrder(current, order));
+      let payment: JsonRecord | undefined;
+      try {
+        payment = await api.createPayment(text(order.orderNo));
+      } catch (error) {
+        setMessage(error instanceof Error ? `订单已创建，支付单创建失败：${error.message}` : "订单已创建，支付单创建失败");
+      }
+      const orderWithPayment = payment ? attachPayment(order, payment) : order;
+      updateOrders((current) => upsertOrder(current, orderWithPayment));
+      if (payment) {
+        setOrderPayments((current) => ({ ...current, [text(order.orderNo)]: payment }));
+      }
       setCheckout(undefined);
-      setSelectedOrder(order);
-      setMessage(`订单已创建：${text(order.orderNo)}，请按店铺收款信息付款后等待后台确认。`);
+      setSelectedOrder(orderWithPayment);
+      if (payment) {
+        setMessage(paymentStatusMessage(payment));
+      }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "下单失败");
     } finally {
@@ -305,6 +318,24 @@ function App() {
     setMessage(`订单 ${text(order.orderNo)} 待收款确认，请使用当前店铺收款通道付款。`);
   }
 
+  async function createOrderPayment(order: JsonRecord) {
+    const orderNo = text(order.orderNo);
+    if (!orderNo) return;
+    try {
+      setLoading(true);
+      const payment = await api.createPayment(orderNo);
+      const nextOrder = attachPayment(order, payment);
+      setOrderPayments((current) => ({ ...current, [orderNo]: payment }));
+      updateOrders((current) => upsertOrder(current, nextOrder));
+      setSelectedOrder(nextOrder);
+      setMessage(paymentStatusMessage(payment));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "支付单创建失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function openPaymentVoucher(order: JsonRecord) {
     const channel = inferPaymentVoucherChannel(selectedCollectionChannel(collectionChannels, selectedCollectionChannelId));
     setPaymentVoucherForm({
@@ -313,32 +344,32 @@ function App() {
       voucherUrl: "",
       note: ""
     });
-    setPaymentVoucherOrder(order);
+    setSupportMaterialOrder(order);
   }
 
   async function submitPaymentVoucher() {
-    if (!paymentVoucherOrder) return;
+    if (!supportMaterialOrder) return;
     if (!paymentVoucherForm.voucherUrl.trim() && !paymentVoucherForm.note.trim()) {
-      setMessage("请填写付款凭证 URL 或备注，便于后台核验。");
+      setMessage("请填写异常材料 URL 或备注，便于客服核实。");
       return;
     }
     try {
       setLoading(true);
-      const voucher = await api.submitPaymentVoucher(text(paymentVoucherOrder.orderNo), {
+      const voucher = await api.submitPaymentVoucher(text(supportMaterialOrder.orderNo), {
         channel: paymentVoucherForm.channel || undefined,
         payerName: paymentVoucherForm.payerName.trim() || undefined,
         voucherUrl: paymentVoucherForm.voucherUrl.trim() || undefined,
         note: paymentVoucherForm.note.trim() || undefined
       });
       updateOrders((current) => upsertOrder(current, {
-        ...paymentVoucherOrder,
-        paymentVoucherStatus: text(voucher.status, "pending_review"),
+        ...supportMaterialOrder,
+        disputeMaterialStatus: text(voucher.status, "pending_review"),
         paymentVoucherId: text(voucher.id, "")
       }));
-      setPaymentVoucherOrder(undefined);
-      setMessage(`付款凭证已提交：${text(voucher.id, "待审核")}`);
+      setSupportMaterialOrder(undefined);
+      setMessage(`异常材料已提交：${text(voucher.id, "待核实")}`);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "付款凭证提交失败");
+      setMessage(error instanceof Error ? error.message : "异常材料提交失败");
     } finally {
       setLoading(false);
     }
@@ -540,7 +571,6 @@ function App() {
             <em>{statusLabel(order)}</em>
             <strong>{cents(orderPaidAmount(order))}</strong>
             {text(order.paymentStatus) === "unpaid" ? <button type="button" onClick={() => showCollection(order)}>收款信息</button> : null}
-            {text(order.paymentStatus) === "unpaid" ? <button type="button" onClick={() => openPaymentVoucher(order)}>提交凭证</button> : null}
             {text(order.paymentStatus) === "paid" && text(order.refundStatus, "none") === "none" ? (
               <button type="button" onClick={() => setAfterSaleOrder(order)}>申请售后</button>
             ) : null}
@@ -707,13 +737,16 @@ function App() {
             <div className="checkout-row"><span>实付金额</span><strong>{cents(orderPaidAmount(selectedOrder))}</strong></div>
             <div className="checkout-row"><span>支付状态</span><strong>{statusLabel(selectedOrder)}</strong></div>
             <div className="checkout-row"><span>履约方式</span><strong>{text(selectedOrder.fulfillmentStatus, "待处理")}</strong></div>
-            {text(selectedOrder.paymentStatus) === "unpaid" ? <CollectionBox channels={collectionChannels} orderAmountCents={orderPaidAmount(selectedOrder)} selectedChannelId={selectedCollectionChannelId} onSelect={setSelectedCollectionChannelId} /> : null}
-            {text(selectedOrder.paymentStatus) === "unpaid" ? (
-              <div className="checkout-actions">
-                <button type="button" onClick={() => openPaymentVoucher(selectedOrder)}>提交付款凭证</button>
-              </div>
+            {text(selectedOrder.paymentStatus) === "unpaid" || text(selectedOrder.paymentStatus) === "paying" ? (
+              <CollectionBox
+                channels={collectionChannels}
+                orderAmountCents={orderPaidAmount(selectedOrder)}
+                selectedChannelId={selectedCollectionChannelId}
+                onSelect={setSelectedCollectionChannelId}
+                payment={orderPayments[text(selectedOrder.orderNo)] ?? paymentForOrder(selectedOrder)}
+              />
             ) : null}
-            {text(selectedOrder.paymentVoucherStatus, "") ? <div className="checkout-row"><span>凭证状态</span><strong>{text(selectedOrder.paymentVoucherStatus)}</strong></div> : null}
+            {text(selectedOrder.disputeMaterialStatus, "") ? <div className="checkout-row"><span>异常材料</span><strong>{text(selectedOrder.disputeMaterialStatus)}</strong></div> : null}
             <DeliveryBlock order={selectedOrder} onExtract={(token) => {
               if (token) {
                 window.location.href = `/extract?token=${encodeURIComponent(token)}&shopId=${encodeURIComponent(shopId)}`;
@@ -725,23 +758,29 @@ function App() {
             }} />
             <ServiceContact shop={shop} compact />
             <p>虚拟权益订单会保留支付、履约和售后记录；遇到问题请联系店铺客服。</p>
+            <div className="checkout-actions">
+              {text(selectedOrder.paymentStatus) === "unpaid" && !paymentForOrder(selectedOrder) ? (
+                <button type="button" disabled={loading} onClick={() => void createOrderPayment(selectedOrder)}>生成支付信息</button>
+              ) : null}
+              <button type="button" className="ghost" onClick={() => openPaymentVoucher(selectedOrder)}>补充异常材料</button>
+            </div>
           </section>
         </div>
       ) : null}
 
-      {paymentVoucherOrder ? (
-        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="提交付款凭证">
+      {supportMaterialOrder ? (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="补充异常材料">
           <section className="checkout">
             <div className="checkout-head">
               <div>
-                <span>付款凭证</span>
-                <h2>{text(paymentVoucherOrder.orderNo)}</h2>
+                <span>异常材料</span>
+                <h2>{text(supportMaterialOrder.orderNo)}</h2>
               </div>
-              <button type="button" className="icon-button" onClick={() => setPaymentVoucherOrder(undefined)}>关闭</button>
+              <button type="button" className="icon-button" onClick={() => setSupportMaterialOrder(undefined)}>关闭</button>
             </div>
-            <div className="checkout-row"><span>订单金额</span><strong>{cents(orderPaidAmount(paymentVoucherOrder))}</strong></div>
+            <div className="checkout-row"><span>订单金额</span><strong>{cents(orderPaidAmount(supportMaterialOrder))}</strong></div>
             <label className="field">
-              <span>付款通道</span>
+              <span>相关通道</span>
               <select value={paymentVoucherForm.channel} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, channel: event.target.value })}>
                 <option value="">按收款码核验</option>
                 <option value="alipay_wap">支付宝</option>
@@ -754,17 +793,17 @@ function App() {
               <input value={paymentVoucherForm.payerName} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, payerName: event.target.value })} placeholder="选填，付款账号名或姓名" />
             </label>
             <label className="field">
-              <span>凭证 URL</span>
-              <input value={paymentVoucherForm.voucherUrl} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, voucherUrl: event.target.value })} placeholder="付款截图或凭证链接" />
+              <span>材料 URL</span>
+              <input value={paymentVoucherForm.voucherUrl} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, voucherUrl: event.target.value })} placeholder="选填，图片或说明链接" />
             </label>
             <label className="field">
               <span>备注</span>
-              <textarea value={paymentVoucherForm.note} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, note: event.target.value })} rows={3} placeholder="付款时间、账号尾号或其他核验信息" />
+              <textarea value={paymentVoucherForm.note} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, note: event.target.value })} rows={3} placeholder="说明异常情况、客服沟通结果或账号尾号" />
             </label>
-            <p>订单金额以后端生成为准；提交后由商户或平台后台确认收款。</p>
+            <p>此入口仅用于异常或争议核实，不作为支付成功依据，也不会触发自动发货。</p>
             <div className="checkout-actions">
-              <button type="button" className="ghost" onClick={() => setPaymentVoucherOrder(undefined)}>取消</button>
-              <button type="button" disabled={loading || (!paymentVoucherForm.voucherUrl.trim() && !paymentVoucherForm.note.trim())} onClick={() => void submitPaymentVoucher()}>提交凭证</button>
+              <button type="button" className="ghost" onClick={() => setSupportMaterialOrder(undefined)}>取消</button>
+              <button type="button" disabled={loading || (!paymentVoucherForm.voucherUrl.trim() && !paymentVoucherForm.note.trim())} onClick={() => void submitPaymentVoucher()}>提交材料</button>
             </div>
           </section>
         </div>
@@ -1123,9 +1162,14 @@ function ServiceContact(props: { shop: JsonRecord; compact?: boolean }) {
   );
 }
 
-function CollectionBox(props: { channels: JsonRecord[]; orderAmountCents: string; selectedChannelId?: string; onSelect?: (channelId: string) => void }) {
+function CollectionBox(props: { channels: JsonRecord[]; orderAmountCents: string; selectedChannelId?: string; onSelect?: (channelId: string) => void; payment?: JsonRecord }) {
   const channel = selectedCollectionChannel(props.channels, props.selectedChannelId);
-  const hasQr = Boolean(usableImageSrc(text(channel?.qrUrl, "")));
+  const payment = props.payment;
+  const paymentParams = payment?.paymentParams as JsonRecord | undefined;
+  const paymentMethod = payment?.paymentMethod as JsonRecord | undefined;
+  const paymentQr = text(paymentParams?.qrCodeUrl, text(paymentMethod?.qrUrl, ""));
+  const paymentUrl = text(paymentParams?.paymentUrl, text(paymentParams?.returnUrl, text(paymentMethod?.paymentUrl, "")));
+  const paymentProvider = text(payment?.provider, text(paymentMethod?.provider, ""));
   if (!channel) {
     return (
       <div className="collection-box unavailable">
@@ -1137,12 +1181,20 @@ function CollectionBox(props: { channels: JsonRecord[]; orderAmountCents: string
       </div>
     );
   }
+  const personalAlipay = paymentProvider === "personal_alipay" || isPersonalAlipayChannel(channel);
+  const interfaceCollection = ["alipay_merchant", "wechat_merchant", "epay"].includes(paymentProvider) || isInterfaceCollectionChannel(channel);
+  const displayQr = paymentQr || text(channel.qrUrl);
   return (
     <div className="collection-box">
       <div>
-        <strong>店铺收款通道</strong>
-        <span>{text(channel.displayName, "商户收款")} / {text(channel.accountName, "未填写账户名")}</span>
-        <small>请按订单金额付款，付款后等待商家或平台后台确认收款。</small>
+        <strong>{payment ? paymentProviderDisplayName(paymentProvider) : paymentChannelDisplayName(channel)}</strong>
+        <span>{text(paymentMethod?.displayName, text(channel.displayName, "商户收款"))} / {text(paymentMethod?.accountName, text(channel.accountName, "未填写账户名"))}</span>
+        <small>{interfaceCollection
+          ? text(payment?.message, "请使用官方二维码或支付链接完成支付，订单以服务端回调或主动查单确认为准。")
+          : personalAlipay
+            ? text(payment?.message, "个人支付宝仅支持人工确认，请按订单金额付款后等待商户确认收款。")
+            : "请按订单金额付款，订单以后台确认结果为准。"}</small>
+        {payment ? <small>支付单状态：{humanPaymentStatus(text(payment.status))}</small> : null}
         {props.channels.length > 1 ? (
           <select value={text(channel.id, "")} onChange={(event) => props.onSelect?.(event.target.value)} aria-label="选择收款通道">
             {props.channels.map((item) => <option key={text(item.id)} value={text(item.id)}>{text(item.displayName, "商户收款")}</option>)}
@@ -1150,12 +1202,14 @@ function CollectionBox(props: { channels: JsonRecord[]; orderAmountCents: string
         ) : null}
       </div>
       <strong className="collection-amount">{cents(props.orderAmountCents)}</strong>
-      {hasQr ? (
-        <ImageWithFallback src={text(channel.qrUrl)} alt="店铺收款码" fallback={<div className="qr-empty">收款码</div>} />
+      {displayQr ? (
+        usableImageSrc(displayQr)
+          ? <ImageWithFallback src={displayQr} alt={interfaceCollection ? "官方支付二维码" : "店铺收款码"} fallback={<div className="qr-empty">{interfaceCollection ? "支付二维码" : "收款码"}</div>} />
+          : <div className="qr-empty">{interfaceCollection ? "官方支付参数" : "收款信息"}</div>
       ) : (
-        <div className="qr-empty">收款码</div>
+        <div className="qr-empty">{interfaceCollection ? "支付二维码" : "收款码"}</div>
       )}
-      {text(channel.paymentUrl, "") ? <a href={text(channel.paymentUrl)} target="_blank" rel="noreferrer">打开支付链接</a> : null}
+      {paymentUrl ? <a href={paymentUrl} target="_blank" rel="noreferrer">{interfaceCollection ? "打开官方支付链接" : "打开支付链接"}</a> : null}
     </div>
   );
 }
@@ -1450,6 +1504,50 @@ function orderPayableAmount(quote: JsonRecord): string {
   return text(quote.buyerPaidAmountCents, text(quote.paidAmountCents, "0"));
 }
 
+function attachPayment(order: JsonRecord, payment: JsonRecord): JsonRecord {
+  const paymentSnapshot = isRecord(payment.paymentSnapshot) ? payment.paymentSnapshot : {};
+  return {
+    ...order,
+    paymentClient: payment,
+    paymentSnapshot,
+    paymentStatus: text(payment.status) === "created" ? "paying" : text(order.paymentStatus, "unpaid")
+  };
+}
+
+function paymentForOrder(order: JsonRecord): JsonRecord | undefined {
+  if (isRecord(order.paymentClient)) return order.paymentClient;
+  if (isRecord(order.paymentSnapshot)) return {
+    status: text(order.paymentSnapshot.status, text(order.paymentStatus)),
+    provider: text(order.paymentSnapshot.provider),
+    paymentSnapshot: order.paymentSnapshot
+  };
+  return undefined;
+}
+
+function paymentStatusMessage(payment: JsonRecord): string {
+  const orderNo = text(payment.orderNo);
+  if (text(payment.status) === "pending_manual_confirmation") return `订单 ${orderNo} 已生成个人支付宝收款信息，请付款后等待商户确认。`;
+  if (text(payment.status) === "created") return `订单 ${orderNo} 已生成官方支付信息，请完成支付并等待回调确认。`;
+  if (text(payment.status) === "already_paid") return `订单 ${orderNo} 已支付。`;
+  return text(payment.message, `订单 ${orderNo} 支付信息已更新。`);
+}
+
+function humanPaymentStatus(status: string): string {
+  const labels: Record<string, string> = {
+    created: "等待官方确认",
+    paying: "等待官方确认",
+    pending_manual_confirmation: "等待商户确认",
+    already_paid: "已支付",
+    not_configured: "未配置",
+    not_implemented: "未开通"
+  };
+  return labels[status] ?? status;
+}
+
+function isRecord(value: unknown): value is JsonRecord {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
 function inferPaymentVoucherChannel(channel?: JsonRecord): string {
   const type = text(channel?.channelType, "").toLowerCase();
   if (type.includes("alipay")) return "alipay_wap";
@@ -1459,6 +1557,32 @@ function inferPaymentVoucherChannel(channel?: JsonRecord): string {
 
 function selectedCollectionChannel(channels: JsonRecord[], selectedChannelId?: string): JsonRecord | undefined {
   return channels.find((item) => text(item.id) === selectedChannelId) ?? channels[0];
+}
+
+function isPersonalAlipayChannel(channel?: JsonRecord): boolean {
+  return text(channel?.channelType).startsWith("alipay_personal");
+}
+
+function isInterfaceCollectionChannel(channel?: JsonRecord): boolean {
+  const type = text(channel?.channelType);
+  return type.startsWith("alipay_merchant") || type.startsWith("wechat_merchant") || type.startsWith("epay");
+}
+
+function paymentChannelDisplayName(channel?: JsonRecord): string {
+  const type = text(channel?.channelType);
+  if (type.startsWith("alipay_merchant")) return "支付宝商户收款";
+  if (type.startsWith("wechat_merchant")) return "腾讯/微信商户收款";
+  if (type.startsWith("epay")) return "e支付收款";
+  if (type.startsWith("alipay_personal")) return "个人支付宝收款";
+  return "店铺收款通道";
+}
+
+function paymentProviderDisplayName(provider: string): string {
+  if (provider === "alipay_merchant") return "支付宝商户收款";
+  if (provider === "wechat_merchant") return "腾讯/微信商户收款";
+  if (provider === "epay") return "e支付收款";
+  if (provider === "personal_alipay") return "个人支付宝收款";
+  return "店铺收款通道";
 }
 
 function orderProductName(order: JsonRecord): string {
@@ -1472,6 +1596,9 @@ function statusLabel(order: JsonRecord): string {
   if (["refunded", "success", "succeeded"].includes(refundStatus)) return "已退款";
   if (refundStatus !== "none") return "售后处理中";
   if (text(order.paymentStatus) === "paid") return "已支付";
+  const channel = order.collectionChannelSnapshot as JsonRecord | undefined;
+  if (isPersonalAlipayChannel(channel)) return "待商户确认收款";
+  if (isInterfaceCollectionChannel(channel)) return "待官方确认支付";
   return "待支付";
 }
 

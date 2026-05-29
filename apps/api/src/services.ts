@@ -29,7 +29,7 @@ import {
   type PrismaRepositoryRegistry,
   type PrismaTx
 } from "../../../packages/database/src/index.js";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 
 export class ApiError extends Error {
   constructor(
@@ -145,7 +145,19 @@ function createPrismaProductionServices() {
       }
       return async (...args: unknown[]) => {
         await hydrate();
-        const result = (value as (...methodArgs: unknown[]) => unknown).apply(target, args);
+        let result: unknown;
+        try {
+          result = (value as (...methodArgs: unknown[]) => unknown).apply(target, args);
+        } catch (error) {
+          if (property === "paymentProviderCallback" || property === "queryPaymentOrder") {
+            try {
+              await repository.saveForMethod(String(property), service.store);
+            } catch (persistError) {
+              throw toPrismaApiError(persistError);
+            }
+          }
+          throw error;
+        }
         if (isMutatingServiceMethod(String(property))) {
           try {
             await repository.saveForMethod(String(property), service.store);
@@ -180,7 +192,7 @@ function createPersistenceDisabledServices(message: string) {
 }
 
 function isMutatingServiceMethod(name: string) {
-  return /^(add|approve|batchSelect|confirm|create|deduct|export|fulfill|generate|grant|mark|paymentCallback|refundCallback|register|release|reveal|review|select|set|submit|update|upsert)/.test(name);
+  return /^(add|approve|batchSelect|confirm|create|deduct|delete|export|fulfill|generate|grant|handle|mark|paymentCallback|paymentProviderCallback|queryPaymentOrder|refundCallback|register|release|reveal|review|select|set|submit|test|update|upsert)/.test(name);
 }
 
 type BackendServicesOptions = {
@@ -616,6 +628,83 @@ class BackendServices {
       channel: input.channel,
       amountCents: payableAmount(order),
       message: "支付渠道已启用元数据，但真实签名下单需要接入商户证书后开放。"
+    };
+  }
+
+  createPaymentOrder(actor: UserActor, orderNo: string, input: { paymentMethodId?: string }) {
+    const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
+    assertUserOrderScope(actor, order);
+    if (order.paymentStatus === "paid") {
+      return { status: "already_paid" as const, orderNo, order: this.serializePublicOrder(order, { includeDeliveryCodes: false }) };
+    }
+    if (order.refundStatus !== "none" || order.status === "refunded") {
+      throw new ApiError(400, "PAYMENT_ORDER_NOT_ALLOWED", "refunded orders cannot create payment");
+    }
+    const method = this.resolvePaymentMethodForOrder(order, input.paymentMethodId);
+    const amountCents = payableAmount(order);
+    const paymentNo = `payment:${order.orderNo}`;
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+    const maskedIdentity = this.paymentMethodMaskedIdentity(method);
+    order.paymentSnapshot = {
+      paymentNo,
+      paymentMethodId: method.id,
+      provider: method.provider,
+      confirmationMode: method.confirmationMode,
+      merchantNoMasked: maskedIdentity.merchantNoMasked,
+      appIdMasked: maskedIdentity.appIdMasked,
+      serviceProviderMasked: maskedIdentity.serviceProviderMasked,
+      amountCents,
+      currency: "CNY",
+      orderNo: order.orderNo,
+      status: method.provider === "personal_alipay" ? "pending_manual_confirmation" : "created",
+      expiresAt,
+      createdAt: new Date()
+    };
+    if (method.provider === "personal_alipay") {
+      order.status = "pending_payment_confirmation";
+      order.paymentStatus = "unpaid";
+      this.audit("user", "payment.manual.create", "order", order.orderNo, {
+        paymentMethodId: method.id,
+        provider: method.provider,
+        amountCents
+      });
+      return {
+        status: "pending_manual_confirmation" as const,
+        orderNo,
+        provider: method.provider,
+        amountCents,
+        paymentMethod: this.serializePaymentMethod(method),
+        paymentSnapshot: order.paymentSnapshot,
+        message: "请使用个人支付宝收款信息付款，付款后等待商户人工确认收款。"
+      };
+    }
+    order.paymentStatus = "paying";
+    const providerTradeNo = `tp_${order.orderNo}_${Date.now()}`;
+    order.paymentSnapshot.providerPaymentNo = providerTradeNo;
+    order.paymentSnapshot.status = "paying";
+    const signaturePayload = this.paymentSignaturePayload(method.provider, order.orderNo, amountCents, providerTradeNo, method.merchantNo);
+    this.audit("user", "payment.order.create", "order", order.orderNo, {
+      paymentMethodId: method.id,
+      provider: method.provider,
+      amountCents,
+      providerTradeNo
+    });
+    return {
+      status: "created" as const,
+      orderNo,
+      provider: method.provider,
+      amountCents,
+      paymentNo,
+      providerTradeNo,
+      expiresAt,
+      paymentSnapshot: order.paymentSnapshot,
+      paymentParams: {
+        qrCodeUrl: `tosell-pay://${method.provider}/${encodeURIComponent(providerTradeNo)}`,
+        returnUrl: method.returnUrl,
+        notifyUrl: this.providerCallbackUrl(method.provider),
+        signaturePayload
+      },
+      message: "支付状态只以服务端回调或后台查单结果为准，前端返回页不能确认支付成功。"
     };
   }
 
@@ -2054,6 +2143,9 @@ class BackendServices {
     assertAdminPermission(actor, "settlement.confirm");
     const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
     const expectedAmount = payableAmount(order);
+    if (order.paymentSnapshot?.provider && order.paymentSnapshot.provider !== "personal_alipay") {
+      throw new ApiError(400, "MANUAL_CONFIRM_NOT_ALLOWED", "only personal alipay orders can be manually confirmed");
+    }
     if (input.amountCents !== expectedAmount) {
       throw new ApiError(400, "AMOUNT_MISMATCH", "offline payment amount does not match order amount");
     }
@@ -2119,6 +2211,144 @@ class BackendServices {
     } catch (error) {
       throw new ApiError(400, "PAYMENT_CALLBACK_REJECTED", getErrorMessage(error));
     }
+  }
+
+  paymentProviderCallback(provider: PaymentProviderType, input: {
+    orderNo?: string;
+    providerTradeNo: string;
+    amountCents: bigint;
+    merchantNo?: string;
+    appId?: string;
+    serviceProviderId?: string;
+    tradeStatus: string;
+    signature: string;
+    rawPayload?: unknown;
+  }) {
+    const order = input.orderNo ? this.store.orders.get(input.orderNo) : undefined;
+    const method = this.findPaymentMethodForCallback(provider, input, order);
+    const logBase = {
+      id: nextId(this.store, "pay-callback"),
+      provider,
+      orderNo: input.orderNo,
+      providerTradeNo: input.providerTradeNo,
+      amountCents: input.amountCents,
+      merchantNoMasked: maskSecret(input.merchantNo),
+      appIdMasked: maskSecret(input.appId),
+      serviceProviderMasked: maskSecret(input.serviceProviderId),
+      rawPayloadMasked: this.maskPaymentPayload(input.rawPayload ?? input),
+      receivedAt: new Date()
+    };
+    if (!method || !this.verifyPaymentSignature(method, input.orderNo ?? "", input.amountCents, input.providerTradeNo, input.signature)) {
+      const exception = this.recordPaymentException({
+        ...logBase,
+        orderNo: input.orderNo,
+        reasonCode: "SIGNATURE_INVALID",
+        reason: "payment callback signature verification failed",
+        handled: false
+      });
+      this.store.paymentCallbackLogs.push({ ...logBase, verified: false, status: "rejected", exceptionId: exception.id });
+      throw new ApiError(400, "PAYMENT_CALLBACK_SIGNATURE_INVALID", "payment callback signature verification failed");
+    }
+    const orderEntity = order ?? this.store.orders.get(input.orderNo ?? "");
+    if (!orderEntity) {
+      const exception = this.recordPaymentException({
+        ...logBase,
+        reasonCode: "ORDER_NOT_FOUND",
+        reason: "payment callback order not found",
+        handled: false
+      });
+      this.store.paymentCallbackLogs.push({ ...logBase, verified: true, status: "exception", exceptionId: exception.id });
+      throw new ApiError(404, "PAYMENT_CALLBACK_ORDER_NOT_FOUND", "payment callback order not found");
+    }
+    const result = this.applyVerifiedPaymentResult({
+      order: orderEntity,
+      method,
+      providerTradeNo: input.providerTradeNo,
+      amountCents: input.amountCents,
+      merchantNo: input.merchantNo,
+      appId: input.appId,
+      serviceProviderId: input.serviceProviderId,
+      tradeStatus: input.tradeStatus,
+      source: "callback",
+      logBase
+    });
+    this.store.paymentCallbackLogs.push({
+      ...logBase,
+      orderNo: orderEntity.orderNo,
+      verified: true,
+      status: result.status === "processed" || result.status === "duplicate" ? "accepted" : "exception",
+      exceptionId: "exception" in result ? result.exception.id : undefined
+    });
+    return result;
+  }
+
+  queryPaymentOrder(actor: AdminActor, orderNo: string, input: {
+    providerTradeNo: string;
+    amountCents: bigint;
+    merchantNo?: string;
+    appId?: string;
+    serviceProviderId?: string;
+    tradeStatus: string;
+    signature: string;
+  }) {
+    assertAdminPermission(actor, "settlement.confirm");
+    const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
+    const method = this.resolvePaymentMethodFromOrder(order);
+    if (method.provider === "personal_alipay") throw new ApiError(400, "PAYMENT_QUERY_NOT_SUPPORTED", "personal alipay does not support automatic query confirmation");
+    if (!this.verifyPaymentSignature(method, order.orderNo, input.amountCents, input.providerTradeNo, input.signature)) {
+      const exception = this.recordPaymentException({
+        id: nextId(this.store, "pay-exception"),
+        provider: method.provider,
+        orderNo: order.orderNo,
+        providerTradeNo: input.providerTradeNo,
+        amountCents: input.amountCents,
+        reasonCode: "SIGNATURE_INVALID",
+        reason: "payment query signature verification failed",
+        handled: false,
+        receivedAt: new Date()
+      });
+      throw new ApiError(400, "PAYMENT_QUERY_SIGNATURE_INVALID", exception.reason);
+    }
+    return this.applyVerifiedPaymentResult({
+      order,
+      method,
+      providerTradeNo: input.providerTradeNo,
+      amountCents: input.amountCents,
+      merchantNo: input.merchantNo,
+      appId: input.appId,
+      serviceProviderId: input.serviceProviderId,
+      tradeStatus: input.tradeStatus,
+      source: "query",
+      logBase: {
+        id: nextId(this.store, "pay-query"),
+        provider: method.provider,
+        orderNo: order.orderNo,
+        providerTradeNo: input.providerTradeNo,
+        amountCents: input.amountCents,
+        receivedAt: new Date()
+      }
+    });
+  }
+
+  listPaymentCallbackLogs(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return this.store.paymentCallbackLogs;
+  }
+
+  listPaymentExceptions(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return this.store.paymentExceptions;
+  }
+
+  handlePaymentException(actor: AdminActor, exceptionId: string, input: { action: "mark_handled" | "keep_exception"; note?: string }) {
+    assertAdminPermission(actor, "settlement.confirm");
+    const exception = requireEntity(this.store.paymentExceptions.find((item) => item.id === exceptionId), "RESOURCE_NOT_FOUND", "payment exception not found");
+    exception.handled = input.action === "mark_handled";
+    exception.handledBy = actor.adminId;
+    exception.handledAt = new Date();
+    exception.note = input.note;
+    this.audit(actor.role, "payment_exception.handle", "payment_exception", exception.id, input);
+    return exception;
   }
 
   refundCallback(input: { channel: string; channelRefundNo: string; refundNo: string }) {
@@ -2593,6 +2823,93 @@ class BackendServices {
     };
   }
 
+  listAdminPaymentMethods(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return [...this.store.paymentMethods.values()].map((method) => this.serializePaymentMethod(method));
+  }
+
+  upsertAdminPaymentMethod(actor: AdminActor, input: PaymentMethodUpsertInput) {
+    assertAdminPermission(actor, "payment_config.manage");
+    const method = this.upsertPaymentMethod("platform", actor.adminId, input);
+    this.audit(actor.role, "payment_method.upsert", "payment_method", method.id, this.serializePaymentMethod(method));
+    return this.serializePaymentMethod(method);
+  }
+
+  setAdminPaymentMethodDefault(actor: AdminActor, methodId: string) {
+    assertAdminPermission(actor, "payment_config.manage");
+    const method = requireEntity(this.store.paymentMethods.get(methodId), "RESOURCE_NOT_FOUND", "payment method not found");
+    if (method.ownerType !== "platform") throw new ApiError(403, "PAYMENT_METHOD_SCOPE_FORBIDDEN", "admin default route only manages platform payment methods");
+    this.setPaymentMethodDefault(method);
+    this.audit(actor.role, "payment_method.default", "payment_method", method.id, this.serializePaymentMethod(method));
+    return this.serializePaymentMethod(method);
+  }
+
+  deleteAdminPaymentMethod(actor: AdminActor, methodId: string) {
+    assertAdminPermission(actor, "payment_config.manage");
+    const method = requireEntity(this.store.paymentMethods.get(methodId), "RESOURCE_NOT_FOUND", "payment method not found");
+    if (method.ownerType !== "platform") throw new ApiError(403, "PAYMENT_METHOD_SCOPE_FORBIDDEN", "admin delete route only manages platform payment methods");
+    method.status = "disabled";
+    method.enabled = false;
+    method.updatedAt = new Date();
+    this.audit(actor.role, "payment_method.disable", "payment_method", method.id, this.serializePaymentMethod(method));
+    return this.serializePaymentMethod(method);
+  }
+
+  testAdminPaymentMethod(actor: AdminActor, methodId: string) {
+    assertAdminPermission(actor, "payment_config.manage");
+    const method = requireEntity(this.store.paymentMethods.get(methodId), "RESOURCE_NOT_FOUND", "payment method not found");
+    const result = this.testPaymentMethod(method);
+    this.audit(actor.role, "payment_method.test", "payment_method", method.id, result);
+    return result;
+  }
+
+  listAgentPaymentMethods(actor: AgentActor) {
+    this.getAgentShop(actor);
+    return [...this.store.paymentMethods.values()]
+      .filter((method) => method.ownerType === "agent" && method.agentId === actor.agentId && method.shopId === actor.shopId)
+      .map((method) => this.serializePaymentMethod(method));
+  }
+
+  upsertAgentPaymentMethod(actor: AgentActor, input: PaymentMethodUpsertInput) {
+    this.getAgentShop(actor);
+    const method = this.upsertPaymentMethod("agent", actor.agentId, {
+      ...input,
+      agentId: actor.agentId,
+      shopId: actor.shopId
+    });
+    this.audit("agent", "payment_method.upsert", "payment_method", method.id, this.serializePaymentMethod(method));
+    return this.serializePaymentMethod(method);
+  }
+
+  setAgentPaymentMethodDefault(actor: AgentActor, methodId: string) {
+    this.getAgentShop(actor);
+    const method = requireEntity(this.store.paymentMethods.get(methodId), "RESOURCE_NOT_FOUND", "payment method not found");
+    assertAgentScope(actor, { agentId: required(method.agentId, "agentId"), shopId: method.shopId });
+    this.setPaymentMethodDefault(method);
+    this.audit("agent", "payment_method.default", "payment_method", method.id, this.serializePaymentMethod(method));
+    return this.serializePaymentMethod(method);
+  }
+
+  deleteAgentPaymentMethod(actor: AgentActor, methodId: string) {
+    this.getAgentShop(actor);
+    const method = requireEntity(this.store.paymentMethods.get(methodId), "RESOURCE_NOT_FOUND", "payment method not found");
+    assertAgentScope(actor, { agentId: required(method.agentId, "agentId"), shopId: method.shopId });
+    method.status = "disabled";
+    method.enabled = false;
+    method.updatedAt = new Date();
+    this.audit("agent", "payment_method.disable", "payment_method", method.id, this.serializePaymentMethod(method));
+    return this.serializePaymentMethod(method);
+  }
+
+  testAgentPaymentMethod(actor: AgentActor, methodId: string) {
+    this.getAgentShop(actor);
+    const method = requireEntity(this.store.paymentMethods.get(methodId), "RESOURCE_NOT_FOUND", "payment method not found");
+    assertAgentScope(actor, { agentId: required(method.agentId, "agentId"), shopId: method.shopId });
+    const result = this.testPaymentMethod(method);
+    this.audit("agent", "payment_method.test", "payment_method", method.id, result);
+    return result;
+  }
+
   listServiceQrCodes(actor: AdminActor) {
     assertAdminPermission(actor, "audit.read");
     return [...this.store.shops.values()].map((shop) => ({
@@ -2734,10 +3051,10 @@ class BackendServices {
     voucher.reviewedBy = actor.adminId;
     voucher.reason = input.reason;
     if (input.approved) {
-      this.confirmOfflinePayment(actor, voucher.orderNo, {
-        amountCents: voucher.amountCents,
-        voucherUrl: voucher.voucherUrl,
-        note: `付款凭证审核通过：${input.reason ?? ""}`
+      voucher.disputeMaterialOnly = true;
+      this.audit(actor.role, "payment_voucher.dispute_material.accept", "payment_voucher", voucherId, {
+        orderNo: voucher.orderNo,
+        reason: input.reason
       });
     }
     this.audit(actor.role, "payment_voucher.review", "payment_voucher", voucherId, voucher);
@@ -2822,6 +3139,329 @@ class BackendServices {
     shop.customerServiceNote = input.customerServiceNote ?? shop.customerServiceNote;
     this.audit(actor.role, "shop.service_qrcode.update", "shop", shop.id, input);
     return shop;
+  }
+
+  private upsertPaymentMethod(ownerType: "platform" | "agent", operatorId: string, input: PaymentMethodUpsertInput) {
+    this.assertPaymentMethodInput(ownerType, input);
+    const existing = input.id ? this.store.paymentMethods.get(input.id) : undefined;
+    if (existing) {
+      if (ownerType === "agent" && (existing.agentId !== input.agentId || existing.shopId !== input.shopId)) {
+        throw new ApiError(403, "PAYMENT_METHOD_SCOPE_FORBIDDEN", "cannot update another merchant payment method");
+      }
+      existing.provider = input.provider ?? existing.provider;
+      existing.displayName = input.displayName ?? existing.displayName;
+      existing.productType = input.productType ?? existing.productType;
+      existing.merchantNo = input.merchantNo ?? existing.merchantNo;
+      existing.appId = input.appId ?? existing.appId;
+      existing.serviceProviderId = input.serviceProviderId ?? existing.serviceProviderId;
+      existing.gatewayUrl = input.gatewayUrl ?? existing.gatewayUrl;
+      existing.accountName = input.accountName ?? existing.accountName;
+      existing.qrUrl = input.qrUrl ?? existing.qrUrl;
+      existing.paymentUrl = input.paymentUrl ?? existing.paymentUrl;
+      existing.note = input.note ?? existing.note;
+      existing.returnUrl = input.returnUrl ?? existing.returnUrl;
+      existing.enabled = input.enabled ?? existing.enabled;
+      existing.status = input.status ?? (existing.enabled ? "enabled" : existing.status);
+      existing.isDefault = input.isDefault ?? existing.isDefault;
+      existing.updatedAt = new Date();
+      existing.updatedBy = operatorId;
+      this.applyPaymentMethodSecrets(existing, input);
+      if (existing.isDefault) this.setPaymentMethodDefault(existing);
+      return existing;
+    }
+    const method: PaymentMethodConfig = {
+      id: nextId(this.store, "payment-method"),
+      ownerType,
+      agentId: ownerType === "agent" ? required(input.agentId, "agentId") : input.agentId,
+      shopId: ownerType === "agent" ? required(input.shopId, "shopId") : input.shopId,
+      provider: required(input.provider, "provider"),
+      confirmationMode: input.provider === "personal_alipay" ? "manual" : "automatic",
+      displayName: required(input.displayName, "displayName"),
+      productType: input.productType,
+      merchantNo: input.merchantNo,
+      appId: input.appId,
+      serviceProviderId: input.serviceProviderId,
+      gatewayUrl: input.gatewayUrl,
+      accountName: input.accountName,
+      qrUrl: input.qrUrl,
+      paymentUrl: input.paymentUrl,
+      note: input.note,
+      returnUrl: input.returnUrl,
+      enabled: input.enabled ?? false,
+      status: input.status ?? (input.enabled ? "enabled" : "pending_test"),
+      isDefault: input.isDefault ?? false,
+      secretConfigured: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      updatedBy: operatorId
+    };
+    this.applyPaymentMethodSecrets(method, input);
+    this.store.paymentMethods.set(method.id, method);
+    if (method.isDefault) this.setPaymentMethodDefault(method);
+    return method;
+  }
+
+  private assertPaymentMethodInput(ownerType: "platform" | "agent", input: PaymentMethodUpsertInput) {
+    if (ownerType === "agent" && (!input.agentId || !input.shopId)) throw new ApiError(400, "PAYMENT_METHOD_SCOPE_REQUIRED", "merchant payment method requires agent and shop scope");
+    if (!input.provider && !input.id) throw new ApiError(400, "PAYMENT_METHOD_PROVIDER_REQUIRED", "payment provider is required");
+    if (input.provider === "personal_alipay") {
+      if (!input.accountName || !input.qrUrl) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "personal alipay requires account name and QR code");
+      return;
+    }
+    if (input.provider && ["alipay_merchant", "wechat_merchant", "epay"].includes(input.provider)) {
+      if (!input.merchantNo) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "merchant number is required");
+      if (input.provider !== "epay" && !input.appId) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "app id is required");
+      if (input.provider === "epay" && !input.gatewayUrl) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "epay gateway url is required");
+      if (!input.signingSecret && !input.id) throw new ApiError(400, "PAYMENT_METHOD_SECRET_REQUIRED", "signing secret is required");
+    }
+  }
+
+  private applyPaymentMethodSecrets(method: PaymentMethodConfig, input: PaymentMethodUpsertInput) {
+    if (input.signingSecret) {
+      method.signingSecretHash = hashSecret(input.signingSecret);
+      method.signingSecretPreview = previewSecret(input.signingSecret);
+      method.signingSecretEncrypted = `sha256:${hashSecret(input.signingSecret)}`;
+      method.secretConfigured = true;
+    }
+    if (input.privateKey) {
+      method.privateKeyConfigured = true;
+      method.privateKeyPreview = previewSecret(input.privateKey);
+    }
+    if (input.publicKey) {
+      method.publicKeyConfigured = true;
+      method.publicKeyPreview = previewSecret(input.publicKey);
+    }
+    if (input.certificate) {
+      method.certificateConfigured = true;
+      method.certificatePreview = previewSecret(input.certificate);
+    }
+  }
+
+  private setPaymentMethodDefault(method: PaymentMethodConfig) {
+    for (const candidate of this.store.paymentMethods.values()) {
+      if (candidate.id === method.id) continue;
+      if (candidate.ownerType === method.ownerType && candidate.agentId === method.agentId && candidate.shopId === method.shopId) candidate.isDefault = false;
+    }
+    method.isDefault = true;
+    method.enabled = true;
+    method.status = "enabled";
+    method.updatedAt = new Date();
+  }
+
+  private serializePaymentMethod(method: PaymentMethodConfig) {
+    return {
+      id: method.id,
+      ownerType: method.ownerType,
+      agentId: method.agentId,
+      shopId: method.shopId,
+      provider: method.provider,
+      confirmationMode: method.confirmationMode,
+      displayName: method.displayName,
+      productType: method.productType,
+      merchantNoMasked: maskSecret(method.merchantNo),
+      appIdMasked: maskSecret(method.appId),
+      serviceProviderMasked: maskSecret(method.serviceProviderId),
+      gatewayUrl: method.gatewayUrl,
+      accountName: method.provider === "personal_alipay" ? method.accountName : maskSecret(method.accountName),
+      qrUrl: method.provider === "personal_alipay" ? method.qrUrl : undefined,
+      paymentUrl: method.provider === "personal_alipay" ? method.paymentUrl : undefined,
+      note: method.note,
+      returnUrl: method.returnUrl,
+      callbackUrl: this.providerCallbackUrl(method.provider),
+      enabled: method.enabled,
+      status: method.status,
+      isDefault: method.isDefault,
+      keyStatus: {
+        signingSecret: method.secretConfigured ? "configured" : "missing",
+        privateKey: method.privateKeyConfigured ? "configured" : "missing",
+        publicKey: method.publicKeyConfigured ? "configured" : "missing",
+        certificate: method.certificateConfigured ? "configured" : "missing"
+      },
+      updatedAt: method.updatedAt,
+      lastTestAt: method.lastTestAt,
+      lastTestResult: method.lastTestResult,
+      lastCallbackAt: method.lastCallbackAt
+    };
+  }
+
+  private testPaymentMethod(method: PaymentMethodConfig) {
+    const ok = method.provider === "personal_alipay"
+      ? Boolean(method.accountName && method.qrUrl)
+      : Boolean(method.merchantNo && method.secretConfigured && (method.provider === "epay" || method.appId));
+    method.lastTestAt = new Date();
+    method.lastTestResult = ok ? "passed" : "failed";
+    return {
+      status: ok ? "passed" as const : "failed" as const,
+      provider: method.provider,
+      methodId: method.id,
+      callbackUrl: this.providerCallbackUrl(method.provider),
+      message: ok ? "payment method configuration shape is valid" : "payment method configuration is incomplete"
+    };
+  }
+
+  private resolvePaymentMethodForOrder(order: DemoOrder, paymentMethodId?: string) {
+    const methods = [...this.store.paymentMethods.values()]
+      .filter((method) => method.enabled && method.status === "enabled")
+      .filter((method) =>
+        method.ownerType === "platform"
+        || (method.ownerType === "agent" && method.agentId === order.agentId && method.shopId === order.shopId)
+      );
+    const method = paymentMethodId
+      ? methods.find((candidate) => candidate.id === paymentMethodId)
+      : methods.find((candidate) => candidate.ownerType === "agent" && candidate.agentId === order.agentId && candidate.shopId === order.shopId && candidate.isDefault)
+        ?? methods.find((candidate) => candidate.ownerType === "platform" && candidate.isDefault);
+    return requireEntity(method, "PAYMENT_METHOD_UNAVAILABLE", "no enabled payment method is available for this order");
+  }
+
+  private resolvePaymentMethodFromOrder(order: DemoOrder) {
+    const methodId = order.paymentSnapshot?.paymentMethodId;
+    if (!methodId) throw new ApiError(400, "PAYMENT_SNAPSHOT_MISSING", "order has no payment snapshot");
+    return requireEntity(this.store.paymentMethods.get(methodId), "RESOURCE_NOT_FOUND", "payment method not found");
+  }
+
+  private findPaymentMethodForCallback(provider: PaymentProviderType, input: { merchantNo?: string; appId?: string }, order?: DemoOrder) {
+    const snapshotMethod = order?.paymentSnapshot?.paymentMethodId ? this.store.paymentMethods.get(order.paymentSnapshot.paymentMethodId) : undefined;
+    if (snapshotMethod?.provider === provider) return snapshotMethod;
+    return [...this.store.paymentMethods.values()].find((method) =>
+      method.provider === provider
+      && method.enabled
+      && method.status === "enabled"
+      && (!input.merchantNo || method.merchantNo === input.merchantNo)
+      && (!input.appId || method.appId === input.appId)
+    );
+  }
+
+  private paymentSignaturePayload(provider: PaymentProviderType, orderNo: string, amountCents: bigint, providerTradeNo: string, merchantNo?: string) {
+    return `${provider}|${orderNo}|${amountCents.toString()}|${providerTradeNo}|${merchantNo ?? ""}`;
+  }
+
+  private signPaymentPayload(method: PaymentMethodConfig, orderNo: string, amountCents: bigint, providerTradeNo: string) {
+    const secret = method.signingSecretEncrypted ?? method.signingSecretHash ?? "";
+    return createHmac("sha256", secret).update(this.paymentSignaturePayload(method.provider, orderNo, amountCents, providerTradeNo, method.merchantNo)).digest("hex");
+  }
+
+  private verifyPaymentSignature(method: PaymentMethodConfig, orderNo: string, amountCents: bigint, providerTradeNo: string, signature: string) {
+    if (!signature || !method.secretConfigured) return false;
+    return this.signPaymentPayload(method, orderNo, amountCents, providerTradeNo) === signature;
+  }
+
+  private paymentMethodMaskedIdentity(method: PaymentMethodConfig) {
+    return {
+      merchantNoMasked: maskSecret(method.merchantNo),
+      appIdMasked: maskSecret(method.appId),
+      serviceProviderMasked: maskSecret(method.serviceProviderId)
+    };
+  }
+
+  private providerCallbackUrl(provider: PaymentProviderType) {
+    return `/api/callbacks/payments/${provider}`;
+  }
+
+  private applyVerifiedPaymentResult(input: {
+    order: DemoOrder;
+    method: PaymentMethodConfig;
+    providerTradeNo: string;
+    amountCents: bigint;
+    merchantNo?: string;
+    appId?: string;
+    serviceProviderId?: string;
+    tradeStatus: string;
+    source: "callback" | "query";
+    logBase: Record<string, unknown>;
+  }) {
+    const order = input.order;
+    const exceptionBase = {
+      id: nextId(this.store, "pay-exception"),
+      provider: input.method.provider,
+      orderNo: order.orderNo,
+      providerTradeNo: input.providerTradeNo,
+      amountCents: input.amountCents,
+      receivedAt: new Date(),
+      handled: false
+    };
+    if (order.refundStatus !== "none" || order.status === "refunded") {
+      return { status: "exception" as const, exception: this.recordPaymentException({ ...exceptionBase, reasonCode: "ORDER_REFUNDED", reason: "payment arrived after refund" }) };
+    }
+    if (input.amountCents !== payableAmount(order)) {
+      order.paymentStatus = "failed";
+      order.riskStatus = "order_frozen";
+      return { status: "exception" as const, exception: this.recordPaymentException({ ...exceptionBase, reasonCode: "AMOUNT_MISMATCH", reason: "payment amount does not match order amount" }) };
+    }
+    if (input.merchantNo && input.method.merchantNo && input.merchantNo !== input.method.merchantNo) {
+      return { status: "exception" as const, exception: this.recordPaymentException({ ...exceptionBase, reasonCode: "MERCHANT_MISMATCH", reason: "payment merchant number does not match configuration" }) };
+    }
+    if (input.appId && input.method.appId && input.appId !== input.method.appId) {
+      return { status: "exception" as const, exception: this.recordPaymentException({ ...exceptionBase, reasonCode: "APP_ID_MISMATCH", reason: "payment app id does not match configuration" }) };
+    }
+    if (!["SUCCESS", "TRADE_SUCCESS", "PAID"].includes(input.tradeStatus)) {
+      return { status: "exception" as const, exception: this.recordPaymentException({ ...exceptionBase, reasonCode: "TRADE_STATUS_NOT_SUCCESS", reason: "payment trade status is not success" }) };
+    }
+    const key = `payment:${input.method.provider}:${input.providerTradeNo}`;
+    const result = this.registry.runOnce(key, () => {
+      if (order.paymentStatus === "paid") return { status: "duplicate" as const, idempotencyKey: key, order: this.serializePublicOrder(order, { includeDeliveryCodes: false }) };
+      this.applyPaidOrder(order, input.amountCents, input.source, {
+        provider: input.method.provider,
+        paymentMethodId: input.method.id,
+        providerTradeNo: input.providerTradeNo
+      });
+      order.paymentSnapshot = {
+        ...(order.paymentSnapshot ?? {}),
+        paymentMethodId: input.method.id,
+        provider: input.method.provider,
+        confirmationMode: input.method.confirmationMode,
+        providerTradeNo: input.providerTradeNo,
+        amountCents: input.amountCents,
+        currency: "CNY",
+        orderNo: order.orderNo,
+        status: "paid",
+        confirmationSource: input.source,
+        paidAt: order.paidAt ?? new Date(),
+        callbackProcessedAt: input.source === "callback" ? new Date() : order.paymentSnapshot?.callbackProcessedAt
+      };
+      input.method.lastCallbackAt = input.source === "callback" ? new Date() : input.method.lastCallbackAt;
+      this.audit("system", `payment.${input.source}.success`, "order", order.orderNo, { provider: input.method.provider, providerTradeNo: input.providerTradeNo });
+      return { status: "processed" as const, idempotencyKey: key, order: this.serializePublicOrder(order, { includeDeliveryCodes: false }) };
+    });
+    return result ?? { status: "duplicate" as const, idempotencyKey: key, order: this.serializePublicOrder(order, { includeDeliveryCodes: false }) };
+  }
+
+  private applyPaidOrder(order: DemoOrder, amountCents: bigint, source: string, metadata: Record<string, unknown>) {
+    order.paymentStatus = "paid";
+    order.status = "fulfilling";
+    order.fulfillmentStatus = "processing";
+    order.paidAt = order.paidAt ?? new Date();
+    if (order.salesChannelType !== "platform_self_operated") {
+      this.store.pendingIncomeByAgent.set(order.agentId, (this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n) + order.snapshot.amountSnapshot.agentExpectedIncomeCents);
+      this.addChannelPendingIncome(order);
+    }
+    this.ledger(source === "manual" ? "MANUAL_PAYMENT_CONFIRMED" : "PAYMENT_SUCCEEDED", { orderNo: order.orderNo, agentId: order.agentId }, amountCents, metadata);
+    this.tryAutoFulfillWithRightsCode(order);
+  }
+
+  private recordPaymentException(input: PaymentException) {
+    const existing = this.store.paymentExceptions.find((item) =>
+      item.provider === input.provider
+      && item.orderNo === input.orderNo
+      && item.providerTradeNo === input.providerTradeNo
+      && item.reasonCode === input.reasonCode
+    );
+    if (existing) return existing;
+    this.store.paymentExceptions.push(input);
+    this.audit("system", "payment.exception", "payment_exception", input.id, {
+      provider: input.provider,
+      orderNo: input.orderNo,
+      reasonCode: input.reasonCode
+    });
+    return input;
+  }
+
+  private maskPaymentPayload(payload: unknown) {
+    if (!isRecord(payload)) return payload;
+    const output: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(payload)) {
+      output[key] = /secret|key|sign|cert|token|payload/i.test(key) ? maskSecret(String(value)) : value;
+    }
+    return output;
   }
 
   private buildSnapshot(input: { orderNo: string; userId: string; shopId: string; agentProductId: string; quantity?: number; entrySource?: string }): DemoOrderSnapshot {
@@ -3403,6 +4043,7 @@ class BackendServices {
       fulfillmentMode: fulfillmentMode(order.snapshot),
       delivery: this.serializeDelivery(order, options),
       collectionChannel: order.collectionChannelSnapshot,
+      paymentSnapshot: order.paymentSnapshot,
       snapshot: {
         productType: order.snapshot.productType
       }
@@ -3710,6 +4351,9 @@ class BackendServices {
     note?: string;
   }) {
     const expectedAmount = payableAmount(input.order);
+    if (input.order.paymentSnapshot?.provider && input.order.paymentSnapshot.provider !== "personal_alipay") {
+      throw new ApiError(400, "MANUAL_CONFIRM_NOT_ALLOWED", "only personal alipay orders can be manually confirmed");
+    }
     if (input.amountCents !== expectedAmount) {
       throw new ApiError(400, "AMOUNT_MISMATCH", "offline payment amount does not match order amount");
     }
@@ -3718,21 +4362,23 @@ class BackendServices {
       if (input.order.paymentStatus === "paid") {
         return { status: "already_paid" as const, idempotencyKey, order: this.serializePublicOrder(input.order, { includeDeliveryCodes: false }) };
       }
-      input.order.paymentStatus = "paid";
-      input.order.status = "fulfilling";
-      input.order.fulfillmentStatus = "processing";
-      input.order.paidAt = new Date();
-      if (input.order.salesChannelType !== "platform_self_operated") {
-        this.store.pendingIncomeByAgent.set(input.order.agentId, (this.store.pendingIncomeByAgent.get(input.order.agentId) ?? 0n) + input.order.snapshot.amountSnapshot.agentExpectedIncomeCents);
-        this.addChannelPendingIncome(input.order);
-      }
-      this.ledger("OFFLINE_PAYMENT_CONFIRMED", { orderNo: input.order.orderNo, agentId: input.order.agentId }, expectedAmount, {
+      this.applyPaidOrder(input.order, expectedAmount, "manual", {
         voucherUrl: input.voucherUrl,
         note: input.note,
         operatorId: input.operatorId,
         confirmActor: input.actor
       });
-      this.tryAutoFulfillWithRightsCode(input.order);
+      input.order.paymentSnapshot = {
+        ...(input.order.paymentSnapshot ?? {}),
+        provider: input.order.paymentSnapshot?.provider ?? "personal_alipay",
+        confirmationMode: "manual",
+        amountCents: expectedAmount,
+        currency: "CNY",
+        orderNo: input.order.orderNo,
+        status: "paid",
+        confirmationSource: "manual",
+        paidAt: input.order.paidAt ?? new Date()
+      };
       this.audit(input.auditRole, "order.offline_payment.confirm", "order", input.order.orderNo, {
         amountCents: input.amountCents,
         voucherUrl: input.voucherUrl,
@@ -4217,9 +4863,11 @@ class PrismaStateRepository {
       this.loadCoupons(store),
       this.loadInviteAndChannelState(store),
       this.loadFinancialState(store),
-      this.loadEmailDeliveries(store),
-      this.loadPaymentConfig(store)
+      this.loadEmailDeliveries(store)
     ]);
+    await this.loadPaymentConfig(store);
+    await this.loadPaymentMethodConfigs(store);
+    await this.loadPaymentRuntimeState(store);
     return store;
   }
 
@@ -4386,10 +5034,10 @@ class PrismaStateRepository {
     }
     if (method === "confirmPaymentVoucher") {
       await this.persistInShortTransaction((tx) => this.persistLatestPaymentVoucher(tx, store));
-      const voucher = this.latestPaymentVoucher(store);
-      if (voucher?.status === "approved") {
-        await this.persistInShortTransaction((tx) => this.persistLatestOfflinePaymentConfirmation(tx, store));
-      }
+      return;
+    }
+    if (method === "createPaymentOrder") {
+      await this.persistInShortTransaction((tx) => this.persistLatestPaymentOrderCreation(tx, store));
       return;
     }
     if (method === "fulfillAgentOrder") {
@@ -4436,18 +5084,11 @@ class PrismaStateRepository {
     if ([
       "fulfillOrder",
       "refundCallback",
-      "paymentCallback"
+      "paymentCallback",
+      "paymentProviderCallback",
+      "queryPaymentOrder"
     ].includes(method)) {
-      await this.persistInShortTransaction((tx) => this.persistUsers(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistAgents(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistShops(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistProducts(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistCollectionChannels(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistCoupons(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistOrders(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistFulfillmentAndExtraction(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistAfterSalesAndRefunds(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistRiskAuditLedger(tx, store));
+      await this.persistInShortTransaction((tx) => this.persistLatestPaymentResult(tx, store, method));
       return;
     }
     if (method === "generateSettlement") {
@@ -4460,6 +5101,23 @@ class PrismaStateRepository {
     }
     if (method === "createRiskFreeze" || method === "releaseRiskFreeze") {
       await this.persistInShortTransaction((tx) => this.persistRiskAuditLedger(tx, store));
+      return;
+    }
+    if (method === "handlePaymentException") {
+      await this.persistInShortTransaction((tx) => this.persistLatestPaymentExceptionHandling(tx, store));
+      return;
+    }
+    if ([
+      "upsertAdminPaymentMethod",
+      "setAdminPaymentMethodDefault",
+      "deleteAdminPaymentMethod",
+      "testAdminPaymentMethod",
+      "upsertAgentPaymentMethod",
+      "setAgentPaymentMethodDefault",
+      "deleteAgentPaymentMethod",
+      "testAgentPaymentMethod"
+    ].includes(method)) {
+      await this.persistInShortTransaction((tx) => this.persistLatestPaymentMethodMutation(tx, store));
       return;
     }
     if (method === "markNotificationRead" || method === "updatePaymentConfigMetadata") {
@@ -5118,6 +5776,9 @@ class PrismaStateRepository {
     const order = orderNo ? store.orders.get(orderNo) : undefined;
     if (!order) throw new Error("offline payment confirmation missing current order");
     await this.persistOrder(tx, order);
+    const method = this.paymentMethodForOrder(store, order);
+    if (method) await this.persistPaymentMethodConfig(tx, method);
+    await this.persistPaymentSnapshotForOrder(tx, store, order);
     await this.persistPaymentConfirmation(tx, order, audit);
     if (order.extractionCodeHash) await this.persistOrderExtractSecret(tx, order);
     await this.persistIssuedRightsCodesForOrder(tx, store, order);
@@ -5136,10 +5797,10 @@ class PrismaStateRepository {
   private async persistLatestPaymentVoucher(tx: PrismaTx, store: MemoryStore) {
     const voucher = this.latestPaymentVoucher(store);
     if (!voucher) throw new Error("payment voucher persistence missing current voucher");
-    await this.persistPaymentVoucher(tx, voucher);
+    await this.persistPaymentDisputeMaterial(tx, voucher);
     const audits = store.auditLogs.filter((item) => {
       const action = stringValue(item.action);
-      if (action !== "payment_voucher.submit" && action !== "payment_voucher.review") return false;
+      if (action !== "payment_voucher.submit" && action !== "payment_voucher.review" && action !== "payment_voucher.dispute_material.accept") return false;
       const targetId = stringValue(item.targetId);
       if (targetId === voucher.id || targetId === voucher.orderNo) return true;
       const after = isRecord(item.afterJson) ? item.afterJson : undefined;
@@ -5148,9 +5809,85 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audits);
   }
 
+  private async persistLatestPaymentMethodMutation(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, [
+      "payment_method.upsert",
+      "payment_method.default",
+      "payment_method.disable",
+      "payment_method.test"
+    ]);
+    const methodId = audit ? stringValue(audit.targetId) : undefined;
+    const method = methodId ? store.paymentMethods.get(methodId) : undefined;
+    if (!method) throw new Error("payment method persistence missing current method");
+    await this.persistPaymentMethodConfig(tx, method);
+    await this.persistPaymentMethodOwnerDefaults(tx, store, method);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestPaymentOrderCreation(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["payment.manual.create", "payment.order.create"]);
+    const orderNo = audit ? stringValue(audit.targetId) : undefined;
+    const order = orderNo ? store.orders.get(orderNo) : undefined;
+    if (!order) throw new Error("payment order persistence missing current order");
+    await this.persistOrder(tx, order);
+    const method = this.paymentMethodForOrder(store, order);
+    if (method) await this.persistPaymentMethodConfig(tx, method);
+    await this.persistPaymentSnapshotForOrder(tx, store, order);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestPaymentResult(tx: PrismaTx, store: MemoryStore, methodName: string) {
+    const latestLog = [...store.paymentCallbackLogs].reverse()[0];
+    const latestException = [...store.paymentExceptions].reverse()[0];
+    const audit = this.latestAuditLog(store, ["payment.callback.success", "payment.query.success", "payment.exception"]);
+    const orderNo = stringValue(audit?.targetId) ?? latestLog?.orderNo ?? latestException?.orderNo;
+    const order = orderNo ? store.orders.get(orderNo) : undefined;
+    if (order) {
+      await this.persistOrder(tx, order);
+      const method = this.paymentMethodForOrder(store, order);
+      if (method) await this.persistPaymentMethodConfig(tx, method);
+      await this.persistPaymentSnapshotForOrder(tx, store, order);
+      if (order.extractionCodeHash) await this.persistOrderExtractSecret(tx, order);
+      await this.persistIssuedRightsCodesForOrder(tx, store, order);
+      await this.persistFulfillmentRecordForOrder(tx, store, order);
+      await this.persistEmailDeliveriesForOrder(tx, store, order);
+    }
+    const logs = store.paymentCallbackLogs.filter((item) =>
+      item === latestLog || (orderNo && item.orderNo === orderNo)
+    );
+    const exceptions = store.paymentExceptions.filter((item) =>
+      item === latestException || (orderNo && item.orderNo === orderNo)
+    );
+    for (const log of logs) await this.persistPaymentCallbackLog(tx, store, log);
+    for (const exception of exceptions) await this.persistPaymentException(tx, store, exception);
+    const recentLedgers = store.ledgerEntries.filter((item) =>
+      orderNo && item.orderNo === orderNo && (item.entryType === "PAYMENT_SUCCEEDED" || item.entryType === "MANUAL_PAYMENT_CONFIRMED")
+    );
+    await this.persistLedgerEntries(tx, recentLedgers);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+    if (!order && !logs.length && !exceptions.length && methodName !== "paymentCallback") {
+      throw new Error("payment result persistence missing current payment mutation");
+    }
+  }
+
+  private async persistLatestPaymentExceptionHandling(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["payment.exception.handle"]);
+    const exceptionId = audit ? stringValue(audit.targetId) : undefined;
+    const exception = exceptionId
+      ? store.paymentExceptions.find((item) => item.id === exceptionId)
+      : [...store.paymentExceptions].reverse()[0];
+    if (!exception) throw new Error("payment exception handling missing current exception");
+    await this.persistPaymentException(tx, store, exception);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
   private latestPaymentVoucher(store: MemoryStore) {
     return [...store.paymentVouchers.values()]
       .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())[0];
+  }
+
+  private paymentMethodForOrder(store: MemoryStore, order: DemoOrder) {
+    return order.paymentSnapshot?.paymentMethodId ? store.paymentMethods.get(order.paymentSnapshot.paymentMethodId) : undefined;
   }
 
   private async persistLatestFulfillmentUpdate(tx: PrismaTx, store: MemoryStore) {
@@ -6096,6 +6833,302 @@ class PrismaStateRepository {
         payer_name = EXCLUDED.payer_name,
         voucher_url = EXCLUDED.voucher_url,
         note = EXCLUDED.note,
+        updated_at = now()
+      `;
+  }
+
+  private async persistPaymentMethodOwnerDefaults(tx: PrismaTx, store: MemoryStore, changed: PaymentMethodConfig) {
+    const scoped = [...store.paymentMethods.values()].filter((method) =>
+      method.ownerType === changed.ownerType
+      && (method.agentId ?? null) === (changed.agentId ?? null)
+      && (method.shopId ?? null) === (changed.shopId ?? null)
+    );
+    for (const method of scoped) await this.persistPaymentMethodConfig(tx, method);
+  }
+
+  private async persistPaymentMethodConfig(tx: PrismaTx, method: PaymentMethodConfig) {
+    const ownerType = method.ownerType === "agent" ? "agent" : "platform";
+    const status = mapCollectionPaymentConfigStatus(method.status, method.enabled);
+    const actorType = method.ownerType === "agent" ? "agent" : "admin";
+    const credentialStatus = method.secretConfigured || method.provider === "personal_alipay" ? "configured" : "not_configured";
+    const maskedIdentity = {
+      merchantNoMasked: maskSecret(method.merchantNo),
+      appIdMasked: maskSecret(method.appId),
+      serviceProviderMasked: maskSecret(method.serviceProviderId)
+    };
+    await tx.$executeRaw`
+      INSERT INTO collection_payment_configs (
+        id, config_no, owner_type, owner_agent_id, owner_merchant_id, shop_id,
+        provider, confirm_mode, environment, status, is_default, display_name,
+        merchant_no_masked, app_id_masked, service_provider_masked,
+        credential_ref, credential_ciphertext, secret_version, credential_status,
+        notify_url, return_url, test_status, last_test_at, last_test_result_json,
+        last_callback_at, qr_url, account_masked, instruction,
+        created_by_type, created_by_id, updated_by_type, updated_by_id,
+        enabled_at, disabled_at, idempotency_key, created_at, updated_at
+      )
+      VALUES (
+        ${method.id}, ${method.id}, CAST(${ownerType} AS "CollectionConfigOwnerType"),
+        ${method.agentId ?? null}, NULL, ${method.shopId ?? null},
+        CAST(${mapPaymentProviderToDb(method.provider)} AS "PaymentProvider"),
+        CAST(${mapPaymentConfirmModeToDb(method.confirmationMode)} AS "PaymentConfirmMode"),
+        CAST('production' AS "PaymentEnvironment"),
+        CAST(${status} AS "CollectionConfigStatus"),
+        ${method.isDefault}, ${method.displayName},
+        ${maskedIdentity.merchantNoMasked ?? null}, ${maskedIdentity.appIdMasked ?? null}, ${maskedIdentity.serviceProviderMasked ?? null},
+        ${method.signingSecretPreview ?? method.privateKeyPreview ?? method.publicKeyPreview ?? method.certificatePreview ?? null},
+        ${method.signingSecretEncrypted ?? null}, 1, CAST(${credentialStatus} AS "CredentialStatus"),
+        ${providerCallbackUrlForPersistence(method.provider)}, ${method.returnUrl ?? null},
+        ${method.lastTestResult ?? null}, ${method.lastTestAt ?? null},
+        ${method.lastTestResult ? jsonForDb({ status: method.lastTestResult }) : null}::jsonb,
+        ${method.lastCallbackAt ?? null}, ${method.qrUrl ?? method.paymentUrl ?? null},
+        ${method.accountName ? maskSecret(method.accountName) : null}, ${method.note ?? null},
+        CAST(${actorType} AS "ActorType"), ${method.updatedBy ?? null},
+        CAST(${actorType} AS "ActorType"), ${method.updatedBy ?? null},
+        ${method.enabled ? method.updatedAt : null}, ${method.enabled ? null : method.updatedAt},
+        ${`collection-payment-config:${method.id}`}, ${method.createdAt}, ${method.updatedAt}
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        owner_type = EXCLUDED.owner_type,
+        owner_agent_id = EXCLUDED.owner_agent_id,
+        owner_merchant_id = EXCLUDED.owner_merchant_id,
+        shop_id = EXCLUDED.shop_id,
+        provider = EXCLUDED.provider,
+        confirm_mode = EXCLUDED.confirm_mode,
+        status = EXCLUDED.status,
+        is_default = EXCLUDED.is_default,
+        display_name = EXCLUDED.display_name,
+        merchant_no_masked = EXCLUDED.merchant_no_masked,
+        app_id_masked = EXCLUDED.app_id_masked,
+        service_provider_masked = EXCLUDED.service_provider_masked,
+        credential_ref = EXCLUDED.credential_ref,
+        credential_ciphertext = EXCLUDED.credential_ciphertext,
+        credential_status = EXCLUDED.credential_status,
+        notify_url = EXCLUDED.notify_url,
+        return_url = EXCLUDED.return_url,
+        test_status = EXCLUDED.test_status,
+        last_test_at = EXCLUDED.last_test_at,
+        last_test_result_json = EXCLUDED.last_test_result_json,
+        last_callback_at = EXCLUDED.last_callback_at,
+        qr_url = EXCLUDED.qr_url,
+        account_masked = EXCLUDED.account_masked,
+        instruction = EXCLUDED.instruction,
+        updated_by_type = EXCLUDED.updated_by_type,
+        updated_by_id = EXCLUDED.updated_by_id,
+        enabled_at = EXCLUDED.enabled_at,
+        disabled_at = EXCLUDED.disabled_at,
+        updated_at = EXCLUDED.updated_at
+    `;
+  }
+
+  private async persistPaymentSnapshotForOrder(tx: PrismaTx, store: MemoryStore, order: DemoOrder) {
+    const snapshot = order.paymentSnapshot;
+    if (!snapshot?.paymentMethodId || !snapshot.provider) return;
+    const method = store.paymentMethods.get(snapshot.paymentMethodId);
+    const paymentNo = snapshot.paymentNo ?? `payment:${order.orderNo}`;
+    const paymentId = stableDbId("payment", paymentNo);
+    const providerPaymentNo = snapshot.providerPaymentNo ?? null;
+    const providerTradeNo = snapshot.providerTradeNo ?? null;
+    const channelTradeNo = providerTradeNo ?? providerPaymentNo;
+    const status = mapPaymentSnapshotStatus(snapshot.status ?? order.paymentStatus);
+    const confirmSource = mapPaymentConfirmSource(snapshot.confirmationSource);
+    const amountCents = snapshot.amountCents ?? payableAmount(order);
+    const configSnapshot = method ? serializePaymentMethodForPersistence(method) : {
+      id: snapshot.paymentMethodId,
+      provider: snapshot.provider,
+      confirmationMode: snapshot.confirmationMode
+    };
+    await tx.$executeRaw`
+      INSERT INTO payments (
+        id, payment_no, order_id, user_id, collection_channel_id, collection_payment_config_id,
+        collection_snapshot_json, channel, provider, confirm_mode, environment,
+        channel_trade_no, provider_payment_no, provider_trade_no, amount_cents,
+        channel_fee_cents, status, confirm_source, idempotency_key, expires_at,
+        paid_at, callback_handled_at, exception_reason, created_at, updated_at
+      )
+      VALUES (
+        ${paymentId}, ${paymentNo},
+        (SELECT id FROM orders WHERE order_no = ${order.orderNo}), ${order.userId},
+        ${order.collectionChannelId ?? null}, ${snapshot.paymentMethodId},
+        ${jsonForDb(order.collectionChannelSnapshot ?? {})}::jsonb,
+        CAST(${mapProviderToLegacyPaymentChannel(snapshot.provider)} AS "PaymentChannel"),
+        CAST(${mapPaymentProviderToDb(snapshot.provider)} AS "PaymentProvider"),
+        CAST(${mapPaymentConfirmModeToDb(snapshot.confirmationMode ?? "automatic")} AS "PaymentConfirmMode"),
+        CAST('production' AS "PaymentEnvironment"),
+        ${channelTradeNo}, ${providerPaymentNo}, ${providerTradeNo}, ${amountCents},
+        0, CAST(${status} AS "PaymentStatus"),
+        CAST(${confirmSource} AS "PaymentConfirmSource"),
+        ${`payment:${paymentNo}`}, ${snapshot.expiresAt ?? null}, ${snapshot.paidAt ?? order.paidAt ?? null},
+        ${snapshot.callbackProcessedAt ?? null}, ${status === "failed" ? "payment_exception" : null},
+        ${snapshot.createdAt ?? new Date()}, now()
+      )
+      ON CONFLICT (payment_no) DO UPDATE SET
+        collection_payment_config_id = EXCLUDED.collection_payment_config_id,
+        collection_snapshot_json = EXCLUDED.collection_snapshot_json,
+        provider = EXCLUDED.provider,
+        confirm_mode = EXCLUDED.confirm_mode,
+        channel_trade_no = COALESCE(EXCLUDED.channel_trade_no, payments.channel_trade_no),
+        provider_payment_no = COALESCE(EXCLUDED.provider_payment_no, payments.provider_payment_no),
+        provider_trade_no = COALESCE(EXCLUDED.provider_trade_no, payments.provider_trade_no),
+        amount_cents = EXCLUDED.amount_cents,
+        status = EXCLUDED.status,
+        confirm_source = EXCLUDED.confirm_source,
+        expires_at = EXCLUDED.expires_at,
+        paid_at = EXCLUDED.paid_at,
+        callback_handled_at = EXCLUDED.callback_handled_at,
+        exception_reason = EXCLUDED.exception_reason,
+        updated_at = now()
+    `;
+    await tx.$executeRaw`
+      INSERT INTO payment_snapshots (
+        id, snapshot_no, order_id, payment_id, collection_config_id, provider,
+        confirm_mode, environment, config_snapshot_json, merchant_no_masked,
+        app_id_masked, service_provider_masked, payable_amount_cents, currency,
+        payment_no, provider_payment_no, provider_trade_no, status, confirm_source,
+        expires_at, paid_at, callback_handled_at, exception_reason, idempotency_key,
+        created_at, updated_at
+      )
+      VALUES (
+        ${stableDbId("payment_snapshot", order.orderNo)}, ${`snapshot:${order.orderNo}`},
+        (SELECT id FROM orders WHERE order_no = ${order.orderNo}), ${paymentId}, ${snapshot.paymentMethodId},
+        CAST(${mapPaymentProviderToDb(snapshot.provider)} AS "PaymentProvider"),
+        CAST(${mapPaymentConfirmModeToDb(snapshot.confirmationMode ?? "automatic")} AS "PaymentConfirmMode"),
+        CAST('production' AS "PaymentEnvironment"),
+        ${jsonForDb(configSnapshot)}::jsonb,
+        ${snapshot.merchantNoMasked ?? null}, ${snapshot.appIdMasked ?? null}, ${snapshot.serviceProviderMasked ?? null},
+        ${amountCents}, ${snapshot.currency ?? "CNY"}, ${paymentNo}, ${providerPaymentNo}, ${providerTradeNo},
+        CAST(${status} AS "PaymentStatus"),
+        CAST(${confirmSource} AS "PaymentConfirmSource"),
+        ${snapshot.expiresAt ?? null}, ${snapshot.paidAt ?? order.paidAt ?? null},
+        ${snapshot.callbackProcessedAt ?? null}, ${status === "failed" ? "payment_exception" : null},
+        ${`payment-snapshot:${order.orderNo}`}, ${snapshot.createdAt ?? new Date()}, now()
+      )
+      ON CONFLICT (snapshot_no) DO UPDATE SET
+        payment_id = EXCLUDED.payment_id,
+        collection_config_id = EXCLUDED.collection_config_id,
+        provider = EXCLUDED.provider,
+        confirm_mode = EXCLUDED.confirm_mode,
+        config_snapshot_json = EXCLUDED.config_snapshot_json,
+        provider_payment_no = COALESCE(EXCLUDED.provider_payment_no, payment_snapshots.provider_payment_no),
+        provider_trade_no = COALESCE(EXCLUDED.provider_trade_no, payment_snapshots.provider_trade_no),
+        status = EXCLUDED.status,
+        confirm_source = EXCLUDED.confirm_source,
+        paid_at = EXCLUDED.paid_at,
+        callback_handled_at = EXCLUDED.callback_handled_at,
+        exception_reason = EXCLUDED.exception_reason,
+        updated_at = now()
+    `;
+  }
+
+  private async persistPaymentCallbackLog(tx: PrismaTx, store: MemoryStore, log: PaymentCallbackLog) {
+    const order = log.orderNo ? store.orders.get(log.orderNo) : undefined;
+    const method = order ? this.paymentMethodForOrder(store, order) : undefined;
+    const paymentNo = order?.paymentSnapshot?.paymentNo ?? (log.orderNo ? `payment:${log.orderNo}` : null);
+    await tx.$executeRaw`
+      INSERT INTO payment_callback_logs (
+        id, callback_no, payment_id, order_id, payment_snapshot_id, collection_config_id,
+        provider, source, order_no, provider_payment_no, provider_trade_no, notified_at,
+        signature_valid, amount_matched, merchant_matched, processed_status,
+        provider_event_id, idempotency_key, error_code, error_message,
+        raw_payload_ciphertext, raw_payload_masked_json, created_at, processed_at
+      )
+      VALUES (
+        ${log.id}, ${log.id},
+        ${paymentNo ? stableDbId("payment", paymentNo) : null},
+        ${log.orderNo ? stableDbId("order", log.orderNo) : null},
+        ${log.orderNo ? stableDbId("payment_snapshot", log.orderNo) : null},
+        ${method?.id ?? null}, CAST(${mapPaymentProviderToDb(log.provider)} AS "PaymentProvider"),
+        'callback', ${log.orderNo ?? null}, ${log.providerTradeNo}, ${log.providerTradeNo},
+        ${log.receivedAt}, ${log.verified}, ${log.status !== "exception"}, ${log.status !== "exception"},
+        CAST(${mapCallbackProcessStatus(log.status)} AS "CallbackProcessStatus"),
+        ${`callback:${log.provider}:${log.providerTradeNo}:${log.id}`},
+        ${`payment-callback:${log.id}`}, ${log.status === "accepted" ? null : log.status},
+        ${log.exceptionId ?? null}, NULL, ${jsonForDb(log.rawPayloadMasked ?? {})}::jsonb,
+        ${log.receivedAt}, ${log.status === "accepted" ? log.receivedAt : null}
+      )
+      ON CONFLICT (callback_no) DO UPDATE SET
+        processed_status = EXCLUDED.processed_status,
+        error_code = EXCLUDED.error_code,
+        error_message = EXCLUDED.error_message,
+        raw_payload_masked_json = EXCLUDED.raw_payload_masked_json,
+        processed_at = EXCLUDED.processed_at
+    `;
+  }
+
+  private async persistPaymentException(tx: PrismaTx, store: MemoryStore, exception: PaymentException) {
+    const order = exception.orderNo ? store.orders.get(exception.orderNo) : undefined;
+    const method = order ? this.paymentMethodForOrder(store, order) : undefined;
+    const paymentNo = order?.paymentSnapshot?.paymentNo ?? (exception.orderNo ? `payment:${exception.orderNo}` : null);
+    const relatedLog = store.paymentCallbackLogs.find((log) => log.exceptionId === exception.id);
+    await tx.$executeRaw`
+      INSERT INTO payment_exceptions (
+        id, exception_no, order_id, payment_id, payment_snapshot_id, callback_log_id,
+        collection_config_id, exception_type, status, reason, action_taken,
+        resolution_json, handled_by_type, handled_by_id, handled_at, idempotency_key,
+        created_at, updated_at
+      )
+      VALUES (
+        ${exception.id}, ${exception.id},
+        ${exception.orderNo ? stableDbId("order", exception.orderNo) : null},
+        ${paymentNo ? stableDbId("payment", paymentNo) : null},
+        ${exception.orderNo ? stableDbId("payment_snapshot", exception.orderNo) : null},
+        ${relatedLog?.id ?? null}, ${method?.id ?? null},
+        CAST(${mapPaymentExceptionType(exception.reasonCode)} AS "PaymentExceptionType"),
+        CAST(${exception.handled ? "resolved" : "open"} AS "PaymentExceptionStatus"),
+        ${exception.reason}, ${exception.handled ? exception.note ?? "handled" : null},
+        ${jsonForDb({
+          reasonCode: exception.reasonCode,
+          amountCents: exception.amountCents,
+          providerTradeNo: exception.providerTradeNo,
+          merchantNoMasked: exception.merchantNoMasked,
+          appIdMasked: exception.appIdMasked,
+          serviceProviderMasked: exception.serviceProviderMasked
+        })}::jsonb,
+        ${exception.handledBy ? "admin" : null}::"ActorType",
+        ${exception.handledBy ?? null}, ${exception.handledAt ?? null},
+        ${`payment-exception:${exception.id}`}, ${exception.receivedAt}, now()
+      )
+      ON CONFLICT (exception_no) DO UPDATE SET
+        status = EXCLUDED.status,
+        reason = EXCLUDED.reason,
+        action_taken = EXCLUDED.action_taken,
+        resolution_json = EXCLUDED.resolution_json,
+        handled_by_type = EXCLUDED.handled_by_type,
+        handled_by_id = EXCLUDED.handled_by_id,
+        handled_at = EXCLUDED.handled_at,
+        updated_at = now()
+    `;
+  }
+
+  private async persistPaymentDisputeMaterial(tx: PrismaTx, voucher: PaymentVoucher) {
+    await tx.$executeRaw`
+      INSERT INTO payment_dispute_materials (
+        id, material_no, order_id, payment_id, payment_exception_id, material_type,
+        status, file_url, file_hash, note, uploaded_by_type, uploaded_by_id,
+        reviewed_by_type, reviewed_by_id, reviewed_at, review_note, idempotency_key,
+        created_at, updated_at
+      )
+      VALUES (
+        ${stableDbId("payment_dispute_material", voucher.id)}, ${voucher.id},
+        (SELECT id FROM orders WHERE order_no = ${voucher.orderNo}),
+        (SELECT id FROM payments WHERE payment_no = ${`payment:${voucher.orderNo}`}),
+        NULL, CAST('payment_screenshot' AS "PaymentDisputeMaterialType"),
+        CAST(${voucher.status === "pending_review" ? "submitted" : "reviewed"} AS "PaymentDisputeMaterialStatus"),
+        ${voucher.voucherUrl ?? null}, ${voucher.voucherUrl ? hashSecret(voucher.voucherUrl) : null},
+        ${voucher.note ?? voucher.reason ?? null}, CAST('user' AS "ActorType"), ${voucher.userId},
+        ${voucher.reviewedBy ? "admin" : null}::"ActorType", ${voucher.reviewedBy ?? null},
+        ${voucher.reviewedAt}, ${voucher.reason ?? null}, ${`payment-dispute-material:${voucher.id}`},
+        ${voucher.createdAt}, now()
+      )
+      ON CONFLICT (material_no) DO UPDATE SET
+        status = EXCLUDED.status,
+        file_url = EXCLUDED.file_url,
+        file_hash = EXCLUDED.file_hash,
+        note = EXCLUDED.note,
+        reviewed_by_type = EXCLUDED.reviewed_by_type,
+        reviewed_by_id = EXCLUDED.reviewed_by_id,
+        reviewed_at = EXCLUDED.reviewed_at,
+        review_note = EXCLUDED.review_note,
         updated_at = now()
     `;
   }
@@ -7048,6 +8081,233 @@ class PrismaStateRepository {
     if (rows.length) store.paymentChannelConfigs = rows;
   }
 
+  private async loadPaymentMethodConfigs(store: MemoryStore) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      owner_type: string;
+      owner_agent_id: string | null;
+      shop_id: string | null;
+      provider: string;
+      confirm_mode: string;
+      status: string;
+      is_default: boolean;
+      display_name: string;
+      merchant_no_masked: string | null;
+      app_id_masked: string | null;
+      service_provider_masked: string | null;
+      credential_ref: string | null;
+      credential_ciphertext: string | null;
+      credential_status: string;
+      return_url: string | null;
+      test_status: string | null;
+      last_test_at: Date | null;
+      last_test_result_json: unknown;
+      last_callback_at: Date | null;
+      qr_url: string | null;
+      account_masked: string | null;
+      instruction: string | null;
+      updated_by_id: string | null;
+      created_at: Date;
+      updated_at: Date;
+    }>>`
+      SELECT id, owner_type, owner_agent_id, shop_id, provider, confirm_mode, status,
+             is_default, display_name, merchant_no_masked, app_id_masked, service_provider_masked,
+             credential_ref, credential_ciphertext, credential_status, return_url, test_status,
+             last_test_at, last_test_result_json, last_callback_at, qr_url, account_masked,
+             instruction, updated_by_id, created_at, updated_at
+        FROM collection_payment_configs
+    `;
+    for (const row of rows) {
+      const provider = mapPaymentProviderFromDb(row.provider);
+      const status = mapCollectionPaymentConfigStatusFromDb(row.status);
+      store.paymentMethods.set(row.id, {
+        id: row.id,
+        ownerType: row.owner_type === "agent" ? "agent" : "platform",
+        agentId: row.owner_agent_id ?? undefined,
+        shopId: row.shop_id ?? undefined,
+        provider,
+        confirmationMode: mapPaymentConfirmModeFromDb(row.confirm_mode),
+        displayName: row.display_name,
+        merchantNo: row.merchant_no_masked ?? undefined,
+        appId: row.app_id_masked ?? undefined,
+        serviceProviderId: row.service_provider_masked ?? undefined,
+        accountName: row.account_masked ?? undefined,
+        qrUrl: row.qr_url ?? undefined,
+        paymentUrl: row.qr_url ?? undefined,
+        note: row.instruction ?? undefined,
+        returnUrl: row.return_url ?? undefined,
+        enabled: row.status === "active",
+        status,
+        isDefault: row.is_default,
+        signingSecretEncrypted: row.credential_ciphertext ?? undefined,
+        signingSecretPreview: row.credential_ref ?? undefined,
+        secretConfigured: row.credential_status === "configured",
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        updatedBy: row.updated_by_id ?? undefined,
+        lastTestAt: row.last_test_at ?? undefined,
+        lastTestResult: row.test_status === "passed" || row.test_status === "failed" ? row.test_status : undefined,
+        lastCallbackAt: row.last_callback_at ?? undefined
+      });
+    }
+  }
+
+  private async loadPaymentRuntimeState(store: MemoryStore) {
+    const snapshots = await this.prisma.$queryRaw<Array<{
+      order_no: string;
+      payment_no: string;
+      collection_config_id: string | null;
+      provider: string;
+      confirm_mode: string;
+      merchant_no_masked: string | null;
+      app_id_masked: string | null;
+      service_provider_masked: string | null;
+      payable_amount_cents: bigint;
+      currency: string;
+      provider_payment_no: string | null;
+      provider_trade_no: string | null;
+      status: string;
+      confirm_source: string;
+      expires_at: Date | null;
+      paid_at: Date | null;
+      callback_handled_at: Date | null;
+      created_at: Date;
+    }>>`
+      SELECT o.order_no, ps.payment_no, ps.collection_config_id, ps.provider, ps.confirm_mode,
+             ps.merchant_no_masked, ps.app_id_masked, ps.service_provider_masked,
+             ps.payable_amount_cents, ps.currency, ps.provider_payment_no, ps.provider_trade_no,
+             ps.status, ps.confirm_source, ps.expires_at, ps.paid_at, ps.callback_handled_at,
+             ps.created_at
+        FROM payment_snapshots ps
+        JOIN orders o ON o.id = ps.order_id
+    `;
+    for (const row of snapshots) {
+      const order = store.orders.get(row.order_no);
+      if (!order) continue;
+      order.paymentSnapshot = {
+        paymentNo: row.payment_no,
+        paymentMethodId: row.collection_config_id ?? undefined,
+        provider: mapPaymentProviderFromDb(row.provider),
+        confirmationMode: mapPaymentConfirmModeFromDb(row.confirm_mode),
+        merchantNoMasked: row.merchant_no_masked ?? undefined,
+        appIdMasked: row.app_id_masked ?? undefined,
+        serviceProviderMasked: row.service_provider_masked ?? undefined,
+        amountCents: row.payable_amount_cents,
+        currency: row.currency,
+        orderNo: row.order_no,
+        providerPaymentNo: row.provider_payment_no ?? undefined,
+        providerTradeNo: row.provider_trade_no ?? undefined,
+        status: row.status,
+        confirmationSource: mapPaymentConfirmSourceFromDb(row.confirm_source),
+        expiresAt: row.expires_at ?? undefined,
+        createdAt: row.created_at,
+        paidAt: row.paid_at ?? undefined,
+        callbackProcessedAt: row.callback_handled_at ?? undefined
+      };
+    }
+
+    const callbackLogs = await this.prisma.$queryRaw<Array<{
+      callback_no: string;
+      provider: string;
+      order_no: string | null;
+      provider_trade_no: string | null;
+      raw_payload_masked_json: unknown;
+      notified_at: Date | null;
+      created_at: Date;
+      signature_valid: boolean | null;
+      processed_status: string;
+      error_message: string | null;
+    }>>`
+      SELECT callback_no, provider, order_no, provider_trade_no, raw_payload_masked_json,
+             notified_at, created_at, signature_valid, processed_status, error_message
+        FROM payment_callback_logs
+    `;
+    store.paymentCallbackLogs = callbackLogs.map((row) => ({
+      id: row.callback_no,
+      provider: mapPaymentProviderFromDb(row.provider),
+      orderNo: row.order_no ?? undefined,
+      providerTradeNo: row.provider_trade_no ?? "",
+      amountCents: 0n,
+      rawPayloadMasked: row.raw_payload_masked_json,
+      receivedAt: row.notified_at ?? row.created_at,
+      verified: row.signature_valid ?? false,
+      status: mapCallbackProcessStatusFromDb(row.processed_status),
+      exceptionId: row.error_message ?? undefined
+    }));
+
+    const exceptions = await this.prisma.$queryRaw<Array<{
+      exception_no: string;
+      order_no: string | null;
+      provider: string | null;
+      provider_trade_no: string | null;
+      exception_type: string;
+      status: string;
+      reason: string | null;
+      handled_by_id: string | null;
+      handled_at: Date | null;
+      created_at: Date;
+    }>>`
+      SELECT pe.exception_no, o.order_no, ps.provider, ps.provider_trade_no, pe.exception_type,
+             pe.status, pe.reason, pe.handled_by_id, pe.handled_at, pe.created_at
+        FROM payment_exceptions pe
+        LEFT JOIN orders o ON o.id = pe.order_id
+        LEFT JOIN payment_snapshots ps ON ps.id = pe.payment_snapshot_id
+    `;
+    store.paymentExceptions = exceptions.map((row) => ({
+      id: row.exception_no,
+      provider: mapPaymentProviderFromDb(row.provider ?? "alipay_merchant"),
+      orderNo: row.order_no ?? undefined,
+      providerTradeNo: row.provider_trade_no ?? undefined,
+      reasonCode: mapPaymentExceptionReasonCodeFromDb(row.exception_type),
+      reason: row.reason ?? row.exception_type,
+      handled: row.status === "resolved" || row.status === "ignored",
+      receivedAt: row.created_at,
+      handledBy: row.handled_by_id ?? undefined,
+      handledAt: row.handled_at ?? undefined
+    }));
+
+    const materials = await this.prisma.$queryRaw<Array<{
+      material_no: string;
+      order_no: string;
+      user_id: string;
+      shop_id: string;
+      amount_cents: bigint;
+      file_url: string | null;
+      note: string | null;
+      status: string;
+      uploaded_by_id: string | null;
+      created_at: Date;
+      reviewed_at: Date | null;
+      reviewed_by_id: string | null;
+      review_note: string | null;
+    }>>`
+      SELECT pdm.material_no, o.order_no, o.user_id, o.shop_id, p.amount_cents,
+             pdm.file_url, pdm.note, pdm.status, pdm.uploaded_by_id, pdm.created_at,
+             pdm.reviewed_at, pdm.reviewed_by_id, pdm.review_note
+        FROM payment_dispute_materials pdm
+        JOIN orders o ON o.id = pdm.order_id
+        LEFT JOIN payments p ON p.id = pdm.payment_id
+    `;
+    for (const row of materials) {
+      store.paymentVouchers.set(row.material_no, {
+        id: row.material_no,
+        orderNo: row.order_no,
+        userId: row.uploaded_by_id ?? row.user_id,
+        shopId: row.shop_id,
+        amountCents: row.amount_cents ?? 0n,
+        channel: "alipay_wap",
+        voucherUrl: row.file_url ?? undefined,
+        note: row.note ?? undefined,
+        status: row.status === "submitted" ? "pending_review" : "approved",
+        reason: row.review_note ?? undefined,
+        disputeMaterialOnly: true,
+        createdAt: row.created_at,
+        reviewedAt: row.reviewed_at,
+        reviewedBy: row.reviewed_by_id
+      });
+    }
+  }
+
   private async loadRightsCodes(store: MemoryStore) {
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
@@ -7539,6 +8799,13 @@ function previewSecret(value: string) {
   return `${trimmed.slice(0, 2)}***${trimmed.slice(-2)}`;
 }
 
+function maskSecret(value?: string) {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length <= 4) return "***";
+  return `${trimmed.slice(0, 2)}***${trimmed.slice(-2)}`;
+}
+
 function verifyPassword(password: string, storedHash: string) {
   if (storedHash.startsWith("sha256:")) return hashSecret(password) === storedHash.slice("sha256:".length);
   const envHash = process.env.ADMIN_PASSWORD_HASH;
@@ -7725,6 +8992,129 @@ function mapOrderStatus(status: string): "pending_payment" | "paid" | "fulfillin
 
 function mapPaymentStatus(status: string): "unpaid" | "paying" | "paid" | "failed" | "cancelled" | "expired" {
   return ["unpaid", "paying", "paid", "failed", "cancelled", "expired"].includes(status) ? status as ReturnType<typeof mapPaymentStatus> : "unpaid";
+}
+
+function mapPaymentProviderToDb(provider: PaymentProviderType): "alipay_merchant" | "wechat_merchant" | "epay" | "alipay_personal" {
+  return provider === "personal_alipay" ? "alipay_personal" : provider;
+}
+
+function mapPaymentProviderFromDb(provider: string): PaymentProviderType {
+  return provider === "alipay_personal" ? "personal_alipay" : provider as PaymentProviderType;
+}
+
+function mapPaymentConfirmModeToDb(mode: "automatic" | "manual"): "callback_query" | "manual_confirm" {
+  return mode === "manual" ? "manual_confirm" : "callback_query";
+}
+
+function mapPaymentConfirmModeFromDb(mode: string): "automatic" | "manual" {
+  return mode === "manual_confirm" ? "manual" : "automatic";
+}
+
+function mapCollectionPaymentConfigStatus(status: string, enabled: boolean): "disabled" | "pending_test" | "active" | "paused" {
+  if (!enabled || status === "disabled") return "disabled";
+  if (status === "enabled") return "active";
+  if (status === "paused") return "paused";
+  return "pending_test";
+}
+
+function mapCollectionPaymentConfigStatusFromDb(status: string): PaymentMethodConfig["status"] {
+  if (status === "active") return "enabled";
+  if (status === "paused") return "paused";
+  if (status === "disabled") return "disabled";
+  return "pending_test";
+}
+
+function mapPaymentSnapshotStatus(status: string): "unpaid" | "paying" | "paid" | "failed" | "cancelled" | "expired" {
+  if (status === "created") return "paying";
+  if (status === "pending_manual_confirmation") return "unpaid";
+  return mapPaymentStatus(status);
+}
+
+function mapPaymentConfirmSource(source?: "callback" | "query" | "manual"): "unconfirmed" | "callback" | "query" | "manual_confirm" {
+  if (source === "callback" || source === "query") return source;
+  if (source === "manual") return "manual_confirm";
+  return "unconfirmed";
+}
+
+function mapPaymentConfirmSourceFromDb(source: string): PaymentSnapshot["confirmationSource"] | undefined {
+  if (source === "callback" || source === "query") return source;
+  if (source === "manual_confirm") return "manual";
+  return undefined;
+}
+
+function mapCallbackProcessStatus(status: PaymentCallbackLog["status"]): "received" | "processed" | "ignored_duplicate" | "failed" {
+  if (status === "accepted") return "processed";
+  return "failed";
+}
+
+function mapCallbackProcessStatusFromDb(status: string): PaymentCallbackLog["status"] {
+  if (status === "processed" || status === "ignored_duplicate") return "accepted";
+  if (status === "failed") return "rejected";
+  return "exception";
+}
+
+function mapPaymentExceptionType(reasonCode: string): "signature_failed" | "amount_mismatch" | "merchant_mismatch" | "duplicate_callback" | "order_not_found" | "refunded_order_callback" | "fulfilled_dispute" | "provider_error" | "manual_review" {
+  if (reasonCode === "SIGNATURE_INVALID") return "signature_failed";
+  if (reasonCode === "AMOUNT_MISMATCH") return "amount_mismatch";
+  if (reasonCode === "MERCHANT_MISMATCH" || reasonCode === "APP_ID_MISMATCH") return "merchant_mismatch";
+  if (reasonCode === "ORDER_NOT_FOUND") return "order_not_found";
+  if (reasonCode === "ORDER_REFUNDED") return "refunded_order_callback";
+  if (reasonCode === "DUPLICATE_CALLBACK") return "duplicate_callback";
+  return "manual_review";
+}
+
+function mapPaymentExceptionReasonCodeFromDb(type: string): string {
+  if (type === "signature_failed") return "SIGNATURE_INVALID";
+  if (type === "amount_mismatch") return "AMOUNT_MISMATCH";
+  if (type === "merchant_mismatch") return "MERCHANT_MISMATCH";
+  if (type === "order_not_found") return "ORDER_NOT_FOUND";
+  if (type === "refunded_order_callback") return "ORDER_REFUNDED";
+  if (type === "duplicate_callback") return "DUPLICATE_CALLBACK";
+  return "MANUAL_REVIEW";
+}
+
+function mapProviderToLegacyPaymentChannel(provider: PaymentProviderType): "wechat_h5" | "alipay_wap" {
+  return provider === "wechat_merchant" ? "wechat_h5" : "alipay_wap";
+}
+
+function providerCallbackUrlForPersistence(provider: PaymentProviderType) {
+  return `/api/callbacks/payments/${provider}`;
+}
+
+function serializePaymentMethodForPersistence(method: PaymentMethodConfig) {
+  return {
+    id: method.id,
+    ownerType: method.ownerType,
+    agentId: method.agentId,
+    shopId: method.shopId,
+    provider: method.provider,
+    confirmationMode: method.confirmationMode,
+    displayName: method.displayName,
+    productType: method.productType,
+    merchantNoMasked: maskSecret(method.merchantNo),
+    appIdMasked: maskSecret(method.appId),
+    serviceProviderMasked: maskSecret(method.serviceProviderId),
+    gatewayUrl: method.gatewayUrl,
+    accountName: method.provider === "personal_alipay" ? method.accountName : maskSecret(method.accountName),
+    qrUrl: method.provider === "personal_alipay" ? method.qrUrl : undefined,
+    paymentUrl: method.provider === "personal_alipay" ? method.paymentUrl : undefined,
+    note: method.note,
+    returnUrl: method.returnUrl,
+    callbackUrl: providerCallbackUrlForPersistence(method.provider),
+    enabled: method.enabled,
+    status: method.status,
+    isDefault: method.isDefault,
+    keyStatus: {
+      signingSecret: method.secretConfigured ? "configured" : "missing",
+      privateKey: method.privateKeyConfigured ? "configured" : "missing",
+      publicKey: method.publicKeyConfigured ? "configured" : "missing",
+      certificate: method.certificateConfigured ? "configured" : "missing"
+    },
+    updatedAt: method.updatedAt,
+    lastTestAt: method.lastTestAt,
+    lastTestResult: method.lastTestResult,
+    lastCallbackAt: method.lastCallbackAt
+  };
 }
 
 function mapFulfillmentStatus(status: string): "not_started" | "processing" | "success" | "failed" | "resent" | "revoked" {
@@ -7952,6 +9342,9 @@ function createEmptyMemoryStore(): MemoryStore {
     userCoupons: new Map(),
     inviteCodes: new Map(),
     collectionChannels: new Map(),
+    paymentMethods: new Map(),
+    paymentCallbackLogs: [],
+    paymentExceptions: [],
     extractLogs: [],
     emailDeliveries: [],
     paymentChannelConfigs: [
@@ -7984,7 +9377,8 @@ const storeMapKeys = [
   "couponTemplates",
   "userCoupons",
   "inviteCodes",
-  "collectionChannels"
+  "collectionChannels",
+  "paymentMethods"
 ] as const;
 
 const storeSetKeys = ["settlementItemKeys", "activeRiskFreezeKeys"] as const;
@@ -8002,6 +9396,8 @@ const storeArrayKeys = [
   "channelAuthorizations",
   "channelRelations",
   "channelProductOffers",
+  "paymentCallbackLogs",
+  "paymentExceptions",
   "extractLogs",
   "emailDeliveries",
   "paymentChannelConfigs"
@@ -8303,13 +9699,16 @@ type DemoAgentProduct = {
 
 type SalesChannelType = "platform_self_operated" | "single_agent" | "two_tier" | "three_tier";
 type PaymentChannel = "wechat_miniprogram" | "wechat_h5_jsapi" | "wechat_h5" | "alipay_wap" | "mock";
+type PaymentProviderType = "alipay_merchant" | "wechat_merchant" | "epay" | "personal_alipay";
 type CollectionChannelType =
   | "alipay_personal_qr"
   | "alipay_merchant_qr"
   | "alipay_merchant_link"
   | "wechat_personal_qr"
   | "wechat_merchant_qr"
-  | "wechat_merchant_link";
+  | "wechat_merchant_link"
+  | "epay_qr"
+  | "epay_link";
 
 type DemoPlatformShopProduct = {
   id: string;
@@ -8375,6 +9774,7 @@ type DemoOrder = {
   buyerPaidAmountCents?: bigint;
   collectionChannelId?: string;
   collectionChannelSnapshot?: CollectionChannelPublicSnapshot;
+  paymentSnapshot?: PaymentSnapshot;
   refundedAmountCents: bigint;
   snapshot: DemoOrderSnapshot;
 };
@@ -8558,6 +9958,108 @@ type PaymentChannelConfig = {
   updatedAt: Date;
 };
 
+type PaymentMethodConfig = {
+  id: string;
+  ownerType: "platform" | "agent";
+  agentId?: string;
+  shopId?: string;
+  provider: PaymentProviderType;
+  confirmationMode: "automatic" | "manual";
+  displayName: string;
+  productType?: string;
+  merchantNo?: string;
+  appId?: string;
+  serviceProviderId?: string;
+  gatewayUrl?: string;
+  accountName?: string;
+  qrUrl?: string;
+  paymentUrl?: string;
+  note?: string;
+  returnUrl?: string;
+  enabled: boolean;
+  status: "pending_test" | "enabled" | "disabled" | "paused";
+  isDefault: boolean;
+  signingSecretEncrypted?: string;
+  signingSecretHash?: string;
+  signingSecretPreview?: string;
+  secretConfigured: boolean;
+  privateKeyConfigured?: boolean;
+  privateKeyPreview?: string;
+  publicKeyConfigured?: boolean;
+  publicKeyPreview?: string;
+  certificateConfigured?: boolean;
+  certificatePreview?: string;
+  createdAt: Date;
+  updatedAt: Date;
+  updatedBy?: string;
+  lastTestAt?: Date;
+  lastTestResult?: "passed" | "failed";
+  lastCallbackAt?: Date;
+};
+
+type PaymentMethodUpsertInput = Partial<PaymentMethodConfig> & {
+  signingSecret?: string;
+  privateKey?: string;
+  publicKey?: string;
+  certificate?: string;
+};
+
+type PaymentSnapshot = {
+  paymentNo?: string;
+  paymentMethodId?: string;
+  provider?: PaymentProviderType;
+  confirmationMode?: "automatic" | "manual";
+  merchantNoMasked?: string;
+  appIdMasked?: string;
+  serviceProviderMasked?: string;
+  amountCents?: bigint;
+  currency?: string;
+  orderNo?: string;
+  providerPaymentNo?: string;
+  providerTradeNo?: string;
+  status?: string;
+  confirmationSource?: "callback" | "query" | "manual";
+  expiresAt?: Date;
+  createdAt?: Date;
+  paidAt?: Date;
+  callbackProcessedAt?: Date;
+};
+
+type PaymentException = {
+  id: string;
+  provider: PaymentProviderType;
+  orderNo?: string;
+  providerTradeNo?: string;
+  amountCents?: bigint;
+  merchantNoMasked?: string;
+  appIdMasked?: string;
+  serviceProviderMasked?: string;
+  rawPayloadMasked?: unknown;
+  reasonCode: string;
+  reason: string;
+  handled: boolean;
+  receivedAt: Date;
+  handledBy?: string;
+  handledAt?: Date;
+  note?: string;
+};
+
+type PaymentCallbackLog = {
+  id: string;
+  provider: PaymentProviderType;
+  orderNo?: string;
+  providerTradeNo: string;
+  amountCents: bigint;
+  merchantNoMasked?: string;
+  appIdMasked?: string;
+  serviceProviderMasked?: string;
+  rawPayloadMasked?: unknown;
+  receivedAt: Date;
+  verified: boolean;
+  status: "accepted" | "rejected" | "exception";
+  exceptionId?: string;
+};
+
 type CollectionChannel = {
   id: string;
   shopId: string;
@@ -8607,6 +10109,7 @@ type PaymentVoucher = {
   note?: string;
   status: "pending_review" | "approved" | "rejected";
   reason?: string;
+  disputeMaterialOnly?: boolean;
   createdAt: Date;
   reviewedAt: Date | null;
   reviewedBy: string | null;
@@ -8698,6 +10201,9 @@ type MemoryStore = {
   userCoupons: Map<string, UserCoupon>;
   inviteCodes: Map<string, InviteCode>;
   collectionChannels: Map<string, CollectionChannel>;
+  paymentMethods: Map<string, PaymentMethodConfig>;
+  paymentCallbackLogs: PaymentCallbackLog[];
+  paymentExceptions: PaymentException[];
   extractLogs: Array<Record<string, unknown>>;
   emailDeliveries: EmailDelivery[];
   paymentChannelConfigs: PaymentChannelConfig[];

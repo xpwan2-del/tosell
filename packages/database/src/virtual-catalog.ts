@@ -66,14 +66,14 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
     category: "AI 会员",
     tags: ["自动发码", "Claude", "秒级发放"],
     subtitle: "标准卡密库存，支付成功后自动发放。",
-    description: "Claude 类虚拟权益自动发卡商品；购买时设置纯数字提取码，支付成功后按订单提取查看卡密。",
-    usageGuide: "请妥善保存购买时设置的提取码；错误三次锁定 30 分钟，退款后不可继续查看卡密。",
+    description: "Claude 类虚拟权益自动发卡商品；购买时设置纯数字购买密码，支付成功后按订单查看卡密。",
+    usageGuide: "请妥善保存购买时设置的购买密码；错误三次锁定 30 分钟，退款后不可继续查看卡密。",
     imageUrl: "https://images.unsplash.com/photo-1556742502-ec7c0e9f34b1?auto=format&fit=crop&w=900&q=80",
     specs: ["一个月", "自动卡密"],
     detailSections: [
-      { title: "产品使用说明", items: ["适合 Claude 会员权益兑换或共享使用场景。", "下单时设置提取码，支付成功后从订单详情提取卡密。"] },
+      { title: "产品使用说明", items: ["适合 Claude 会员权益兑换或共享使用场景。", "下单时设置购买密码，支付成功后从订单详情查看卡密。"] },
       { title: "产品特点", items: ["自动发码，库存由后台卡密池管理。", "提取记录、发放记录、订单记录均由服务端保存。"] },
-      { title: "使用须知", items: ["请妥善保存购买时设置的提取码。", "提取码错误三次锁定 30 分钟；退款后不可继续查看卡密。"] },
+      { title: "使用须知", items: ["请妥善保存购买时设置的购买密码。", "购买密码错误三次锁定 30 分钟；退款后不可继续查看卡密。"] },
       { title: "交付方式", items: ["支付成功后系统自动占用库存并生成发放凭证。"] }
     ],
     stockCount: 26,
@@ -127,7 +127,7 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
     category: "AI 会员",
     tags: ["自动发码", "Gemini", "兑换码"],
     subtitle: "Gemini 类兑换权益，适合自动码池交付。",
-    description: "支付成功后系统自动发放兑换码；用户进入订单提取页输入购买时设置的提取码查看。",
+    description: "支付成功后系统自动发放兑换码；用户进入订单页面输入购买时设置的购买密码查看。",
     usageGuide: "兑换前请核对账号地区和有效期；已退款订单不可继续查看或使用卡密。",
     imageUrl: "https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&w=900&q=80",
     specs: ["一年会员", "自助激活"],
@@ -135,7 +135,7 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
       { title: "产品使用说明", items: ["适合 Gemini Advanced 兑换权益场景。", "购买后通过订单详情提取兑换码，并按说明完成激活。"] },
       { title: "产品特点", items: ["自动发码，减少人工等待。", "后台可查看库存、批次、发放状态和订单绑定。"] },
       { title: "使用须知", items: ["兑换前请确认账号地区、有效期和适用范围。", "退款后系统不再展示卡密。"] },
-      { title: "交付方式", items: ["支付成功后自动发放，输入提取码即可查看。"] }
+      { title: "交付方式", items: ["支付成功后自动发放，输入购买密码即可查看。"] }
     ],
     stockCount: 9,
     soldCount: 301,
@@ -236,15 +236,15 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
     category: "API 额度",
     tags: ["自动发码", "API", "兑换卡"],
     subtitle: "API 额度兑换卡密，适合自动发码。",
-    description: "API 额度、兑换卡类虚拟商品；购买时设置提取码，系统支付成功后自动发放卡密。",
-    usageGuide: "提取码错误三次锁定 30 分钟；兑换前请确认卡密有效期和适用范围。",
+    description: "API 额度、兑换卡类虚拟商品；购买时设置购买密码，系统支付成功后自动发放卡密。",
+    usageGuide: "购买密码错误三次锁定 30 分钟；兑换前请确认卡密有效期和适用范围。",
     imageUrl: "https://images.unsplash.com/photo-1551288049-bebda4e38f71?auto=format&fit=crop&w=900&q=80",
     specs: ["100刀额度", "300刀额度"],
     detailSections: [
       { title: "产品使用说明", items: ["适合 API 额度兑换、开发测试和工具接入场景。", "购买前请确认额度类型、有效期和适用范围。"] },
       { title: "产品特点", items: ["自动发码，支付成功后可立即提取。", "卡密批次、库存和发放状态可在后台管理。"] },
       { title: "使用须知", items: ["请勿公开泄露卡密或用于违规用途。", "退款后不可继续查看或使用已发放卡密。"] },
-      { title: "交付方式", items: ["系统支付成功后自动发放，输入提取码查看卡密。"] }
+      { title: "交付方式", items: ["系统支付成功后自动发放，输入购买密码查看卡密。"] }
     ],
     stockCount: 14,
     soldCount: 388,
@@ -261,7 +261,7 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
 
 export const virtualShopSeed = {
   name: "云享数码权益店",
-  announcement: "主营虚拟账号、会员权益、兑换码与人工交付服务；下单前请确认商品说明，自动发码商品购买时设置提取码。",
+  announcement: "主营虚拟账号、会员权益、兑换码与人工交付服务；下单前请确认商品说明，自动发码商品购买时设置购买密码。",
   customerServiceWechat: "yunxiang_service",
   collectionAccountName: "云享数码权益店",
   collectionNote: "支付账号开通前用于模拟收款；正式上线后以系统支付结果为准",

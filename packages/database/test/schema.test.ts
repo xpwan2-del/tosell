@@ -42,6 +42,14 @@ const productionAuthRefundCodeAuditMigrationSql = readFileSync(
   resolve(testDir, "../prisma/migrations/000016_production_auth_refund_code_audit/migration.sql"),
   "utf8"
 );
+const paymentBindingMigrationSql = readFileSync(
+  resolve(testDir, "../prisma/migrations/000021_payment_binding_and_voucher_removal/migration.sql"),
+  "utf8"
+);
+const backendServicesSource = readFileSync(
+  resolve(testDir, "../../../apps/api/src/services.ts"),
+  "utf8"
+);
 
 function modelBlock(modelName: string) {
   const match = schema.match(new RegExp(`model\\s+${modelName}\\s+\\{([\\s\\S]*?)\\n\\}`));
@@ -349,5 +357,73 @@ describe("Prisma database contract", () => {
     expect(productionAuthRefundCodeAuditMigrationSql).toContain('CREATE TABLE IF NOT EXISTS "code_plaintext_access_logs"');
     expect(productionAuthRefundCodeAuditMigrationSql).toContain("code_plaintext_access_logs_no_update");
     expect(productionAuthRefundCodeAuditMigrationSql).toContain("code_plaintext_access_logs_no_delete");
+  });
+
+  it("models payment binding, callback verification, and dispute-only materials", () => {
+    expect(schema).toContain("enum PaymentProvider");
+    expect(schema).toContain("alipay_merchant");
+    expect(schema).toContain("wechat_merchant");
+    expect(schema).toContain("epay");
+    expect(schema).toContain("alipay_personal");
+
+    const config = modelBlock("CollectionPaymentConfig");
+    expect(config).toMatch(/ownerType\s+CollectionConfigOwnerType\s+@map\("owner_type"\)/);
+    expect(config).toMatch(/provider\s+PaymentProvider/);
+    expect(config).toMatch(/confirmMode\s+PaymentConfirmMode\s+@map\("confirm_mode"\)/);
+    expect(config).toMatch(/credentialRef\s+String\?\s+@map\("credential_ref"\)/);
+    expect(config).toMatch(/credentialCiphertext\s+String\?\s+@map\("credential_ciphertext"\)/);
+    expect(config).toMatch(/secretVersion\s+Int\s+@default\(1\)\s+@map\("secret_version"\)/);
+    expect(config).toMatch(/idempotencyKey\s+String\s+@unique\s+@map\("idempotency_key"\)/);
+
+    const snapshot = modelBlock("PaymentSnapshot");
+    expect(snapshot).toMatch(/payableAmountCents\s+BigInt\s+@map\("payable_amount_cents"\)/);
+    expect(snapshot).toMatch(/providerTradeNo\s+String\?\s+@map\("provider_trade_no"\)/);
+    expect(snapshot).toMatch(/confirmSource\s+PaymentConfirmSource\s+@default\(unconfirmed\)\s+@map\("confirm_source"\)/);
+    expect(snapshot).toMatch(/configSnapshotJson\s+Json\s+@map\("config_snapshot_json"\)/);
+
+    const callback = modelBlock("PaymentCallbackLog");
+    expect(callback).toMatch(/signatureValid\s+Boolean\?\s+@map\("signature_valid"\)/);
+    expect(callback).toMatch(/amountMatched\s+Boolean\?\s+@map\("amount_matched"\)/);
+    expect(callback).toMatch(/merchantMatched\s+Boolean\?\s+@map\("merchant_matched"\)/);
+    expect(callback).toMatch(/rawPayloadCiphertext\s+String\?\s+@map\("raw_payload_ciphertext"\)/);
+    expect(callback).toMatch(/idempotencyKey\s+String\s+@unique\s+@map\("idempotency_key"\)/);
+
+    const exception = modelBlock("PaymentException");
+    expect(exception).toMatch(/exceptionType\s+PaymentExceptionType\s+@map\("exception_type"\)/);
+    expect(exception).toMatch(/actionTaken\s+String\?\s+@map\("action_taken"\)/);
+
+    const material = modelBlock("PaymentDisputeMaterial");
+    expect(material).toMatch(/materialType\s+PaymentDisputeMaterialType\s+@map\("material_type"\)/);
+    expect(material).toMatch(/status\s+PaymentDisputeMaterialStatus\s+@default\(submitted\)/);
+    expect(material).toMatch(/reviewedById\s+String\?\s+@map\("reviewed_by_id"\)/);
+    expect(material).toMatch(/reviewedAt\s+DateTime\?\s+@map\("reviewed_at"\)/);
+    expect(schema).toContain("payment_screenshot");
+
+    expect(paymentBindingMigrationSql).toContain('CREATE TABLE IF NOT EXISTS "collection_payment_configs"');
+    expect(paymentBindingMigrationSql).toContain('CREATE TABLE IF NOT EXISTS "payment_snapshots"');
+    expect(paymentBindingMigrationSql).toContain('CREATE TABLE IF NOT EXISTS "payment_callback_logs"');
+    expect(paymentBindingMigrationSql).toContain('CREATE TABLE IF NOT EXISTS "payment_exceptions"');
+    expect(paymentBindingMigrationSql).toContain('CREATE TABLE IF NOT EXISTS "payment_dispute_materials"');
+    expect(paymentBindingMigrationSql).toContain("collection_payment_configs_confirm_mode_check");
+    expect(paymentBindingMigrationSql).toContain("payment_snapshots_confirm_mode_check");
+    expect(paymentBindingMigrationSql).toContain("collection_payment_configs_shop_default_active_unique");
+    expect(paymentBindingMigrationSql).toContain('CREATE TYPE "PaymentDisputeMaterialStatus"');
+    expect(paymentBindingMigrationSql).toContain("payment_dispute_materials_status_created_at_idx");
+  });
+
+  it("routes payment binding runtime persistence through the production Prisma tables", () => {
+    expect(backendServicesSource).toContain("INSERT INTO collection_payment_configs");
+    expect(backendServicesSource).toContain("FROM collection_payment_configs");
+    expect(backendServicesSource).toContain("INSERT INTO payments");
+    expect(backendServicesSource).toContain("INSERT INTO payment_snapshots");
+    expect(backendServicesSource).toContain("FROM payment_snapshots");
+    expect(backendServicesSource).toContain("INSERT INTO payment_callback_logs");
+    expect(backendServicesSource).toContain("FROM payment_callback_logs");
+    expect(backendServicesSource).toContain("INSERT INTO payment_exceptions");
+    expect(backendServicesSource).toContain("FROM payment_exceptions");
+    expect(backendServicesSource).toContain("INSERT INTO payment_dispute_materials");
+    expect(backendServicesSource).toContain("FROM payment_dispute_materials");
+    expect(backendServicesSource).toContain("mapPaymentProviderToDb");
+    expect(backendServicesSource).toContain("mapPaymentProviderFromDb");
   });
 });

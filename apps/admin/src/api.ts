@@ -1,7 +1,7 @@
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV ? "http://localhost:3000" : "");
 
 type RequestOptions = {
-  method?: "GET" | "POST" | "PATCH";
+  method?: "GET" | "POST" | "PATCH" | "DELETE";
   body?: unknown;
   headers?: Record<string, string>;
 };
@@ -19,6 +19,37 @@ export type AgentSession = {
   expiresAt: number;
   agent: JsonRecord;
   shop: JsonRecord;
+};
+export type PaymentMethodInput = {
+  id?: string;
+  provider: string;
+  displayName: string;
+  productType?: string;
+  merchantNo?: string;
+  appId?: string;
+  serviceProviderId?: string;
+  gatewayUrl?: string;
+  accountName?: string;
+  qrUrl?: string;
+  paymentUrl?: string;
+  note?: string;
+  returnUrl?: string;
+  enabled?: boolean;
+  status?: string;
+  isDefault?: boolean;
+  signingSecret?: string;
+  privateKey?: string;
+  publicKey?: string;
+  certificate?: string;
+};
+export type PaymentQueryInput = {
+  providerTradeNo: string;
+  amountCents: string;
+  merchantNo?: string;
+  appId?: string;
+  serviceProviderId?: string;
+  tradeStatus: string;
+  signature: string;
 };
 
 export class ApiClientError extends Error {
@@ -114,6 +145,30 @@ function requireSnapshotCents(value: unknown, fieldName: string): string {
   throw new ApiClientError(400, "CLIENT_INPUT_REQUIRED", `${fieldName} 缺失或非法`);
 }
 
+function paymentMethodPayload(input: PaymentMethodInput): JsonRecord {
+  return {
+    provider: requireText(input.provider, "收款方式"),
+    displayName: requireText(input.displayName, "展示名称"),
+    productType: input.productType || undefined,
+    merchantNo: input.merchantNo || undefined,
+    appId: input.appId || undefined,
+    serviceProviderId: input.serviceProviderId || undefined,
+    gatewayUrl: input.gatewayUrl || undefined,
+    accountName: input.accountName || undefined,
+    qrUrl: input.qrUrl || undefined,
+    paymentUrl: input.paymentUrl || undefined,
+    note: input.note || undefined,
+    returnUrl: input.returnUrl || undefined,
+    enabled: input.enabled,
+    status: input.status || undefined,
+    isDefault: input.isDefault,
+    signingSecret: input.signingSecret || undefined,
+    privateKey: input.privateKey || undefined,
+    publicKey: input.publicKey || undefined,
+    certificate: input.certificate || undefined
+  };
+}
+
 export const api = {
   baseUrl: API_BASE_URL || "同源 /api",
   currentAdminSession,
@@ -152,8 +207,69 @@ export const api = {
   paymentGuide: () => request<JsonRecord>("/api/admin/payment-onboarding-guide", {
     headers: adminHeaders()
   }),
-  paymentConfigStatus: () => request<JsonRecord[]>("/api/admin/payment-config/status", {
+  adminPaymentMethods: () => request<JsonRecord[]>("/api/admin/payment-methods", {
     headers: adminHeaders()
+  }),
+  agentPaymentMethods: () => request<JsonRecord[]>("/api/agent/payment-methods", {
+    headers: agentHeaders()
+  }),
+  saveAdminPaymentMethod: (input: PaymentMethodInput) => request<JsonRecord>(input.id ? `/api/admin/payment-methods/${encodeURIComponent(input.id)}` : "/api/admin/payment-methods", {
+    method: input.id ? "PATCH" : "POST",
+    headers: adminHeaders(),
+    body: paymentMethodPayload(input)
+  }),
+  saveAgentPaymentMethod: (input: PaymentMethodInput) => request<JsonRecord>(input.id ? `/api/agent/payment-methods/${encodeURIComponent(input.id)}` : "/api/agent/payment-methods", {
+    method: input.id ? "PATCH" : "POST",
+    headers: agentHeaders(),
+    body: paymentMethodPayload(input)
+  }),
+  disableAdminPaymentMethod: (methodId: string) => request<JsonRecord>(`/api/admin/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}`, {
+    method: "DELETE",
+    headers: adminHeaders()
+  }),
+  disableAgentPaymentMethod: (methodId: string) => request<JsonRecord>(`/api/agent/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}`, {
+    method: "DELETE",
+    headers: agentHeaders()
+  }),
+  setAdminPaymentMethodDefault: (methodId: string) => request<JsonRecord>(`/api/admin/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}/default`, {
+    method: "POST",
+    headers: adminHeaders()
+  }),
+  setAgentPaymentMethodDefault: (methodId: string) => request<JsonRecord>(`/api/agent/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}/default`, {
+    method: "POST",
+    headers: agentHeaders()
+  }),
+  testAdminPaymentMethod: (methodId: string) => request<JsonRecord>(`/api/admin/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}/test`, {
+    method: "POST",
+    headers: adminHeaders()
+  }),
+  testAgentPaymentMethod: (methodId: string) => request<JsonRecord>(`/api/agent/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}/test`, {
+    method: "POST",
+    headers: agentHeaders()
+  }),
+  paymentCallbacks: () => request<JsonRecord[]>("/api/admin/payment-callbacks", {
+    headers: adminHeaders()
+  }),
+  paymentExceptions: () => request<JsonRecord[]>("/api/admin/payment-exceptions", {
+    headers: adminHeaders()
+  }),
+  handlePaymentException: (exceptionId: string, input: { action: "mark_handled" | "keep_exception"; note?: string }) => request<JsonRecord>(`/api/admin/payment-exceptions/${encodeURIComponent(requireText(exceptionId, "异常记录"))}/handle`, {
+    method: "POST",
+    headers: adminHeaders(),
+    body: { action: input.action, note: input.note || undefined }
+  }),
+  queryOrderPayment: (orderNo: string, input: PaymentQueryInput) => request<JsonRecord>(`/api/admin/orders/${encodeURIComponent(requireText(orderNo, "订单号"))}/payment-query`, {
+    method: "POST",
+    headers: adminHeaders(),
+    body: {
+      providerTradeNo: requireText(input.providerTradeNo, "渠道交易号"),
+      amountCents: requirePositiveCents(input.amountCents, "查单金额"),
+      merchantNo: input.merchantNo || undefined,
+      appId: input.appId || undefined,
+      serviceProviderId: input.serviceProviderId || undefined,
+      tradeStatus: input.tradeStatus || "TRADE_SUCCESS",
+      signature: requireText(input.signature, "签名")
+    }
   }),
   paymentVouchers: () => request<JsonRecord[]>("/api/admin/payment-vouchers", {
     headers: adminHeaders()
@@ -165,15 +281,6 @@ export const api = {
     method: "POST",
     headers: adminHeaders(),
     body: { approved, reason: reason || undefined }
-  }),
-  paymentConfigCheck: () => request<JsonRecord>("/api/admin/payment-config/check", {
-    method: "POST",
-    headers: adminHeaders()
-  }),
-  updatePaymentConfig: () => request<JsonRecord>("/api/admin/payment-config/metadata", {
-    method: "PATCH",
-    headers: adminHeaders(),
-    body: { channel: "wechat_h5", enabled: false, statusNote: "等待微信/支付宝商户收款能力开通" }
   }),
   adminOrders: () => request<JsonRecord[]>("/api/admin/orders", {
     headers: adminHeaders()

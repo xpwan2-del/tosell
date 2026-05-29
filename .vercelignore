@@ -10,4 +10,5 @@ coverage/
 coverage/**
 .env
 .env.local
+.env*.local
 *.log
