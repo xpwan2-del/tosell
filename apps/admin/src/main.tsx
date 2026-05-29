@@ -146,6 +146,164 @@ const mvpCoverageLabels = [
   "消息通知"
 ] as const;
 
+const moduleHelp: Record<string, string[]> = {
+  首页: ["先看待办数量，再进入对应模块处理。", "日常运营优先处理待确认收款、待发货、待处理售后。"],
+  商品: ["商品列表点击“选择”会带出商品详情进行修改。", "自动发码商品去卡密池导入库存；人工交付商品只维护交付说明和客服信息。"],
+  库存卡密: ["一行一个卡密，先预检再导入。", "默认只看脱敏卡密，平台查看明文会写入审计。"],
+  优惠券: ["平台统一创建、启用、停用优惠券。", "注册赠券和退款后作废规则由后端处理，前台不能绕过。"],
+  订单管理: ["先在列表选择订单，再处理确认收款或查看凭证。", "买家必须从 H5 下单，后台只处理订单，不手工造单。"],
+  发货管理: ["自动发码订单在确认收款后自动发货。", "人工交付订单由商户按客服/交付说明处理后确认发货。"],
+  售后退款: ["先选择订单或售后单，再做拆账、审批和人工退款确认。", "退款完成后客户不能再查看卡密。"],
+  销售统计: ["用于看经营结果，不在这里改订单。", "金额以已支付订单和 ledger 为准。"],
+  店铺设置: ["维护买家能看到的店铺名称、公告、客服微信/QQ 和收款信息。", "平台不做在线客服，只展示联系方式和二维码。"],
+  "代理/渠道": ["平台创建或审核商户，确认保证金后商户才可以经营。", "上游商户只能看下游经营汇总，不能操作下游商户数据。"],
+  二级渠道管理: ["用于维护一级到二级、二级到三级的渠道关系和转供价。", "三级不能再创建四级。"],
+  结算: ["生成结算单后再人工确认打款。", "退款和追扣会影响可结算金额。"],
+  风控日志: ["冻结订单或店铺用于紧急止损。", "所有风控动作都要能在审计中追溯。"],
+  支付配置: ["当前真实支付平台未接入，先用付款凭证和人工确认收款。", "后续接入支付宝/微信支付时再配置真实渠道。"]
+};
+
+const fieldLabels: Record<string, string> = {
+  id: "编号",
+  codeId: "卡密编号",
+  productId: "商品编号",
+  platformProductId: "平台商品",
+  agentProductId: "店铺商品",
+  ownProductId: "自有商品",
+  shopId: "店铺",
+  agentId: "商户",
+  firstTierAgentId: "一级商户",
+  secondTierAgentId: "二级商户",
+  thirdTierAgentId: "三级商户",
+  downstreamAgentId: "下游商户",
+  userId: "买家",
+  reviewedBy: "审核人",
+  createdBy: "创建人",
+  orderNo: "订单号",
+  afterSaleNo: "售后单号",
+  refundNo: "退款单号",
+  settlementNo: "结算单号",
+  payoutNo: "打款单号",
+  clawbackNo: "追扣单号",
+  transactionNo: "流水号",
+  applicationNo: "申请单号",
+  name: "名称",
+  productName: "商品名称",
+  category: "类目",
+  tags: "标签",
+  subtitle: "副标题",
+  description: "商品说明",
+  usageGuide: "使用说明",
+  fulfillmentMode: "发货方式",
+  status: "状态",
+  reviewStatus: "审核状态",
+  paymentStatus: "支付状态",
+  fulfillmentStatus: "发货状态",
+  refundStatus: "退款状态",
+  settlementStatus: "结算状态",
+  riskStatus: "风控状态",
+  stockCount: "库存",
+  soldCount: "销量",
+  salePriceCents: "售价",
+  supplyPriceCents: "供货价",
+  platformSupplyPriceCents: "平台供货价",
+  visibleUpstreamSupplyPriceCents: "上游供货价",
+  minSalePriceCents: "最低售价",
+  suggestedSalePriceCents: "建议售价",
+  resellSupplyPriceCents: "转供价",
+  totalPaidCents: "成交额",
+  paidOrderCount: "已支付订单",
+  orderCount: "订单数",
+  totalOrderCount: "订单数",
+  totalAgentIncomeCents: "商户收益",
+  requiredAmountCents: "应缴保证金",
+  availableAmountCents: "可用保证金",
+  amountCents: "金额",
+  requestedRefundCents: "申请退款",
+  discountCents: "抵扣金额",
+  validDays: "有效天数",
+  grantOnFirstRegister: "注册赠送",
+  productIds: "适用商品",
+  channel: "支付渠道",
+  channelType: "通道类型",
+  collectionAccountName: "收款账户",
+  collectionQrUrl: "收款二维码",
+  collectionNote: "收款说明",
+  displayName: "展示名称",
+  accountName: "账户名",
+  qrUrl: "二维码",
+  voucherUrl: "凭证",
+  payerName: "付款人",
+  note: "备注",
+  customerServiceWechat: "客服微信",
+  customerServiceQrUrl: "微信二维码",
+  customerServiceQq: "客服 QQ",
+  customerServiceQqQrUrl: "QQ 二维码",
+  ownerType: "归属",
+  targetType: "对象类型",
+  targetId: "对象",
+  freezeType: "冻结类型",
+  entryType: "账务类型",
+  sourceType: "来源类型",
+  sourceId: "来源",
+  reasonCode: "原因",
+  maxUses: "最多使用",
+  usedCount: "已使用",
+  expiresAt: "过期时间",
+  createdAt: "创建时间",
+  updatedAt: "更新时间",
+  batchNo: "批次",
+  codePreview: "卡密预览",
+  code: "卡密/邀请码",
+  envVar: "配置项"
+};
+
+const valueLabels: Record<string, string> = {
+  pending: "待处理",
+  pending_review: "待审核",
+  approved: "已通过",
+  rejected: "已拒绝",
+  active: "启用",
+  listed: "上架",
+  disabled: "停用",
+  frozen: "冻结",
+  open: "营业中",
+  not_opened: "未开店",
+  paid: "已支付",
+  unpaid: "待付款",
+  fulfilled: "已完成",
+  fulfilling: "发货中",
+  success: "成功",
+  failed: "失败",
+  processing: "处理中",
+  refunded: "已退款",
+  refunding: "退款中",
+  none: "无",
+  manual: "人工交付",
+  code_pool: "自动发码",
+  platform: "平台",
+  agent: "商户",
+  user: "买家",
+  mixed: "共同承担",
+  available: "可用",
+  issued: "已发放",
+  voided: "已作废",
+  voided_after_refund: "退款后作废",
+  first_tier: "一级商户",
+  second_tier: "二级商户",
+  third_tier: "三级商户",
+  alipay_personal_qr: "支付宝个人码",
+  alipay_merchant_qr: "支付宝商户码",
+  alipay_merchant_link: "支付宝链接",
+  wechat_personal_qr: "微信个人码",
+  wechat_merchant_qr: "微信商户码",
+  wechat_merchant_link: "微信链接",
+  platform_self_operated: "平台自营",
+  single_agent: "单商户销售",
+  agent_owned: "商户自有",
+  normal: "正常"
+};
+
 function App() {
   const [data, setData] = useState<LoadState>(initialState);
   const [active, setActive] = useState<ModuleId>(() => moduleFromHash());
@@ -1120,21 +1278,26 @@ function App() {
     if (active === "orders") {
       return (
         <Module title="订单管理" subtitle="查单、人工确认收款、订单履约流转">
-          <section className="split">
+          <section className="split sticky-workbench">
             <Panel title="当前订单" kicker={selectedOrderNo || "未选择"}>
               <KeyValue label="订单号" value={selectedOrderNo || "暂无订单"} />
               <KeyValue label="金额" value={cents(selectedOrderAmount)} />
-              <KeyValue label="支付状态" value={text(selectedOrder?.paymentStatus)} />
-              <KeyValue label="履约状态" value={text(selectedOrder?.fulfillmentStatus)} />
+              <KeyValue label="支付状态" value={humanValue(selectedOrder?.paymentStatus)} />
+              <KeyValue label="履约状态" value={humanValue(selectedOrder?.fulfillmentStatus)} />
               <KeyValue label="收款通道" value={collectionChannelLabel(selectedOrder)} />
-              <KeyValue label="凭证状态" value={selectedOrderPaymentVouchers.length > 0 ? selectedOrderPaymentVouchers.map((item) => text(item.status)).join("、") : text(selectedOrder?.paymentVoucherStatus, "暂无凭证")} />
+              <KeyValue label="凭证状态" value={selectedOrderPaymentVouchers.length > 0 ? selectedOrderPaymentVouchers.map((item) => humanValue(item.status)).join("、") : humanValue(selectedOrder?.paymentVoucherStatus, "暂无凭证")} />
               <div className="actions">
                 <button disabled={!selectedOrderNo || text(selectedOrder?.paymentStatus) === "paid"} onClick={submitConfirmPayment}>人工确认收款</button>
                 <button className="secondary" disabled={!selectedOrderNo} onClick={() => switchModule("fulfillment")}>去发货</button>
               </div>
             </Panel>
             <Panel title="操作说明" kicker="生产">
-              <p className="hint">生产后台不提供快捷写单入口。订单必须由 H5 买家端按当前店铺、商品、收款通道和后端价格规则创建；商户账号只处理自己店铺订单。</p>
+              <ol className="steps">
+                <li>买家从 H5 店铺下单并提交付款凭证。</li>
+                <li>平台在“付款凭证”里审核，通过后订单进入已收款。</li>
+                <li>自动发码商品会自动发卡；人工交付商品再去“发货”确认处理结果。</li>
+                <li>商户账号只能看自己店铺订单，平台账号可以看全平台订单。</li>
+              </ol>
             </Panel>
           </section>
           <Panel title="订单列表" kicker={`${visibleOrders.length} 笔`}>
@@ -1691,6 +1854,7 @@ function App() {
 }
 
 function Module(props: { title: string; subtitle: string; children: React.ReactNode }) {
+  const help = moduleHelp[props.title] ?? [];
   return (
     <section className="module">
       <div className="module-head">
@@ -1699,6 +1863,14 @@ function Module(props: { title: string; subtitle: string; children: React.ReactN
           <p>{props.subtitle}</p>
         </div>
       </div>
+      {help.length > 0 ? (
+        <div className="module-guide" aria-label={`${props.title}使用说明`}>
+          <strong>怎么用</strong>
+          <ul>
+            {help.map((item) => <li key={item}>{item}</li>)}
+          </ul>
+        </div>
+      ) : null}
       {props.children}
     </section>
   );
@@ -1880,10 +2052,15 @@ function KeyValue(props: { label: string; value: string }) {
   );
 }
 
+function StatusBadge(props: { value: unknown }) {
+  const raw = text(props.value, "unknown");
+  return <span className={`status-badge ${statusTone(raw)}`}>{humanValue(raw)}</span>;
+}
+
 function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) => void }) {
   if (props.rows.length === 0) return <p className="empty">暂无记录</p>;
   return (
-    <div className="table-wrap">
+    <div className="table-wrap orders-table-wrap">
       <table>
         <thead>
           <tr>
@@ -1900,10 +2077,10 @@ function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) =>
           {props.rows.map((order) => (
             <tr key={text(order.orderNo)}>
               <td>{text(order.orderNo)}</td>
-              <td>{text(order.shopId)}</td>
-              <td>{text(order.status)}</td>
-              <td>{text(order.paymentStatus)}</td>
-              <td>{text(order.fulfillmentStatus)}</td>
+              <td>{orderShopLabel(order)}</td>
+              <td><StatusBadge value={order.status} /></td>
+              <td><StatusBadge value={order.paymentStatus} /></td>
+              <td><StatusBadge value={order.fulfillmentStatus} /></td>
               <td>{cents(amountOf(order))}</td>
               <td><button className="small" type="button" onClick={() => props.onPick(order)}>选择</button></td>
             </tr>
@@ -1936,15 +2113,19 @@ function Table(props: { rows: JsonRecord[]; columns: string[]; moneyColumns?: st
         <table>
           <thead>
             <tr>
-              {props.onPick ? <th>选择</th> : null}
-              {props.columns.map((column) => <th key={column}>{column}</th>)}
+              {props.onPick ? <th>操作</th> : null}
+              {props.columns.map((column) => <th key={column}>{fieldLabel(column)}</th>)}
             </tr>
           </thead>
           <tbody>
             {pageRows.map((row, index) => (
               <tr key={`${props.columns.map((column) => text(row[column])).join("-")}-${index}`}>
                 {props.onPick ? <td><button className="small" type="button" onClick={() => props.onPick?.(row)}>选择</button></td> : null}
-                {props.columns.map((column) => <td key={column}>{moneyColumns.has(column) ? cents(row[column]) : cellText(row[column])}</td>)}
+                {props.columns.map((column) => (
+                  <td key={column} className={isIdLikeColumn(column) ? "muted-id" : undefined}>
+                    {moneyColumns.has(column) ? cents(row[column]) : humanCell(row, column)}
+                  </td>
+                ))}
               </tr>
             ))}
           </tbody>
@@ -1967,6 +2148,62 @@ function cellText(value: unknown): string {
   return text(value);
 }
 
+function fieldLabel(column: string): string {
+  return fieldLabels[column] ?? column.replace(/([A-Z])/g, " $1").trim();
+}
+
+function humanValue(value: unknown, fallback = "未填写"): string {
+  const raw = cellText(value);
+  if (!raw) return fallback;
+  return valueLabels[raw] ?? raw;
+}
+
+function humanCell(row: JsonRecord, column: string): string {
+  const value = row[column];
+  if (column === "shopId") return relatedName(row, "shop", "name") || friendlyId(value, "店铺");
+  if (column === "agentId") return relatedName(row, "agent", "name") || friendlyId(value, "商户");
+  if (column === "productId" || column === "platformProductId" || column === "agentProductId" || column === "ownProductId") {
+    return relatedName(row, "product", "name") || relatedName(row, "platformProduct", "name") || friendlyId(value, "商品");
+  }
+  if (column === "userId") return friendlyId(value, "买家");
+  if (column === "id" || isIdLikeColumn(column)) return friendlyId(value, "编号");
+  if (column.toLowerCase().includes("status") || column === "fulfillmentMode" || column === "channelType" || column === "ownerType" || column === "targetTier") {
+    return humanValue(value);
+  }
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (Array.isArray(value)) return value.map((item) => humanValue(item, "")).filter(Boolean).join("、");
+  return humanValue(value, "");
+}
+
+function relatedName(row: JsonRecord, relationKey: string, nameKey: string): string {
+  const relation = row[relationKey] as JsonRecord | undefined;
+  return text(relation?.[nameKey], "");
+}
+
+function isIdLikeColumn(column: string): boolean {
+  return column === "id" || column.endsWith("Id") || column.endsWith("No") || column === "codeId" || column === "targetId" || column === "sourceId";
+}
+
+function friendlyId(value: unknown, label = "编号"): string {
+  const raw = text(value, "");
+  if (!raw) return "未返回";
+  if (raw.length <= 14) return raw;
+  return `${label}...${raw.slice(-6)}`;
+}
+
+function orderShopLabel(order?: JsonRecord): string {
+  const snapshot = order?.snapshot as JsonRecord | undefined;
+  const shopSnapshot = snapshot?.shopSnapshot as JsonRecord | undefined;
+  return text(shopSnapshot?.name, friendlyId(order?.shopId, "店铺"));
+}
+
+function statusTone(value: string): string {
+  if (["paid", "success", "fulfilled", "active", "approved", "open", "available"].includes(value)) return "good";
+  if (["pending", "pending_review", "unpaid", "processing", "fulfilling", "refunding"].includes(value)) return "todo";
+  if (["rejected", "failed", "disabled", "frozen", "refunded", "voided", "voided_after_refund"].includes(value)) return "warn";
+  return "neutral";
+}
+
 function amountOf(order?: JsonRecord): string {
   if (order?.paidAmountCents) return text(order.paidAmountCents, "0");
   const snapshot = order?.snapshot as JsonRecord | undefined;
@@ -1977,15 +2214,15 @@ function amountOf(order?: JsonRecord): string {
 function collectionChannelLabel(order?: JsonRecord): string {
   const channel = order?.collectionChannel as JsonRecord | undefined;
   if (channel) {
-    return [channel.displayName, channel.channelType, channel.id].map((item) => text(item, "")).filter(Boolean).join(" / ");
+    return [channel.displayName, humanValue(channel.channelType, ""), friendlyId(channel.id, "通道")].map((item) => text(item, "")).filter(Boolean).join(" / ");
   }
   const snapshot = order?.snapshot as JsonRecord | undefined;
   const channelSnapshot = order?.collectionChannelSnapshot as JsonRecord | undefined
     ?? snapshot?.collectionChannelSnapshot as JsonRecord | undefined;
   if (channelSnapshot) {
-    return [channelSnapshot.displayName, channelSnapshot.channelType, channelSnapshot.id].map((item) => text(item, "")).filter(Boolean).join(" / ");
+    return [channelSnapshot.displayName, humanValue(channelSnapshot.channelType, ""), friendlyId(channelSnapshot.id, "通道")].map((item) => text(item, "")).filter(Boolean).join(" / ");
   }
-  return text(order?.collectionChannelId, text(snapshot?.collectionChannelId, "未返回"));
+  return friendlyId(order?.collectionChannelId ?? snapshot?.collectionChannelId, "通道");
 }
 
 function selectedAfterSaleNo(rows: JsonRecord[], current?: JsonRecord): string {
