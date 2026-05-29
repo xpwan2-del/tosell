@@ -392,6 +392,11 @@ textarea {
   gap: 12px;
 }
 
+.dashboard-flow {
+  display: grid;
+  gap: 16px;
+}
+
 .todo-card {
   min-height: 86px;
   color: #172026;
@@ -405,6 +410,15 @@ textarea {
   display: block;
   margin-top: 8px;
   font-size: 26px;
+}
+
+.todo-card em {
+  display: block;
+  margin-top: 8px;
+  color: #106270;
+  font-style: normal;
+  font-weight: 700;
+  font-size: 12px;
 }
 
 .quick-grid {

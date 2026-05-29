@@ -147,14 +147,14 @@ const mvpCoverageLabels = [
 ] as const;
 
 const moduleHelp: Record<string, string[]> = {
-  首页: ["先看待办数量，再进入对应模块处理。", "日常运营优先处理待确认收款、待发货、待处理售后。"],
+  首页: ["这里是工作台，只放今天要处理的事。", "先处理待办，再看最近订单；经营数据请去销售统计。"],
   商品: ["商品列表点击“选择”会带出商品详情进行修改。", "自动发码商品去卡密池导入库存；人工交付商品只维护交付说明和客服信息。"],
   库存卡密: ["一行一个卡密，先预检再导入。", "默认只看脱敏卡密，平台查看明文会写入审计。"],
   优惠券: ["平台统一创建、启用、停用优惠券。", "注册赠券和退款后作废规则由后端处理，前台不能绕过。"],
   订单管理: ["先在列表选择订单，再处理确认收款或查看凭证。", "买家必须从 H5 下单，后台只处理订单，不手工造单。"],
   发货管理: ["自动发码订单在确认收款后自动发货。", "人工交付订单由商户按客服/交付说明处理后确认发货。"],
   售后退款: ["先选择订单或售后单，再做拆账、审批和人工退款确认。", "退款完成后客户不能再查看卡密。"],
-  销售统计: ["用于看经营结果，不在这里改订单。", "金额以已支付订单和 ledger 为准。"],
+  销售统计: ["这里单独看经营数据，不处理订单。", "金额以已支付订单和 ledger 为准。"],
   店铺设置: ["维护买家能看到的店铺名称、公告、客服微信/QQ 和收款信息。", "平台不做在线客服，只展示联系方式和二维码。"],
   "代理/渠道": ["平台创建或审核商户，确认保证金后商户才可以经营。", "上游商户只能看下游经营汇总，不能操作下游商户数据。"],
   二级渠道管理: ["用于维护一级到二级、二级到三级的渠道关系和转供价。", "三级不能再创建四级。"],
@@ -1033,30 +1033,55 @@ function App() {
     window.history.replaceState(null, "", `#${moduleId}`);
   }
 
+  function handleOrderNextAction(order: JsonRecord) {
+    setCurrentOrder(order);
+    const refundStatus = text(order.refundStatus, "none");
+    const paymentStatus = text(order.paymentStatus);
+    const fulfillmentStatus = text(order.fulfillmentStatus);
+    if (refundStatus !== "none") {
+      switchModule("afterSales");
+      return;
+    }
+    if (paymentStatus !== "paid") {
+      switchModule("orders");
+      return;
+    }
+    if (fulfillmentStatus !== "success") {
+      switchModule("fulfillment");
+      return;
+    }
+    switchModule("orders");
+  }
+
   function renderModule() {
     if (active === "dashboard") {
       return (
-        <Module title="经营首页" subtitle="关键数据、待办和最快操作入口">
-          <section className="metric-grid">
-            {metrics.map((item) => <Metric key={item.label} {...item} />)}
+        <Module title="经营首页" subtitle="待办、最近订单和常用操作">
+          <section className="dashboard-flow">
+            <Panel title="今天先处理这些" kicker="待办">
+              <section className="work-grid">
+                {todoItems.map((item) => (
+                  <button className="todo-card" key={item.label} type="button" onClick={() => switchModule(item.target)}>
+                    <span>{item.label}</span>
+                    <strong>{item.value}</strong>
+                    <em>{item.value > 0 ? "去处理" : "暂无待办"}</em>
+                  </button>
+                ))}
+              </section>
+            </Panel>
+            <Panel title="最近订单" kicker="按状态处理">
+              <OrdersTable rows={visibleOrders.slice(0, 6)} onPick={handleOrderNextAction} mode="next-action" />
+            </Panel>
+            <Panel title="常用入口" kicker="快捷操作">
+              <section className="quick-grid">
+                <button type="button" onClick={() => switchModule("orders")}>处理订单</button>
+                <button type="button" onClick={() => switchModule("shops")}>配置收款码</button>
+                <button type="button" onClick={() => switchModule("inventory")}>导入卡密</button>
+                <button type="button" onClick={() => switchModule("products")}>新增商品</button>
+                <button className="secondary" type="button" onClick={() => switchModule("sales")}>查看经营数据</button>
+              </section>
+            </Panel>
           </section>
-          <section className="work-grid">
-            {todoItems.map((item) => (
-              <button className="todo-card" key={item.label} type="button" onClick={() => switchModule(item.target)}>
-                <span>{item.label}</span>
-                <strong>{item.value}</strong>
-              </button>
-            ))}
-          </section>
-          <section className="quick-grid">
-            <button type="button" onClick={() => switchModule("products")}>新增商品</button>
-            <button type="button" onClick={() => switchModule("inventory")}>导入卡密</button>
-            <button type="button" onClick={() => switchModule("orders")}>处理订单</button>
-            <button type="button" onClick={() => switchModule("shops")}>配置收款码</button>
-          </section>
-          <Panel title="最近订单" kicker="运营">
-            <OrdersTable rows={visibleOrders.slice(0, 6)} onPick={setCurrentOrder} />
-          </Panel>
         </Module>
       );
     }
@@ -2057,7 +2082,7 @@ function StatusBadge(props: { value: unknown }) {
   return <span className={`status-badge ${statusTone(raw)}`}>{humanValue(raw)}</span>;
 }
 
-function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) => void }) {
+function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) => void; mode?: "select" | "next-action" }) {
   if (props.rows.length === 0) return <p className="empty">暂无记录</p>;
   return (
     <div className="table-wrap orders-table-wrap">
@@ -2082,13 +2107,20 @@ function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) =>
               <td><StatusBadge value={order.paymentStatus} /></td>
               <td><StatusBadge value={order.fulfillmentStatus} /></td>
               <td>{cents(amountOf(order))}</td>
-              <td><button className="small" type="button" onClick={() => props.onPick(order)}>选择</button></td>
+              <td><button className="small" type="button" onClick={() => props.onPick(order)}>{props.mode === "next-action" ? orderActionLabel(order) : "选择"}</button></td>
             </tr>
           ))}
         </tbody>
       </table>
     </div>
   );
+}
+
+function orderActionLabel(order: JsonRecord): string {
+  if (text(order.refundStatus, "none") !== "none") return "处理售后";
+  if (text(order.paymentStatus) !== "paid") return "确认收款";
+  if (text(order.fulfillmentStatus) !== "success") return "去发货";
+  return "查看订单";
 }
 
 function Table(props: { rows: JsonRecord[]; columns: string[]; moneyColumns?: string[]; onPick?: (row: JsonRecord) => void }) {
