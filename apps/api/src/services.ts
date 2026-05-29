@@ -3905,6 +3905,18 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestOfflinePaymentConfirmation(tx, store));
       return;
     }
+    if (method === "createPaymentVoucher") {
+      await this.persistInShortTransaction((tx) => this.persistLatestPaymentVoucher(tx, store));
+      return;
+    }
+    if (method === "confirmPaymentVoucher") {
+      await this.persistInShortTransaction((tx) => this.persistLatestPaymentVoucher(tx, store));
+      const voucher = this.latestPaymentVoucher(store);
+      if (voucher?.status === "approved") {
+        await this.persistInShortTransaction((tx) => this.persistLatestOfflinePaymentConfirmation(tx, store));
+      }
+      return;
+    }
     if (method === "fulfillAgentOrder") {
       await this.persistInShortTransaction((tx) => this.persistLatestFulfillmentUpdate(tx, store));
       return;
@@ -3943,8 +3955,6 @@ class PrismaStateRepository {
       return;
     }
     if ([
-      "createPaymentVoucher",
-      "confirmPaymentVoucher",
       "fulfillOrder",
       "refundCallback",
       "paymentCallback"
@@ -4612,6 +4622,26 @@ class PrismaStateRepository {
       .find((item) => stringValue(item.action) === "fulfillment.auto_code_pool" && stringValue(item.targetId) === order.orderNo);
     await this.persistLedgerEntries(tx, ledger ? [ledger] : []);
     await this.persistAuditLogs(tx, [autoFulfillmentAudit, audit].filter((item): item is Record<string, unknown> => Boolean(item)));
+  }
+
+  private async persistLatestPaymentVoucher(tx: PrismaTx, store: MemoryStore) {
+    const voucher = this.latestPaymentVoucher(store);
+    if (!voucher) throw new Error("payment voucher persistence missing current voucher");
+    await this.persistPaymentVoucher(tx, voucher);
+    const audits = store.auditLogs.filter((item) => {
+      const action = stringValue(item.action);
+      if (action !== "payment_voucher.submit" && action !== "payment_voucher.review") return false;
+      const targetId = stringValue(item.targetId);
+      if (targetId === voucher.id || targetId === voucher.orderNo) return true;
+      const after = isRecord(item.afterJson) ? item.afterJson : undefined;
+      return stringValue(after?.id) === voucher.id;
+    });
+    await this.persistAuditLogs(tx, audits);
+  }
+
+  private latestPaymentVoucher(store: MemoryStore) {
+    return [...store.paymentVouchers.values()]
+      .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())[0];
   }
 
   private async persistLatestFulfillmentUpdate(tx: PrismaTx, store: MemoryStore) {
@@ -5500,6 +5530,35 @@ class PrismaStateRepository {
       ON CONFLICT (idempotency_key) DO UPDATE SET
         status = EXCLUDED.status,
         reviewed_at = EXCLUDED.reviewed_at,
+        voucher_url = EXCLUDED.voucher_url,
+        note = EXCLUDED.note,
+        updated_at = now()
+    `;
+  }
+
+  private async persistPaymentVoucher(tx: PrismaTx, voucher: PaymentVoucher) {
+    await tx.$executeRaw`
+      INSERT INTO payment_confirmations (
+        id, confirmation_no, order_id, payment_id, shop_id, collection_channel_id,
+        amount_cents, payer_name, voucher_url, note, status, reviewed_by,
+        reviewed_at, reject_reason, idempotency_key, created_at, updated_at
+      )
+      VALUES (
+        ${stableDbId("payment_voucher", voucher.id)}, ${voucher.id},
+        (SELECT id FROM orders WHERE order_no = ${voucher.orderNo}),
+        (SELECT id FROM payments WHERE payment_no = ${`payment:${voucher.orderNo}`}),
+        ${voucher.shopId}, NULL, ${voucher.amountCents}, ${voucher.payerName ?? null},
+        ${voucher.voucherUrl ?? null}, ${voucher.note ?? null},
+        CAST(${mapPaymentVoucherStatus(voucher.status)} AS "PaymentConfirmationStatus"),
+        ${voucher.reviewedBy}, ${voucher.reviewedAt}, ${voucher.reason ?? null},
+        ${`payment-voucher:${voucher.id}`}, ${voucher.createdAt}, now()
+      )
+      ON CONFLICT (idempotency_key) DO UPDATE SET
+        status = EXCLUDED.status,
+        reviewed_by = EXCLUDED.reviewed_by,
+        reviewed_at = EXCLUDED.reviewed_at,
+        reject_reason = EXCLUDED.reject_reason,
+        payer_name = EXCLUDED.payer_name,
         voucher_url = EXCLUDED.voucher_url,
         note = EXCLUDED.note,
         updated_at = now()
@@ -6682,6 +6741,49 @@ class PrismaStateRepository {
       totalAgentIncomeCents: row.total_agent_income_cents
     }));
 
+    const paymentVouchers = await this.prisma.$queryRaw<Array<{
+      confirmation_no: string;
+      order_no: string;
+      user_id: string;
+      shop_id: string;
+      amount_cents: bigint;
+      channel: PaymentChannel | null;
+      payer_name: string | null;
+      voucher_url: string | null;
+      note: string | null;
+      status: string;
+      reviewed_at: Date | null;
+      reviewed_by: string | null;
+      reject_reason: string | null;
+      created_at: Date;
+    }>>`
+      SELECT pc.confirmation_no, o.order_no, o.user_id, pc.shop_id, pc.amount_cents,
+             p.channel, pc.payer_name, pc.voucher_url, pc.note, pc.status,
+             pc.reviewed_at, pc.reviewed_by, pc.reject_reason, pc.created_at
+        FROM payment_confirmations pc
+        JOIN orders o ON o.id = pc.order_id
+        LEFT JOIN payments p ON p.id = pc.payment_id
+       WHERE pc.idempotency_key LIKE 'payment-voucher:%'
+       ORDER BY pc.created_at DESC
+       LIMIT 500
+    `;
+    store.paymentVouchers = new Map(paymentVouchers.map((row) => [row.confirmation_no, {
+      id: row.confirmation_no,
+      orderNo: row.order_no,
+      userId: row.user_id,
+      shopId: row.shop_id,
+      amountCents: row.amount_cents,
+      channel: row.channel ?? "alipay_wap",
+      payerName: row.payer_name ?? undefined,
+      voucherUrl: row.voucher_url ?? undefined,
+      note: row.note ?? undefined,
+      status: row.status === "confirmed" ? "approved" : row.status === "rejected" ? "rejected" : "pending_review",
+      reason: row.reject_reason ?? undefined,
+      createdAt: row.created_at,
+      reviewedAt: row.reviewed_at,
+      reviewedBy: row.reviewed_by
+    }]));
+
     const audits = await this.prisma.$queryRaw<Array<{
       actor_type: string;
       actor_id: string;
@@ -6821,6 +6923,12 @@ function mapDepositStatus(status: string): "pending_payment" | "paid" | "partial
   return ["pending_payment", "paid", "partially_deducted", "frozen", "refund_reviewing", "refunded", "insufficient"].includes(status)
     ? status as ReturnType<typeof mapDepositStatus>
     : "pending_payment";
+}
+
+function mapPaymentVoucherStatus(status: PaymentVoucher["status"]): "pending" | "confirmed" | "rejected" {
+  if (status === "approved") return "confirmed";
+  if (status === "rejected") return "rejected";
+  return "pending";
 }
 
 function mapRiskStatus(status: string): "normal" | "order_frozen" | "shop_frozen" | "settlement_restricted" | "product_removed" | "disabled" {
