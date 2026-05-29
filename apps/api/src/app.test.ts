@@ -1902,6 +1902,16 @@ describe.sequential("api", () => {
         note: "页面级验收付款凭证"
       }
     });
+    const crossUserVoucher = await app.inject({
+      method: "POST",
+      url: `/api/user/orders/${order.json().orderNo}/payment-vouchers`,
+      headers: { "x-user-id": "other-voucher-user" },
+      payload: {
+        channel: "alipay_wap",
+        payerName: "越权付款人",
+        voucherUrl: "https://example.test/cross-voucher.png"
+      }
+    });
     const ownList = await app.inject({
       method: "GET",
       url: "/api/agent/payment-vouchers",
@@ -1925,6 +1935,8 @@ describe.sequential("api", () => {
     });
 
     expect(voucher.statusCode).toBe(200);
+    expect(crossUserVoucher.statusCode).toBe(403);
+    expect(crossUserVoucher.json()).toMatchObject({ code: "FORBIDDEN_USER_SCOPE" });
     expect(ownList.json()).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: voucher.json().id, orderNo: order.json().orderNo, status: "pending_review" })
     ]));

@@ -8,7 +8,6 @@ import {
   applyFulfillmentAttempt,
   assertAdminPermission,
   assertAgentScope,
-  assertUserScope,
   buildOrderSnapshot,
   buildSettlementItems,
   calculateServiceFeeCents,
@@ -583,7 +582,7 @@ class BackendServices {
 
   createPaymentIntent(actor: UserActor, orderNo: string, input: { channel: PaymentChannel }) {
     const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
-    assertUserScope(actor, order);
+    assertUserOrderScope(actor, order);
     if (order.paymentStatus === "paid") {
       return { status: "already_paid" as const, orderNo, channel: input.channel };
     }
@@ -621,13 +620,13 @@ class BackendServices {
 
   getUserOrder(actor: UserActor, orderNo: string) {
     const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
-    assertUserScope(actor, order);
+    assertUserOrderScope(actor, order);
     return this.serializePublicOrder(order, { includeDeliveryCodes: false, includeBuyerContact: true });
   }
 
   extractOrderCodes(actor: UserActor, orderNo: string, extractionCode: string) {
     const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
-    assertUserScope(actor, order);
+    assertUserOrderScope(actor, order);
     if (fulfillmentMode(order.snapshot) !== "code_pool") {
       throw new ApiError(400, "EXTRACTION_NOT_REQUIRED", "this order is manually delivered");
     }
@@ -690,7 +689,7 @@ class BackendServices {
     description?: string;
   }) {
     const order = requireEntity(this.store.orders.get(input.orderNo), "RESOURCE_NOT_FOUND", "order not found");
-    assertUserScope(actor, order);
+    assertUserOrderScope(actor, order);
     if (order.paymentStatus !== "paid") throw new ApiError(400, "AFTER_SALE_NOT_ALLOWED", "only paid orders can apply after sale");
     if (order.refundStatus === "refunded") throw new ApiError(400, "AFTER_SALE_NOT_ALLOWED", "order already refunded");
     if (order.refundStatus === "pending" || order.refundStatus === "refunding") {
@@ -2406,7 +2405,7 @@ class BackendServices {
 
   createPaymentVoucher(actor: UserActor, orderNo: string, input: { channel?: PaymentChannel; payerName?: string; voucherUrl?: string; note?: string }) {
     const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
-    assertUserScope(actor, order);
+    assertUserOrderScope(actor, order);
     if (order.paymentStatus === "paid") throw new ApiError(400, "ORDER_ALREADY_PAID", "order is already paid");
     const voucher: PaymentVoucher = {
       id: nextId(this.store, "pay-voucher"),
@@ -6895,6 +6894,12 @@ function verifyPassword(password: string, storedHash: string) {
   const envHash = process.env.ADMIN_PASSWORD_HASH;
   if (envHash?.startsWith("sha256:")) return hashSecret(password) === envHash.slice("sha256:".length);
   return process.env.NODE_ENV !== "production" && storedHash === password;
+}
+
+function assertUserOrderScope(actor: UserActor, resource: { userId: string }) {
+  if (actor.userId !== resource.userId) {
+    throw new ApiError(403, "FORBIDDEN_USER_SCOPE", "user cannot access another user resource");
+  }
 }
 
 function dbId(prefix: string) {
