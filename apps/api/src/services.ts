@@ -12,6 +12,7 @@ import {
   buildSettlementItems,
   calculateServiceFeeCents,
   deductDeposit,
+  hasAdminPermission,
   processPaymentCallback,
   quoteAgentOwnedProduct,
   quotePlatformProduct,
@@ -530,7 +531,7 @@ class BackendServices {
       }
       const coupon = this.resolveCouponDiscount(actor, snapshot, input.couponId);
       if (requiresExtractionCode(snapshot) && !input.extractionCode) {
-        throw new ApiError(400, "EXTRACTION_CODE_REQUIRED", "this product requires a purchase extraction code");
+        throw new ApiError(400, "PURCHASE_PASSWORD_REQUIRED", "this product requires a purchase password");
       }
       const collectionChannel = this.resolvePublicCollectionChannel(snapshot.shopId, input.collectionChannelId);
       const order: DemoOrder = {
@@ -653,7 +654,7 @@ class BackendServices {
         attemptCount: order.extractionAttemptCount,
         lockedUntil: order.extractionLockedUntil
       });
-      throw new ApiError(403, "EXTRACTION_CODE_INVALID", "extraction code is incorrect");
+      throw new ApiError(403, "PURCHASE_PASSWORD_INVALID", "purchase password is incorrect");
     }
     order.extractionAttemptCount = 0;
     order.extractionLockedUntil = null;
@@ -671,8 +672,19 @@ class BackendServices {
   }
 
   extractOrderCodesByToken(actor: UserActor, token: string, extractionCode: string) {
-    const order = [...this.store.orders.values()].find((candidate) => this.extractionTokenForOrder(candidate) === token);
-    if (!order) throw new ApiError(404, "EXTRACTION_TOKEN_NOT_FOUND", "extraction link is invalid or expired");
+    const parsed = parseExtractionToken(token);
+    if (!parsed || parsed.expiresAt <= Date.now()) {
+      this.audit("user", parsed ? "order.extract.token_expired" : "order.extract.token_invalid", "extraction", "token", {
+        userId: actor.userId
+      });
+      throw new ApiError(parsed ? 410 : 404, parsed ? "EXTRACTION_TOKEN_EXPIRED" : "EXTRACTION_TOKEN_NOT_FOUND", "extraction link is invalid or expired");
+    }
+    const order = [...this.store.orders.values()]
+      .find((candidate) => this.extractionTokenSignature(candidate, parsed.expiresAt) === parsed.signature);
+    if (!order) {
+      this.audit("user", "order.extract.token_invalid", "extraction", "token", { userId: actor.userId });
+      throw new ApiError(404, "EXTRACTION_TOKEN_NOT_FOUND", "extraction link is invalid or expired");
+    }
     return this.extractOrderCodes(actor, order.orderNo, extractionCode);
   }
 
@@ -810,24 +822,55 @@ class BackendServices {
     return [...this.store.platformProducts.values()];
   }
 
+  getAdminPlatformProductDetail(actor: AdminActor, productId: string) {
+    assertAdminPermission(actor, "product.manage");
+    const product = requireEntity(this.store.platformProducts.get(productId), "RESOURCE_NOT_FOUND", "platform product not found");
+    return this.serializePlatformProductDetail(product, "admin", actor);
+  }
+
   updatePlatformProduct(actor: AdminActor, productId: string, input: {
     name?: string;
+    category?: string;
+    tags?: string[];
+    subtitle?: string;
+    description?: string;
+    usageGuide?: string;
+    imageUrl?: string;
+    specs?: string[];
+    detailSections?: ProductDetailSection[];
+    stockCount?: number;
+    soldCount?: number;
     supplyPriceCents?: bigint;
     minSalePriceCents?: bigint;
     suggestedSalePriceCents?: bigint;
+    fulfillmentRule?: unknown;
+    afterSaleRule?: unknown;
     status?: string;
   }) {
     assertAdminPermission(actor, "product.manage");
     const product = requireEntity(this.store.platformProducts.get(productId), "RESOURCE_NOT_FOUND", "platform product not found");
-    Object.assign(product, input);
-    if (product.supplyPriceCents < 0n || product.minSalePriceCents < 0n || product.suggestedSalePriceCents < 0n) {
-      throw new ApiError(400, "PRICE_RULE_FAILED", "product prices must be non-negative");
+    const nextFulfillmentMode = input.fulfillmentRule === undefined ? undefined : fulfillmentRuleMode(input.fulfillmentRule);
+    if (nextFulfillmentMode && nextFulfillmentMode !== fulfillmentRuleMode(product.fulfillmentRule)) {
+      this.assertSafePlatformFulfillmentModeChange(product.id, nextFulfillmentMode);
+    }
+    assignDefined(product, input);
+    if (product.stockCount !== undefined && (!Number.isInteger(product.stockCount) || product.stockCount < 0)) {
+      throw new ApiError(400, "PRODUCT_INPUT_INVALID", "stock count must be a non-negative integer");
+    }
+    if (product.soldCount !== undefined && (!Number.isInteger(product.soldCount) || product.soldCount < 0)) {
+      throw new ApiError(400, "PRODUCT_INPUT_INVALID", "sold count must be a non-negative integer");
+    }
+    if (product.supplyPriceCents <= 0n || product.minSalePriceCents <= 0n || product.suggestedSalePriceCents <= 0n) {
+      throw new ApiError(400, "PRICE_RULE_FAILED", "product prices must be positive");
     }
     if (product.minSalePriceCents < product.supplyPriceCents) {
       throw new ApiError(400, "PRICE_RULE_FAILED", "minimum sale price cannot be below supply price");
     }
+    if (product.suggestedSalePriceCents < product.minSalePriceCents) {
+      throw new ApiError(400, "PRICE_RULE_FAILED", "suggested sale price cannot be below minimum sale price");
+    }
     this.audit(actor.role, "platform_product.update", "platform_product", product.id, input);
-    return product;
+    return this.serializePlatformProductDetail(product, "admin", actor);
   }
 
   listAdminPlatformShopProducts(actor: AdminActor) {
@@ -836,6 +879,24 @@ class BackendServices {
       ...item,
       product: this.store.platformProducts.get(item.platformProductId)
     }));
+  }
+
+  getAdminPlatformShopProductDetail(actor: AdminActor, shopProductId: string) {
+    assertAdminPermission(actor, "product.manage");
+    const shopProduct = requireEntity(this.store.platformShopProducts.get(shopProductId), "RESOURCE_NOT_FOUND", "platform shop product not found");
+    return this.serializePlatformShopProductDetail(shopProduct, actor);
+  }
+
+  updatePlatformShopProductDetail(actor: AdminActor, shopProductId: string, input: { salePriceCents?: bigint; fulfillmentCostCents?: bigint; status?: string }) {
+    assertAdminPermission(actor, "product.manage");
+    const shopProduct = requireEntity(this.store.platformShopProducts.get(shopProductId), "RESOURCE_NOT_FOUND", "platform shop product not found");
+    const product = requireEntity(this.store.platformProducts.get(shopProduct.platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
+    const nextSalePrice = input.salePriceCents ?? shopProduct.salePriceCents;
+    if (nextSalePrice < product.minSalePriceCents) throw new ApiError(400, "PRICE_RULE_FAILED", "sale price is below minimum sale price");
+    if (input.fulfillmentCostCents !== undefined && input.fulfillmentCostCents < 0n) throw new ApiError(400, "PRICE_RULE_FAILED", "fulfillment cost must be non-negative");
+    assignDefined(shopProduct, input);
+    this.audit(actor.role, "platform_shop_product.update", "platform_shop_product", shopProduct.id, input);
+    return this.serializePlatformShopProductDetail(shopProduct, actor);
   }
 
   upsertPlatformShopProduct(actor: AdminActor, input: {
@@ -895,6 +956,21 @@ class BackendServices {
     return [...this.store.agentProducts.values()]
       .filter((agentProduct) => agentProduct.agentId === actor.agentId && agentProduct.shopId === actor.shopId)
       .map((agentProduct) => this.serializeAgentProductForActor(actor, agentProduct));
+  }
+
+  getAgentProductDetail(actor: AgentActor, agentProductId: string) {
+    const agentProduct = requireEntity(this.store.agentProducts.get(agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
+    assertAgentScope(actor, agentProduct);
+    return this.serializeAgentProductDetailForActor(actor, agentProduct);
+  }
+
+  updateAgentProductDetail(actor: AgentActor, agentProductId: string, input: { salePriceCents?: bigint; status?: string }) {
+    const agentProduct = requireEntity(this.store.agentProducts.get(agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
+    assertAgentScope(actor, agentProduct);
+    if (input.salePriceCents !== undefined) this.setAgentProductPrice(actor, agentProductId, input.salePriceCents);
+    if (input.status !== undefined) agentProduct.status = input.status;
+    this.audit("agent", "agent_product.detail_update", "agent_product", agentProduct.id, input);
+    return this.serializeAgentProductDetailForActor(actor, agentProduct);
   }
 
   listAgentOrders(actor: AgentActor) {
@@ -957,8 +1033,58 @@ class BackendServices {
     return [...this.store.ownProducts.values()].filter((product) => product.agentId === actor.agentId && product.shopId === actor.shopId);
   }
 
+  getOwnProductDetail(actor: AgentActor, ownProductId: string) {
+    const product = requireEntity(this.store.ownProducts.get(ownProductId), "RESOURCE_NOT_FOUND", "own product not found");
+    assertAgentScope(actor, product);
+    return this.serializeOwnProductDetail(product, "merchant");
+  }
+
+  updateOwnProductDetail(actor: AgentActor, ownProductId: string, input: {
+    name?: string;
+    category?: string;
+    tags?: string[];
+    subtitle?: string;
+    description?: string;
+    usageGuide?: string;
+    imageUrl?: string;
+    specs?: string[];
+    detailSections?: ProductDetailSection[];
+    stockCount?: number;
+    soldCount?: number;
+    salePriceCents?: bigint;
+    minSalePriceCents?: bigint;
+    fulfillmentRule?: unknown;
+    afterSaleRule?: unknown;
+    status?: string;
+  }) {
+    const product = requireEntity(this.store.ownProducts.get(ownProductId), "RESOURCE_NOT_FOUND", "own product not found");
+    assertAgentScope(actor, product);
+    if (product.reviewStatus !== "pending_review" && (input.name || input.category || input.fulfillmentRule)) {
+      throw new ApiError(400, "OWN_PRODUCT_EDIT_LOCKED", "approved or rejected own product core fields cannot be changed");
+    }
+    const nextFulfillmentMode = input.fulfillmentRule === undefined ? undefined : fulfillmentRuleMode(input.fulfillmentRule);
+    if (nextFulfillmentMode && nextFulfillmentMode !== fulfillmentRuleMode(product.fulfillmentRule)) {
+      this.assertSafeOwnFulfillmentModeChange(product.id, nextFulfillmentMode);
+    }
+    const nextSalePrice = input.salePriceCents ?? product.salePriceCents;
+    const nextMinSalePrice = input.minSalePriceCents ?? product.minSalePriceCents;
+    quoteAgentOwnedProduct({ salePriceCents: nextSalePrice, minSalePriceCents: nextMinSalePrice });
+    assignDefined(product, input);
+    product.updatedAt = new Date();
+    this.audit("agent", "own_product.update", "own_product", product.id, input);
+    return this.serializeOwnProductDetail(product, "merchant");
+  }
+
   submitOwnProduct(actor: AgentActor, input: {
     name: string;
+    category?: string;
+    tags?: string[];
+    subtitle?: string;
+    description?: string;
+    usageGuide?: string;
+    imageUrl?: string;
+    specs?: string[];
+    detailSections?: ProductDetailSection[];
     salePriceCents: bigint;
     minSalePriceCents?: bigint;
     fulfillmentRule?: unknown;
@@ -977,6 +1103,14 @@ class BackendServices {
       agentId: actor.agentId,
       shopId: shop.id,
       name: input.name,
+      category: input.category,
+      tags: input.tags,
+      subtitle: input.subtitle,
+      description: input.description,
+      usageGuide: input.usageGuide,
+      imageUrl: input.imageUrl,
+      specs: input.specs,
+      detailSections: input.detailSections,
       salePriceCents: input.salePriceCents,
       minSalePriceCents: input.minSalePriceCents,
       fulfillmentRule: input.fulfillmentRule ?? { mode: "manual" },
@@ -1343,6 +1477,12 @@ class BackendServices {
     };
   }
 
+  getAdminOwnProductReviewDetail(actor: AdminActor, ownProductId: string) {
+    assertAdminPermission(actor, "product.manage");
+    const product = requireEntity(this.store.ownProducts.get(ownProductId), "RESOURCE_NOT_FOUND", "own product not found");
+    return this.serializeOwnProductDetail(product, "admin");
+  }
+
   reviewOwnProduct(actor: AdminActor, ownProductId: string, input: { approved: boolean; reason?: string }) {
     assertAdminPermission(actor, "product.manage");
     const ownProduct = requireEntity(this.store.ownProducts.get(ownProductId), "RESOURCE_NOT_FOUND", "own product not found");
@@ -1527,9 +1667,44 @@ class BackendServices {
     return codes;
   }
 
+  precheckRightsCodes(actor: AdminActor, input: { productId: string; codes: string[] }) {
+    assertAdminPermission(actor, "product.manage");
+    const product = requireEntity(this.store.platformProducts.get(input.productId), "RESOURCE_NOT_FOUND", "platform product not found");
+    if (fulfillmentRuleMode(product.fulfillmentRule) !== "code_pool") {
+      throw new ApiError(400, "RIGHTS_CODE_PRODUCT_MODE_INVALID", "card-code pool is only available for code_pool products");
+    }
+    const precheck = this.analyzeRightsCodeImport(input.codes, (code) =>
+      this.store.rightsCodes.some((item) => item.productId === product.id && item.code === code)
+    );
+    return this.redactRightsCodeImportPrecheck(precheck);
+  }
+
   listEmailDeliveries(actor: AdminActor) {
     assertAdminPermission(actor, "audit.read");
     return this.store.emailDeliveries;
+  }
+
+  resendOrderEmailDelivery(actor: AdminActor, orderNo: string) {
+    assertAdminPermission(actor, "after_sale.arbitrate");
+    const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
+    if (!order.buyerEmail) throw new ApiError(400, "EMAIL_DELIVERY_NOT_CONFIGURED", "buyer email is not set for this order");
+    if (order.refundStatus !== "none" || order.status === "refunded") {
+      throw new ApiError(403, "EMAIL_DELIVERY_FORBIDDEN_AFTER_REFUND", "refunded orders cannot resend delivery codes");
+    }
+    if (order.paymentStatus !== "paid" || order.fulfillmentStatus !== "success") {
+      throw new ApiError(400, "EMAIL_DELIVERY_NOT_READY", "delivery is not ready for this order");
+    }
+    const codes = this.store.rightsCodes.filter((code) => code.orderNo === order.orderNo && code.status === "issued");
+    if (fulfillmentMode(order.snapshot) === "code_pool" && codes.length === 0) {
+      throw new ApiError(400, "EMAIL_DELIVERY_CODE_NOT_ISSUED", "no issued codes are bound to this order");
+    }
+    const delivery = this.recordEmailDelivery(order, codes, "manual_resend");
+    this.audit(actor.role, "email.delivery.resend", "order", order.orderNo, {
+      email: order.buyerEmail,
+      codeCount: codes.length,
+      deliveryId: delivery?.id
+    });
+    return delivery;
   }
 
   private filterRightsCodes(filters: { productId?: string; orderNo?: string; status?: RightsCode["status"]; shopId?: string } = {}) {
@@ -1555,14 +1730,69 @@ class BackendServices {
     };
   }
 
+  private analyzeRightsCodeImport(codes: string[], exists: (code: string) => boolean): RightsCodeImportPrecheck {
+    const seen = new Set<string>();
+    const details = codes.map((rawCode, index): RightsCodeImportDetail => {
+      const normalizedCode = rawCode.trim();
+      const base = {
+        line: index + 1,
+        codePreview: normalizedCode ? previewSecret(normalizedCode) : undefined,
+        normalizedCode: normalizedCode || undefined
+      };
+      if (!normalizedCode) {
+        return { ...base, action: "fail", reasonCode: "EMPTY_LINE", reason: "empty line" };
+      }
+      if (normalizedCode.length > 256 || /[\u0000-\u001f\u007f]/.test(normalizedCode)) {
+        return { ...base, action: "fail", reasonCode: "INVALID_FORMAT", reason: "card code contains invalid characters or is too long" };
+      }
+      if (seen.has(normalizedCode)) {
+        return { ...base, action: "skip", reasonCode: "DUPLICATE_IN_REQUEST", reason: "duplicate in current import" };
+      }
+      seen.add(normalizedCode);
+      if (exists(normalizedCode)) {
+        return { ...base, action: "skip", reasonCode: "DUPLICATE_EXISTING", reason: "card code already exists" };
+      }
+      return { ...base, action: "create", reasonCode: null, reason: null };
+    });
+    const created = details.filter((item) => item.action === "create").length;
+    const skipped = details.filter((item) => item.action === "skip").length;
+    const failed = details.filter((item) => item.action === "fail").length;
+    return {
+      summary: {
+        total: details.length,
+        create: created,
+        created,
+        skipped,
+        failed,
+        importable: created
+      },
+      details
+    };
+  }
+
+  private redactRightsCodeImportPrecheck(precheck: RightsCodeImportPrecheck) {
+    return {
+      ...precheck,
+      details: precheck.details.map(({ normalizedCode: _normalizedCode, ...item }) => item)
+    };
+  }
+
   addRightsCodes(actor: AdminActor, input: { productId: string; codes: string[]; batchNo?: string }) {
     assertAdminPermission(actor, "product.manage");
     const product = requireEntity(this.store.platformProducts.get(input.productId), "RESOURCE_NOT_FOUND", "platform product not found");
-    const uniqueCodes = [...new Set(input.codes.map((code) => code.trim()).filter(Boolean))];
-    if (uniqueCodes.length === 0) throw new ApiError(400, "RIGHTS_CODE_EMPTY", "codes are required");
+    if (fulfillmentRuleMode(product.fulfillmentRule) !== "code_pool") {
+      throw new ApiError(400, "RIGHTS_CODE_PRODUCT_MODE_INVALID", "card-code pool is only available for code_pool products");
+    }
+    const precheck = this.analyzeRightsCodeImport(input.codes, (code) =>
+      this.store.rightsCodes.some((item) => item.productId === product.id && item.code === code)
+    );
+    const importableCodes = precheck.details
+      .filter((item) => item.action === "create")
+      .map((item) => item.normalizedCode)
+      .filter((code): code is string => Boolean(code));
+    if (importableCodes.length === 0) throw new ApiError(400, "RIGHTS_CODE_EMPTY", "no importable card codes");
     const created: RightsCode[] = [];
-    for (const code of uniqueCodes) {
-      if (this.store.rightsCodes.some((item) => item.productId === product.id && item.code === code)) continue;
+    for (const code of importableCodes) {
       const item: RightsCode = {
         codeId: nextId(this.store, "code"),
         productId: product.id,
@@ -1575,13 +1805,28 @@ class BackendServices {
       this.store.rightsCodes.push(item);
       created.push(item);
     }
-    product.fulfillmentRule = { ...(isRecord(product.fulfillmentRule) ? product.fulfillmentRule : {}), mode: "code_pool" };
     this.audit(actor.role, "rights_code.import", "platform_product", product.id, {
       count: created.length,
       batchNo: input.batchNo ?? "manual",
       codeIds: created.map((code) => code.codeId)
     });
-    return { count: created.length, product, codes: created.map((code) => this.redactRightsCode(code)) };
+    return {
+      count: created.length,
+      createdCount: created.length,
+      skippedCount: precheck.summary.skipped,
+      failedCount: precheck.summary.failed,
+      product,
+      codes: created.map((code) => this.redactRightsCode(code)),
+      details: this.redactRightsCodeImportPrecheck({
+        ...precheck,
+        details: precheck.details.map((item) =>
+          item.action === "create"
+            ? { ...item, codeId: created.find((code) => code.code === item.normalizedCode)?.codeId }
+            : item
+        )
+      }).details,
+      summary: precheck.summary
+    };
   }
 
   listAgentRightsCodes(actor: AgentActor, filters: { agentProductId?: string; status?: RightsCode["status"] } = {}) {
@@ -1593,6 +1838,23 @@ class BackendServices {
       .filter((code) => !filters.agentProductId || code.productId === filters.agentProductId || code.agentProductId === filters.agentProductId)
       .filter((code) => !filters.status || code.status === filters.status)
       .map((code) => this.redactRightsCode(code));
+  }
+
+  precheckAgentRightsCodes(actor: AgentActor, input: { agentProductId: string; codes: string[] }) {
+    this.assertAgentDepositConfirmed(actor.agentId, "import own rights codes");
+    const agentProduct = requireEntity(this.store.agentProducts.get(input.agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
+    assertAgentScope(actor, agentProduct);
+    if (agentProduct.productType !== "agent_owned") {
+      throw new ApiError(400, "RIGHTS_CODE_PRODUCT_SCOPE_INVALID", "merchant can only import card codes for own reviewed products");
+    }
+    const ownProduct = requireEntity(this.store.ownProducts.get(required(agentProduct.ownProductReviewId, "ownProductReviewId")), "RESOURCE_NOT_FOUND", "own product not found");
+    if (fulfillmentRuleMode(ownProduct.fulfillmentRule) !== "code_pool") {
+      throw new ApiError(400, "RIGHTS_CODE_PRODUCT_MODE_INVALID", "own product must use automatic card-code fulfillment");
+    }
+    const precheck = this.analyzeRightsCodeImport(input.codes, (code) =>
+      this.store.rightsCodes.some((item) => (item.agentProductId ?? item.productId) === agentProduct.id && item.code === code)
+    );
+    return this.redactRightsCodeImportPrecheck(precheck);
   }
 
   addAgentRightsCodes(actor: AgentActor, input: { agentProductId: string; codes: string[]; batchNo?: string }) {
@@ -1608,11 +1870,16 @@ class BackendServices {
       throw new ApiError(400, "RIGHTS_CODE_PRODUCT_MODE_INVALID", "own product must use automatic card-code fulfillment");
     }
     ownProduct.fulfillmentRule = { ...rule, mode: "code_pool", extractCodeRequired: true };
-    const uniqueCodes = [...new Set(input.codes.map((code) => code.trim()).filter(Boolean))];
-    if (uniqueCodes.length === 0) throw new ApiError(400, "RIGHTS_CODE_EMPTY", "codes are required");
+    const precheck = this.analyzeRightsCodeImport(input.codes, (code) =>
+      this.store.rightsCodes.some((item) => (item.agentProductId ?? item.productId) === agentProduct.id && item.code === code)
+    );
+    const importableCodes = precheck.details
+      .filter((item) => item.action === "create")
+      .map((item) => item.normalizedCode)
+      .filter((code): code is string => Boolean(code));
+    if (importableCodes.length === 0) throw new ApiError(400, "RIGHTS_CODE_EMPTY", "no importable card codes");
     const created: RightsCode[] = [];
-    for (const code of uniqueCodes) {
-      if (this.store.rightsCodes.some((item) => (item.agentProductId ?? item.productId) === agentProduct.id && item.code === code)) continue;
+    for (const code of importableCodes) {
       const item: RightsCode = {
         codeId: nextId(this.store, "code"),
         productId: agentProduct.id,
@@ -1630,7 +1897,23 @@ class BackendServices {
       batchNo: input.batchNo ?? "merchant",
       codeIds: created.map((code) => code.codeId)
     });
-    return { count: created.length, agentProduct, codes: created.map((code) => this.redactRightsCode(code)) };
+    return {
+      count: created.length,
+      createdCount: created.length,
+      skippedCount: precheck.summary.skipped,
+      failedCount: precheck.summary.failed,
+      agentProduct,
+      codes: created.map((code) => this.redactRightsCode(code)),
+      details: this.redactRightsCodeImportPrecheck({
+        ...precheck,
+        details: precheck.details.map((item) =>
+          item.action === "create"
+            ? { ...item, codeId: created.find((code) => code.code === item.normalizedCode)?.codeId }
+            : item
+        )
+      }).details,
+      summary: precheck.summary
+    };
   }
 
   fulfillOrder(actor: AdminActor, orderNo: string, input: { status: "success" | "failed"; attemptNo: number; evidence?: string; failReason?: string }) {
@@ -2792,6 +3075,50 @@ class BackendServices {
     return { ...agentProduct, product };
   }
 
+  private serializePlatformProductDetail(product: DemoPlatformProduct, audience: "admin" | "merchant", actor?: AdminActor) {
+    const isCodePool = fulfillmentRuleMode(product.fulfillmentRule) === "code_pool";
+    const rightsCodePool = this.rightsCodePoolSummary(product.id, {
+      canImport: audience === "admin" && Boolean(actor) && hasAdminPermission(actor!, "product.manage") && isCodePool,
+      canExportMasked: audience === "admin" && Boolean(actor) && hasAdminPermission(actor!, "product.manage"),
+      canViewPlaintext: audience === "admin" && Boolean(actor) && hasAdminPermission(actor!, "rights_code.secret.read"),
+      canExportPlaintext: audience === "admin" && Boolean(actor) && hasAdminPermission(actor!, "rights_code.secret.read")
+    });
+    const fulfillmentModeValue = fulfillmentRuleMode(product.fulfillmentRule);
+    return {
+      ...product,
+      fulfillmentMode: fulfillmentModeValue,
+      manualFulfillmentInstruction: manualFulfillmentInstruction(product.fulfillmentRule),
+      rightsCodePool,
+      fieldPermissions: audience === "admin"
+        ? {
+            editable: ["name", "category", "tags", "subtitle", "description", "usageGuide", "imageUrl", "specs", "detailSections", "supplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents", "fulfillmentMode", "afterSaleRule", "status"],
+            readonly: []
+          }
+        : {
+            editable: [],
+            readonly: ["name", "category", "tags", "subtitle", "description", "usageGuide", "imageUrl", "specs", "detailSections", "minSalePriceCents", "suggestedSalePriceCents", "fulfillmentMode", "afterSaleRule", "status"]
+          },
+      saveConfirmation: {
+        requiresConfirmation: true,
+        message: "保存会影响后续展示和新订单快照，既有订单不回写。"
+      }
+    };
+  }
+
+  private serializePlatformShopProductDetail(shopProduct: DemoPlatformShopProduct, actor?: AdminActor) {
+    const product = requireEntity(this.store.platformProducts.get(shopProduct.platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
+    const shop = this.store.shops.get(shopProduct.shopId);
+    return {
+      ...shopProduct,
+      shop: shop ? { id: shop.id, name: shop.name, status: shop.status, ownerType: shop.ownerType ?? "agent" } : undefined,
+      product: this.serializePlatformProductDetail(product, "admin", actor),
+      fieldPermissions: {
+        editable: ["salePriceCents", "fulfillmentCostCents", "status"],
+        readonly: ["platformProductId", "product"]
+      }
+    };
+  }
+
   private serializeAgentProductForActor(actor: AgentActor, agentProduct: DemoAgentProduct) {
     const base = this.serializeAgentProduct(agentProduct) as Record<string, unknown> & { product?: Record<string, unknown> };
     if (!base.product || agentProduct.productType !== "platform") return base;
@@ -2802,6 +3129,116 @@ class BackendServices {
     if (visibility.visibleUpstreamSupplyPriceCents !== undefined) product.visibleUpstreamSupplyPriceCents = visibility.visibleUpstreamSupplyPriceCents;
     if (visibility.ownTransferSupplyPriceCents !== undefined) product.ownTransferSupplyPriceCents = visibility.ownTransferSupplyPriceCents;
     return { ...base, product };
+  }
+
+  private serializeAgentProductDetailForActor(actor: AgentActor, agentProduct: DemoAgentProduct) {
+    const base = this.serializeAgentProductForActor(actor, agentProduct) as Record<string, unknown> & { product?: Record<string, unknown> };
+    const inventoryProductId = agentProduct.productType === "agent_owned" ? agentProduct.id : agentProduct.platformProductId;
+    return {
+      ...base,
+      rightsCodePool: inventoryProductId ? this.rightsCodePoolSummary(inventoryProductId, {
+        canImport: agentProduct.productType === "agent_owned",
+        canExportMasked: agentProduct.productType === "agent_owned",
+        canViewPlaintext: false,
+        canExportPlaintext: false
+      }) : undefined,
+      fieldPermissions: {
+        editable: ["salePriceCents", "status"],
+        readonly: ["product", "fulfillmentMode", "afterSaleRule", "rightsCodePool"]
+      },
+      canViewPlainRightsCodes: agentProduct.productType === "agent_owned",
+      priceVisibility: agentProduct.productType === "platform" ? this.priceVisibilityForAgent(actor.agentId, agentProduct.platformProductId) : undefined
+    };
+  }
+
+  private serializeOwnProductDetail(product: DemoOwnProduct, audience: "admin" | "merchant") {
+    const agent = this.store.agents.get(product.agentId);
+    const shop = this.store.shops.get(product.shopId);
+    const agentProduct = [...this.store.agentProducts.values()].find((item) => item.ownProductReviewId === product.id);
+    const editable = audience === "admin"
+      ? ["reviewStatus", "status"]
+      : product.reviewStatus === "pending_review"
+        ? ["name", "category", "tags", "subtitle", "description", "usageGuide", "imageUrl", "specs", "detailSections", "salePriceCents", "minSalePriceCents", "fulfillmentMode", "afterSaleRule"]
+        : ["salePriceCents", "status"];
+    return {
+      ...product,
+      ownProductId: product.id,
+      agentProductId: agentProduct?.id,
+      agent: agent ? { id: agent.id, name: agent.name, tier: agent.tier, status: agent.status } : undefined,
+      shop: shop ? { id: shop.id, name: shop.name, status: shop.status } : undefined,
+      fulfillmentMode: fulfillmentRuleMode(product.fulfillmentRule),
+      manualFulfillmentInstruction: manualFulfillmentInstruction(product.fulfillmentRule),
+      rightsCodePool: agentProduct ? this.rightsCodePoolSummary(agentProduct.id, {
+        canImport: audience === "merchant" && fulfillmentRuleMode(product.fulfillmentRule) === "code_pool",
+        canExportMasked: audience === "merchant",
+        canViewPlaintext: false,
+        canExportPlaintext: false
+      }) : this.rightsCodePoolSummary(product.id, {
+        canImport: false,
+        canExportMasked: false,
+        canViewPlaintext: false,
+        canExportPlaintext: false
+      }),
+      fieldPermissions: { editable, readonly: audience === "admin" ? ["agent", "shop", "rightsCodePool"] : ["reviewStatus", "agent", "shop"] },
+      saveConfirmation: {
+        requiresConfirmation: true,
+        message: "保存后只影响后续展示和新订单，已产生订单保持原快照。"
+      }
+    };
+  }
+
+  private rightsCodePoolSummary(productId: string, permissions: {
+    canImport?: boolean;
+    canExportMasked?: boolean;
+    canViewPlaintext?: boolean;
+    canExportPlaintext?: boolean;
+  } = {}) {
+    const codes = this.store.rightsCodes.filter((code) => code.productId === productId || code.agentProductId === productId);
+    const available = codes.filter((code) => code.status === "available").length;
+    const issued = codes.filter((code) => code.status === "issued").length;
+    const voided = codes.filter((code) => code.status === "voided").length;
+    return {
+      productId,
+      total: codes.length,
+      available,
+      issued,
+      voided,
+      lowStock: available > 0 && available <= 3,
+      plaintextDefaultVisible: false,
+      permissions: {
+        canImport: permissions.canImport ?? false,
+        canExportMasked: permissions.canExportMasked ?? true,
+        canViewPlaintext: permissions.canViewPlaintext ?? false,
+        canExportPlaintext: permissions.canExportPlaintext ?? false
+      }
+    };
+  }
+
+  private assertSafePlatformFulfillmentModeChange(productId: string, nextMode: "manual" | "code_pool") {
+    if (nextMode === "code_pool") return;
+    const hasCodes = this.store.rightsCodes.some((code) => code.productId === productId);
+    const hasActiveOrders = [...this.store.orders.values()].some((order) =>
+      getSnapshotProductId(order.snapshot) === productId
+      && !["refunded", "closed"].includes(order.status)
+      && order.fulfillmentStatus !== "not_started"
+    );
+    if (hasCodes || hasActiveOrders) {
+      throw new ApiError(400, "FULFILLMENT_MODE_CHANGE_UNSAFE", "cannot switch to manual after code_pool orders or issued codes exist");
+    }
+  }
+
+  private assertSafeOwnFulfillmentModeChange(ownProductId: string, nextMode: "manual" | "code_pool") {
+    const agentProduct = [...this.store.agentProducts.values()].find((product) => product.ownProductReviewId === ownProductId);
+    if (!agentProduct || nextMode === "code_pool") return;
+    const hasCodes = this.store.rightsCodes.some((code) => (code.agentProductId ?? code.productId) === agentProduct.id);
+    const hasActiveOrders = [...this.store.orders.values()].some((order) =>
+      order.agentProductId === agentProduct.id
+      && !["refunded", "closed"].includes(order.status)
+      && order.fulfillmentStatus !== "not_started"
+    );
+    if (hasCodes || hasActiveOrders) {
+      throw new ApiError(400, "FULFILLMENT_MODE_CHANGE_UNSAFE", "cannot switch to manual after code_pool orders or issued codes exist");
+    }
   }
 
   private serializeAgentOrderForActor(actor: AgentActor, order: DemoOrder) {
@@ -2945,7 +3382,7 @@ class BackendServices {
       fulfillmentStatus: order.fulfillmentStatus,
       refundStatus: order.refundStatus,
       buyerEmail: options.includeBuyerContact ? order.buyerEmail : undefined,
-      extractionCodeSet: order.extractionCodeSet,
+      purchasePasswordSet: order.extractionCodeSet,
       paidAt: order.paidAt,
       fulfilledAt: order.fulfilledAt,
       refundedAmountCents: order.refundedAmountCents,
@@ -2975,10 +3412,17 @@ class BackendServices {
   private serializeDelivery(order: DemoOrder, options: { includeDeliveryCodes?: boolean; includeBuyerContact?: boolean }) {
     const mode = fulfillmentMode(order.snapshot);
     if (mode !== "code_pool") {
+      const instruction = manualFulfillmentInstruction(order.snapshot.fulfillmentRuleSnapshot);
       return {
         mode: "manual",
         status: order.fulfillmentStatus,
-        message: "本商品为人工交付，请添加店铺客服领取卡密或账号。"
+        manualFulfillmentInstruction: instruction,
+        customerServiceWechat: (order.snapshot.shopSnapshot as { customerServiceWechat?: string }).customerServiceWechat,
+        customerServiceQrUrl: (order.snapshot.shopSnapshot as { customerServiceQrUrl?: string }).customerServiceQrUrl,
+        customerServiceQq: (order.snapshot.shopSnapshot as { customerServiceQq?: string }).customerServiceQq,
+        customerServiceQqQrUrl: (order.snapshot.shopSnapshot as { customerServiceQqQrUrl?: string }).customerServiceQqQrUrl,
+        customerServiceNote: (order.snapshot.shopSnapshot as { customerServiceNote?: string }).customerServiceNote,
+        message: instruction ?? "本商品为人工交付，请添加店铺客服领取账号、服务或权益。"
       };
     }
     const codes = this.store.rightsCodes
@@ -2992,11 +3436,11 @@ class BackendServices {
       mode: "automatic",
       status: order.fulfillmentStatus,
       buyerEmail: options.includeBuyerContact ? order.buyerEmail : undefined,
-      extractionCodeSet: order.extractionCodeSet,
+      purchasePasswordSet: order.extractionCodeSet,
       extractable: Boolean(order.extractionCodeSet) && order.paymentStatus === "paid" && order.fulfillmentStatus === "success" && order.refundStatus === "none",
       extractionToken: Boolean(order.extractionCodeSet) ? this.extractionTokenForOrder(order) : undefined,
       codes: !order.extractionCodeSet && options.includeBuyerContact && order.paymentStatus === "paid" && order.fulfillmentStatus === "success" && order.refundStatus === "none" ? codes : [],
-      message: codes.length > 0 ? "卡密已自动发放，请使用购买时设置的提取码查看。" : "付款后系统会自动发放卡密。"
+      message: codes.length > 0 ? "卡密已自动发放，请使用购买时设置的购买密码查看。" : "付款后系统会自动发放卡密。"
     };
   }
 
@@ -3580,13 +4024,29 @@ class BackendServices {
   }
 
   private extractionTokenForOrder(order: DemoOrder) {
-    const secret = process.env.AUTH_TOKEN_SECRET ?? "dev-extraction-token-secret";
-    const source = `${order.orderNo}:${order.userId}:${order.extractionCodeHash ?? "no-code"}:${secret}`;
-    return `ext_${hashSecret(source).slice(0, 40)}`;
+    const baseTime = order.fulfilledAt ?? order.paidAt ?? new Date();
+    const expiresAt = baseTime.getTime() + 24 * 60 * 60 * 1000;
+    return `ext_${expiresAt.toString(36)}_${this.extractionTokenSignature(order, expiresAt)}`;
   }
 
-  private recordEmailDelivery(order: DemoOrder, issuedCodes: RightsCode[]) {
-    if (!order.buyerEmail) return;
+  private extractionTokenSignature(order: DemoOrder, expiresAt: number) {
+    const secret = process.env.AUTH_TOKEN_SECRET ?? "dev-extraction-token-secret";
+    const source = [
+      order.orderNo,
+      order.userId,
+      order.shopId,
+      "rights_code_extract",
+      expiresAt.toString(),
+      order.refundStatus,
+      order.status,
+      order.extractionCodeHash ?? "no-password",
+      secret
+    ].join(":");
+    return hashSecret(source).slice(0, 40);
+  }
+
+  private recordEmailDelivery(order: DemoOrder, issuedCodes: RightsCode[], source: "auto_fulfillment" | "manual_resend" = "auto_fulfillment") {
+    if (!order.buyerEmail) return undefined;
     const enabled = process.env.EMAIL_DELIVERY_ENABLED === "true";
     const item: EmailDelivery = {
       id: nextId(this.store, "email"),
@@ -3594,6 +4054,7 @@ class BackendServices {
       userId: order.userId,
       email: order.buyerEmail,
       codeCount: issuedCodes.length,
+      source,
       status: enabled ? "sent" : "provider_not_configured",
       reason: enabled ? undefined : "EMAIL_PROVIDER_NOT_CONFIGURED",
       createdAt: new Date()
@@ -3603,8 +4064,10 @@ class BackendServices {
       email: item.email,
       status: item.status,
       codeCount: item.codeCount,
+      source,
       reason: item.reason
     });
+    return item;
   }
 
   listExtractLogs(actor: AdminActor) {
@@ -3754,6 +4217,7 @@ class PrismaStateRepository {
       this.loadCoupons(store),
       this.loadInviteAndChannelState(store),
       this.loadFinancialState(store),
+      this.loadEmailDeliveries(store),
       this.loadPaymentConfig(store)
     ]);
     return store;
@@ -3844,6 +4308,10 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestPlatformShopProductUpsert(tx, store));
       return;
     }
+    if (method === "updatePlatformShopProductDetail") {
+      await this.persistInShortTransaction((tx) => this.persistLatestPlatformShopProductUpdate(tx, store));
+      return;
+    }
     if (method === "upsertChannelProductOffer" || method === "upsertAgentChannelProductOffer") {
       await this.persistInShortTransaction((tx) => this.persistLatestChannelProductOfferUpsert(tx, store));
       return;
@@ -3864,6 +4332,10 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestOwnProductSubmission(tx, store));
       return;
     }
+    if (method === "updateOwnProductDetail") {
+      await this.persistInShortTransaction((tx) => this.persistLatestOwnProductUpdate(tx, store));
+      return;
+    }
     if (method === "reviewOwnProduct") {
       await this.persistInShortTransaction((tx) => this.persistLatestOwnProductReview(tx, store));
       return;
@@ -3874,6 +4346,10 @@ class PrismaStateRepository {
     }
     if (method === "setAgentProductPrice") {
       await this.persistInShortTransaction((tx) => this.persistLatestAgentProductPriceUpdate(tx, store));
+      return;
+    }
+    if (method === "updateAgentProductDetail") {
+      await this.persistInShortTransaction((tx) => this.persistLatestAgentProductDetailUpdate(tx, store));
       return;
     }
     if ([
@@ -3918,6 +4394,10 @@ class PrismaStateRepository {
     }
     if (method === "fulfillAgentOrder") {
       await this.persistInShortTransaction((tx) => this.persistLatestFulfillmentUpdate(tx, store));
+      return;
+    }
+    if (method === "resendOrderEmailDelivery") {
+      await this.persistInShortTransaction((tx) => this.persistRiskAuditLedger(tx, store));
       return;
     }
     if (method === "createAfterSale") {
@@ -4494,6 +4974,17 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
+  private async persistLatestOwnProductUpdate(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["own_product.update"]);
+    const ownProductId = audit ? stringValue(audit.targetId) : undefined;
+    const ownProduct = ownProductId ? store.ownProducts.get(ownProductId) : undefined;
+    if (!ownProduct) throw new Error("own product update missing current product");
+    await this.persistOwnProductReview(tx, ownProduct);
+    const agentProduct = [...store.agentProducts.values()].find((product) => product.ownProductReviewId === ownProduct.id);
+    if (agentProduct) await this.persistAgentProductWithDependencies(tx, store, agentProduct);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
   private async persistLatestPlatformProductBatchSelection(tx: PrismaTx, store: MemoryStore) {
     const audit = this.latestAuditLog(store, ["agent_product.batch_select_platform"]);
     const shopId = audit ? stringValue(audit.targetId) : undefined;
@@ -4513,6 +5004,15 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
+  private async persistLatestAgentProductDetailUpdate(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["agent_product.detail_update", "agent_product.price_update"]);
+    const agentProductId = audit ? stringValue(audit.targetId) : undefined;
+    const agentProduct = agentProductId ? store.agentProducts.get(agentProductId) : undefined;
+    if (!agentProduct) throw new Error("agent product detail update missing current product");
+    await this.persistAgentProductWithDependencies(tx, store, agentProduct);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
   private async persistLatestPlatformShopProductUpsert(tx: PrismaTx, store: MemoryStore) {
     const audit = this.latestAuditLog(store, ["platform_shop_product.upsert"]);
     const shopProductId = audit ? stringValue(audit.targetId) : undefined;
@@ -4524,6 +5024,15 @@ class PrismaStateRepository {
     if (!product) throw new Error("platform shop product upsert missing current platform product");
     await this.persistShop(tx, shop);
     await this.persistPlatformProduct(tx, product);
+    await this.persistPlatformShopProduct(tx, shopProduct);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestPlatformShopProductUpdate(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["platform_shop_product.update"]);
+    const shopProductId = audit ? stringValue(audit.targetId) : undefined;
+    const shopProduct = shopProductId ? store.platformShopProducts.get(shopProductId) : undefined;
+    if (!shopProduct) throw new Error("platform shop product update missing current shop product");
     await this.persistPlatformShopProduct(tx, shopProduct);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
@@ -4613,6 +5122,7 @@ class PrismaStateRepository {
     if (order.extractionCodeHash) await this.persistOrderExtractSecret(tx, order);
     await this.persistIssuedRightsCodesForOrder(tx, store, order);
     await this.persistFulfillmentRecordForOrder(tx, store, order);
+    await this.persistEmailDeliveriesForOrder(tx, store, order);
     const ledger = [...store.ledgerEntries]
       .reverse()
       .find((item) => item.orderNo === order.orderNo && item.entryType === "OFFLINE_PAYMENT_CONFIRMED");
@@ -4887,13 +5397,14 @@ class PrismaStateRepository {
     await tx.$executeRaw`
       INSERT INTO agent_product_reviews (
         id, agent_id, shop_id, name, detail_json, sale_price_cents,
-        after_sale_rule_json, fulfillment_rule_json, status, reject_reason,
+        after_sale_rule_json, fulfillment_rule_json, fulfillment_type, status, reject_reason,
         risk_reason, reviewed_by, reviewed_at, created_at, updated_at
       )
       VALUES (
         ${ownProduct.id}, ${ownProduct.agentId}, ${ownProduct.shopId}, ${ownProduct.name},
         ${jsonForDb(ownProduct)}::jsonb, ${ownProduct.salePriceCents},
         ${jsonForDb(ownProduct.afterSaleRule)}::jsonb, ${jsonForDb(ownProduct.fulfillmentRule)}::jsonb,
+        CAST(${fulfillmentModeFromRule(ownProduct.fulfillmentRule)} AS "FulfillmentType"),
         CAST(${mapReviewStatus(ownProduct.reviewStatus)} AS "ReviewStatus"), NULL, NULL, NULL,
         ${ownProduct.reviewStatus === "approved" ? ownProduct.updatedAt ?? new Date() : null},
         ${ownProduct.createdAt ?? new Date()}, ${ownProduct.updatedAt ?? new Date()}
@@ -4904,6 +5415,7 @@ class PrismaStateRepository {
         sale_price_cents = EXCLUDED.sale_price_cents,
         after_sale_rule_json = EXCLUDED.after_sale_rule_json,
         fulfillment_rule_json = EXCLUDED.fulfillment_rule_json,
+        fulfillment_type = EXCLUDED.fulfillment_type,
         status = EXCLUDED.status,
         updated_at = EXCLUDED.updated_at
     `;
@@ -5017,24 +5529,48 @@ class PrismaStateRepository {
   }
 
   private async persistAvailableRightsCode(tx: PrismaTx, code: RightsCode, store: MemoryStore) {
-    const platformProductId = code.platformProductId ?? (store.platformProducts.has(code.productId) ? code.productId : null);
-    const agentProductId = code.agentProductId ?? (store.agentProducts.has(code.productId) ? code.productId : null);
+    const shape = this.rightsCodeDbShape(code, store);
     await tx.$executeRaw`
       INSERT INTO rights_codes (
-        id, product_id, agent_product_id, code_ciphertext, batch_no, status, order_id,
-        issue_key, issued_at, created_at, updated_at
+        id, product_id, agent_product_id, code_ciphertext, code_hash, secret_preview,
+        owner_type, owner_agent_id, shop_id, batch_no, status, order_id,
+        issue_key, issued_at, import_audit_json, created_at, updated_at
       )
       VALUES (
-        ${code.codeId}, ${platformProductId}, ${agentProductId}, ${code.code}, ${code.batchNo},
-        CAST('available' AS "RightsCodeStatus"), NULL, NULL, NULL, ${code.createdAt}, now()
+        ${code.codeId}, ${shape.platformProductId}, ${shape.agentProductId}, ${code.code},
+        ${shape.codeHash}, ${shape.secretPreview}, CAST(${shape.ownerType} AS "RightsCodeOwnerType"),
+        ${shape.ownerAgentId}, ${shape.shopId}, ${code.batchNo},
+        CAST('available' AS "RightsCodeStatus"), NULL, NULL, NULL,
+        ${jsonForDb({ batchNo: code.batchNo, source: "targeted_import" })}::jsonb,
+        ${code.createdAt}, now()
       )
       ON CONFLICT (id) DO UPDATE SET
         status = CASE
           WHEN rights_codes.order_id IS NULL THEN EXCLUDED.status
           ELSE rights_codes.status
         END,
+        code_hash = COALESCE(rights_codes.code_hash, EXCLUDED.code_hash),
+        secret_preview = COALESCE(rights_codes.secret_preview, EXCLUDED.secret_preview),
+        owner_type = EXCLUDED.owner_type,
+        owner_agent_id = EXCLUDED.owner_agent_id,
+        shop_id = EXCLUDED.shop_id,
         updated_at = now()
     `;
+  }
+
+  private rightsCodeDbShape(code: RightsCode, store: MemoryStore) {
+    const platformProductId = code.platformProductId ?? (store.platformProducts.has(code.productId) ? code.productId : null);
+    const agentProductId = code.agentProductId ?? (store.agentProducts.has(code.productId) ? code.productId : null);
+    const agentProduct = agentProductId ? store.agentProducts.get(agentProductId) : undefined;
+    return {
+      platformProductId,
+      agentProductId,
+      ownerType: agentProductId ? "agent" : "platform",
+      ownerAgentId: agentProduct?.agentId ?? null,
+      shopId: agentProduct?.shopId ?? null,
+      codeHash: hashSecret(code.code),
+      secretPreview: previewSecret(code.code)
+    };
   }
 
   private async persistCollectionChannels(tx: PrismaTx, store: MemoryStore) {
@@ -5567,24 +6103,33 @@ class PrismaStateRepository {
   private async persistIssuedRightsCodesForOrder(tx: PrismaTx, store: MemoryStore, order: DemoOrder) {
     const codes = store.rightsCodes.filter((code) => code.orderNo === order.orderNo && code.status === "issued");
     for (const code of codes) {
-      const platformProductId = code.platformProductId ?? (store.platformProducts.has(code.productId) ? code.productId : null);
-      const agentProductId = code.agentProductId ?? (store.agentProducts.has(code.productId) ? code.productId : null);
+      const shape = this.rightsCodeDbShape(code, store);
       await tx.$executeRaw`
         INSERT INTO rights_codes (
-          id, product_id, agent_product_id, code_ciphertext, batch_no, status, order_id,
-          issue_key, issued_at, created_at, updated_at
+          id, product_id, agent_product_id, code_ciphertext, code_hash, secret_preview,
+          owner_type, owner_agent_id, shop_id, batch_no, status, order_id,
+          issue_key, issued_at, import_audit_json, created_at, updated_at
         )
         VALUES (
-          ${code.codeId}, ${platformProductId}, ${agentProductId}, ${code.code}, ${code.batchNo},
+          ${code.codeId}, ${shape.platformProductId}, ${shape.agentProductId}, ${code.code},
+          ${shape.codeHash}, ${shape.secretPreview}, CAST(${shape.ownerType} AS "RightsCodeOwnerType"),
+          ${shape.ownerAgentId}, ${shape.shopId}, ${code.batchNo},
           CAST('issued' AS "RightsCodeStatus"),
           (SELECT id FROM orders WHERE order_no = ${order.orderNo}),
-          ${code.issueKey ?? null}, ${code.issuedAt ?? new Date()}, ${code.createdAt}, now()
+          ${code.issueKey ?? null}, ${code.issuedAt ?? new Date()},
+          ${jsonForDb({ batchNo: code.batchNo, orderNo: order.orderNo, source: "auto_fulfillment" })}::jsonb,
+          ${code.createdAt}, now()
         )
         ON CONFLICT (id) DO UPDATE SET
           status = EXCLUDED.status,
           order_id = EXCLUDED.order_id,
           issue_key = EXCLUDED.issue_key,
           issued_at = EXCLUDED.issued_at,
+          code_hash = COALESCE(rights_codes.code_hash, EXCLUDED.code_hash),
+          secret_preview = COALESCE(rights_codes.secret_preview, EXCLUDED.secret_preview),
+          owner_type = EXCLUDED.owner_type,
+          owner_agent_id = EXCLUDED.owner_agent_id,
+          shop_id = EXCLUDED.shop_id,
           updated_at = now()
       `;
       await tx.$executeRaw`
@@ -5695,24 +6240,33 @@ class PrismaStateRepository {
 
   private async persistFulfillmentAndExtraction(tx: PrismaTx, store: MemoryStore) {
     for (const code of store.rightsCodes) {
-      const platformProductId = code.platformProductId ?? (store.platformProducts.has(code.productId) ? code.productId : null);
-      const agentProductId = code.agentProductId ?? (store.agentProducts.has(code.productId) ? code.productId : null);
+      const shape = this.rightsCodeDbShape(code, store);
       await tx.$executeRaw`
         INSERT INTO rights_codes (
-          id, product_id, agent_product_id, code_ciphertext, batch_no, status, order_id,
-          issue_key, issued_at, created_at, updated_at
+          id, product_id, agent_product_id, code_ciphertext, code_hash, secret_preview,
+          owner_type, owner_agent_id, shop_id, batch_no, status, order_id,
+          issue_key, issued_at, import_audit_json, created_at, updated_at
         )
         VALUES (
-          ${code.codeId}, ${platformProductId}, ${agentProductId}, ${code.code}, ${code.batchNo},
+          ${code.codeId}, ${shape.platformProductId}, ${shape.agentProductId}, ${code.code},
+          ${shape.codeHash}, ${shape.secretPreview}, CAST(${shape.ownerType} AS "RightsCodeOwnerType"),
+          ${shape.ownerAgentId}, ${shape.shopId}, ${code.batchNo},
           CAST(${code.status} AS "RightsCodeStatus"),
           ${code.orderNo ? stableDbId("order", code.orderNo) : null},
-          ${code.issueKey ?? null}, ${code.issuedAt ?? null}, ${code.createdAt}, now()
+          ${code.issueKey ?? null}, ${code.issuedAt ?? null},
+          ${jsonForDb({ batchNo: code.batchNo, orderNo: code.orderNo ?? null, source: "fulfillment_sync" })}::jsonb,
+          ${code.createdAt}, now()
         )
         ON CONFLICT (id) DO UPDATE SET
           status = EXCLUDED.status,
           order_id = EXCLUDED.order_id,
           issue_key = EXCLUDED.issue_key,
           issued_at = EXCLUDED.issued_at,
+          code_hash = COALESCE(rights_codes.code_hash, EXCLUDED.code_hash),
+          secret_preview = COALESCE(rights_codes.secret_preview, EXCLUDED.secret_preview),
+          owner_type = EXCLUDED.owner_type,
+          owner_agent_id = EXCLUDED.owner_agent_id,
+          shop_id = EXCLUDED.shop_id,
           updated_at = now()
       `;
       if (code.status === "issued" && code.orderNo) {
@@ -5804,6 +6358,46 @@ class PrismaStateRepository {
         ON CONFLICT (idempotency_key) DO NOTHING
       `;
     }
+
+    for (const delivery of store.emailDeliveries) {
+      await this.persistEmailDelivery(tx, store, delivery);
+    }
+  }
+
+  private async persistEmailDeliveriesForOrder(tx: PrismaTx, store: MemoryStore, order: DemoOrder) {
+    const deliveries = store.emailDeliveries.filter((delivery) => delivery.orderNo === order.orderNo);
+    for (const delivery of deliveries) await this.persistEmailDelivery(tx, store, delivery);
+  }
+
+  private async persistEmailDelivery(tx: PrismaTx, store: MemoryStore, delivery: EmailDelivery) {
+    const order = store.orders.get(delivery.orderNo);
+    if (!order) return;
+    const issuedCodeCount = store.rightsCodes.filter((code) => code.orderNo === delivery.orderNo && code.status === "issued").length;
+    const status = order.refundStatus === "refunded" ? "skipped_refunded" : delivery.status;
+    await tx.$executeRaw`
+      INSERT INTO email_delivery_records (
+        id, delivery_no, order_id, order_item_id, email, scope, status, code_count,
+        extract_token_hash, error_code, error_message, retry_count, actor_type, actor_id,
+        source, idempotency_key, sent_at, created_at, updated_at
+      )
+      VALUES (
+        ${stableDbId("email_delivery", delivery.id)}, ${delivery.id},
+        (SELECT id FROM orders WHERE order_no = ${delivery.orderNo}), ${stableDbId("order_item", delivery.orderNo)},
+        ${delivery.email}, CAST(${order.extractionCodeHash ? "extract_link" : "codes"} AS "EmailDeliveryScope"),
+        CAST(${status} AS "EmailDeliveryStatus"), ${issuedCodeCount || delivery.codeCount},
+        ${order.extractionCodeHash ? hashSecret(`extract-email:${order.orderNo}:${order.extractionCodeHash}`) : null},
+        ${delivery.reason ?? null}, ${delivery.reason ?? null}, 0, CAST('system' AS "ActorType"), 'system',
+        'auto_fulfillment', ${`email-delivery:${delivery.id}`},
+        ${delivery.status === "sent" ? delivery.createdAt : null}, ${delivery.createdAt}, now()
+      )
+      ON CONFLICT (idempotency_key) DO UPDATE SET
+        status = EXCLUDED.status,
+        code_count = EXCLUDED.code_count,
+        error_code = EXCLUDED.error_code,
+        error_message = EXCLUDED.error_message,
+        sent_at = COALESCE(email_delivery_records.sent_at, EXCLUDED.sent_at),
+        updated_at = now()
+    `;
   }
 
   private async persistAfterSale(tx: PrismaTx, afterSale: DemoAfterSale) {
@@ -6836,6 +7430,39 @@ class PrismaStateRepository {
       createdAt: row.created_at
     }));
   }
+
+  private async loadEmailDeliveries(store: MemoryStore) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      delivery_no: string;
+      order_no: string;
+      user_id: string;
+      email: string;
+      code_count: number;
+      source: string;
+      status: EmailDelivery["status"];
+      error_code: string | null;
+      error_message: string | null;
+      created_at: Date;
+    }>>`
+      SELECT ed.delivery_no, o.order_no, o.user_id, ed.email, ed.code_count,
+             ed.source, ed.status, ed.error_code, ed.error_message, ed.created_at
+        FROM email_delivery_records ed
+        JOIN orders o ON o.id = ed.order_id
+       ORDER BY ed.created_at DESC
+       LIMIT 500
+    `;
+    store.emailDeliveries = rows.map((row) => ({
+      id: row.delivery_no,
+      orderNo: row.order_no,
+      userId: row.user_id,
+      email: row.email,
+      codeCount: row.code_count,
+      source: row.source === "manual_resend" ? "manual_resend" : "auto_fulfillment",
+      status: row.status,
+      reason: row.error_message ?? row.error_code ?? undefined,
+      createdAt: row.created_at
+    }));
+  }
 }
 
 function requiredPaymentEnv() {
@@ -6879,6 +7506,23 @@ function fulfillmentMode(snapshot: DemoOrderSnapshot) {
   return isRecord(rule) && rule.mode === "code_pool" ? "code_pool" : "manual";
 }
 
+function fulfillmentRuleMode(rule: unknown): "manual" | "code_pool" {
+  return isRecord(rule) && rule.mode === "code_pool" ? "code_pool" : "manual";
+}
+
+function manualFulfillmentInstruction(rule: unknown): string | undefined {
+  if (!isRecord(rule)) return undefined;
+  return stringValue(rule.manualFulfillmentInstruction);
+}
+
+function parseExtractionToken(token: string): { expiresAt: number; signature: string } | undefined {
+  const match = /^ext_([0-9a-z]+)_([0-9a-f]{40})$/.exec(token);
+  if (!match) return undefined;
+  const expiresAt = Number.parseInt(match[1], 36);
+  if (!Number.isFinite(expiresAt)) return undefined;
+  return { expiresAt, signature: match[2] };
+}
+
 function requiresExtractionCode(snapshot: DemoOrderSnapshot) {
   const rule = snapshot.fulfillmentRuleSnapshot;
   if (!isRecord(rule) || fulfillmentMode(snapshot) !== "code_pool") return false;
@@ -6887,6 +7531,12 @@ function requiresExtractionCode(snapshot: DemoOrderSnapshot) {
 
 function hashSecret(value: string) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function previewSecret(value: string) {
+  const trimmed = value.trim();
+  if (trimmed.length <= 6) return "***";
+  return `${trimmed.slice(0, 2)}***${trimmed.slice(-2)}`;
 }
 
 function verifyPassword(password: string, storedHash: string) {
@@ -7097,8 +7747,8 @@ function mapCollectionChannelType(type: CollectionChannelType): "wechat_qr" | "a
   return "other";
 }
 
-function fulfillmentModeFromRule(rule: unknown): "manual" | "automatic" | "external" {
-  return isRecord(rule) && rule.mode === "code_pool" ? "automatic" : "manual";
+function fulfillmentModeFromRule(rule: unknown): "manual" | "code_pool" {
+  return isRecord(rule) && rule.mode === "code_pool" ? "code_pool" : "manual";
 }
 
 function pickAdminRole(roleCodes: string[]): AdminLoginResult["role"] {
@@ -7129,6 +7779,14 @@ function getSnapshotProductId(snapshot: DemoOrderSnapshot): string | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function assignDefined<T extends object>(target: T, input: object) {
+  const writable = target as Record<string, unknown>;
+  for (const [key, value] of Object.entries(input)) {
+    if (value !== undefined) writable[key] = value;
+  }
+  return target;
 }
 
 function createMemoryStore(): MemoryStore {
@@ -7821,13 +8479,35 @@ type RightsCode = {
   issuedAt?: Date;
 };
 
+type RightsCodeImportDetail = {
+  line: number;
+  action: "create" | "skip" | "fail";
+  reasonCode: "EMPTY_LINE" | "INVALID_FORMAT" | "DUPLICATE_IN_REQUEST" | "DUPLICATE_EXISTING" | null;
+  reason: string | null;
+  normalizedCode?: string;
+  codePreview?: string;
+};
+
+type RightsCodeImportPrecheck = {
+  summary: {
+    total: number;
+    create: number;
+    created: number;
+    skipped: number;
+    failed: number;
+    importable: number;
+  };
+  details: RightsCodeImportDetail[];
+};
+
 type EmailDelivery = {
   id: string;
   orderNo: string;
   userId: string;
   email: string;
   codeCount: number;
-  status: "sent" | "provider_not_configured" | "failed";
+  source?: "auto_fulfillment" | "manual_resend";
+  status: "pending" | "sent" | "provider_not_configured" | "failed" | "skipped_refunded";
   reason?: string;
   createdAt: Date;
 };

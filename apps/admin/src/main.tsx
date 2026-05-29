@@ -88,6 +88,31 @@ const navItems = [
 
 type ModuleId = (typeof navItems)[number]["id"];
 type BackendSession = AdminSession | AgentSession;
+type RightsCodePrecheckResult = {
+  totalLines: number;
+  validCodes: string[];
+  blankLines: number[];
+  duplicateCodes: string[];
+  invalidRows: Array<{ line: number; value: string; reason: string }>;
+};
+type ProductFormState = {
+  name: string;
+  category: string;
+  tags: string;
+  subtitle: string;
+  description: string;
+  usageGuide: string;
+  imageUrl: string;
+  specs: string;
+  detailSections: string;
+  stockCount: string;
+  soldCount: string;
+  fulfillmentMode: string;
+  supplyPriceCents: string;
+  minSalePriceCents: string;
+  suggestedSalePriceCents: string;
+  status: string;
+};
 const configuredShopId = import.meta.env.VITE_SHOP_ID ?? "";
 const configuredPlatformShopId = import.meta.env.VITE_PLATFORM_SHOP_ID ?? "";
 
@@ -143,7 +168,12 @@ function App() {
   const [downstreamAgentId, setDownstreamAgentId] = useState("");
   const [afterSaleAssistNote, setAfterSaleAssistNote] = useState("");
   const [attemptNo, setAttemptNo] = useState(1);
-  const [productForm, setProductForm] = useState({
+  const [selectedPlatformProduct, setSelectedPlatformProduct] = useState<JsonRecord | undefined>();
+  const [selectedAgentProductOverride, setSelectedAgentProductOverride] = useState<JsonRecord | undefined>();
+  const [selectedOwnProductReview, setSelectedOwnProductReview] = useState<JsonRecord | undefined>();
+  const [productDetailTab, setProductDetailTab] = useState<"base" | "codes" | "audit">("base");
+  const [rightsPrecheck, setRightsPrecheck] = useState<RightsCodePrecheckResult | undefined>();
+  const [productForm, setProductForm] = useState<ProductFormState>({
     name: "",
     category: "",
     tags: "",
@@ -158,7 +188,8 @@ function App() {
     fulfillmentMode: "",
     supplyPriceCents: "",
     minSalePriceCents: "",
-    suggestedSalePriceCents: ""
+    suggestedSalePriceCents: "",
+    status: "active"
   });
   const [inventoryForm, setInventoryForm] = useState({
     productId: "",
@@ -208,6 +239,14 @@ function App() {
   });
   const [ownProductForm, setOwnProductForm] = useState({
     name: "",
+    category: "",
+    tags: "",
+    subtitle: "",
+    description: "",
+    usageGuide: "",
+    imageUrl: "",
+    specs: "",
+    detailSections: "",
     salePriceCents: "",
     minSalePriceCents: "",
     fulfillmentMode: ""
@@ -231,11 +270,11 @@ function App() {
 
   const selectedPublicProduct = data.publicProducts[0];
   const selectedPlatformShopProduct = data.platformShopProducts[0];
-  const selectedAgentProduct = data.agentProducts[0];
+  const selectedAgentProduct = selectedAgentProductOverride ?? data.agentProducts[0];
   const selectedOwnAgentProduct = data.agentProducts.find((item) => text(item.id) === inventoryForm.productId)
     ?? data.agentProducts.find((item) => text(item.productType) === "agent_owned")
     ?? data.agentProducts[0];
-  const selectedOwnProduct = data.ownProducts.find((item) => text(item.reviewStatus) === "pending_review") ?? data.ownProducts[0];
+  const selectedOwnProduct = selectedOwnProductReview ?? data.ownProducts.find((item) => text(item.reviewStatus) === "pending_review") ?? data.ownProducts[0];
   const activeAgentSession = isAgentSession(session) ? session : undefined;
   const merchantSessionActive = Boolean(activeAgentSession);
   const visibleOrders = merchantSessionActive ? data.agentOrders : data.adminOrders;
@@ -602,12 +641,63 @@ function App() {
     void runAction("创建平台商品", () => api.createPlatformProduct(productForm));
   }
 
+  function pickPlatformProduct(row: JsonRecord) {
+    setSelectedPlatformProduct(row);
+    setProductDetailTab("base");
+    setRightsPrecheck(undefined);
+    const rule = row.fulfillmentRule as JsonRecord | undefined;
+    setProductForm({
+      name: text(row.name, ""),
+      category: text(row.category, ""),
+      tags: Array.isArray(row.tags) ? row.tags.map((item) => text(item, "")).filter(Boolean).join("，") : "",
+      subtitle: text(row.subtitle, ""),
+      description: text(row.description, ""),
+      usageGuide: text(row.usageGuide, ""),
+      imageUrl: text(row.imageUrl, ""),
+      specs: Array.isArray(row.specs) ? row.specs.map((item) => text(item, "")).filter(Boolean).join("\n") : "",
+      detailSections: formatDetailSections(row.detailSections),
+      stockCount: text(row.stockCount, ""),
+      soldCount: text(row.soldCount, ""),
+      fulfillmentMode: text(rule?.mode, "manual"),
+      supplyPriceCents: text(row.supplyPriceCents, ""),
+      minSalePriceCents: text(row.minSalePriceCents, ""),
+      suggestedSalePriceCents: text(row.suggestedSalePriceCents, ""),
+      status: text(row.status, "active")
+    });
+    setMessage(`已选择平台商品：${text(row.name, text(row.id))}`);
+  }
+
+  function pickOwnProductReview(row: JsonRecord) {
+    setSelectedOwnProductReview(row);
+    setMessage(`已打开自有商品审核详情：${text(row.name, text(row.id))}`);
+  }
+
+  function submitPlatformProductUpdate() {
+    if (!selectedPlatformProduct?.id) {
+      setMessage("请先从平台商品库选择商品。");
+      return;
+    }
+    const error = validatePlatformProductForm(productForm);
+    if (error) {
+      setMessage(error);
+      return;
+    }
+    if (!window.confirm("确认保存平台商品详情？本次变更会写入审计，并只影响后续展示和新订单快照。")) return;
+    void runAction("保存平台商品详情", () => api.updatePlatformProduct(text(selectedPlatformProduct.id, ""), productForm));
+  }
+
   function submitRightsCodes() {
-    const codes = inventoryForm.codes.split(/\n|,/).map((item) => item.trim()).filter(Boolean);
+    const precheck = precheckRightsCodes(inventoryForm.codes);
+    setRightsPrecheck(precheck);
+    const codes = precheck.validCodes;
     const targetProductId = merchantSessionActive ? text(selectedOwnAgentProduct?.id, inventoryForm.productId.trim()) : inventoryForm.productId.trim();
     const error = validateRightsCodeForm(targetProductId, inventoryForm.batchNo, codes);
     if (error) {
       setMessage(error);
+      return;
+    }
+    if (precheck.invalidRows.length > 0 || precheck.blankLines.length > 0 || precheck.duplicateCodes.length > 0) {
+      setMessage("卡密导入预检未通过：请先处理空行、重复或非法行。");
       return;
     }
     void runAction("导入卡密", () => merchantSessionActive
@@ -623,10 +713,30 @@ function App() {
       }));
   }
 
-  async function revealRightsCodes(label = "查看明文") {
+  function submitSelectedPlatformRightsCodes() {
+    const productId = text(selectedPlatformProduct?.id, "");
+    const precheck = precheckRightsCodes(inventoryForm.codes);
+    setRightsPrecheck(precheck);
+    const error = validateRightsCodeForm(productId, inventoryForm.batchNo, precheck.validCodes);
+    if (error) {
+      setMessage(error);
+      return;
+    }
+    if (precheck.invalidRows.length > 0 || precheck.blankLines.length > 0 || precheck.duplicateCodes.length > 0) {
+      setMessage("卡密导入预检未通过：请先处理空行、重复或非法行。");
+      return;
+    }
+    void runAction("商品详情卡密导入", () => api.importRightsCodes({
+      productId,
+      batchNo: inventoryForm.batchNo.trim(),
+      codes: precheck.validCodes
+    }));
+  }
+
+  async function revealRightsCodes(label = "查看明文", filters: { productId?: string; orderNo?: string; status?: string } = {}) {
     setLoading(true);
     try {
-      const rows = await api.rightsCodesPlaintext();
+      const rows = await api.rightsCodesPlaintext(filters);
       setSensitiveRightsCodes(rows);
       setShowSensitiveCodes(true);
       if (label === "导出明文") downloadCsv("rights-codes-plaintext.csv", rows, ["codeId", "productId", "batchNo", "status", "orderNo", "code"]);
@@ -636,6 +746,17 @@ function App() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function submitOwnProductReviewDecision(approved: boolean) {
+    const ownProductId = text(selectedOwnProduct?.id, text(selectedOwnProduct?.ownProductId, ""));
+    if (!ownProductId) {
+      setMessage("请先打开自有商品审核详情。");
+      return;
+    }
+    const actionLabel = approved ? "通过自有商品审核" : "拒绝自有商品审核";
+    if (!window.confirm(`确认${approved ? "通过" : "拒绝"}该自有商品？本操作会写入平台审核记录。`)) return;
+    void runAction(actionLabel, () => api.reviewOwnProduct(ownProductId, approved));
   }
 
   function submitCouponTemplate() {
@@ -793,7 +914,8 @@ function App() {
                 <button className="secondary" disabled={merchantBlocked || data.platformProducts.length === 0} onClick={submitBatchSelection}>批量选品上架</button>
               </Panel>
             ) : (
-              <Panel title="新增平台供货商品" kicker="平台">
+              <Panel title={selectedPlatformProduct ? "平台商品详情" : "新增平台供货商品"} kicker={selectedPlatformProduct ? text(selectedPlatformProduct.id) : "平台"}>
+                {selectedPlatformProduct ? <p className="hint">当前正在编辑已选平台商品。保存前请确认价格、履约方式和状态变更；后端会写入审计。</p> : null}
                 <div className="form-grid">
                   <label>商品名称<input value={productForm.name} onChange={(event) => setProductForm({ ...productForm, name: event.target.value })} placeholder="例如：会员月卡/账号成品号" /></label>
                   <label>类目<input value={productForm.category} onChange={(event) => setProductForm({ ...productForm, category: event.target.value })} placeholder="例如：AI 会员" /></label>
@@ -805,6 +927,7 @@ function App() {
                   <label>使用说明<textarea value={productForm.usageGuide} onChange={(event) => setProductForm({ ...productForm, usageGuide: event.target.value })} rows={3} /></label>
                   <label>详情模块<textarea value={productForm.detailSections} onChange={(event) => setProductForm({ ...productForm, detailSections: event.target.value })} rows={5} placeholder="标题：内容一；内容二" /></label>
                   <label>发货方式<select value={productForm.fulfillmentMode} onChange={(event) => setProductForm({ ...productForm, fulfillmentMode: event.target.value })}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发码</option></select></label>
+                  <label>商品状态<select value={productForm.status} onChange={(event) => setProductForm({ ...productForm, status: event.target.value })}><option value="active">上架</option><option value="listed">上架中</option><option value="disabled">下架</option><option value="frozen">冻结</option></select></label>
                   <label>库存<input inputMode="numeric" value={productForm.stockCount} onChange={(event) => setProductForm({ ...productForm, stockCount: event.target.value })} placeholder="必填，非负整数" /></label>
                   <label>销量<input inputMode="numeric" value={productForm.soldCount} onChange={(event) => setProductForm({ ...productForm, soldCount: event.target.value })} placeholder="选填，非负整数" /></label>
                   <label>供货价(分)<input inputMode="numeric" value={productForm.supplyPriceCents} onChange={(event) => setProductForm({ ...productForm, supplyPriceCents: event.target.value })} placeholder="必填，正整数" /></label>
@@ -812,9 +935,12 @@ function App() {
                   <label>建议售价(分)<input inputMode="numeric" value={productForm.suggestedSalePriceCents} onChange={(event) => setProductForm({ ...productForm, suggestedSalePriceCents: event.target.value })} placeholder="必填，不低于最低售价" /></label>
                 </div>
                 <div className="actions">
-                  <button onClick={submitPlatformProduct}>保存并入库</button>
+                  <button onClick={selectedPlatformProduct ? submitPlatformProductUpdate : submitPlatformProduct}>{selectedPlatformProduct ? "确认保存详情" : "保存并入库"}</button>
+                  {selectedPlatformProduct ? <button className="secondary" type="button" onClick={() => { setSelectedPlatformProduct(undefined); setMessage("已退出商品详情编辑"); }}>退出详情</button> : null}
+                  {productForm.fulfillmentMode === "code_pool" && selectedPlatformProduct ? <button className="secondary" type="button" onClick={() => { setInventoryForm((current) => ({ ...current, productId: text(selectedPlatformProduct.id, current.productId) })); switchModule("inventory"); }}>进入卡密池</button> : null}
                   {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
                 </div>
+                {productForm.fulfillmentMode === "manual" ? <p className="hint">人工交付商品不显示卡密池入口；请维护商品说明、使用说明和店铺客服信息。</p> : null}
               </Panel>
             )}
             <Panel title="代理改价" kicker="商家">
@@ -826,16 +952,21 @@ function App() {
             </Panel>
           </section>
           <Panel title="平台商品库" kicker={`${data.platformProducts.length} 个商品`}>
-            <Table rows={data.platformProducts} columns={platformProductColumns} moneyColumns={["supplyPriceCents", "visibleUpstreamSupplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents"]} />
+            <Table rows={data.platformProducts} columns={platformProductColumns} moneyColumns={["supplyPriceCents", "visibleUpstreamSupplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents"]} onPick={merchantSessionActive ? undefined : pickPlatformProduct} />
           </Panel>
           <Panel title="店铺已上架商品" kicker={`${data.agentProducts.length} 个商品`}>
-            <Table rows={agentProductRows(data.agentProducts)} columns={agentProductColumns} moneyColumns={["salePriceCents", "supplyPriceCents", "platformSupplyPriceCents", "visibleUpstreamSupplyPriceCents", "minSalePriceCents"]} />
+            <Table rows={agentProductRows(data.agentProducts)} columns={agentProductColumns} moneyColumns={["salePriceCents", "supplyPriceCents", "platformSupplyPriceCents", "visibleUpstreamSupplyPriceCents", "minSalePriceCents"]} onPick={(row) => setSelectedAgentProductOverride(data.agentProducts.find((item) => text(item.id) === text(row.id)) ?? row)} />
           </Panel>
           <Panel title="代理自有商品审核" kicker="平台审核">
             <div className="actions">
               {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
               <div className="form-grid wide">
                 <label>商品名称<input value={ownProductForm.name} onChange={(event) => setOwnProductForm({ ...ownProductForm, name: event.target.value })} /></label>
+                <label>类目<input value={ownProductForm.category} onChange={(event) => setOwnProductForm({ ...ownProductForm, category: event.target.value })} /></label>
+                <label>标签<input value={ownProductForm.tags} onChange={(event) => setOwnProductForm({ ...ownProductForm, tags: event.target.value })} placeholder="逗号分隔" /></label>
+                <label>商品图<input value={ownProductForm.imageUrl} onChange={(event) => setOwnProductForm({ ...ownProductForm, imageUrl: event.target.value })} placeholder="https://..." /></label>
+                <label className="span-2">商品说明<textarea rows={3} value={ownProductForm.description} onChange={(event) => setOwnProductForm({ ...ownProductForm, description: event.target.value })} /></label>
+                <label className="span-2">使用/人工交付说明<textarea rows={3} value={ownProductForm.usageGuide} onChange={(event) => setOwnProductForm({ ...ownProductForm, usageGuide: event.target.value })} placeholder="manual 商品请填写人工交付说明，不得填写批量卡密明文" /></label>
                 <label>售价(分)<input value={ownProductForm.salePriceCents} onChange={(event) => setOwnProductForm({ ...ownProductForm, salePriceCents: event.target.value })} /></label>
                 <label>最低价(分)<input value={ownProductForm.minSalePriceCents} onChange={(event) => setOwnProductForm({ ...ownProductForm, minSalePriceCents: event.target.value })} /></label>
                 <label>交付方式<select value={ownProductForm.fulfillmentMode} onChange={(event) => setOwnProductForm({ ...ownProductForm, fulfillmentMode: event.target.value })}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发码</option></select></label>
@@ -843,14 +974,41 @@ function App() {
               <button disabled={merchantBlocked || !ownProductForm.name || !ownProductForm.salePriceCents || !ownProductForm.fulfillmentMode} onClick={() => void runAction("代理提交自有商品", () => api.submitOwnProduct(ownProductForm))}>提交自有商品</button>
               {merchantSessionActive ? null : (
                 <>
-                  <button disabled={!selectedOwnProduct?.id} onClick={() => void runAction("自有商品审核通过", () => api.reviewOwnProduct(text(selectedOwnProduct?.id, "")))}>审核当前待审</button>
-                  <button className="secondary" disabled={!selectedOwnProduct?.id} onClick={() => void runAction("自有商品审核拒绝", () => api.reviewOwnProduct(text(selectedOwnProduct?.id, ""), false))}>拒绝当前待审</button>
+                  <button disabled={!selectedOwnProduct?.id} onClick={() => setSelectedOwnProductReview(selectedOwnProduct)}>打开审核详情</button>
+                  <button className="secondary" disabled={!selectedOwnProduct?.id} onClick={() => submitOwnProductReviewDecision(false)}>拒绝当前详情</button>
                 </>
               )}
             </div>
-            <Table rows={data.ownProducts} columns={["id", "name", "salePriceCents", "minSalePriceCents", "reviewStatus", "status"]} moneyColumns={["salePriceCents", "minSalePriceCents"]} />
+            <Table rows={data.ownProducts} columns={["id", "name", "salePriceCents", "minSalePriceCents", "fulfillmentMode", "reviewStatus", "status"]} moneyColumns={["salePriceCents", "minSalePriceCents"]} onPick={merchantSessionActive ? undefined : pickOwnProductReview} />
             {!merchantSessionActive ? <p className="hint">平台后台通过 /api/admin/agent-products/reviews 拉取审核队列，审核动作走 /api/admin/agent-products/reviews/:id/review，并由后端 RBAC 校验 product.manage。</p> : null}
           </Panel>
+          {!merchantSessionActive && selectedPlatformProduct ? (
+            <PlatformProductDrawer
+              product={selectedPlatformProduct}
+              form={productForm}
+              setForm={setProductForm}
+              tab={productDetailTab}
+              setTab={setProductDetailTab}
+              rightsCodes={data.rightsCodes.filter((item) => text(item.productId) === text(selectedPlatformProduct.id) || text(item.platformProductId) === text(selectedPlatformProduct.id))}
+              inventoryForm={inventoryForm}
+              setInventoryForm={setInventoryForm}
+              precheck={rightsPrecheck}
+              onPrecheck={() => setRightsPrecheck(precheckRightsCodes(inventoryForm.codes))}
+              onImport={submitSelectedPlatformRightsCodes}
+              onSave={submitPlatformProductUpdate}
+              onClose={() => setSelectedPlatformProduct(undefined)}
+              onReveal={() => void revealRightsCodes("查看明文", { productId: text(selectedPlatformProduct.id) })}
+              onExportPlain={() => void revealRightsCodes("导出明文", { productId: text(selectedPlatformProduct.id) })}
+            />
+          ) : null}
+          {!merchantSessionActive && selectedOwnProductReview ? (
+            <OwnProductReviewDrawer
+              product={selectedOwnProduct}
+              onApprove={() => submitOwnProductReviewDecision(true)}
+              onReject={() => submitOwnProductReviewDecision(false)}
+              onClose={() => setSelectedOwnProductReview(undefined)}
+            />
+          ) : null}
         </Module>
       );
     }
@@ -1558,6 +1716,152 @@ function Panel(props: { title: string; kicker: string; children: React.ReactNode
   );
 }
 
+function PlatformProductDrawer(props: {
+  product: JsonRecord;
+  form: ProductFormState;
+  setForm: React.Dispatch<React.SetStateAction<ProductFormState>>;
+  tab: "base" | "codes" | "audit";
+  setTab: (tab: "base" | "codes" | "audit") => void;
+  rightsCodes: JsonRecord[];
+  inventoryForm: { productId: string; batchNo: string; codes: string };
+  setInventoryForm: React.Dispatch<React.SetStateAction<{ productId: string; batchNo: string; codes: string }>>;
+  precheck?: RightsCodePrecheckResult;
+  onPrecheck: () => void;
+  onImport: () => void;
+  onSave: () => void;
+  onClose: () => void;
+  onReveal: () => void;
+  onExportPlain: () => void;
+}) {
+  const isCodePool = props.form.fulfillmentMode === "code_pool";
+  const availableCount = props.rightsCodes.filter((item) => text(item.status) === "available").length;
+  const issuedCount = props.rightsCodes.filter((item) => text(item.status) === "issued").length;
+  const lowStock = isCodePool && availableCount <= 3;
+  return (
+    <aside className="drawer" role="dialog" aria-modal="false" aria-label="平台商品详情">
+      <div className="drawer-head">
+        <div>
+          <span>平台商品详情</span>
+          <h3>{text(props.product.name, text(props.product.id))}</h3>
+        </div>
+        <button className="secondary" type="button" onClick={props.onClose}>关闭</button>
+      </div>
+      <div className="tabs">
+        <button className={props.tab === "base" ? "active" : ""} type="button" onClick={() => props.setTab("base")}>基础与价格</button>
+        <button className={props.tab === "codes" ? "active" : ""} type="button" disabled={!isCodePool} onClick={() => props.setTab("codes")}>卡密池</button>
+        <button className={props.tab === "audit" ? "active" : ""} type="button" onClick={() => props.setTab("audit")}>确认与审计</button>
+      </div>
+      {props.tab === "base" ? (
+        <>
+          <div className="form-grid wide">
+            <label>商品名称<input value={props.form.name} onChange={(event) => props.setForm((form) => ({ ...form, name: event.target.value }))} /></label>
+            <label>状态<select value={props.form.status} onChange={(event) => props.setForm((form) => ({ ...form, status: event.target.value }))}><option value="active">上架</option><option value="listed">上架中</option><option value="disabled">下架</option><option value="frozen">冻结</option></select></label>
+            <label>类目<input value={props.form.category} onChange={(event) => props.setForm((form) => ({ ...form, category: event.target.value }))} /></label>
+            <label>标签<input value={props.form.tags} onChange={(event) => props.setForm((form) => ({ ...form, tags: event.target.value }))} /></label>
+            <label className="span-2">商品图<input value={props.form.imageUrl} onChange={(event) => props.setForm((form) => ({ ...form, imageUrl: event.target.value }))} /></label>
+            <label>发货方式<select value={props.form.fulfillmentMode} onChange={(event) => props.setForm((form) => ({ ...form, fulfillmentMode: event.target.value }))}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发码</option></select></label>
+            <label>库存<input inputMode="numeric" value={props.form.stockCount} onChange={(event) => props.setForm((form) => ({ ...form, stockCount: event.target.value }))} /></label>
+            <label>供货价(分)<input inputMode="numeric" value={props.form.supplyPriceCents} onChange={(event) => props.setForm((form) => ({ ...form, supplyPriceCents: event.target.value }))} /></label>
+            <label>最低售价(分)<input inputMode="numeric" value={props.form.minSalePriceCents} onChange={(event) => props.setForm((form) => ({ ...form, minSalePriceCents: event.target.value }))} /></label>
+            <label>建议售价(分)<input inputMode="numeric" value={props.form.suggestedSalePriceCents} onChange={(event) => props.setForm((form) => ({ ...form, suggestedSalePriceCents: event.target.value }))} /></label>
+            <label>销量<input inputMode="numeric" value={props.form.soldCount} onChange={(event) => props.setForm((form) => ({ ...form, soldCount: event.target.value }))} /></label>
+            <label className="span-2">商品说明<textarea rows={3} value={props.form.description} onChange={(event) => props.setForm((form) => ({ ...form, description: event.target.value }))} /></label>
+            <label className="span-2">使用/人工交付说明<textarea rows={3} value={props.form.usageGuide} onChange={(event) => props.setForm((form) => ({ ...form, usageGuide: event.target.value }))} /></label>
+            <label className="span-2">详情模块<textarea rows={4} value={props.form.detailSections} onChange={(event) => props.setForm((form) => ({ ...form, detailSections: event.target.value }))} placeholder="标题：内容一；内容二" /></label>
+          </div>
+          <div className="actions">
+            <button type="button" onClick={props.onSave}>确认保存详情</button>
+          </div>
+          {!isCodePool ? <p className="hint">人工交付商品不显示卡密导入、自动发放或买家查看卡密入口；请维护人工交付说明和客服信息。</p> : null}
+        </>
+      ) : null}
+      {props.tab === "codes" ? (
+        isCodePool ? (
+          <>
+            <section className="mini-metrics">
+              <KeyValue label="可用卡密" value={String(availableCount)} />
+              <KeyValue label="已发放" value={String(issuedCount)} />
+              <KeyValue label="库存预警" value={lowStock ? "低库存，请补充" : "正常"} />
+            </section>
+            <div className="form-grid wide">
+              <label>批次号<input value={props.inventoryForm.batchNo} onChange={(event) => props.setInventoryForm((form) => ({ ...form, productId: text(props.product.id), batchNo: event.target.value }))} /></label>
+              <label className="span-2">待导入卡密<textarea rows={6} value={props.inventoryForm.codes} onChange={(event) => props.setInventoryForm((form) => ({ ...form, productId: text(props.product.id), codes: event.target.value }))} placeholder="一行一个；先预检再导入" /></label>
+            </div>
+            <div className="actions">
+              <button className="secondary" type="button" onClick={props.onPrecheck}>预检</button>
+              <button type="button" onClick={props.onImport}>导入卡密</button>
+              <button className="secondary" type="button" onClick={() => downloadCsv("rights-codes-masked.csv", props.rightsCodes, ["codeId", "productId", "batchNo", "status", "orderNo", "codePreview"])}>导出脱敏</button>
+              <button className="secondary" type="button" onClick={props.onReveal}>查看明文</button>
+              <button className="secondary" type="button" onClick={props.onExportPlain}>导出明文</button>
+            </div>
+            <RightsPrecheckPanel result={props.precheck} />
+            <Table rows={props.rightsCodes} columns={["codeId", "productId", "codePreview", "batchNo", "status", "orderNo"]} />
+          </>
+        ) : <p className="empty">人工交付商品没有卡密池。请在基础信息中维护人工交付说明和客服资料。</p>
+      ) : null}
+      {props.tab === "audit" ? (
+        <div className="audit-note">
+          <KeyValue label="接口" value={`PATCH /api/admin/products/${text(props.product.id)}`} />
+          <KeyValue label="保存确认" value="点击确认保存详情前弹出二次确认" />
+          <KeyValue label="审计动作" value="platform_product.update / rights_code.secret.read / rights_code.import" />
+          <KeyValue label="结果反馈" value="顶部提示条展示成功或错误原因，保存后自动刷新数据" />
+        </div>
+      ) : null}
+    </aside>
+  );
+}
+
+function RightsPrecheckPanel(props: { result?: RightsCodePrecheckResult }) {
+  if (!props.result) return <p className="hint">预检会列出空行、本次重复和非法行；通过后才允许导入。</p>;
+  return (
+    <div className="precheck">
+      <KeyValue label="总行数" value={String(props.result.totalLines)} />
+      <KeyValue label="有效行" value={String(props.result.validCodes.length)} />
+      <KeyValue label="空行" value={props.result.blankLines.length ? props.result.blankLines.join("、") : "无"} />
+      <KeyValue label="重复" value={props.result.duplicateCodes.length ? props.result.duplicateCodes.join("、") : "无"} />
+      <KeyValue label="非法行" value={props.result.invalidRows.length ? props.result.invalidRows.map((row) => `${row.line}:${row.reason}`).join("；") : "无"} />
+    </div>
+  );
+}
+
+function OwnProductReviewDrawer(props: {
+  product: JsonRecord;
+  onApprove: () => void;
+  onReject: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <aside className="drawer" role="dialog" aria-modal="false" aria-label="自有商品审核详情">
+      <div className="drawer-head">
+        <div>
+          <span>自有商品审核详情</span>
+          <h3>{text(props.product.name, text(props.product.id))}</h3>
+        </div>
+        <button className="secondary" type="button" onClick={props.onClose}>关闭</button>
+      </div>
+      <section className="detail-grid">
+        <KeyValue label="商户" value={`${text((props.product.agent as JsonRecord | undefined)?.name, text(props.product.agentId))} / ${text(props.product.shopId)}`} />
+        <KeyValue label="售价" value={cents(props.product.salePriceCents)} />
+        <KeyValue label="最低价" value={cents(props.product.minSalePriceCents)} />
+        <KeyValue label="履约方式" value={fulfillmentModeLabel(props.product.fulfillmentRule)} />
+        <KeyValue label="审核状态" value={text(props.product.reviewStatus)} />
+        <KeyValue label="商品状态" value={text(props.product.status)} />
+      </section>
+      <section className="review-copy">
+        <h4>商品说明</h4>
+        <p>{text(props.product.description, "未填写")}</p>
+        <h4>人工交付/使用说明</h4>
+        <p>{text(props.product.usageGuide, text(props.product.manualFulfillmentInstruction, "未填写"))}</p>
+      </section>
+      <div className="actions">
+        <button type="button" onClick={props.onApprove}>确认审核通过</button>
+        <button className="secondary" type="button" onClick={props.onReject}>确认审核拒绝</button>
+      </div>
+      <p className="hint">审核动作走 /api/admin/agent-products/reviews/:id/review，由后端 RBAC 校验并写入审核审计。</p>
+    </aside>
+  );
+}
+
 function Metric(props: { label: string; value: string; tone?: string }) {
   return (
     <div className={props.tone === "strong" ? "metric strong" : "metric"}>
@@ -1770,6 +2074,16 @@ function channelRows(channels: JsonRecord | undefined, key: string): JsonRecord[
   return Array.isArray(value) ? value as JsonRecord[] : [];
 }
 
+function formatDetailSections(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value.map((item) => {
+    const section = isRecord(item) ? item : {};
+    const title = text(section.title, "");
+    const items = Array.isArray(section.items) ? section.items.map((entry) => text(entry, "")).filter(Boolean) : [];
+    return [title, ...items].filter(Boolean).join("：");
+  }).filter(Boolean).join("\n");
+}
+
 function depositStatusRows(rows: JsonRecord[]): Array<{ label: string; value: string }> {
   const statuses = ["paid", "pending_payment", "pending_review", "partially_deducted", "insufficient", "deducted", "unknown"];
   return statuses.map((status) => ({
@@ -1807,6 +2121,40 @@ function validateRightsCodeForm(productId: string, batchNo: string, codes: strin
   if (!batchNo.trim()) return "请填写批次号";
   if (codes.length === 0) return "请填写至少一个卡密/账号";
   return "";
+}
+
+function precheckRightsCodes(value: string): RightsCodePrecheckResult {
+  const lines = value.split(/\n/);
+  const seen = new Set<string>();
+  const validCodes: string[] = [];
+  const duplicateCodes: string[] = [];
+  const blankLines: number[] = [];
+  const invalidRows: Array<{ line: number; value: string; reason: string }> = [];
+  for (const [index, raw] of lines.entries()) {
+    const lineNo = index + 1;
+    const code = raw.trim();
+    if (!code) {
+      blankLines.push(lineNo);
+      continue;
+    }
+    if (code.length < 3 || code.length > 500) {
+      invalidRows.push({ line: lineNo, value: code, reason: "长度需为 3-500 个字符" });
+      continue;
+    }
+    if (seen.has(code)) {
+      duplicateCodes.push(code);
+      continue;
+    }
+    seen.add(code);
+    validCodes.push(code);
+  }
+  return {
+    totalLines: lines.length,
+    validCodes,
+    blankLines,
+    duplicateCodes,
+    invalidRows
+  };
 }
 
 function validateCouponForm(form: { name: string; discountCents: string; validDays: string; status: string }): string {

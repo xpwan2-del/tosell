@@ -481,6 +481,32 @@ export const api = {
   adminPlatformProducts: () => request<JsonRecord[]>("/api/admin/products", {
     headers: adminHeaders()
   }),
+  updatePlatformProduct: (productId: string, input: { name: string; category?: string; tags?: string; subtitle?: string; description?: string; usageGuide?: string; imageUrl?: string; specs?: string; detailSections?: string; stockCount: string; soldCount?: string; fulfillmentMode: string; supplyPriceCents: string; minSalePriceCents: string; suggestedSalePriceCents: string; status: string }) => {
+    const stockCount = input.stockCount ? requireNonNegativeInteger(input.stockCount, "库存") : undefined;
+    const soldCount = input.soldCount ? requireNonNegativeInteger(input.soldCount, "销量") : undefined;
+    return request<JsonRecord>(`/api/admin/products/${encodeURIComponent(requireText(productId, "商品ID"))}`, {
+      method: "PATCH",
+      headers: adminHeaders(),
+      body: {
+        name: requireText(input.name, "商品名称"),
+        category: input.category || undefined,
+        tags: input.tags ? input.tags.split(/,|，/).map((item) => item.trim()).filter(Boolean) : undefined,
+        subtitle: input.subtitle || undefined,
+        description: input.description || undefined,
+        usageGuide: input.usageGuide || undefined,
+        imageUrl: input.imageUrl || undefined,
+        specs: splitLines(input.specs),
+        detailSections: parseDetailSections(input.detailSections),
+        stockCount,
+        soldCount,
+        fulfillmentMode: requireText(input.fulfillmentMode, "履约方式"),
+        supplyPriceCents: requirePositiveCents(input.supplyPriceCents, "供货价"),
+        minSalePriceCents: requirePositiveCents(input.minSalePriceCents, "最低售价"),
+        suggestedSalePriceCents: requirePositiveCents(input.suggestedSalePriceCents, "建议售价"),
+        status: requireText(input.status, "商品状态")
+      }
+    });
+  },
   adminPlatformShopProducts: () => request<JsonRecord[]>("/api/admin/platform-shop-products", {
     headers: adminHeaders()
   }),
@@ -539,9 +565,15 @@ export const api = {
       headers: agentHeaders()
     }).then((rows) => rows.map(stripRightsCodePlaintext));
   },
-  rightsCodesPlaintext: () => request<JsonRecord[]>("/api/admin/rights-codes/plaintext", {
+  rightsCodesPlaintext: (filters: { productId?: string; orderNo?: string; status?: string } = {}) => {
+    const params = new URLSearchParams();
+    if (filters.productId) params.set("productId", filters.productId);
+    if (filters.orderNo) params.set("orderNo", filters.orderNo);
+    if (filters.status) params.set("status", filters.status);
+    return request<JsonRecord[]>(`/api/admin/rights-codes/plaintext${params.size ? `?${params.toString()}` : ""}`, {
     headers: adminHeaders()
-  }),
+    });
+  },
   importRightsCodes: (input: { productId: string; batchNo: string; codes: string[] }) => request<JsonRecord>("/api/admin/rights-codes/import", {
     method: "POST",
     headers: adminHeaders(),
@@ -572,14 +604,22 @@ export const api = {
   adminOwnProductReviews: () => request<JsonRecord[]>("/api/admin/agent-products/reviews", {
     headers: adminHeaders()
   }),
-  submitOwnProduct: (input: { name: string; salePriceCents: string; minSalePriceCents: string; fulfillmentMode: string }) => request<JsonRecord>("/api/agent/products/own", {
+  submitOwnProduct: (input: { name: string; category?: string; tags?: string; subtitle?: string; description?: string; usageGuide?: string; imageUrl?: string; specs?: string; detailSections?: string; salePriceCents: string; minSalePriceCents: string; fulfillmentMode: string }) => request<JsonRecord>("/api/agent/products/own", {
     method: "POST",
     headers: agentHeaders(),
     body: {
-      name: input.name,
-      salePriceCents: input.salePriceCents,
-      minSalePriceCents: input.minSalePriceCents,
-      fulfillmentMode: input.fulfillmentMode
+      name: requireText(input.name, "商品名称"),
+      category: input.category || undefined,
+      tags: input.tags ? input.tags.split(/,|，/).map((item) => item.trim()).filter(Boolean) : undefined,
+      subtitle: input.subtitle || undefined,
+      description: input.description || undefined,
+      usageGuide: input.usageGuide || undefined,
+      imageUrl: input.imageUrl || undefined,
+      specs: splitLines(input.specs),
+      detailSections: parseDetailSections(input.detailSections),
+      salePriceCents: requirePositiveCents(input.salePriceCents, "售价"),
+      minSalePriceCents: input.minSalePriceCents ? requirePositiveCents(input.minSalePriceCents, "最低价") : undefined,
+      fulfillmentMode: requireText(input.fulfillmentMode, "交付方式")
     }
   }),
   reviewOwnProduct: (ownProductId: string, approved = true) => request<JsonRecord>(`/api/admin/agent-products/reviews/${ownProductId}/review`, {

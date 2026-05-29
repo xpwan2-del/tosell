@@ -73,6 +73,7 @@ enum ProductType {
 
 enum FulfillmentType {
   manual
+  code_pool
   automatic
   external
 }
@@ -116,7 +117,14 @@ enum FulfillmentStatus {
 enum RightsCodeStatus {
   available
   issued
+  locked
+  revoked
   voided
+}
+
+enum RightsCodeOwnerType {
+  platform
+  agent
 }
 
 enum RefundStatus {
@@ -491,6 +499,20 @@ enum CodePlaintextAccessType {
   export
 }
 
+enum EmailDeliveryScope {
+  codes
+  extract_link
+  codes_and_link
+}
+
+enum EmailDeliveryStatus {
+  pending
+  sent
+  provider_not_configured
+  failed
+  skipped_refunded
+}
+
 model User {
   id        String     @id @default(cuid())
   openid    String?    @unique
@@ -592,6 +614,7 @@ model Agent {
   ledgerEntries           LedgerEntry[]
   notifications           AgentNotification[]
   sessions                AuthSession[]
+  ownedRightsCodes        RightsCode[]
   firstTierAuthorizations ChannelAuthorization[] @relation("FirstTierAuthorization")
   firstTierRelations      ChannelRelation[]      @relation("FirstTierRelations")
   secondTierRelations     ChannelRelation[]      @relation("SecondTierRelations")
@@ -674,6 +697,7 @@ model Merchant {
   shops               Shop[]
   products            MerchantProduct[]
   productReviews      MerchantProductReview[]
+  ownedRightsCodes    RightsCode[]
   depositAccount      DepositAccount?
   depositTransactions DepositTransaction[]
   orders              Order[]
@@ -784,6 +808,7 @@ model Shop {
   merchantProductReviews MerchantProductReview[]
   productReviews         AgentProductReview[]
   platformShopProducts   PlatformShopProduct[]
+  rightsCodes            RightsCode[]
   orders                 Order[]
   afterSales             AfterSale[]
   fulfillmentRecords     FulfillmentRecord[]
@@ -880,6 +905,11 @@ model PlatformProduct {
   suggestedSalePriceCents BigInt          @map("suggested_sale_price_cents")
   fulfillmentType         FulfillmentType @default(manual) @map("fulfillment_type")
   fulfillmentRuleJson     Json            @map("fulfillment_rule_json")
+  manualFulfillmentInstruction String?    @map("manual_fulfillment_instruction")
+  manualFulfillmentWechatQrUrl String?    @map("manual_fulfillment_wechat_qr_url")
+  manualFulfillmentQqQrUrl     String?    @map("manual_fulfillment_qq_qr_url")
+  manualFulfillmentWechatId    String?    @map("manual_fulfillment_wechat_id")
+  manualFulfillmentQqId        String?    @map("manual_fulfillment_qq_id")
   afterSaleRuleJson       Json            @map("after_sale_rule_json")
   extractCodeRequired     Boolean         @default(false) @map("extract_code_required")
   extractCodeTtlMinutes   Int?            @map("extract_code_ttl_minutes")
@@ -926,21 +956,32 @@ model PlatformShopProduct {
 }
 
 model RightsCode {
-  id             String           @id @default(cuid())
-  productId      String?          @map("product_id")
-  agentProductId String?          @map("agent_product_id")
-  codeCiphertext String           @map("code_ciphertext")
-  batchNo        String           @map("batch_no")
-  status         RightsCodeStatus @default(available)
-  orderId        String?          @map("order_id")
-  issueKey       String?          @unique @map("issue_key")
-  importedById   String?          @map("imported_by")
-  issuedAt       DateTime?        @map("issued_at")
-  createdAt      DateTime         @default(now()) @map("created_at")
-  updatedAt      DateTime         @updatedAt @map("updated_at")
+  id              String              @id @default(cuid())
+  productId       String?             @map("product_id")
+  agentProductId  String?             @map("agent_product_id")
+  codeCiphertext  String              @map("code_ciphertext")
+  codeHash        String?             @map("code_hash")
+  secretPreview   String?             @map("secret_preview")
+  ownerType       RightsCodeOwnerType @default(platform) @map("owner_type")
+  ownerAgentId    String?             @map("owner_agent_id")
+  ownerMerchantId String?             @map("owner_merchant_id")
+  shopId          String?             @map("shop_id")
+  batchNo         String              @map("batch_no")
+  status          RightsCodeStatus    @default(available)
+  orderId         String?             @map("order_id")
+  issueKey        String?             @unique @map("issue_key")
+  importedById    String?             @map("imported_by")
+  issuedAt        DateTime?           @map("issued_at")
+  revokedAt       DateTime?           @map("revoked_at")
+  importAuditJson Json?               @map("import_audit_json")
+  createdAt       DateTime            @default(now()) @map("created_at")
+  updatedAt       DateTime            @updatedAt @map("updated_at")
 
   product      PlatformProduct?        @relation(fields: [productId], references: [id])
   agentProduct AgentProduct?           @relation(fields: [agentProductId], references: [id])
+  ownerAgent   Agent?                  @relation(fields: [ownerAgentId], references: [id])
+  ownerMerchant Merchant?              @relation(fields: [ownerMerchantId], references: [id])
+  shop         Shop?                   @relation(fields: [shopId], references: [id])
   order        Order?                  @relation(fields: [orderId], references: [id])
   accessLogs   CodePlaintextAccessLog[]
 
@@ -948,6 +989,11 @@ model RightsCode {
   @@unique([agentProductId, codeCiphertext])
   @@index([productId, status])
   @@index([agentProductId, status])
+  @@index([ownerType, status])
+  @@index([ownerAgentId, status])
+  @@index([ownerMerchantId, status])
+  @@index([shopId, status])
+  @@index([codeHash])
   @@index([batchNo])
   @@map("rights_codes")
 }
@@ -1046,6 +1092,12 @@ model AgentProductReview {
   salePriceCents      BigInt       @map("sale_price_cents")
   afterSaleRuleJson   Json         @map("after_sale_rule_json")
   fulfillmentRuleJson Json         @map("fulfillment_rule_json")
+  fulfillmentType     FulfillmentType @default(manual) @map("fulfillment_type")
+  manualFulfillmentInstruction String? @map("manual_fulfillment_instruction")
+  manualFulfillmentWechatQrUrl String? @map("manual_fulfillment_wechat_qr_url")
+  manualFulfillmentQqQrUrl String? @map("manual_fulfillment_qq_qr_url")
+  manualFulfillmentWechatId String? @map("manual_fulfillment_wechat_id")
+  manualFulfillmentQqId String? @map("manual_fulfillment_qq_id")
   status              ReviewStatus @default(pending_review)
   rejectReason        String?      @map("reject_reason")
   riskReason          String?      @map("risk_reason")
@@ -1103,6 +1155,12 @@ model MerchantProductReview {
   salePriceCents      BigInt       @map("sale_price_cents")
   afterSaleRuleJson   Json         @map("after_sale_rule_json")
   fulfillmentRuleJson Json         @map("fulfillment_rule_json")
+  fulfillmentType     FulfillmentType @default(manual) @map("fulfillment_type")
+  manualFulfillmentInstruction String? @map("manual_fulfillment_instruction")
+  manualFulfillmentWechatQrUrl String? @map("manual_fulfillment_wechat_qr_url")
+  manualFulfillmentQqQrUrl String? @map("manual_fulfillment_qq_qr_url")
+  manualFulfillmentWechatId String? @map("manual_fulfillment_wechat_id")
+  manualFulfillmentQqId String? @map("manual_fulfillment_qq_id")
   status              ReviewStatus @default(pending_review)
   rejectReason        String?      @map("reject_reason")
   riskReason          String?      @map("risk_reason")
@@ -1180,6 +1238,7 @@ model Order {
   clearingItems             ClearingItem[]
   refundManualConfirmations RefundManualConfirmation[]
   codeAccessLogs            CodePlaintextAccessLog[]
+  emailDeliveryRecords      EmailDeliveryRecord[]
   channelRelation           ChannelRelation?           @relation(fields: [channelRelationId], references: [id])
 
   @@index([agentId, createdAt])
@@ -1242,6 +1301,7 @@ model OrderItem {
   reservedVirtualCodes VirtualCode[]            @relation("VirtualCodeReservedOrderItem")
   extractSecrets       OrderExtractSecret[]
   codeAccessLogs       CodePlaintextAccessLog[]
+  emailDeliveryRecords EmailDeliveryRecord[]
   clearingItems        ClearingItem[]
 
   @@index([orderId])
@@ -1516,6 +1576,38 @@ model CodePlaintextAccessLog {
   @@index([orderId, createdAt])
   @@index([requestId])
   @@map("code_plaintext_access_logs")
+}
+
+model EmailDeliveryRecord {
+  id               String              @id @default(cuid())
+  deliveryNo       String              @unique @map("delivery_no")
+  orderId          String              @map("order_id")
+  orderItemId      String?             @map("order_item_id")
+  email            String
+  scope            EmailDeliveryScope  @default(extract_link)
+  status           EmailDeliveryStatus @default(pending)
+  codeCount        Int                 @default(0) @map("code_count")
+  extractTokenHash String?             @map("extract_token_hash")
+  errorCode        String?             @map("error_code")
+  errorMessage     String?             @map("error_message")
+  retryCount       Int                 @default(0) @map("retry_count")
+  nextRetryAt      DateTime?           @map("next_retry_at")
+  actorType        ActorType           @default(system) @map("actor_type")
+  actorId          String?             @map("actor_id")
+  source           String              @default("auto_fulfillment")
+  idempotencyKey   String              @unique @map("idempotency_key")
+  sentAt           DateTime?           @map("sent_at")
+  createdAt        DateTime            @default(now()) @map("created_at")
+  updatedAt        DateTime            @updatedAt @map("updated_at")
+
+  order     Order      @relation(fields: [orderId], references: [id])
+  orderItem OrderItem? @relation(fields: [orderItemId], references: [id])
+
+  @@index([orderId, status])
+  @@index([email, createdAt])
+  @@index([status, nextRetryAt])
+  @@index([actorType, actorId, createdAt])
+  @@map("email_delivery_records")
 }
 
 model AfterSale {

@@ -25,9 +25,27 @@ const collectionChannelType = z.enum([
 const emailSchema = z.string().email().max(160);
 const extractionCodeSchema = z.string().regex(/^\d{4,12}$/).max(12);
 const agentTierSchema = z.enum(["first_tier", "second_tier", "third_tier"]);
+const fulfillmentModeSchema = z.enum(["manual", "code_pool"]);
 const productDetailSectionSchema = z.object({
   title: z.string().min(1).max(60),
   items: z.array(z.string().min(1).max(240)).max(12)
+});
+const productDetailUpdateSchema = z.object({
+  name: z.string().trim().min(1).optional(),
+  category: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  subtitle: z.string().optional(),
+  description: z.string().optional(),
+  usageGuide: z.string().optional(),
+  imageUrl: z.string().optional(),
+  specs: z.array(z.string().min(1).max(60)).max(12).optional(),
+  detailSections: z.array(productDetailSectionSchema).max(8).optional(),
+  stockCount: z.number().int().nonnegative().optional(),
+  soldCount: z.number().int().nonnegative().optional(),
+  fulfillmentMode: fulfillmentModeSchema.optional(),
+  manualFulfillmentInstruction: z.string().max(1000).optional(),
+  afterSaleRule: z.unknown().optional(),
+  status: z.string().optional()
 });
 
 export function buildApp() {
@@ -193,12 +211,16 @@ export function buildApp() {
       quantity: z.number().int().positive().optional(),
       buyerEmail: emailSchema.optional(),
       extractionCode: extractionCodeSchema.optional(),
+      purchasePassword: extractionCodeSchema.optional(),
       couponId: z.string().optional(),
       collectionChannelId: z.string().optional(),
       clientPaidAmountCents: bigintString.optional()
     }).parse(request.body);
     try {
-      return serializeBigInt(services.createOrder(getUserActor(request), body));
+      return serializeBigInt(services.createOrder(getUserActor(request), {
+        ...body,
+        extractionCode: body.purchasePassword ?? body.extractionCode
+      }));
     } catch (error) {
       if (error instanceof ApiError) throw error;
       throw new ApiError(400, "ORDER_CREATE_FAILED", error instanceof Error ? error.message : "order create failed");
@@ -233,14 +255,20 @@ export function buildApp() {
 
   app.post("/api/user/orders/:orderNo/extract", async (request) => {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
-    const body = z.object({ extractionCode: extractionCodeSchema }).parse(request.body);
-    return serializeBigInt(services.extractOrderCodes(getUserActor(request), orderNo, body.extractionCode));
+    const body = z.object({
+      extractionCode: extractionCodeSchema.optional(),
+      purchasePassword: extractionCodeSchema.optional()
+    }).parse(request.body);
+    return serializeBigInt(services.extractOrderCodes(getUserActor(request), orderNo, body.purchasePassword ?? body.extractionCode ?? ""));
   });
 
   app.post("/api/user/extractions/:token", async (request) => {
     const { token } = z.object({ token: z.string().min(20) }).parse(request.params);
-    const body = z.object({ extractionCode: extractionCodeSchema }).parse(request.body);
-    return serializeBigInt(services.extractOrderCodesByToken(getUserActor(request), token, body.extractionCode));
+    const body = z.object({
+      extractionCode: extractionCodeSchema.optional(),
+      purchasePassword: extractionCodeSchema.optional()
+    }).parse(request.body);
+    return serializeBigInt(services.extractOrderCodesByToken(getUserActor(request), token, body.purchasePassword ?? body.extractionCode ?? ""));
   });
 
   app.post("/api/user/after-sales", async (request) => {
@@ -342,20 +370,52 @@ export function buildApp() {
   app.get("/api/agent/products/platform", async (request) => serializeBigInt(services.listPlatformProducts(getAgentActor(request))));
   app.get("/api/agent/products", async (request) => serializeBigInt(services.listAgentProducts(getAgentActor(request))));
   app.get("/api/agent/products/own", async (request) => serializeBigInt(services.listOwnProductReviews(getAgentActor(request))));
+  app.get("/api/agent/products/own/:ownProductId", async (request) => {
+    const { ownProductId } = z.object({ ownProductId: z.string() }).parse(request.params);
+    return serializeBigInt(services.getOwnProductDetail(getAgentActor(request), ownProductId));
+  });
 
   app.post("/api/agent/products/own", async (request) => {
     const body = z.object({
       name: z.string().trim().min(1),
+      category: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+      subtitle: z.string().optional(),
+      description: z.string().optional(),
+      usageGuide: z.string().optional(),
+      imageUrl: z.string().optional(),
+      specs: z.array(z.string().min(1).max(60)).max(12).optional(),
+      detailSections: z.array(productDetailSectionSchema).max(8).optional(),
       salePriceCents: bigintString,
       minSalePriceCents: bigintString.optional(),
-      fulfillmentMode: z.string().optional()
+      fulfillmentMode: fulfillmentModeSchema.optional(),
+      manualFulfillmentInstruction: z.string().max(1000).optional()
     }).parse(request.body);
     return serializeBigInt(services.submitOwnProduct(getAgentActor(request), {
       ...body,
       fulfillmentRule: {
         mode: body.fulfillmentMode ?? "manual",
-        ...(body.fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {})
+        ...(body.fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {}),
+        ...(body.manualFulfillmentInstruction ? { manualFulfillmentInstruction: body.manualFulfillmentInstruction } : {})
       }
+    }));
+  });
+  app.patch("/api/agent/products/own/:ownProductId", async (request) => {
+    const { ownProductId } = z.object({ ownProductId: z.string() }).parse(request.params);
+    const body = productDetailUpdateSchema.extend({
+      salePriceCents: bigintString.optional(),
+      minSalePriceCents: bigintString.optional()
+    }).parse(request.body);
+    const { fulfillmentMode, manualFulfillmentInstruction, ...rest } = body;
+    return serializeBigInt(services.updateOwnProductDetail(getAgentActor(request), ownProductId, {
+      ...rest,
+      fulfillmentRule: fulfillmentMode || manualFulfillmentInstruction
+        ? {
+            mode: fulfillmentMode ?? "manual",
+            ...(fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {}),
+            ...(manualFulfillmentInstruction ? { manualFulfillmentInstruction } : {})
+          }
+        : undefined
     }));
   });
 
@@ -375,10 +435,29 @@ export function buildApp() {
     }).parse(request.body);
     return serializeBigInt(services.addAgentRightsCodes(getAgentActor(request), body));
   });
+  app.post("/api/agent/rights-codes/precheck", async (request) => {
+    const body = z.object({
+      agentProductId: z.string(),
+      codes: z.array(z.string())
+    }).parse(request.body);
+    return serializeBigInt(services.precheckAgentRightsCodes(getAgentActor(request), body));
+  });
 
   app.post("/api/agent/products/platform", async (request) => {
     const body = z.object({ platformProductId: z.string(), salePriceCents: bigintString }).parse(request.body);
     return serializeBigInt(services.selectPlatformProduct(getAgentActor(request), body));
+  });
+  app.get("/api/agent/products/:agentProductId", async (request) => {
+    const { agentProductId } = z.object({ agentProductId: z.string() }).parse(request.params);
+    return serializeBigInt(services.getAgentProductDetail(getAgentActor(request), agentProductId));
+  });
+  app.patch("/api/agent/products/:agentProductId", async (request) => {
+    const { agentProductId } = z.object({ agentProductId: z.string() }).parse(request.params);
+    const body = z.object({
+      salePriceCents: bigintString.optional(),
+      status: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.updateAgentProductDetail(getAgentActor(request), agentProductId, body));
   });
 
   app.post("/api/agent/products/platform/batch", async (request) => {
@@ -523,26 +602,56 @@ export function buildApp() {
       supplyPriceCents: bigintString,
       minSalePriceCents: bigintString,
       suggestedSalePriceCents: bigintString,
-      fulfillmentMode: z.enum(["manual", "code_pool"]).optional()
+      fulfillmentMode: fulfillmentModeSchema.optional(),
+      manualFulfillmentInstruction: z.string().max(1000).optional()
     }).parse(request.body);
     return serializeBigInt(services.createPlatformProduct(getAdminActor(request), {
       ...body,
-      fulfillmentRule: { mode: body.fulfillmentMode ?? "manual" }
+      fulfillmentRule: {
+        mode: body.fulfillmentMode ?? "manual",
+        ...(body.fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {}),
+        ...(body.fulfillmentMode === "manual" && body.manualFulfillmentInstruction ? { manualFulfillmentInstruction: body.manualFulfillmentInstruction } : {})
+      }
     }));
   });
   app.get("/api/admin/products", async (request) => serializeBigInt(services.listAdminPlatformProducts(getAdminActor(request))));
+  app.get("/api/admin/products/:productId", async (request) => {
+    const { productId } = z.object({ productId: z.string() }).parse(request.params);
+    return serializeBigInt(services.getAdminPlatformProductDetail(getAdminActor(request), productId));
+  });
   app.patch("/api/admin/products/:productId", async (request) => {
     const { productId } = z.object({ productId: z.string() }).parse(request.params);
-    const body = z.object({
-      name: z.string().optional(),
+    const body = productDetailUpdateSchema.extend({
       supplyPriceCents: bigintString.optional(),
       minSalePriceCents: bigintString.optional(),
-      suggestedSalePriceCents: bigintString.optional(),
-      status: z.string().optional()
+      suggestedSalePriceCents: bigintString.optional()
     }).parse(request.body);
-    return serializeBigInt(services.updatePlatformProduct(getAdminActor(request), productId, body));
+    const { fulfillmentMode, manualFulfillmentInstruction, ...rest } = body;
+    return serializeBigInt(services.updatePlatformProduct(getAdminActor(request), productId, {
+      ...rest,
+      fulfillmentRule: fulfillmentMode || manualFulfillmentInstruction
+        ? {
+            mode: fulfillmentMode ?? "manual",
+            ...(fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {}),
+            ...(manualFulfillmentInstruction ? { manualFulfillmentInstruction } : {})
+          }
+        : undefined
+    }));
   });
   app.get("/api/admin/platform-shop-products", async (request) => serializeBigInt(services.listAdminPlatformShopProducts(getAdminActor(request))));
+  app.get("/api/admin/platform-shop-products/:shopProductId", async (request) => {
+    const { shopProductId } = z.object({ shopProductId: z.string() }).parse(request.params);
+    return serializeBigInt(services.getAdminPlatformShopProductDetail(getAdminActor(request), shopProductId));
+  });
+  app.patch("/api/admin/platform-shop-products/:shopProductId", async (request) => {
+    const { shopProductId } = z.object({ shopProductId: z.string() }).parse(request.params);
+    const body = z.object({
+      salePriceCents: bigintString.optional(),
+      fulfillmentCostCents: bigintString.optional(),
+      status: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.updatePlatformShopProductDetail(getAdminActor(request), shopProductId, body));
+  });
   app.post("/api/admin/platform-shop-products", async (request) => {
     const body = z.object({
       shopId: z.string(),
@@ -595,6 +704,10 @@ export function buildApp() {
   app.get("/api/admin/email-deliveries", async (request) => {
     return serializeBigInt(services.listEmailDeliveries(getAdminActor(request)));
   });
+  app.post("/api/admin/orders/:orderNo/email-deliveries", async (request) => {
+    const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
+    return serializeBigInt(services.resendOrderEmailDelivery(getAdminActor(request), orderNo));
+  });
 
   app.post("/api/admin/rights-codes/import", async (request) => {
     const body = z.object({
@@ -603,6 +716,13 @@ export function buildApp() {
       batchNo: z.string().optional()
     }).parse(request.body);
     return serializeBigInt(services.addRightsCodes(getAdminActor(request), body));
+  });
+  app.post("/api/admin/rights-codes/precheck", async (request) => {
+    const body = z.object({
+      productId: z.string(),
+      codes: z.array(z.string())
+    }).parse(request.body);
+    return serializeBigInt(services.precheckRightsCodes(getAdminActor(request), body));
   });
 
   app.get("/api/admin/agent-products/reviews", async (request) => {
@@ -617,6 +737,10 @@ export function buildApp() {
       offset: z.coerce.number().int().nonnegative().optional()
     }).parse(request.query);
     return serializeBigInt(services.listAdminOwnProductReviews(getAdminActor(request), query));
+  });
+  app.get("/api/admin/agent-products/reviews/:ownProductId", async (request) => {
+    const { ownProductId } = z.object({ ownProductId: z.string() }).parse(request.params);
+    return serializeBigInt(services.getAdminOwnProductReviewDetail(getAdminActor(request), ownProductId));
   });
 
   app.post("/api/admin/agent-products/reviews/:ownProductId/review", async (request) => {

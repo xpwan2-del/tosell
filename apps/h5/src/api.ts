@@ -73,13 +73,13 @@ export const api = {
     method: "POST",
     body: { shopId, agentProductId: productId, couponId }
   }),
-  createOrder: (shopId: string, productId: string, clientPaidAmountCents: string, input: { extractionCode?: string; couponId?: string; buyerEmail?: string; collectionChannelId?: string } = {}) => request<JsonRecord>("/api/user/orders", {
+  createOrder: (shopId: string, productId: string, clientPaidAmountCents: string, input: { purchasePassword?: string; extractionCode?: string; couponId?: string; buyerEmail?: string; collectionChannelId?: string } = {}) => request<JsonRecord>("/api/user/orders", {
     method: "POST",
     body: {
       shopId,
       agentProductId: productId,
       clientPaidAmountCents,
-      extractionCode: input.extractionCode || undefined,
+      purchasePassword: input.purchasePassword || input.extractionCode || undefined,
       couponId: input.couponId || undefined,
       buyerEmail: input.buyerEmail || undefined,
       collectionChannelId: input.collectionChannelId || undefined
@@ -106,13 +106,13 @@ export const api = {
   orders: () => request<JsonRecord[]>("/api/user/orders")
   ,
   order: (orderNo: string) => request<JsonRecord>(`/api/user/orders/${orderNo}`),
-  extractOrder: (orderNo: string, extractionCode: string) => request<JsonRecord>(`/api/user/orders/${orderNo}/extract`, {
+  extractOrder: (orderNo: string, purchasePassword: string) => request<JsonRecord>(`/api/user/orders/${orderNo}/extract`, {
     method: "POST",
-    body: { extractionCode }
+    body: { purchasePassword }
   }),
-  extractWithToken: (token: string, extractionCode: string) => request<JsonRecord>(`/api/user/extractions/${encodeURIComponent(token)}`, {
+  extractWithToken: (token: string, purchasePassword: string) => request<JsonRecord>(`/api/user/extractions/${encodeURIComponent(token)}`, {
     method: "POST",
-    body: { extractionCode }
+    body: { purchasePassword }
   })
 };
 

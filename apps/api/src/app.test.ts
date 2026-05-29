@@ -441,11 +441,36 @@ describe.sequential("api", () => {
         name: "代理自有课程权益",
         salePriceCents: "19900",
         minSalePriceCents: "9900",
-        fulfillmentMode: "manual"
+        fulfillmentMode: "manual",
+        manualFulfillmentInstruction: "付款后联系店铺客服开通课程权益"
       }
     });
     expect(submitted.statusCode).toBe(200);
     expect(submitted.json().reviewStatus).toBe("pending_review");
+
+    const ownDetail = await app.inject({
+      method: "GET",
+      url: `/api/agent/products/own/${submitted.json().id}`,
+      headers: { "x-agent-id": "agent-1", "x-shop-id": "shop-1" }
+    });
+    expect(ownDetail.statusCode).toBe(200);
+    expect(ownDetail.json()).toMatchObject({
+      ownProductId: submitted.json().id,
+      fulfillmentMode: "manual",
+      manualFulfillmentInstruction: "付款后联系店铺客服开通课程权益"
+    });
+
+    const ownPatch = await app.inject({
+      method: "PATCH",
+      url: `/api/agent/products/own/${submitted.json().id}`,
+      headers: { "x-agent-id": "agent-1", "x-shop-id": "shop-1" },
+      payload: { subtitle: "人工交付课程", manualFulfillmentInstruction: "请提供订单号给客服核销" }
+    });
+    expect(ownPatch.statusCode).toBe(200);
+    expect(ownPatch.json()).toMatchObject({
+      subtitle: "人工交付课程",
+      manualFulfillmentInstruction: "请提供订单号给客服核销"
+    });
 
     const unauthenticatedQueue = await app.inject({ method: "GET", url: "/api/admin/agent-products/reviews" });
     expect(unauthenticatedQueue.statusCode).toBe(401);
@@ -490,6 +515,21 @@ describe.sequential("api", () => {
     expect(reviewed.statusCode).toBe(200);
     expect(reviewed.json().agentProduct.productType).toBe("agent_owned");
 
+    const reviewDetail = await app.inject({
+      method: "GET",
+      url: `/api/admin/agent-products/reviews/${submitted.json().id}`,
+      headers: { "x-admin-id": "operator-1", "x-admin-role": "operator" }
+    });
+    expect(reviewDetail.statusCode).toBe(200);
+    expect(reviewDetail.json()).toMatchObject({
+      ownProductId: submitted.json().id,
+      agentProductId: reviewed.json().agentProduct.id,
+      reviewStatus: "approved",
+      status: "listed",
+      agent: expect.objectContaining({ id: "agent-1" }),
+      shop: expect.objectContaining({ id: "shop-1" })
+    });
+
     const approvedQueue = await app.inject({
       method: "GET",
       url: `/api/admin/agent-products/reviews?status=listed&agentId=agent-1&limit=5&offset=0`,
@@ -517,6 +557,230 @@ describe.sequential("api", () => {
     });
     expect(created.statusCode).toBe(200);
     expect(created.json().snapshot.productType).toBe("agent_owned");
+  });
+
+  it("exposes product detail contracts, safe fulfillment switching, purchase-password extraction, and email resend", async () => {
+    const app = buildApp();
+    const operatorHeaders = { "x-admin-id": "operator-1", "x-admin-role": "operator" };
+    const agentHeaders = { "x-agent-id": "agent-1", "x-shop-id": "shop-1" };
+
+    const platformDetail = await app.inject({ method: "GET", url: "/api/admin/products/prod-code", headers: operatorHeaders });
+    expect(platformDetail.statusCode).toBe(200);
+    expect(platformDetail.json()).toMatchObject({
+      id: "prod-code",
+      fulfillmentMode: "code_pool",
+      rightsCodePool: expect.objectContaining({
+        available: expect.any(Number),
+        plaintextDefaultVisible: false,
+        permissions: expect.objectContaining({
+          canImport: true,
+          canExportMasked: true,
+          canViewPlaintext: false,
+          canExportPlaintext: false
+        })
+      })
+    });
+
+    const unsafeSwitch = await app.inject({
+      method: "PATCH",
+      url: "/api/admin/products/prod-code",
+      headers: operatorHeaders,
+      payload: { fulfillmentMode: "manual" }
+    });
+    expect(unsafeSwitch.statusCode).toBe(400);
+    expect(unsafeSwitch.json().code).toBe("FULFILLMENT_MODE_CHANGE_UNSAFE");
+
+    const manualUpdate = await app.inject({
+      method: "PATCH",
+      url: "/api/admin/products/prod-1",
+      headers: operatorHeaders,
+      payload: { fulfillmentMode: "manual", manualFulfillmentInstruction: "付款后请通过微信或 QQ 联系客服人工交付" }
+    });
+    expect(manualUpdate.statusCode).toBe(200);
+    expect(manualUpdate.json()).toMatchObject({
+      fulfillmentMode: "manual",
+      manualFulfillmentInstruction: "付款后请通过微信或 QQ 联系客服人工交付"
+    });
+
+    const manualCodeImport = await app.inject({
+      method: "POST",
+      url: "/api/admin/rights-codes/import",
+      headers: operatorHeaders,
+      payload: { productId: "prod-1", codes: ["SHOULD-NOT-IMPORT"] }
+    });
+    expect(manualCodeImport.statusCode).toBe(400);
+    expect(manualCodeImport.json().code).toBe("RIGHTS_CODE_PRODUCT_MODE_INVALID");
+
+    const serviceContact = await app.inject({
+      method: "PATCH",
+      url: "/api/agent/shop",
+      headers: agentHeaders,
+      payload: { customerServiceQq: "123456789", customerServiceQqQrUrl: "https://example.test/qq-service.png" }
+    });
+    expect(serviceContact.statusCode).toBe(200);
+
+    const agentProductDetail = await app.inject({ method: "GET", url: "/api/agent/products/ap-1", headers: agentHeaders });
+    expect(agentProductDetail.statusCode).toBe(200);
+    expect(agentProductDetail.json()).toMatchObject({
+      id: "ap-1",
+      fieldPermissions: expect.objectContaining({ editable: expect.arrayContaining(["salePriceCents"]) })
+    });
+    expect(agentProductDetail.json().product.supplyPriceCents).toBeUndefined();
+    expect(agentProductDetail.json().product.platformSupplyPriceCents).toBe("10000");
+
+    const manualOrder = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "manual-detail-user" },
+      payload: { shopId: "shop-1", agentProductId: "ap-1", clientPaidAmountCents: "15000" }
+    });
+    expect(manualOrder.statusCode).toBe(200);
+    const manualConfirm = await app.inject({
+      method: "POST",
+      url: `/api/agent/orders/${manualOrder.json().orderNo}/confirm-payment`,
+      headers: agentHeaders,
+      payload: { amountCents: "15000", voucherUrl: "manual://detail/manual" }
+    });
+    expect(manualConfirm.statusCode).toBe(200);
+    const manualFulfillment = await app.inject({
+      method: "POST",
+      url: `/api/agent/orders/${manualOrder.json().orderNo}/fulfillment`,
+      headers: agentHeaders,
+      payload: { status: "success", attemptNo: 1, evidence: "manual fulfillment evidence" }
+    });
+    expect(manualFulfillment.statusCode).toBe(200);
+    const manualDetail = await app.inject({
+      method: "GET",
+      url: `/api/user/orders/${manualOrder.json().orderNo}`,
+      headers: { "x-user-id": "manual-detail-user" }
+    });
+    expect(manualDetail.json().delivery).toMatchObject({
+      mode: "manual",
+      manualFulfillmentInstruction: "付款后请通过微信或 QQ 联系客服人工交付",
+      customerServiceWechat: expect.any(String),
+      customerServiceQq: expect.any(String)
+    });
+    expect(manualDetail.json().delivery).not.toHaveProperty("codes");
+
+    await app.inject({
+      method: "POST",
+      url: "/api/admin/rights-codes/import",
+      headers: operatorHeaders,
+      payload: { productId: "prod-code", batchNo: "password-detail", codes: ["PWD-CODE-001"] }
+    });
+    const precheck = await app.inject({
+      method: "POST",
+      url: "/api/admin/rights-codes/precheck",
+      headers: operatorHeaders,
+      payload: { productId: "prod-code", codes: ["", "PWD-CODE-001", "NEW-CODE-001", "NEW-CODE-001", "bad\u0001"] }
+    });
+    expect(precheck.statusCode).toBe(200);
+    expect(precheck.json().summary).toMatchObject({ total: 5, create: 1, skipped: 2, failed: 2, importable: 1 });
+    expect(precheck.json().details).toEqual(expect.arrayContaining([
+      expect.objectContaining({ line: 1, action: "fail", reasonCode: "EMPTY_LINE" }),
+      expect.objectContaining({ line: 2, action: "skip", reasonCode: "DUPLICATE_EXISTING" }),
+      expect.objectContaining({ line: 4, action: "skip", reasonCode: "DUPLICATE_IN_REQUEST" }),
+      expect.objectContaining({ line: 5, action: "fail", reasonCode: "INVALID_FORMAT" })
+    ]));
+    expect(JSON.stringify(precheck.json())).not.toContain("PWD-CODE-001");
+    const detailedImport = await app.inject({
+      method: "POST",
+      url: "/api/admin/rights-codes/import",
+      headers: operatorHeaders,
+      payload: { productId: "prod-code", batchNo: "password-detail-extra", codes: ["", "PWD-CODE-001", "NEW-CODE-001", "NEW-CODE-001"] }
+    });
+    expect(detailedImport.statusCode).toBe(200);
+    expect(detailedImport.json()).toMatchObject({ count: 1, createdCount: 1, skippedCount: 2, failedCount: 1 });
+    expect(detailedImport.json().details).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: "create", codeId: expect.any(String) }),
+      expect.objectContaining({ action: "skip", reasonCode: "DUPLICATE_EXISTING" }),
+      expect.objectContaining({ action: "fail", reasonCode: "EMPTY_LINE" })
+    ]));
+    expect(JSON.stringify(detailedImport.json())).not.toContain("NEW-CODE-001");
+
+    const plaintextDenied = await app.inject({
+      method: "GET",
+      url: "/api/admin/rights-codes/plaintext?productId=prod-code",
+      headers: operatorHeaders
+    });
+    expect(plaintextDenied.statusCode).toBe(403);
+    const plaintextAllowed = await app.inject({
+      method: "GET",
+      url: "/api/admin/rights-codes/plaintext?productId=prod-code",
+      headers: { "x-admin-id": "admin-1", "x-admin-role": "admin" }
+    });
+    expect(plaintextAllowed.statusCode).toBe(200);
+    expect(JSON.stringify(plaintextAllowed.json())).toContain("PWD-CODE-001");
+
+    const codeOrder = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "password-user" },
+      payload: {
+        shopId: "shop-1",
+        agentProductId: "ap-code",
+        clientPaidAmountCents: "4900",
+        buyerEmail: "password@example.com",
+        purchasePassword: "135790"
+      }
+    });
+    expect(codeOrder.statusCode).toBe(200);
+    const codePayment = await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: { channel: "mock", channelTradeNo: "trade-password-detail", orderNo: codeOrder.json().orderNo, amountCents: "4900" }
+    });
+    expect(codePayment.statusCode).toBe(200);
+    const codeDetail = await app.inject({
+      method: "GET",
+      url: `/api/user/orders/${codeOrder.json().orderNo}`,
+      headers: { "x-user-id": "password-user" }
+    });
+    expect(codeDetail.json()).toMatchObject({ purchasePasswordSet: true });
+    expect(codeDetail.json().delivery).toMatchObject({
+      purchasePasswordSet: true,
+      extractionToken: expect.stringMatching(/^ext_[0-9a-z]+_[0-9a-f]{40}$/)
+    });
+    expect(codeDetail.json().delivery.message).toContain("购买密码");
+    expect(JSON.stringify(codeDetail.json())).not.toContain("extractionCodeSet");
+
+    const wrongPassword = await app.inject({
+      method: "POST",
+      url: `/api/user/extractions/${codeDetail.json().delivery.extractionToken}`,
+      headers: { "x-user-id": "password-user" },
+      payload: { purchasePassword: "000000" }
+    });
+    expect(wrongPassword.statusCode).toBe(403);
+    expect(wrongPassword.json()).toMatchObject({
+      code: "PURCHASE_PASSWORD_INVALID",
+      message: expect.stringContaining("purchase password")
+    });
+    expect(JSON.stringify(wrongPassword.json())).not.toContain("extraction code");
+
+    const extracted = await app.inject({
+      method: "POST",
+      url: `/api/user/extractions/${codeDetail.json().delivery.extractionToken}`,
+      headers: { "x-user-id": "password-user" },
+      payload: { purchasePassword: "135790" }
+    });
+    expect(extracted.statusCode).toBe(200);
+    expect(extracted.json().codes).toHaveLength(1);
+
+    const resend = await app.inject({
+      method: "POST",
+      url: `/api/admin/orders/${codeOrder.json().orderNo}/email-deliveries`,
+      headers: operatorHeaders
+    });
+    expect(resend.statusCode).toBe(200);
+    expect(resend.json()).toMatchObject({
+      orderNo: codeOrder.json().orderNo,
+      email: "password@example.com",
+      codeCount: 1,
+      source: "manual_resend"
+    });
+
+    const audits = await app.inject({ method: "GET", url: "/api/admin/audit-logs", headers: operatorHeaders });
+    expect(JSON.stringify(audits.json())).toContain("email.delivery.resend");
   });
 
   it("creates clawback from agent responsibility refund after payout", async () => {
@@ -1634,6 +1898,16 @@ describe.sequential("api", () => {
     expect(rejectedPlatformImport.statusCode).toBe(400);
     expect(rejectedPlatformImport.json().code).toBe("RIGHTS_CODE_PRODUCT_SCOPE_INVALID");
 
+    const ownPrecheck = await app.inject({
+      method: "POST",
+      url: "/api/agent/rights-codes/precheck",
+      headers: agentHeaders,
+      payload: { agentProductId, codes: ["OWN-CODE-001", "OWN-CODE-001", "", "bad\u0002"] }
+    });
+    expect(ownPrecheck.statusCode).toBe(200);
+    expect(ownPrecheck.json().summary).toMatchObject({ create: 1, skipped: 1, failed: 2 });
+    expect(JSON.stringify(ownPrecheck.json())).not.toContain("OWN-CODE-001");
+
     const imported = await app.inject({
       method: "POST",
       url: "/api/agent/rights-codes/import",
@@ -1760,7 +2034,7 @@ describe.sequential("api", () => {
     });
 
     expect(response.statusCode).toBe(400);
-    expect(response.json().code).toBe("EXTRACTION_CODE_REQUIRED");
+    expect(response.json().code).toBe("PURCHASE_PASSWORD_REQUIRED");
     expect(optionalEmail.statusCode).toBe(200);
     expect(optionalEmail.json().buyerEmail).toBeUndefined();
   });

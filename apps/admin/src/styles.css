@@ -389,6 +389,90 @@ textarea {
   padding: 18px;
 }
 
+.drawer {
+  position: fixed;
+  inset: 16px 16px 16px auto;
+  z-index: 20;
+  width: min(720px, calc(100vw - 32px));
+  overflow: auto;
+  padding: 20px;
+  background: #fff;
+  border: 1px solid #cbdde3;
+  border-radius: 8px;
+  box-shadow: 0 22px 70px rgba(15, 35, 42, 0.24);
+}
+
+.drawer-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: flex-start;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #edf1f4;
+}
+
+.drawer-head span {
+  color: #106270;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.drawer-head h3 {
+  margin: 4px 0 0;
+  font-size: 22px;
+}
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.tabs button {
+  color: #42525a;
+  background: #f7fafb;
+  border-color: #d6e1e5;
+}
+
+.tabs button.active {
+  color: #fff;
+  background: #106270;
+  border-color: #106270;
+}
+
+.mini-metrics,
+.detail-grid,
+.precheck,
+.audit-note {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+  padding: 12px;
+  background: #f7fafb;
+  border: 1px solid #d6e3e7;
+  border-radius: 8px;
+}
+
+.review-copy {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.review-copy h4 {
+  margin: 0;
+  color: #106270;
+}
+
+.review-copy p {
+  margin: 0;
+  color: #42525a;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
 .panel-head {
   display: flex;
   justify-content: space-between;
@@ -592,6 +676,11 @@ th {
   .form-grid,
   .form-grid.wide {
     grid-template-columns: 1fr;
+  }
+
+  .drawer {
+    inset: 8px;
+    width: auto;
   }
 
   .kv {

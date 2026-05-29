@@ -517,6 +517,7 @@ async function seedVirtualCatalog(agentId: string, shopId: string) {
       stockCount: item.stockCount,
       soldCount: item.soldCount
     };
+    const fulfillmentType = item.fulfillmentMode === "code_pool" ? "code_pool" : "manual";
     const product = await prisma.platformProduct.upsert({
       where: { productNo: item.productNo },
       update: {
@@ -528,7 +529,7 @@ async function seedVirtualCatalog(agentId: string, shopId: string) {
         supplyPriceCents: item.supplyPriceCents,
         minSalePriceCents: item.minSalePriceCents,
         suggestedSalePriceCents: item.suggestedSalePriceCents,
-        fulfillmentType: item.fulfillmentMode === "code_pool" ? "automatic" : "manual",
+        fulfillmentType,
         fulfillmentRuleJson,
         afterSaleRuleJson: { refundBeforeFulfillment: true },
         status: "active"
@@ -543,7 +544,7 @@ async function seedVirtualCatalog(agentId: string, shopId: string) {
         supplyPriceCents: item.supplyPriceCents,
         minSalePriceCents: item.minSalePriceCents,
         suggestedSalePriceCents: item.suggestedSalePriceCents,
-        fulfillmentType: item.fulfillmentMode === "code_pool" ? "automatic" : "manual",
+        fulfillmentType,
         fulfillmentRuleJson,
         afterSaleRuleJson: { refundBeforeFulfillment: true },
         status: "active"

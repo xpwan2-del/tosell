@@ -20,6 +20,9 @@ export type OrderSnapshotInput = {
     riskStatus: SaleRiskStatus | string;
     customerServiceWechat?: string;
     customerServiceQrUrl?: string;
+    customerServiceQq?: string;
+    customerServiceQqQrUrl?: string;
+    customerServiceNote?: string;
   };
   agentProduct: {
     id: string;
@@ -160,6 +163,9 @@ export function buildOrderSnapshot(input: OrderSnapshotInput): OrderSnapshot {
       name: input.shop.name,
       customerServiceWechat: input.shop.customerServiceWechat,
       customerServiceQrUrl: input.shop.customerServiceQrUrl,
+      customerServiceQq: input.shop.customerServiceQq,
+      customerServiceQqQrUrl: input.shop.customerServiceQqQrUrl,
+      customerServiceNote: input.shop.customerServiceNote,
       agentStatus: input.agent.status,
       shopStatus: input.shop.status,
       entrySource: input.entrySource

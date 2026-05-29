@@ -283,7 +283,7 @@ function App() {
         text(checkout.product.id),
         orderPayableAmount(checkout.quote),
         {
-          extractionCode: requiresProductExtractionCode(checkout.product) ? extractionCode : undefined,
+          purchasePassword: requiresProductExtractionCode(checkout.product) ? extractionCode : undefined,
           couponId: checkout.couponId,
           buyerEmail: buyerEmail.trim() || undefined,
           collectionChannelId: selectedCollectionChannelId || text(collectionChannels[0]?.id, "")
@@ -452,7 +452,7 @@ function App() {
             <span>店铺公告</span>
             <p>{text(shop.announcement, "购买虚拟账号、卡密或会员权益前，请确认商品说明、发放方式和售后规则。")}</p>
             <ul>
-              <li>自动发码商品购买时设置纯数字提取码，后台确认收款后按订单提取查看卡密。</li>
+              <li>自动发码商品购买时设置纯数字购买密码，后台确认收款后可在订单详情查看卡密。</li>
               <li>人工交付商品请添加本店客服领取账号或权益。</li>
               <li>遇到发放超时或无法使用，可在订单中心提交售后。</li>
             </ul>
@@ -613,7 +613,7 @@ function App() {
             </label>
             {requiresProductExtractionCode(checkout.product) ? (
               <label className="field">
-                <span>提取码</span>
+                <span>购买密码</span>
                 <input
                   inputMode="numeric"
                   value={extractionCode}
@@ -624,8 +624,8 @@ function App() {
               </label>
             ) : null}
             <p>{requiresProductExtractionCode(checkout.product)
-              ? "后台确认收款并发码后，请使用购买时设置的提取码查看。"
-              : "本商品由客服人工交付，后台确认收款后请添加店铺客服领取卡密或账号。"}</p>
+              ? "后台确认收款并发码后，请使用购买时设置的购买密码查看。"
+              : "本商品由客服人工交付，后台确认收款后请添加店铺客服领取账号资料或使用说明。"}</p>
             <CollectionBox channels={collectionChannels} orderAmountCents={orderPayableAmount(checkout.quote)} selectedChannelId={selectedCollectionChannelId} onSelect={setSelectedCollectionChannelId} />
             <div className="checkout-actions">
               <button type="button" className="ghost" onClick={() => setCheckout(undefined)}>再看看</button>
@@ -652,7 +652,7 @@ function App() {
             <p>为减少虚拟商品售后争议，请在购买前确认商品名称、发放方式、使用说明和客服处理时效。</p>
             <NoticeItem index="1" title="请认真查看商品详情" text="确认规格、发放方式和使用限制；因未阅读说明造成的问题，按页面规则处理。" />
             <NoticeItem index="2" title="付款请以订单金额为准" text="当前店铺收款通道由后台配置，付款后由商家或平台后台确认收款。" />
-            <NoticeItem index="3" title="自动发码需设置提取码" text="提取码由你购买时自行输入，建议 4-12 位纯数字；人工交付商品请添加店铺客服领取。" />
+            <NoticeItem index="3" title="自动发码需设置购买密码" text="购买密码由你购买时自行输入，建议 4-12 位纯数字；人工交付商品请添加店铺客服领取。" />
             <NoticeItem index="4" title="售后请从订单中心提交" text="订单中心会保留支付、履约、卡密和售后记录，便于平台仲裁和追踪。" />
             <div className="checkout-actions">
               <button type="button" onClick={acknowledgeNotice}>我已知晓并继续访问</button>
@@ -781,12 +781,12 @@ function App() {
               <button type="button" className="icon-button" onClick={() => setExtractOrder(undefined)}>关闭</button>
             </div>
             <label className="field">
-              <span>提取码</span>
+              <span>购买密码</span>
               <input
                 inputMode="numeric"
                 value={extractInput}
                 onChange={(event) => setExtractInput(event.target.value.replace(/\D/g, "").slice(0, 12))}
-                placeholder="输入购买时设置的提取码"
+                placeholder="输入购买时设置的购买密码"
               />
             </label>
             {extractResult ? <ExtractResult result={extractResult} /> : null}
@@ -942,7 +942,7 @@ function ExtractionPage() {
   const shopId = params.get("shopId") ?? defaultShopId;
   const [extractionCode, setExtractionCode] = useState("");
   const [result, setResult] = useState<JsonRecord | undefined>();
-  const [message, setMessage] = useState(token ? "输入购买时设置的提取码查看卡密。" : "提取链接无效，请从订单详情重新进入。");
+  const [message, setMessage] = useState(token ? "输入购买时设置的购买密码查看卡密。" : "提取链接无效，请从订单详情重新进入。");
   const [loading, setLoading] = useState(false);
 
   async function submit() {
@@ -971,12 +971,12 @@ function ExtractionPage() {
         </div>
         <p>{message}</p>
         <label className="field">
-          <span>提取码</span>
+          <span>购买密码</span>
           <input
             inputMode="numeric"
             value={extractionCode}
             onChange={(event) => setExtractionCode(event.target.value.replace(/\D/g, "").slice(0, 12))}
-            placeholder="输入购买时设置的纯数字提取码"
+            placeholder="输入购买时设置的纯数字购买密码"
             autoFocus
           />
         </label>
@@ -1189,8 +1189,8 @@ function DeliveryBlock(props: { order: JsonRecord; onExtract: (token?: string) =
       <div className="delivery-box">
         <strong>自动卡密</strong>
         <span>{text(delivery?.message, "付款后自动发放卡密")}</span>
-        {delivery?.extractionCodeSet ? <small>已设置提取码</small> : null}
-        {delivery?.extractable && delivery?.extractionCodeSet ? <button type="button" onClick={() => props.onExtract(extractionToken || undefined)}>提取卡密</button> : null}
+        {delivery?.purchasePasswordSet ? <small>已设置购买密码</small> : null}
+        {delivery?.extractable && delivery?.purchasePasswordSet ? <button type="button" onClick={() => props.onExtract(extractionToken || undefined)}>提取卡密</button> : null}
         {codes.length > 0 ? codes.map((item) => (
           <code key={text(item.codeId, text(item.code))}>{text(item.code)}</code>
         )) : null}
@@ -1200,7 +1200,7 @@ function DeliveryBlock(props: { order: JsonRecord; onExtract: (token?: string) =
   return (
     <div className="delivery-box">
       <strong>人工交付</strong>
-      <span>{text(delivery?.message, "请添加店铺客服领取卡密或账号")}</span>
+      <span>{text(delivery?.message, "请添加店铺客服领取账号资料或使用说明")}</span>
     </div>
   );
 }
@@ -1330,7 +1330,7 @@ function ProductDetailPage(props: { product: JsonRecord; shop: JsonRecord; onClo
           <article>
             <span>{automatic ? "自动提取" : "人工交付"}</span>
             <p>{automatic
-              ? "购买时设置提取码，订单支付成功后进入订单详情提取卡密。"
+              ? "购买时设置购买密码，订单支付成功后进入订单详情提取卡密。"
               : "订单支付成功后添加本店客服领取账号资料或使用说明。"}</p>
           </article>
         </section>
@@ -1506,11 +1506,11 @@ function redactCachedOrder(order: JsonRecord): JsonRecord {
   return {
     ...order,
     buyerEmail: undefined,
-    extractionCodeSet: order.extractionCodeSet,
+    purchasePasswordSet: order.purchasePasswordSet,
     delivery: {
       ...delivery,
       buyerEmail: undefined,
-      extractionCodeSet: delivery.extractionCodeSet,
+      purchasePasswordSet: delivery.purchasePasswordSet,
       codes: []
     }
   };
