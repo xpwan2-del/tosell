@@ -450,6 +450,7 @@ function App() {
     isDefault: false
   });
   const [paymentExceptionNote, setPaymentExceptionNote] = useState("");
+  const [paymentMethodFeedback, setPaymentMethodFeedback] = useState("");
   const [paymentQueryForm, setPaymentQueryForm] = useState<PaymentQueryInput>({
     providerTradeNo: "",
     amountCents: "",
@@ -1021,8 +1022,42 @@ function App() {
 
   function submitPaymentMethod(id?: string) {
     const input = paymentMethodFormInput(collectionChannelForm, id);
+    if (input.provider === "personal_alipay" && !input.qrUrl) {
+      setPaymentMethodFeedback("请先上传个人支付宝收款码。");
+      setMessage("请先上传个人支付宝收款码");
+      return;
+    }
+    setPaymentMethodFeedback(id ? "正在保存当前收款方式..." : "正在新增收款方式...");
     const action = merchantSessionActive ? () => api.saveAgentPaymentMethod(input) : () => api.saveAdminPaymentMethod(input);
-    void runAction(id ? "保存收款方式" : "新增收款方式", action);
+    void runPaymentMethodAction(id ? "保存收款方式" : "新增收款方式", action);
+  }
+
+  async function runPaymentMethodAction(label: string, action: () => Promise<unknown>) {
+    setLoading(true);
+    try {
+      const result = await action();
+      setPaymentMethodFeedback(`已保存：${text((result as JsonRecord)?.displayName, collectionChannelForm.displayName)}`);
+      setMessage(`${label}成功`);
+      await loadAll(`${label}成功，数据已刷新`);
+    } catch (error) {
+      const reason = error instanceof ApiClientError && error.status === 401
+        ? "登录已过期，请重新登录"
+        : error instanceof ApiClientError && error.status === 403
+          ? "当前账号权限不足"
+          : error instanceof Error
+            ? error.message
+            : "未知错误";
+      if (error instanceof ApiClientError && error.status === 401) {
+        api.clearAdminSession();
+        api.clearAgentSession();
+        setSession(undefined);
+        setAuthError(reason);
+      }
+      setPaymentMethodFeedback(`保存失败：${reason}`);
+      setMessage(`${label}失败：${reason}`);
+    } finally {
+      setLoading(false);
+    }
   }
 
   function disablePaymentMethod() {
@@ -1856,12 +1891,13 @@ function App() {
             <Panel title="新增或修改收款方式" kicker="当前店铺">
               <PaymentChannelForm form={collectionChannelForm} setForm={setCollectionChannelForm} />
               <div className="actions">
-                <button disabled={!collectionChannelForm.channelType || !collectionChannelForm.displayName} onClick={() => submitPaymentMethod()}>保存为新方式</button>
-                <button className="secondary" disabled={!selectedPaymentMethod?.id} onClick={() => submitPaymentMethod(text(selectedPaymentMethod?.id))}>更新当前方式</button>
-                <button className="secondary" disabled={!selectedPaymentMethod?.id} onClick={setPaymentMethodDefault}>设为默认</button>
-                <button className="secondary" disabled={!selectedPaymentMethod?.id} onClick={testPaymentMethod}>测试</button>
-                <button className="secondary" disabled={!selectedPaymentMethod?.id} onClick={disablePaymentMethod}>停用</button>
+                <button disabled={loading || !collectionChannelForm.channelType || !collectionChannelForm.displayName} onClick={() => submitPaymentMethod()}>{loading ? "保存中..." : "保存为新方式"}</button>
+                <button className="secondary" disabled={loading || !selectedPaymentMethod?.id} onClick={() => submitPaymentMethod(text(selectedPaymentMethod?.id))}>更新当前方式</button>
+                <button className="secondary" disabled={loading || !selectedPaymentMethod?.id} onClick={setPaymentMethodDefault}>设为默认</button>
+                <button className="secondary" disabled={loading || !selectedPaymentMethod?.id} onClick={testPaymentMethod}>测试</button>
+                <button className="secondary" disabled={loading || !selectedPaymentMethod?.id} onClick={disablePaymentMethod}>停用</button>
               </div>
+              {paymentMethodFeedback ? <p className="inline-feedback">{paymentMethodFeedback}</p> : null}
             </Panel>
             <Panel title="已绑定收款方式" kicker={`${data.paymentMethods.length} 个`}>
               <Table rows={paymentMethodRows(data.paymentMethods)} columns={["method", "displayName", "merchant", "confirmMode", "enabled", "isDefault", "keyStatus", "lastTestResult", "lastCallbackAt"]} />
@@ -1905,9 +1941,10 @@ function App() {
           <Panel title="新增或修改收款方式" kicker="中文字段">
             <PaymentChannelForm form={collectionChannelForm} setForm={setCollectionChannelForm} />
             <div className="actions">
-              <button disabled={!collectionChannelForm.channelType || !collectionChannelForm.displayName} onClick={() => submitPaymentMethod()}>保存为新方式</button>
-              <button className="secondary" disabled={!selectedPaymentMethod?.id} onClick={() => submitPaymentMethod(text(selectedPaymentMethod?.id))}>更新当前方式</button>
+              <button disabled={loading || !collectionChannelForm.channelType || !collectionChannelForm.displayName} onClick={() => submitPaymentMethod()}>{loading ? "保存中..." : "保存为新方式"}</button>
+              <button className="secondary" disabled={loading || !selectedPaymentMethod?.id} onClick={() => submitPaymentMethod(text(selectedPaymentMethod?.id))}>更新当前方式</button>
             </div>
+            {paymentMethodFeedback ? <p className="inline-feedback">{paymentMethodFeedback}</p> : null}
           </Panel>
           <Panel title="已绑定收款方式" kicker={`${data.paymentMethods.length} 个`}>
             <Table rows={paymentMethodRows(data.paymentMethods)} columns={["method", "displayName", "ownerType", "merchant", "confirmMode", "enabled", "isDefault", "keyStatus", "lastTestResult", "lastCallbackAt"]} />

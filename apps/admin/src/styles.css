@@ -291,6 +291,17 @@ textarea {
   color: #6c5200;
 }
 
+.inline-feedback {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  color: #174d5b;
+  background: #edf8fb;
+  border: 1px solid #cfe2ea;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .module {
   display: grid;
   gap: 16px;
