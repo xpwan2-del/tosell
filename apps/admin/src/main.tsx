@@ -2104,6 +2104,20 @@ function PaymentChannelForm(props: {
   const personalAlipay = props.form.channelType === "personal_alipay" || props.form.channelType === "alipay_personal";
   const epay = props.form.channelType === "epay";
   const official = ["alipay_merchant", "wechat_merchant", "epay"].includes(props.form.channelType);
+  async function uploadPersonalAlipayQr(file?: File) {
+    if (!file) return;
+    const allowedTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
+    if (!allowedTypes.has(file.type)) {
+      window.alert("请上传 PNG、JPG 或 WebP 图片。");
+      return;
+    }
+    if (file.size > 600 * 1024) {
+      window.alert("收款码图片太大，请压缩到 600KB 以内再上传。");
+      return;
+    }
+    const dataUrl = await fileToDataUrl(file);
+    props.setForm({ ...props.form, qrUrl: dataUrl });
+  }
   return (
     <div className="form-grid wide">
       <label>收款方式<select value={props.form.channelType} onChange={(event) => props.setForm({ ...props.form, channelType: event.target.value })}><option value="">请选择</option><option value="alipay_merchant">支付宝商户</option><option value="wechat_merchant">微信/腾讯商户</option><option value="epay">e支付</option><option value="personal_alipay">个人支付宝</option></select></label>
@@ -2121,7 +2135,21 @@ function PaymentChannelForm(props: {
       {official ? <label>私钥<input type="password" value={props.form.privateKey} onChange={(event) => props.setForm({ ...props.form, privateKey: event.target.value })} placeholder="只提交，不回显明文" /></label> : null}
       {official ? <label>公钥<input type="password" value={props.form.publicKey} onChange={(event) => props.setForm({ ...props.form, publicKey: event.target.value })} placeholder="只提交，不回显明文" /></label> : null}
       {official ? <label>证书<input type="password" value={props.form.certificate} onChange={(event) => props.setForm({ ...props.form, certificate: event.target.value })} placeholder="只提交，不回显明文" /></label> : null}
-      <label className="span-2">{personalAlipay ? "个人支付宝收款码" : "支付二维码 URL"}<input value={props.form.qrUrl} onChange={(event) => props.setForm({ ...props.form, qrUrl: event.target.value })} placeholder={personalAlipay ? "个人支付宝二维码图片地址" : "支付平台返回二维码时可不填"} /></label>
+      {personalAlipay ? (
+        <div className="span-2 qr-upload">
+          <label>个人支付宝收款码<input type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void uploadPersonalAlipayQr(event.target.files?.[0])} /></label>
+          {props.form.qrUrl ? (
+            <div className="qr-preview">
+              <img src={props.form.qrUrl} alt="个人支付宝收款码预览" />
+              <button className="secondary small" type="button" onClick={() => props.setForm({ ...props.form, qrUrl: "" })}>重新上传</button>
+            </div>
+          ) : (
+            <p className="hint">上传你已经下载好的支付宝收款码图片，保存后客户付款页会展示这张码。</p>
+          )}
+        </div>
+      ) : (
+        <label className="span-2">支付二维码 URL<input value={props.form.qrUrl} onChange={(event) => props.setForm({ ...props.form, qrUrl: event.target.value })} placeholder="支付平台返回二维码时可不填" /></label>
+      )}
       <label className="span-2">支付链接<input value={props.form.paymentUrl} onChange={(event) => props.setForm({ ...props.form, paymentUrl: event.target.value })} placeholder={personalAlipay ? "可不填" : "官方支付链接或测试链接"} /></label>
       {official ? <label className="span-2">支付后返回地址<input value={props.form.returnUrl} onChange={(event) => props.setForm({ ...props.form, returnUrl: event.target.value })} placeholder="只负责跳回页面，不代表支付成功" /></label> : null}
       <label className="span-2">给运营看的说明<textarea value={props.form.note} onChange={(event) => props.setForm({ ...props.form, note: event.target.value })} rows={2} placeholder={personalAlipay ? "例如：付款后 10 分钟内人工确认" : "例如：支付成功以回调/查单为准"} /></label>
@@ -2553,6 +2581,15 @@ function downloadCsv(filename: string, rows: JsonRecord[], columns: string[]) {
   link.download = filename;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(new Error("收款码图片读取失败"));
+    reader.readAsDataURL(file);
+  });
 }
 
 function csvCell(value: unknown): string {

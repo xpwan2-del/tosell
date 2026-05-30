@@ -25,7 +25,7 @@ const paymentMethodBodySchema = z.object({
   serviceProviderId: z.string().optional(),
   gatewayUrl: z.string().url().optional(),
   accountName: z.string().optional(),
-  qrUrl: z.string().url().optional(),
+  qrUrl: z.string().min(1).max(900_000).refine((value) => /^https?:\/\//.test(value) || /^data:image\/(png|jpeg|webp);base64,/.test(value), "qrUrl must be an image upload or http url").optional(),
   paymentUrl: z.string().url().optional(),
   note: z.string().optional(),
   returnUrl: z.string().url().optional(),

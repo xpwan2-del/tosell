@@ -743,6 +743,31 @@ textarea {
   max-width: 260px;
 }
 
+.qr-upload {
+  display: grid;
+  gap: 10px;
+}
+
+.qr-preview {
+  display: flex;
+  gap: 12px;
+  align-items: end;
+  flex-wrap: wrap;
+  padding: 12px;
+  border: 1px solid #d6e1e5;
+  border-radius: 8px;
+  background: #f7fafb;
+}
+
+.qr-preview img {
+  width: 148px;
+  height: 148px;
+  object-fit: contain;
+  background: #fff;
+  border: 1px solid #d6e1e5;
+  border-radius: 6px;
+}
+
 .pager {
   justify-content: flex-end;
 }
