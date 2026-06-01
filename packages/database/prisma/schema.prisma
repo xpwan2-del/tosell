@@ -951,6 +951,7 @@ model RightsCode {
   id                       String              @id @default(cuid())
   productId                String?             @map("product_id")
   merchantProductListingId String?             @map("merchant_product_listing_id")
+  merchantProductId        String?             @map("merchant_product_id")
   codeCiphertext           String              @map("code_ciphertext")
   codeHash                 String?             @map("code_hash")
   secretPreview            String?             @map("secret_preview")
@@ -970,6 +971,7 @@ model RightsCode {
 
   product                PlatformProduct?         @relation(fields: [productId], references: [id])
   merchantProductListing MerchantProductListing?  @relation(fields: [merchantProductListingId], references: [id])
+  merchantProduct        MerchantProduct?         @relation(fields: [merchantProductId], references: [id])
   ownerMerchant          Merchant?                @relation(fields: [ownerMerchantId], references: [id])
   shop                   Shop?                    @relation(fields: [shopId], references: [id])
   order                  Order?                   @relation(fields: [orderId], references: [id])
@@ -977,8 +979,10 @@ model RightsCode {
 
   @@unique([productId, codeCiphertext])
   @@unique([merchantProductListingId, codeCiphertext])
+  @@unique([merchantProductId, codeCiphertext])
   @@index([productId, status])
   @@index([merchantProductListingId, status])
+  @@index([merchantProductId, status])
   @@index([ownerType, status])
   @@index([ownerMerchantId, status])
   @@index([shopId, status])
@@ -1109,6 +1113,7 @@ model MerchantProduct {
   ownReview       MerchantProductReview? @relation(fields: [ownProductReviewId], references: [id])
   orderItems      OrderItem[]
   couponScopes    CouponScope[]
+  rightsCodes     RightsCode[]
 
   @@unique([shopId, productType, platformProductId])
   @@index([merchantId, status])

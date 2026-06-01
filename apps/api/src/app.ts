@@ -979,7 +979,7 @@ export function buildApp() {
 
   app.post("/api/admin/settlements/generate", async (request) => {
     const body = z.object({ merchantId: z.string(), now: z.string().optional(), batchNo: z.string().default("default") }).parse(request.body);
-    const result = services.generateSettlement(getAdminActor(request), {
+    const result = await services.generateSettlement(getAdminActor(request), {
       ...internalMerchantRef(body.merchantId),
       batchNo: body.batchNo,
       now: body.now ? new Date(body.now) : undefined
@@ -990,7 +990,7 @@ export function buildApp() {
   app.post("/api/admin/settlements/:settlementNo/payouts", async (request) => {
     const { settlementNo } = z.object({ settlementNo: z.string() }).parse(request.params);
     const body = z.object({ payoutMethod: z.string().optional(), voucherUrl: z.string().optional() }).parse(request.body);
-    return serializeBigInt(services.confirmManualPayout(getAdminActor(request), settlementNo, {
+    return serializeBigInt(await services.confirmManualPayout(getAdminActor(request), settlementNo, {
       voucherUrl: body.voucherUrl ?? "manual-voucher",
       payoutMethod: body.payoutMethod
     }));

@@ -356,6 +356,19 @@ function createPrismaProductionServices() {
           return result;
         };
       }
+      if (property === "generateSettlement") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.generateSettlement(
+          args[0] as AdminActor,
+          args[1] as { merchantId: string; now?: Date; batchNo: string }
+        ));
+      }
+      if (property === "confirmManualPayout") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.confirmManualPayout(
+          args[0] as AdminActor,
+          String(args[1] ?? ""),
+          args[2] as { voucherUrl: string; payoutMethod?: string }
+        ));
+      }
       if (property === "selectPlatformProduct") {
         return async (...args: unknown[]) => {
           const result = await withPrismaRetry(() => repository.selectPlatformProduct(
@@ -2472,6 +2485,7 @@ class BackendServices {
         codeId: nextId(this.store, "code"),
         productId: merchantProductListing.id,
         merchantProductListingId: merchantProductListing.id,
+        merchantProductId: merchantProductListing.id,
         code,
         batchNo: input.batchNo ?? "merchant",
         status: "available",
@@ -7173,7 +7187,7 @@ class PrismaStateRepository {
                  THEN (
                    SELECT COUNT(*)::int
                      FROM rights_codes rc
-                    WHERE rc.merchant_product_listing_id = mp.id
+                    WHERE rc.merchant_product_id = mp.id
                       AND rc.status = 'available'
                  )
                  ELSE COALESCE((opr.detail_json->>'stockCount')::int, 0)
@@ -7364,7 +7378,7 @@ class PrismaStateRepository {
     if (product.merchantProductId) {
       return this.prisma.rightsCode.count({
         where: {
-          merchantProductListingId: product.merchantProductId,
+          merchantProductId: product.merchantProductId,
           status: "available"
         }
       });
@@ -7545,9 +7559,9 @@ class PrismaStateRepository {
                    updated_at = now()
              WHERE id = (
                SELECT id
-                FROM rights_codes
+               FROM rights_codes
                WHERE status = CAST('available' AS "RightsCodeStatus")
-                  AND merchant_product_listing_id = ${product.merchantProductListingId ?? product.merchantProductId}
+                  AND merchant_product_id = ${product.merchantProductId}
                 ORDER BY created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -7743,8 +7757,26 @@ class PrismaStateRepository {
                AND status = CAST('locked' AS "RightsCodeStatus")
           `;
           await tx.$executeRaw`
+            INSERT INTO fulfillment_records (
+              id, order_id, order_item_id, merchant_id, shop_id, idempotency_key,
+              fulfillment_type, status, success_at, created_at, updated_at
+            )
+            VALUES (
+              ${stableDbId("fulfillment", orderNo)}, ${order.id},
+              (SELECT id FROM order_items WHERE order_id = ${order.id} LIMIT 1),
+              ${order.merchant_id}, ${order.shop_id}, ${`fulfillment:${orderNo}`},
+              CAST('code_pool' AS "FulfillmentType"), CAST('success' AS "FulfillmentStatus"),
+              ${now}, ${now}, ${now}
+            )
+            ON CONFLICT (idempotency_key) DO UPDATE SET
+              status = CAST('success' AS "FulfillmentStatus"),
+              success_at = EXCLUDED.success_at,
+              updated_at = now()
+          `;
+          await tx.$executeRaw`
             UPDATE orders
-               SET fulfillment_status = CAST('success' AS "FulfillmentStatus"),
+               SET status = CAST('fulfilled' AS "OrderStatus"),
+                   fulfillment_status = CAST('success' AS "FulfillmentStatus"),
                    fulfilled_at = ${now},
                    updated_at = now()
              WHERE id = ${order.id}
@@ -8126,6 +8158,273 @@ class PrismaStateRepository {
       status: "processed" as const,
       idempotencyKey,
       order: { orderNo, paymentStatus: "paid", fulfillmentStatus: result.fulfillmentStatus }
+    };
+  }
+
+  async generateSettlement(actor: AdminActor, input: { merchantId: string; now?: Date; batchNo: string }) {
+    assertAdminPermission(actor, "settlement.generate");
+    const now = input.now ?? new Date();
+    const idempotencyKey = `settlement:${input.merchantId}:all:${input.batchNo}`;
+    const duplicate = await this.prisma.settlementSheet.findUnique({ where: { idempotencyKey } });
+    if (duplicate) return { status: "duplicate" as const, sheet: duplicate };
+
+    const rows = await this.prisma.$queryRaw<Array<{
+      order_id: string;
+      order_no: string;
+      seller_merchant_id: string | null;
+      seller_shop_id: string;
+      first_tier_merchant_id: string | null;
+      second_tier_merchant_id: string | null;
+      third_tier_merchant_id: string | null;
+      first_tier_shop_id: string | null;
+      second_tier_shop_id: string | null;
+      third_tier_shop_id: string | null;
+      fulfilled_at: Date;
+      paid_amount_cents: bigint;
+      supply_amount_cents: bigint;
+      service_fee_cents: bigint;
+      merchant_expected_income_cents: bigint;
+      platform_supply_price_cents: bigint;
+      first_tier_supply_price_cents: bigint;
+      second_tier_supply_price_cents: bigint;
+      first_tier_income_cents: bigint;
+      second_tier_income_cents: bigint;
+      third_tier_income_cents: bigint;
+    }>>`
+      SELECT o.id AS order_id, o.order_no, o.merchant_id AS seller_merchant_id,
+             o.shop_id AS seller_shop_id, o.first_tier_merchant_id, o.second_tier_merchant_id,
+             o.third_tier_merchant_id, fs.id AS first_tier_shop_id, ss.id AS second_tier_shop_id,
+             ts.id AS third_tier_shop_id, o.fulfilled_at,
+             oas.paid_amount_cents, oas.supply_amount_cents, oas.service_fee_cents,
+             oas.merchant_expected_income_cents, oas.platform_supply_price_cents,
+             oas.first_tier_supply_price_cents, oas.second_tier_supply_price_cents,
+             oas.first_tier_income_cents, oas.second_tier_income_cents, oas.third_tier_income_cents
+        FROM orders o
+        JOIN order_amount_snapshots oas ON oas.order_id = o.id
+        LEFT JOIN shops fs ON fs.merchant_id = o.first_tier_merchant_id
+        LEFT JOIN shops ss ON ss.merchant_id = o.second_tier_merchant_id
+        LEFT JOIN shops ts ON ts.merchant_id = o.third_tier_merchant_id
+       WHERE o.sales_channel_type <> CAST('platform_self_operated' AS "SalesChannelType")
+         AND o.payment_status = CAST('paid' AS "PaymentStatus")
+         AND o.fulfillment_status = CAST('success' AS "FulfillmentStatus")
+         AND o.settlement_status IN (CAST('pending' AS "SettlementStatus"), CAST('settleable' AS "SettlementStatus"))
+         AND o.refund_status = CAST('none' AS "RefundStatus")
+         AND o.risk_status = CAST('normal' AS "RiskStatus")
+         AND o.fulfilled_at IS NOT NULL
+         AND o.fulfilled_at <= ${new Date(now.getTime() - 24 * 60 * 60 * 1000)}
+         AND (
+           o.merchant_id = ${input.merchantId}
+           OR o.first_tier_merchant_id = ${input.merchantId}
+           OR o.second_tier_merchant_id = ${input.merchantId}
+           OR o.third_tier_merchant_id = ${input.merchantId}
+         )
+    `;
+
+    const drafts: Array<{
+      orderId: string;
+      orderNo: string;
+      settlementRole: "single_merchant" | "first_tier" | "second_tier" | "third_tier";
+      merchantId: string;
+      shopId: string;
+      paidAmountCents: bigint;
+      supplyAmountCents: bigint;
+      serviceFeeCents: bigint;
+      merchantIncomeCents: bigint;
+      fulfilledAt: Date;
+      settleableAt: Date;
+    }> = [];
+    const settleableAt = (fulfilledAt: Date) => new Date(fulfilledAt.getTime() + 24 * 60 * 60 * 1000);
+    for (const row of rows) {
+      if (row.first_tier_merchant_id === input.merchantId && row.first_tier_shop_id && row.first_tier_income_cents > 0n) {
+        drafts.push({
+          orderId: row.order_id,
+          orderNo: row.order_no,
+          settlementRole: "first_tier",
+          merchantId: input.merchantId,
+          shopId: row.first_tier_shop_id,
+          paidAmountCents: row.paid_amount_cents,
+          supplyAmountCents: row.platform_supply_price_cents,
+          serviceFeeCents: 0n,
+          merchantIncomeCents: row.first_tier_income_cents,
+          fulfilledAt: row.fulfilled_at,
+          settleableAt: settleableAt(row.fulfilled_at)
+        });
+      }
+      if (row.second_tier_merchant_id === input.merchantId && row.second_tier_shop_id && row.third_tier_merchant_id && row.second_tier_income_cents > 0n) {
+        drafts.push({
+          orderId: row.order_id,
+          orderNo: row.order_no,
+          settlementRole: "second_tier",
+          merchantId: input.merchantId,
+          shopId: row.second_tier_shop_id,
+          paidAmountCents: row.paid_amount_cents,
+          supplyAmountCents: row.first_tier_supply_price_cents,
+          serviceFeeCents: 0n,
+          merchantIncomeCents: row.second_tier_income_cents,
+          fulfilledAt: row.fulfilled_at,
+          settleableAt: settleableAt(row.fulfilled_at)
+        });
+      }
+      if (row.seller_merchant_id === input.merchantId && row.merchant_expected_income_cents > 0n) {
+        drafts.push({
+          orderId: row.order_id,
+          orderNo: row.order_no,
+          settlementRole: row.third_tier_merchant_id ? "third_tier" : row.second_tier_merchant_id ? "second_tier" : "single_merchant",
+          merchantId: input.merchantId,
+          shopId: row.seller_shop_id,
+          paidAmountCents: row.paid_amount_cents,
+          supplyAmountCents: row.supply_amount_cents,
+          serviceFeeCents: row.service_fee_cents,
+          merchantIncomeCents: row.merchant_expected_income_cents,
+          fulfilledAt: row.fulfilled_at,
+          settleableAt: settleableAt(row.fulfilled_at)
+        });
+      }
+    }
+    const unsettled: typeof drafts = [];
+    for (const draft of drafts) {
+      const existing = await this.prisma.settlementItem.findUnique({
+        where: { orderId_settlementRole: { orderId: draft.orderId, settlementRole: draft.settlementRole } }
+      });
+      if (!existing) unsettled.push(draft);
+    }
+    if (unsettled.length === 0) return { status: "no_candidates" as const };
+
+    const settlementNo = `settlement-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    const settlementId = stableDbId("settlement", settlementNo);
+    const totalPaidCents = unsettled.reduce((sum, item) => sum + item.paidAmountCents, 0n);
+    const totalServiceFeeCents = unsettled.reduce((sum, item) => sum + item.serviceFeeCents, 0n);
+    const totalMerchantIncomeCents = unsettled.reduce((sum, item) => sum + item.merchantIncomeCents, 0n);
+    const periodStart = new Date(Math.min(...unsettled.map((item) => item.fulfilledAt.getTime())));
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`
+        INSERT INTO settlement_sheets (
+          id, settlement_no, merchant_id, period_start, period_end, status,
+          total_order_count, total_paid_cents, total_service_fee_cents,
+          total_merchant_income_cents, idempotency_key, created_by, created_at, updated_at
+        )
+        VALUES (
+          ${settlementId}, ${settlementNo}, ${input.merchantId}, ${periodStart}, ${now},
+          CAST('confirmed' AS "SettlementSheetStatus"), ${unsettled.length},
+          ${totalPaidCents}, ${totalServiceFeeCents}, ${totalMerchantIncomeCents},
+          ${idempotencyKey}, ${actor.adminId}, now(), now()
+        )
+      `;
+      for (const item of unsettled) {
+        await tx.$executeRaw`
+          INSERT INTO settlement_items (
+            id, settlement_id, order_id, settlement_role, merchant_id, shop_id,
+            paid_amount_cents, supply_amount_cents, service_fee_cents,
+            merchant_income_cents, deducted_cents, settle_amount_cents,
+            fulfilled_at, settleable_at, created_at
+          )
+          VALUES (
+            ${stableDbId("settlement_item", `${settlementNo}:${item.orderNo}:${item.settlementRole}`)},
+            ${settlementId}, ${item.orderId}, CAST(${item.settlementRole} AS "SettlementRole"),
+            ${item.merchantId}, ${item.shopId}, ${item.paidAmountCents}, ${item.supplyAmountCents},
+            ${item.serviceFeeCents}, ${item.merchantIncomeCents}, 0, ${item.merchantIncomeCents},
+            ${item.fulfilledAt}, ${item.settleableAt}, now()
+          )
+        `;
+        await tx.$executeRaw`
+          UPDATE orders
+             SET settlement_status = CAST('settling' AS "SettlementStatus"),
+                 updated_at = now()
+           WHERE id = ${item.orderId}
+        `;
+      }
+      await tx.$executeRaw`
+        INSERT INTO audit_logs (
+          id, actor_type, actor_id, action, target_type, target_id,
+          after_json, idempotency_key, request_id, ip, created_at
+        )
+        VALUES (
+          ${stableDbId("audit", `settlement.generate:${settlementNo}`)}, CAST('admin' AS "ActorType"),
+          ${actor.adminId}, 'settlement.generate', 'settlement', ${settlementNo},
+          ${jsonForDb({ merchantId: input.merchantId, count: unsettled.length })}::jsonb,
+          ${`audit:settlement.generate:${settlementNo}`}, ${idempotencyKey}, '127.0.0.1', now()
+        )
+      `;
+    }, { maxWait: 10_000, timeout: 30_000 });
+
+    return {
+      status: "processed" as const,
+      sheet: {
+        id: settlementId,
+        settlementNo,
+        merchantId: input.merchantId,
+        status: "confirmed",
+        totalOrderCount: unsettled.length,
+        totalPaidCents,
+        totalServiceFeeCents,
+        totalMerchantIncomeCents,
+        items: unsettled
+      }
+    };
+  }
+
+  async confirmManualPayout(actor: AdminActor, settlementNo: string, input: { voucherUrl: string; payoutMethod?: string }) {
+    assertAdminPermission(actor, "payout.confirm");
+    const sheet = await this.prisma.settlementSheet.findUnique({ where: { settlementNo } });
+    if (!sheet) throw new ApiError(404, "RESOURCE_NOT_FOUND", "settlement not found");
+    if (sheet.status === "paid") return { status: "duplicate" as const, sheet };
+    const payoutNo = `payout-${settlementNo}`;
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`
+        UPDATE settlement_sheets
+           SET status = CAST('paid' AS "SettlementSheetStatus"),
+               confirmed_by = ${actor.adminId},
+               updated_at = now()
+         WHERE settlement_no = ${settlementNo}
+      `;
+      await tx.$executeRaw`
+        INSERT INTO manual_payouts (
+          id, settlement_id, merchant_id, amount_cents, payee_info_snapshot_json,
+          payout_method, payout_voucher_url, status, idempotency_key,
+          paid_by, paid_at, created_at, updated_at
+        )
+        VALUES (
+          ${stableDbId("payout", payoutNo)}, ${sheet.id}, ${sheet.merchantId},
+          ${sheet.totalMerchantIncomeCents}, ${jsonForDb({ settlementNo, merchantId: sheet.merchantId })}::jsonb,
+          ${input.payoutMethod ?? "manual"}, ${input.voucherUrl}, CAST('paid' AS "ManualPayoutStatus"),
+          ${`payout:${payoutNo}`}, ${actor.adminId}, now(), now(), now()
+        )
+        ON CONFLICT (idempotency_key) DO UPDATE SET
+          status = CAST('paid' AS "ManualPayoutStatus"),
+          payout_voucher_url = EXCLUDED.payout_voucher_url,
+          paid_by = EXCLUDED.paid_by,
+          paid_at = EXCLUDED.paid_at,
+          updated_at = now()
+      `;
+      await tx.$executeRaw`
+        UPDATE orders
+           SET settlement_status = CAST('settled' AS "SettlementStatus"),
+               updated_at = now()
+         WHERE id IN (
+           SELECT order_id FROM settlement_items
+            WHERE settlement_id = ${sheet.id}
+              AND merchant_id = ${sheet.merchantId}
+         )
+      `;
+      await tx.$executeRaw`
+        INSERT INTO audit_logs (
+          id, actor_type, actor_id, action, target_type, target_id,
+          after_json, idempotency_key, request_id, ip, created_at
+        )
+        VALUES (
+          ${stableDbId("audit", `manual_payout.confirm:${settlementNo}`)}, CAST('admin' AS "ActorType"),
+          ${actor.adminId}, 'manual_payout.confirm', 'settlement', ${settlementNo},
+          ${jsonForDb({ voucherUrl: input.voucherUrl, payoutMethod: input.payoutMethod ?? "manual" })}::jsonb,
+          ${`audit:manual_payout.confirm:${settlementNo}`}, ${`manual_payout.confirm:${settlementNo}`}, '127.0.0.1', now()
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+    }, { maxWait: 10_000, timeout: 30_000 });
+    return {
+      status: "processed" as const,
+      sheet: { ...sheet, status: "paid" },
+      payout: { payoutNo, settlementNo, merchantId: sheet.merchantId, amountCents: sheet.totalMerchantIncomeCents, status: "paid" }
     };
   }
 
@@ -10644,12 +10943,12 @@ class PrismaStateRepository {
     const shape = this.rightsCodeDbShape(code, store);
     await tx.$executeRaw`
       INSERT INTO rights_codes (
-        id, product_id, merchant_product_listing_id, code_ciphertext, code_hash, secret_preview,
+        id, product_id, merchant_product_listing_id, merchant_product_id, code_ciphertext, code_hash, secret_preview,
         owner_type, owner_merchant_id, shop_id, batch_no, status, order_id,
         issue_key, issued_at, import_audit_json, created_at, updated_at
       )
       VALUES (
-        ${code.codeId}, ${shape.platformProductId}, ${shape.merchantProductListingId}, ${code.code},
+        ${code.codeId}, ${shape.platformProductId}, ${shape.merchantProductListingId}, ${shape.merchantProductId}, ${code.code},
         ${shape.codeHash}, ${shape.secretPreview}, CAST(${shape.ownerType} AS "RightsCodeOwnerType"),
         ${shape.ownerMerchantId}, ${shape.shopId}, ${code.batchNo},
         CAST('available' AS "RightsCodeStatus"), NULL, NULL, NULL,
@@ -10672,14 +10971,23 @@ class PrismaStateRepository {
 
   private rightsCodeDbShape(code: RightsCode, store: MemoryStore) {
     const platformProductId = code.platformProductId ?? (store.platformProducts.has(code.productId) ? code.productId : null);
-    const merchantProductListingId = code.merchantProductListingId ?? (store.merchantProductListings.has(code.productId) ? code.productId : null);
+    const sourceMerchantProduct = code.merchantProductListingId
+      ? store.merchantProductListings.get(code.merchantProductListingId)
+      : store.merchantProductListings.get(code.productId);
+    const merchantProductId = code.merchantProductId
+      ?? (sourceMerchantProduct?.productType === "merchant_owned" ? sourceMerchantProduct.id : null);
+    const merchantProductListingId = merchantProductId
+      ? null
+      : code.merchantProductListingId ?? (store.merchantProductListings.has(code.productId) ? code.productId : null);
     const merchantProductListing = merchantProductListingId ? store.merchantProductListings.get(merchantProductListingId) : undefined;
+    const ownerProduct = sourceMerchantProduct ?? merchantProductListing;
     return {
       platformProductId,
       merchantProductListingId,
-      ownerType: merchantProductListingId ? "merchant" : "platform",
-      ownerMerchantId: merchantProductListing?.merchantId ?? null,
-      shopId: merchantProductListing?.shopId ?? null,
+      merchantProductId,
+      ownerType: merchantProductListingId || merchantProductId ? "merchant" : "platform",
+      ownerMerchantId: ownerProduct?.merchantId ?? null,
+      shopId: ownerProduct?.shopId ?? null,
       codeHash: hashSecret(code.code),
       secretPreview: previewSecret(code.code)
     };
@@ -11472,13 +11780,13 @@ class PrismaStateRepository {
     for (const code of codes) {
       const shape = this.rightsCodeDbShape(code, store);
       await tx.$executeRaw`
-        INSERT INTO rights_codes (
-          id, product_id, merchant_product_listing_id, code_ciphertext, code_hash, secret_preview,
+      INSERT INTO rights_codes (
+          id, product_id, merchant_product_listing_id, merchant_product_id, code_ciphertext, code_hash, secret_preview,
           owner_type, owner_merchant_id, shop_id, batch_no, status, order_id,
           issue_key, issued_at, import_audit_json, created_at, updated_at
         )
         VALUES (
-          ${code.codeId}, ${shape.platformProductId}, ${shape.merchantProductListingId}, ${code.code},
+          ${code.codeId}, ${shape.platformProductId}, ${shape.merchantProductListingId}, ${shape.merchantProductId}, ${code.code},
           ${shape.codeHash}, ${shape.secretPreview}, CAST(${shape.ownerType} AS "RightsCodeOwnerType"),
           ${shape.ownerMerchantId}, ${shape.shopId}, ${code.batchNo},
           CAST('issued' AS "RightsCodeStatus"),
@@ -11525,13 +11833,13 @@ class PrismaStateRepository {
     for (const code of codes) {
       const shape = this.rightsCodeDbShape(code, store);
       await tx.$executeRaw`
-        INSERT INTO rights_codes (
-          id, product_id, merchant_product_listing_id, code_ciphertext, code_hash, secret_preview,
+      INSERT INTO rights_codes (
+          id, product_id, merchant_product_listing_id, merchant_product_id, code_ciphertext, code_hash, secret_preview,
           owner_type, owner_merchant_id, shop_id, batch_no, status, order_id,
           issue_key, issued_at, import_audit_json, created_at, updated_at
         )
         VALUES (
-          ${code.codeId}, ${shape.platformProductId}, ${shape.merchantProductListingId}, ${code.code},
+          ${code.codeId}, ${shape.platformProductId}, ${shape.merchantProductListingId}, ${shape.merchantProductId}, ${code.code},
           ${shape.codeHash}, ${shape.secretPreview}, CAST(${shape.ownerType} AS "RightsCodeOwnerType"),
           ${shape.ownerMerchantId}, ${shape.shopId}, ${code.batchNo},
           CAST('locked' AS "RightsCodeStatus"),
@@ -11663,13 +11971,13 @@ class PrismaStateRepository {
     for (const code of store.rightsCodes) {
       const shape = this.rightsCodeDbShape(code, store);
       await tx.$executeRaw`
-        INSERT INTO rights_codes (
-          id, product_id, merchant_product_listing_id, code_ciphertext, code_hash, secret_preview,
+      INSERT INTO rights_codes (
+          id, product_id, merchant_product_listing_id, merchant_product_id, code_ciphertext, code_hash, secret_preview,
           owner_type, owner_merchant_id, shop_id, batch_no, status, order_id,
           issue_key, issued_at, import_audit_json, created_at, updated_at
         )
         VALUES (
-          ${code.codeId}, ${shape.platformProductId}, ${shape.merchantProductListingId}, ${code.code},
+          ${code.codeId}, ${shape.platformProductId}, ${shape.merchantProductListingId}, ${shape.merchantProductId}, ${code.code},
           ${shape.codeHash}, ${shape.secretPreview}, CAST(${shape.ownerType} AS "RightsCodeOwnerType"),
           ${shape.ownerMerchantId}, ${shape.shopId}, ${code.batchNo},
           CAST(${code.status} AS "RightsCodeStatus"),
@@ -12905,6 +13213,7 @@ class PrismaStateRepository {
       id: string;
       product_id: string | null;
       merchant_product_listing_id: string | null;
+      merchant_product_id: string | null;
       code_ciphertext: string;
       batch_no: string;
       status: RightsCode["status"];
@@ -12913,16 +13222,17 @@ class PrismaStateRepository {
       issued_at: Date | null;
       created_at: Date;
     }>>`
-      SELECT rc.id, rc.product_id, rc.merchant_product_listing_id, rc.code_ciphertext, rc.batch_no,
+      SELECT rc.id, rc.product_id, rc.merchant_product_listing_id, rc.merchant_product_id, rc.code_ciphertext, rc.batch_no,
              rc.status, o.order_no, rc.issue_key, rc.issued_at, rc.created_at
         FROM rights_codes rc
         LEFT JOIN orders o ON o.id = rc.order_id
     `;
     store.rightsCodes = rows.map((row) => ({
       codeId: row.id,
-      productId: row.product_id ?? row.merchant_product_listing_id ?? row.id,
+      productId: row.product_id ?? row.merchant_product_listing_id ?? row.merchant_product_id ?? row.id,
       platformProductId: row.product_id ?? undefined,
       merchantProductListingId: row.merchant_product_listing_id ?? undefined,
+      merchantProductId: row.merchant_product_id ?? undefined,
       code: row.code_ciphertext,
       batchNo: row.batch_no,
       status: row.status,
@@ -14972,6 +15282,7 @@ type RightsCode = {
   productId: string;
   platformProductId?: string;
   merchantProductListingId?: string;
+  merchantProductId?: string;
   code: string;
   batchNo: string;
   status: "available" | "locked" | "issued" | "voided";

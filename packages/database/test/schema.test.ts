@@ -97,6 +97,8 @@ describe("canonical merchants-only database contract", () => {
     expect(servicesSource).toContain("collection_payment_config_id");
     expect(servicesSource).toContain("owner_merchant_id");
     expect(servicesSource).toContain("merchant_product_listing_id");
+    expect(servicesSource).toContain("merchant_product_id");
+    expect(modelBlock("RightsCode")).toContain("merchantProductId");
     expect(servicesSource).not.toContain(legacyConfigTable);
     expect(servicesSource).not.toContain(legacyConfigColumn);
     expect(servicesSource).not.toContain(legacyOwnerColumn);
