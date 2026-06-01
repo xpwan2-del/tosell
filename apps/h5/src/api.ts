@@ -8,19 +8,36 @@ export type AuthSession = {
   grantedCoupon?: JsonRecord;
 };
 
-async function request<T>(path: string, options: { method?: "GET" | "POST"; body?: unknown } = {}): Promise<T> {
+async function request<T>(path: string, options: { method?: "GET" | "POST"; body?: unknown; retryAuth?: boolean; timeoutMs?: number } = {}): Promise<T> {
   const token = path.startsWith("/api/auth/") ? "" : await authToken();
   const headers: Record<string, string> = {
     ...(token ? { authorization: `Bearer ${token}` } : { "x-user-id": h5UserId() })
   };
   if (options.body !== undefined) headers["content-type"] = "application/json";
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    method: options.method ?? "GET",
-    headers,
-    body: options.body === undefined ? undefined : JSON.stringify(options.body)
-  });
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), options.timeoutMs ?? 25_000);
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      method: options.method ?? "GET",
+      headers,
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("请求超时，请检查网络或稍后重试");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
+    if (response.status === 401 && token && options.retryAuth !== false) {
+      logout();
+      return request<T>(path, { ...options, retryAuth: false });
+    }
     throw new Error(typeof data.message === "string" ? data.message : `HTTP ${response.status}`);
   }
   return data as T;
@@ -47,7 +64,7 @@ export const api = {
     shopName?: string;
     contactPhone?: string;
     customerServiceWechat?: string;
-  }) => request<JsonRecord>("/api/agent/register-by-invite", {
+  }) => request<JsonRecord>("/api/merchant/register-by-invite", {
     method: "POST",
     body: {
       inviteCode: input.inviteCode,
@@ -63,31 +80,37 @@ export const api = {
   shop: (shopId: string) => request<JsonRecord>(`/api/user/shops/${shopId}`),
   products: (shopId: string) => request<JsonRecord[]>(`/api/user/shops/${shopId}/products`),
   product: (productId: string) => request<JsonRecord>(`/api/user/products/${encodeURIComponent(productId)}`),
-  collectionChannels: (shopId: string) => request<JsonRecord[]>(`/api/user/shops/${shopId}/collection-channels`),
+  paymentMethods: (shopId: string) => request<JsonRecord[]>(`/api/user/shops/${shopId}/payment-methods`),
   coupons: (shopId: string, productId?: string) => {
     const params = new URLSearchParams({ shopId });
-    if (productId) params.set("agentProductId", productId);
+    if (productId) params.set("merchantProductListingId", productId);
     return request<JsonRecord[]>(`/api/user/coupons?${params.toString()}`);
   },
   quote: (shopId: string, productId: string, couponId?: string) => request<JsonRecord>("/api/user/orders/quote", {
     method: "POST",
-    body: { shopId, agentProductId: productId, couponId }
+    body: { shopId, merchantProductListingId: productId, couponId }
   }),
-  createOrder: (shopId: string, productId: string, clientPaidAmountCents: string, input: { purchasePassword?: string; extractionCode?: string; couponId?: string; buyerEmail?: string; collectionChannelId?: string } = {}) => request<JsonRecord>("/api/user/orders", {
+  createOrder: (shopId: string, productId: string, clientPaidAmountCents: string, input: { purchasePassword?: string; extractionCode?: string; couponId?: string; buyerEmail?: string; buyerPhone?: string; paymentMethodId?: string } = {}) => request<JsonRecord>("/api/user/orders", {
     method: "POST",
     body: {
       shopId,
-      agentProductId: productId,
+      merchantProductListingId: productId,
       clientPaidAmountCents,
       purchasePassword: input.purchasePassword || input.extractionCode || undefined,
       couponId: input.couponId || undefined,
       buyerEmail: input.buyerEmail || undefined,
-      collectionChannelId: input.collectionChannelId || undefined
+      buyerPhone: input.buyerPhone || undefined,
+      paymentMethodId: input.paymentMethodId || undefined
     }
   }),
-  createPayment: (orderNo: string) => request<JsonRecord>(`/api/user/orders/${encodeURIComponent(orderNo)}/payments`, {
+  createPayment: (orderNo: string, paymentMethodId?: string) => request<JsonRecord>(`/api/user/orders/${encodeURIComponent(orderNo)}/payments`, {
     method: "POST",
-    body: {}
+    body: { paymentMethodId: paymentMethodId || undefined }
+  }),
+  wallet: () => request<JsonRecord>("/api/user/wallet"),
+  createWalletRecharge: (amountCents: string, paymentMethodId?: string) => request<JsonRecord>("/api/user/wallet/recharges", {
+    method: "POST",
+    body: { amountCents, paymentMethodId: paymentMethodId || undefined }
   }),
   createAfterSale: (orderNo: string, requestedRefundCents: string, description = "H5 用户售后申请") => request<JsonRecord>("/api/user/after-sales", {
     method: "POST",
@@ -154,5 +177,7 @@ export function cents(value: unknown): string {
 }
 
 export function text(value: unknown, fallback = ""): string {
-  return typeof value === "string" && value.length > 0 ? value : fallback;
+  if (typeof value === "string" && value.length > 0) return value;
+  if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return String(value);
+  return fallback;
 }

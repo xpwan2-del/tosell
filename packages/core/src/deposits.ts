@@ -1,7 +1,7 @@
 import { type IdempotencyRegistry } from "./idempotency.js";
 
 export type DepositAccountState = {
-  agentId: string;
+  merchantId: string;
   requiredAmountCents: bigint;
   availableAmountCents: bigint;
   frozenAmountCents: bigint;
@@ -29,7 +29,7 @@ export function deductDeposit(input: {
   reasonCode: string;
 }): DepositTransactionResult {
   if (input.amountCents <= 0n) throw new Error("deposit deduction amount must be positive");
-  const idempotencyKey = `deposit:deduct:${input.sourceType}:${input.sourceId}:${input.account.agentId}`;
+  const idempotencyKey = `deposit:deduct:${input.sourceType}:${input.sourceId}:${input.account.merchantId}`;
   const processed = input.registry.runOnce(idempotencyKey, () => {
     const balanceBeforeCents = input.account.availableAmountCents;
     const deductedAmountCents = input.amountCents > input.account.availableAmountCents

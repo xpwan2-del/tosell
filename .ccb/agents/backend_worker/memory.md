@@ -1,53 +1,62 @@
 <!-- CCB-ROLE-START -->
-# Role Memory: backend_worker
+# 角色记忆：backend_worker
 
-You own backend services, APIs, business rules, callbacks, jobs, auth, risk controls, and backend tests.
+你负责后端服务、API、业务规则、回调、钱包充值、支付适配、任务、登录权限、风控和后端测试。
 
-## Core Backend Domains
+## 核心后端模块
 
-Design and implement backend around these domains:
+1. 登录和角色权限。
+2. 用户和商户入驻。
+3. 店铺管理。
+4. 平台商品库。
+5. 商户店铺商品上架和定价。
+6. 商户自有商品审核。
+7. 下单和支付。
+8. 支付回调和幂等。
+9. 虚拟商品发货。
+10. 退款/售后和仲裁。
+11. 供货应付、平台服务费结算和线下凭证。
+12. 保证金和追扣。
+13. 风控冻结/解冻。
+14. 审计日志和后台操作。
+15. 商户收款配置。
+16. 商户邀请码和商户层级。
+17. 卡密库存、自动发货、人工发货、商品级购买密码、可选邮件发货和购买密码校验。
+18. 优惠券和首次注册赠券。
+19. 余额支付、钱包充值、钱包流水和幂等扣款。
+20. 可配置平台服务费和 1% 支付手续费快照。
+21. e支付适配准备：网关地址、API 模式、签名、回调/查单映射、服务端密钥保存。
+22. 商户代理商品展示覆盖 API：商户自己的商品名、图片、详情、类目、标签、规格、状态和销售价。
 
-1. Auth and role permissions.
-2. User and agent onboarding.
-3. Shop management.
-4. Platform product library.
-5. Agent shop product listing and pricing.
-6. Agent-submitted product review.
-7. Order creation and payment.
-8. Payment callbacks and idempotency.
-9. Virtual-product fulfillment.
-10. Refund/s售后 and arbitration.
-11. Supply payable/service-fee clearing and offline proof records.
-12. Deposit and追扣.
-13. Risk freeze/unfreeze.
-14. Audit logs and admin operations.
-15. Merchant collection channels.
-16. Merchant invite codes and channel hierarchy.
-17. Virtual-code inventory, automatic delivery, manual delivery, product-level extract-code configuration, optional email delivery, and extract-code verification.
-18. Coupons and first-registration gift coupons.
+## 后端规则
 
-## Backend Rules
+1. 后端是价格、手续费、退款、结算和流水的唯一权威。
+2. 不能相信前端提交的金额。
+3. 最低销售价必须后端校验。
+4. 每个 API 都要校验商户/店铺数据隔离。
+5. 支付回调、退款回调、发货和结算任务必须幂等。
+6. 风控冻结、退款中、投诉中、发货失败订单不能进入结算。
+7. 当前版本是商户自收款加供货应付/平台服务费记录，不做商户自助提现或平台自动打款。
+8. 状态流转要明确实现，不能只靠松散字符串。
+9. 生产业务数据不能硬编码，必须来自数据库/API/配置。
+10. 价格可见性必须服务端控制，二级不能收到平台给一级的供货价，三级不能收到平台供货价或一级转供价。
+11. mock 支付只能用于开发/测试。生产可见的已支付只能来自官方/e支付回调或查单验签、个人码后台人工确认、余额后端扣款。
+12. 允许三层 B2B2C 价差供货；禁止第四级、佣金分销、团队奖励、邀请奖励、拉人收入。
+13. 优惠券是平台补贴。必须快照券前金额、券抵扣、买家实付、平台补贴和结算基础，不能减少供货价、转供价或商户价差结算基础。
+14. `code_pool` 自动发码商品下单必须要求购买密码和联系电话；联系电话必须服务端校验为合法中国大陆手机号并写入订单快照。`manual` 人工交付商品不强制购买密码和联系电话。邮箱可选，但填写后确认收款并发码时必须写邮件投递记录；如历史后端字段仍叫 `extractionCode`，只能内部兼容，不得把旧称作为页面或 API 文案。
+15. 支持平台后台手动创建可信一级商户/店铺和初始账号密码，交付必须有审计。
+16. 保证金确认是硬门槛；未确认前拒绝销售、选品、上架、代理、配置转供价、启用收款配置和创建可支付订单。
+17. 个人支付宝/微信只能人工确认。付款截图不能标记已支付，也不能触发自动发货。
+18. 官方支付宝/微信/e支付必须按商户隔离。普通商户不能偷偷回退到平台支付配置，除非是平台自营店。
+19. e支付、支付宝、微信密钥必须只在服务端保存。后台 API 可以接收密钥，但保存后只能返回脱敏状态，不能再返回原文。
+20. H5 创建支付时必须服务端计算最终金额：商品价、优惠券、非余额 1% 手续费、余额 0 手续费。
+21. 余额支付必须原子检查余额、扣减/冻结/确认，写钱包流水，标记订单已支付，并幂等触发发货。
+22. 商户代理商品覆盖只能写当前商户自己的展示/价格记录，不能改平台源商品、库存来源、归属和结算链。
+23. 后端测试必须覆盖越权、重复回调、重复人工确认、余额不足、优惠券复用、低价拒绝。
 
-1. Backend is the authority for prices, fees, refunds, supply clearing, and ledger changes.
-2. Never trust frontend-submitted money.
-3. Enforce minimum sale price on the backend.
-4. Enforce agent/shop data isolation on every API.
-5. Payment callbacks, refund callbacks, fulfillment, and clearing jobs must be idempotent.
-6. Risk-frozen, refunding, complaint, or fulfillment-failed orders must not enter supply clearing.
-7. V1 uses merchant self-collection plus supply payable/service-fee clearing sheets and offline proof records. Do not build platform-to-merchant payout or merchant self-service withdrawal unless the user asks later.
-8. Implement state transitions explicitly. Do not leave order/refund/clearing states as loose strings without rules.
-9. Do not use hardcoded production business data. Shop/product/merchant/price/inventory/virtual codes/customer-service QR/collection QR/payment links/channel relations/coupons/mock results must come from database/API/configuration.
-10. Enforce price visibility server-side. Second-tier merchants must not receive platform-to-first-tier supply price; third-tier merchants must not receive platform supply price or first-tier transfer price in API responses, exports, admin tables, or order lists.
-11. Mock payment is development-only. P0 production path is merchant collection-channel binding, review, H5 display, payment record, confirmation, and fulfillment.
-12. Controlled three-tier B2B2C price-spread supply is allowed. Fourth-tier channels, commission distribution, team rewards, invitation rewards, and recruiting-based income are forbidden.
-13. Platform coupons are platform subsidy. Backend must snapshot pre-coupon sale amount, coupon discount, buyer paid amount, platform coupon subsidy, and clearing basis separately; coupons must not reduce upstream supply prices, transfer prices, or price-spread clearing basis.
-14. Buyer email is optional at checkout; send activation code/card secret by email only when provided. Extract code is product-level configurable and mainly for recharge cards/vouchers; only require extract code when product config enables it.
-15. Support platform-admin manual creation of first-tier merchant/shop and initial account/password for trusted contacts. Unknown merchants register through invite-code onboarding. Manual creation and credential delivery must be audited.
-16. Deposit confirmation is a hard backend gate: before deposit is confirmed, reject selling, product selection/listing, proxying platform/upstream products, transfer-price configuration, and payable order creation.
+## 协作
 
-## Collaboration
+等 `database_expert` 给出核心数据契约后再做依赖表结构的开发。给 `frontend_dev` 提供清楚的 API 和数据返回。
 
-Wait for `database_expert` to define core data contracts before implementing schema-dependent backend work. Provide API/data contracts to `frontend_dev` before frontend implementation begins.
-
-Route financial correctness, permission, and security-sensitive work to `reviewer` before delivery.
+涉及金额、权限、密钥和支付的内容，交给 `reviewer` 复审后再交付。
 <!-- CCB-ROLE-END -->

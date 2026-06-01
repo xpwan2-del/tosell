@@ -4,6 +4,7 @@ type RequestOptions = {
   method?: "GET" | "POST" | "PATCH" | "DELETE";
   body?: unknown;
   headers?: Record<string, string>;
+  timeoutMs?: number;
 };
 
 type AdminRole = "operator" | "finance" | "admin";
@@ -14,10 +15,10 @@ export type AdminSession = {
   expiresAt: number;
   admin: JsonRecord;
 };
-export type AgentSession = {
+export type MerchantSession = {
   token: string;
   expiresAt: number;
-  agent: JsonRecord;
+  merchant: JsonRecord;
   shop: JsonRecord;
 };
 export type PaymentMethodInput = {
@@ -29,6 +30,7 @@ export type PaymentMethodInput = {
   appId?: string;
   serviceProviderId?: string;
   gatewayUrl?: string;
+  apiMode?: "mapi_first" | "submit";
   accountName?: string;
   qrUrl?: string;
   paymentUrl?: string;
@@ -52,6 +54,20 @@ export type PaymentQueryInput = {
   signature: string;
 };
 
+export type MerchantListingDisplayInput = {
+  salePriceCents: string;
+  status?: string;
+  displayName?: string;
+  displaySubtitle?: string;
+  displayDescription?: string;
+  displayUsageGuide?: string;
+  displayImageUrl?: string;
+  displayCategory?: string;
+  displayTags?: string;
+  displaySpecs?: string;
+  displayDetailSections?: string;
+};
+
 export class ApiClientError extends Error {
   status: number;
   code: string;
@@ -69,11 +85,24 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     ...options.headers
   };
   if (options.body !== undefined) headers["content-type"] = "application/json";
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    method: options.method ?? "GET",
-    headers,
-    body: options.body === undefined ? undefined : JSON.stringify(options.body)
-  });
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), options.timeoutMs ?? 25_000);
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      method: options.method ?? "GET",
+      headers,
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new ApiClientError(408, "REQUEST_TIMEOUT", "请求超时，请检查网络或稍后重试");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -89,16 +118,10 @@ function adminHeaders(): Record<string, string> {
   return session?.token ? { authorization: `Bearer ${session.token}` } : {};
 }
 
-function agentHeaders(): Record<string, string> {
-  const session = currentAgentSession();
+function merchantHeaders(): Record<string, string> {
+  const session = currentMerchantSession();
   if (session?.token) return { authorization: `Bearer ${session.token}` };
-  if (!import.meta.env.DEV || import.meta.env.VITE_ALLOW_DEMO_AGENT_HEADERS !== "true") {
-    return {};
-  }
-  return {
-    "x-agent-id": runtimeValue("tosell_agent_id", "VITE_AGENT_ID"),
-    "x-shop-id": runtimeValue("tosell_shop_id", "VITE_SHOP_ID")
-  };
+  return {};
 }
 
 function buyerHeaders(): Record<string, string> {
@@ -150,10 +173,11 @@ function paymentMethodPayload(input: PaymentMethodInput): JsonRecord {
     provider: requireText(input.provider, "收款方式"),
     displayName: requireText(input.displayName, "展示名称"),
     productType: input.productType || undefined,
-    merchantNo: input.merchantNo || undefined,
-    appId: input.appId || undefined,
-    serviceProviderId: input.serviceProviderId || undefined,
+    merchantNo: unmaskedOrUndefined(input.merchantNo),
+    appId: unmaskedOrUndefined(input.appId),
+    serviceProviderId: unmaskedOrUndefined(input.serviceProviderId),
     gatewayUrl: input.gatewayUrl || undefined,
+    apiMode: input.apiMode || undefined,
     accountName: input.accountName || undefined,
     qrUrl: input.qrUrl || undefined,
     paymentUrl: input.paymentUrl || undefined,
@@ -169,14 +193,20 @@ function paymentMethodPayload(input: PaymentMethodInput): JsonRecord {
   };
 }
 
+function unmaskedOrUndefined(value?: string): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed.includes("***")) return undefined;
+  return trimmed;
+}
+
 export const api = {
   baseUrl: API_BASE_URL || "同源 /api",
   currentAdminSession,
   saveAdminSession,
   clearAdminSession,
-  currentAgentSession,
-  saveAgentSession,
-  clearAgentSession,
+  currentMerchantSession,
+  saveMerchantSession,
+  clearMerchantSession,
   adminLogin: (input: { username: string; password: string; requestedRole?: AdminRole }) => request<AdminSession>("/api/auth/admin/login", {
     method: "POST",
     body: input
@@ -184,19 +214,19 @@ export const api = {
   adminSession: () => request<JsonRecord>("/api/auth/admin/session", {
     headers: adminHeaders()
   }),
-  agentLogin: (input: { account: string; password: string }) => request<AgentSession>("/api/auth/agent/login", {
+  merchantLogin: (input: { account: string; password: string }) => request<MerchantSession>("/api/auth/merchant/login", {
     method: "POST",
     body: input
   }),
-  agentSession: () => request<JsonRecord>("/api/auth/agent/session", {
-    headers: agentHeaders()
+  merchantSession: () => request<JsonRecord>("/api/auth/merchant/session", {
+    headers: merchantHeaders()
   }),
   health: () => request<JsonRecord>("/api/health"),
   reconciliationSummary: () => request<JsonRecord>("/api/exports/reconciliation-summary", {
     headers: adminHeaders()
   }),
-  agentDashboard: () => request<JsonRecord>("/api/agent/dashboard", {
-    headers: agentHeaders()
+  merchantDashboard: () => request<JsonRecord>("/api/merchant/dashboard", {
+    headers: merchantHeaders()
   }),
   riskDashboard: () => request<JsonRecord>("/api/admin/risk-dashboard", {
     headers: adminHeaders()
@@ -207,45 +237,70 @@ export const api = {
   paymentGuide: () => request<JsonRecord>("/api/admin/payment-onboarding-guide", {
     headers: adminHeaders()
   }),
+  platformServiceFee: () => request<JsonRecord>("/api/admin/platform-service-fee", {
+    headers: adminHeaders()
+  }),
+  updatePlatformServiceFee: (input: { enabled: boolean; feeBps: string }) => request<JsonRecord>("/api/admin/platform-service-fee", {
+    method: "PATCH",
+    headers: adminHeaders(),
+    body: {
+      enabled: input.enabled,
+      feeBps: requireNonNegativeInteger(input.feeBps, "平台服务费比例")
+    }
+  }),
+  wallets: () => request<JsonRecord[]>("/api/admin/wallets", {
+    headers: adminHeaders()
+  }),
+  walletRecharges: () => request<JsonRecord[]>("/api/admin/wallet-recharges", {
+    headers: adminHeaders()
+  }),
+  walletTransactions: () => request<JsonRecord[]>("/api/admin/wallet-transactions", {
+    headers: adminHeaders()
+  }),
+  confirmWalletRecharge: (rechargeNo: string, note?: string) => request<JsonRecord>(`/api/admin/wallet-recharges/${encodeURIComponent(requireText(rechargeNo, "充值单号"))}/confirm`, {
+    method: "POST",
+    headers: adminHeaders(),
+    body: { note: note || "后台确认充值到账" }
+  }),
   adminPaymentMethods: () => request<JsonRecord[]>("/api/admin/payment-methods", {
     headers: adminHeaders()
   }),
-  agentPaymentMethods: () => request<JsonRecord[]>("/api/agent/payment-methods", {
-    headers: agentHeaders()
+  merchantPaymentMethods: () => request<JsonRecord[]>("/api/merchant/payment-methods", {
+    headers: merchantHeaders()
   }),
   saveAdminPaymentMethod: (input: PaymentMethodInput) => request<JsonRecord>(input.id ? `/api/admin/payment-methods/${encodeURIComponent(input.id)}` : "/api/admin/payment-methods", {
     method: input.id ? "PATCH" : "POST",
     headers: adminHeaders(),
     body: paymentMethodPayload(input)
   }),
-  saveAgentPaymentMethod: (input: PaymentMethodInput) => request<JsonRecord>(input.id ? `/api/agent/payment-methods/${encodeURIComponent(input.id)}` : "/api/agent/payment-methods", {
+  saveMerchantPaymentMethod: (input: PaymentMethodInput) => request<JsonRecord>(input.id ? `/api/merchant/payment-methods/${encodeURIComponent(input.id)}` : "/api/merchant/payment-methods", {
     method: input.id ? "PATCH" : "POST",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
     body: paymentMethodPayload(input)
   }),
   disableAdminPaymentMethod: (methodId: string) => request<JsonRecord>(`/api/admin/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}`, {
     method: "DELETE",
     headers: adminHeaders()
   }),
-  disableAgentPaymentMethod: (methodId: string) => request<JsonRecord>(`/api/agent/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}`, {
+  disableMerchantPaymentMethod: (methodId: string) => request<JsonRecord>(`/api/merchant/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}`, {
     method: "DELETE",
-    headers: agentHeaders()
+    headers: merchantHeaders()
   }),
   setAdminPaymentMethodDefault: (methodId: string) => request<JsonRecord>(`/api/admin/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}/default`, {
     method: "POST",
     headers: adminHeaders()
   }),
-  setAgentPaymentMethodDefault: (methodId: string) => request<JsonRecord>(`/api/agent/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}/default`, {
+  setMerchantPaymentMethodDefault: (methodId: string) => request<JsonRecord>(`/api/merchant/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}/default`, {
     method: "POST",
-    headers: agentHeaders()
+    headers: merchantHeaders()
   }),
   testAdminPaymentMethod: (methodId: string) => request<JsonRecord>(`/api/admin/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}/test`, {
     method: "POST",
     headers: adminHeaders()
   }),
-  testAgentPaymentMethod: (methodId: string) => request<JsonRecord>(`/api/agent/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}/test`, {
+  testMerchantPaymentMethod: (methodId: string) => request<JsonRecord>(`/api/merchant/payment-methods/${encodeURIComponent(requireText(methodId, "收款方式"))}/test`, {
     method: "POST",
-    headers: agentHeaders()
+    headers: merchantHeaders()
   }),
   paymentCallbacks: () => request<JsonRecord[]>("/api/admin/payment-callbacks", {
     headers: adminHeaders()
@@ -274,8 +329,8 @@ export const api = {
   paymentVouchers: () => request<JsonRecord[]>("/api/admin/payment-vouchers", {
     headers: adminHeaders()
   }),
-  agentPaymentVouchers: () => request<JsonRecord[]>("/api/agent/payment-vouchers", {
-    headers: agentHeaders()
+  merchantPaymentVouchers: () => request<JsonRecord[]>("/api/merchant/payment-vouchers", {
+    headers: merchantHeaders()
   }),
   reviewPaymentVoucher: (voucherId: string, approved: boolean, reason: string) => request<JsonRecord>(`/api/admin/payment-vouchers/${encodeURIComponent(voucherId)}/review`, {
     method: "POST",
@@ -285,14 +340,14 @@ export const api = {
   adminOrders: () => request<JsonRecord[]>("/api/admin/orders", {
     headers: adminHeaders()
   }),
-  agentApplications: () => request<JsonRecord[]>("/api/admin/agent-applications", {
+  merchantApplications: () => request<JsonRecord[]>("/api/admin/merchant-applications", {
     headers: adminHeaders()
   }),
   inviteCodes: () => request<JsonRecord[]>("/api/admin/invite-codes", {
     headers: adminHeaders()
   }),
-  agentInviteCodes: () => request<JsonRecord[]>("/api/agent/invite-codes", {
-    headers: agentHeaders()
+  merchantInviteCodes: () => request<JsonRecord[]>("/api/merchant/invite-codes", {
+    headers: merchantHeaders()
   }),
   createInviteCode: (input: { code: string; targetTier: string; maxUses: string; expiresAt: string; depositRequiredAmountCents: string }) => request<JsonRecord>("/api/admin/invite-codes", {
     method: "POST",
@@ -305,9 +360,9 @@ export const api = {
       depositRequiredAmountCents: requirePositiveCents(input.depositRequiredAmountCents, "应缴保证金金额")
     }
   }),
-  createAgentInviteCode: (input: { code: string; maxUses: string; expiresAt: string; depositRequiredAmountCents: string }) => request<JsonRecord>("/api/agent/invite-codes", {
+  createMerchantInviteCode: (input: { code: string; maxUses: string; expiresAt: string; depositRequiredAmountCents: string }) => request<JsonRecord>("/api/merchant/invite-codes", {
     method: "POST",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
     body: {
       code: input.code || undefined,
       maxUses: input.maxUses ? Number(requirePositiveIntegerString(input.maxUses, "最大使用次数")) : undefined,
@@ -315,7 +370,7 @@ export const api = {
       depositRequiredAmountCents: input.depositRequiredAmountCents ? requirePositiveCents(input.depositRequiredAmountCents, "应缴保证金金额") : undefined
     }
   }),
-  createManualAgent: (input: { name: string; shopName: string; contactPhone: string; customerServiceWechat: string; initialPassword: string; depositRequiredAmountCents: string; depositPaid: boolean }) => request<JsonRecord>("/api/admin/agents/manual", {
+  createManualMerchant: (input: { name: string; shopName: string; contactPhone: string; customerServiceWechat: string; initialPassword: string; depositRequiredAmountCents: string; depositPaid: boolean }) => request<JsonRecord>("/api/admin/merchants/manual", {
     method: "POST",
     headers: adminHeaders(),
     body: {
@@ -341,54 +396,26 @@ export const api = {
   adminDeposits: () => request<JsonRecord[]>("/api/admin/deposits", {
     headers: adminHeaders()
   }),
-  adminChannels: () => request<JsonRecord>("/api/admin/channels", {
+  adminChannels: () => request<JsonRecord>("/api/admin/merchant-supply", {
     headers: adminHeaders()
   }),
-  createChannelRelation: (firstTierAgentId: string, secondTierAgentId: string) => request<JsonRecord>("/api/admin/channels/relations", {
+  createChannelRelation: (firstTierMerchantId: string, secondTierMerchantId: string) => request<JsonRecord>("/api/admin/merchant-supply/relations", {
     method: "POST",
     headers: adminHeaders(),
-    body: { firstTierAgentId, secondTierAgentId, reason: "受控二级供货关系" }
+    body: { firstTierMerchantId, secondTierMerchantId, reason: "受控二级供货关系" }
   }),
-  upsertChannelOffer: (channelRelationId: string, platformProductId: string, resellSupplyPriceCents: string) => request<JsonRecord>("/api/admin/channels/offers", {
+  upsertChannelOffer: (channelRelationId: string, platformProductId: string, resellSupplyPriceCents: string) => request<JsonRecord>("/api/admin/merchant-supply/offers", {
     method: "POST",
     headers: adminHeaders(),
     body: { channelRelationId, platformProductId, resellSupplyPriceCents: requirePositiveCents(resellSupplyPriceCents, "转供价") }
   }),
-  reviewChannel: (agentId: string) => request<JsonRecord>(`/api/admin/channels/${agentId}/review`, {
+  reviewChannel: (merchantId: string) => request<JsonRecord>(`/api/admin/merchant-supply/${merchantId}/review`, {
     method: "POST",
     headers: adminHeaders(),
     body: { approved: true, reason: "开通受控二级供货能力" }
   }),
   serviceQrCodes: () => request<JsonRecord[]>("/api/admin/service-qrcodes", {
     headers: adminHeaders()
-  }),
-  collectionChannels: () => request<JsonRecord[]>("/api/admin/collection-channels", {
-    headers: adminHeaders()
-  }),
-  agentCollectionChannels: () => request<JsonRecord[]>("/api/agent/collection-channels", {
-    headers: agentHeaders()
-  }),
-  submitCollectionChannel: (input: { channelType: string; displayName: string; accountName: string; qrUrl: string; paymentUrl: string }) => request<JsonRecord>("/api/agent/collection-channels", {
-    method: "POST",
-    headers: agentHeaders(),
-    body: {
-      channelType: input.channelType,
-      displayName: input.displayName,
-      accountName: input.accountName || undefined,
-      qrUrl: input.qrUrl || undefined,
-      paymentUrl: input.paymentUrl || undefined,
-      isDefault: true
-    }
-  }),
-  reviewCollectionChannel: (channelId: string, approved: boolean) => request<JsonRecord>(`/api/admin/collection-channels/${channelId}/review`, {
-    method: "POST",
-    headers: adminHeaders(),
-    body: { approved, reason: approved ? "收款通道资料通过" : "收款通道资料需补充" }
-  }),
-  saveCollectionChannel: (shopId: string, collectionAccountName: string, collectionQrUrl: string, collectionNote: string) => request<JsonRecord>(`/api/admin/shops/${shopId}/collection`, {
-    method: "PATCH",
-    headers: adminHeaders(),
-    body: { collectionAccountName, collectionQrUrl, collectionNote }
   }),
   riskFreezes: () => request<JsonRecord[]>("/api/admin/risk-freezes", {
     headers: adminHeaders()
@@ -399,18 +426,18 @@ export const api = {
   ledgerEntries: () => request<JsonRecord[]>("/api/admin/ledger-entries", {
     headers: adminHeaders()
   }),
-  reviewAgent: (agentId: string, approved: boolean, reason?: string) => request<JsonRecord>(`/api/admin/agents/${agentId}/review`, {
+  reviewMerchant: (merchantId: string, approved: boolean, reason?: string) => request<JsonRecord>(`/api/admin/merchants/${merchantId}/review`, {
     method: "POST",
     headers: adminHeaders(),
     body: { approved, reason }
   }),
-  confirmDeposit: (agentId: string, amountCents: string, requiredAmountCents?: string) => request<JsonRecord>(`/api/admin/deposits/${agentId}/confirm`, {
+  confirmDeposit: (merchantId: string, amountCents: string, requiredAmountCents?: string) => request<JsonRecord>(`/api/admin/deposits/${merchantId}/confirm`, {
     method: "POST",
     headers: adminHeaders(),
     body: {
       amountCents: requirePositiveCents(amountCents, "确认保证金金额"),
       requiredAmountCents: requiredAmountCents ? requirePositiveCents(requiredAmountCents, "应缴保证金金额") : undefined,
-      voucherUrl: `manual://deposit/${agentId}/${Date.now()}`
+      voucherUrl: `manual://deposit/${merchantId}/${Date.now()}`
     }
   }),
   createPlatformProduct: (input: { name: string; category?: string; tags?: string; subtitle?: string; description?: string; usageGuide?: string; imageUrl?: string; specs?: string; detailSections?: string; stockCount: string; soldCount?: string; fulfillmentMode: string; supplyPriceCents: string; minSalePriceCents: string; suggestedSalePriceCents: string }) => {
@@ -455,16 +482,16 @@ export const api = {
       note: "后台人工确认收款"
     }
   }),
-  confirmAgentPayment: (orderNo: string, amountCents: string) => request<JsonRecord>(`/api/agent/orders/${orderNo}/confirm-payment`, {
+  confirmMerchantPayment: (orderNo: string, amountCents: string) => request<JsonRecord>(`/api/merchant/orders/${orderNo}/confirm-payment`, {
     method: "POST",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
     body: {
       amountCents: requirePositiveCents(amountCents, "确认收款金额"),
-      voucherUrl: `manual://agent-offline-payment/${orderNo}/${Date.now()}`,
+      voucherUrl: `manual://merchant-offline-payment/${orderNo}/${Date.now()}`,
       note: "商户后台人工确认收款"
     }
   }),
-  allocateRefund: (order: JsonRecord, refundAmountCents: string, responsibility: "platform" | "agent" | "user" | "mixed") => {
+  allocateRefund: (order: JsonRecord, refundAmountCents: string, responsibility: "platform" | "merchant" | "user" | "mixed") => {
     const snapshot = order.snapshot as JsonRecord | undefined;
     const amount = snapshot?.amountSnapshot as JsonRecord | undefined;
     const refundCents = requirePositiveCents(refundAmountCents, "退款金额");
@@ -475,18 +502,18 @@ export const api = {
       body: {
         paidAmountCents: requireSnapshotCents(amount?.paidAmountCents, "订单实付金额快照"),
         supplyAmountCents: requireSnapshotCents(amount?.supplyAmountCents, "订单供货金额快照"),
-        agentIncomeCents: requireSnapshotCents(amount?.agentExpectedIncomeCents, "商户收入金额快照"),
+        merchantIncomeCents: requireSnapshotCents(amount?.merchantExpectedIncomeCents ?? amount?.merchantExpectedIncomeCents, "商户收入金额快照"),
         refundAmountCents: refundCents,
-        responsibility,
+        responsibility: responsibility,
         platformBearCents: responsibility === "mixed" ? split.platformBearCents : undefined,
-        agentBearCents: responsibility === "mixed" ? split.agentBearCents : undefined
+        merchantBearCents: responsibility === "mixed" ? split.merchantBearCents : undefined
       }
     });
   },
-  generateSettlement: (agentId: string) => request<JsonRecord>("/api/admin/settlements/generate", {
+  generateSettlement: (merchantId: string) => request<JsonRecord>("/api/admin/settlements/generate", {
     method: "POST",
     headers: adminHeaders(),
-    body: { agentId, now: "2030-01-01T00:00:00.000Z", batchNo: `ui-${Date.now()}` }
+    body: { merchantId, now: "2030-01-01T00:00:00.000Z", batchNo: `ui-${Date.now()}` }
   }),
   confirmPayout: (settlementNo: string) => request<JsonRecord>(`/api/admin/settlements/${settlementNo}/payouts`, {
     method: "POST",
@@ -496,7 +523,7 @@ export const api = {
       voucherUrl: `manual://payout/${settlementNo}/${Date.now()}`
     }
   }),
-  deductDeposit: (agentId: string, amountCents: string) => request<JsonRecord>(`/api/admin/deposits/${agentId}/deduct`, {
+  deductDeposit: (merchantId: string, amountCents: string) => request<JsonRecord>(`/api/admin/deposits/${merchantId}/deduct`, {
     method: "POST",
     headers: adminHeaders(),
     body: {
@@ -522,15 +549,15 @@ export const api = {
   shopProducts: (shopId: string) => request<JsonRecord[]>(`/api/user/shops/${shopId}/products`, {
     headers: buyerHeaders()
   }),
-  quoteOrder: (shopId: string, agentProductId: string) => request<JsonRecord>("/api/user/orders/quote", {
+  quoteOrder: (shopId: string, merchantProductListingId: string) => request<JsonRecord>("/api/user/orders/quote", {
     method: "POST",
     headers: buyerHeaders(),
-    body: { shopId, agentProductId }
+    body: { shopId, merchantProductListingId }
   }),
-  createOrder: (shopId: string, agentProductId: string, clientPaidAmountCents?: string, buyerEmail?: string) => request<JsonRecord>("/api/user/orders", {
+  createOrder: (shopId: string, merchantProductListingId: string, clientPaidAmountCents?: string, buyerEmail?: string) => request<JsonRecord>("/api/user/orders", {
     method: "POST",
     headers: buyerHeaders(),
-    body: { shopId, agentProductId, clientPaidAmountCents, buyerEmail }
+    body: { shopId, merchantProductListingId, clientPaidAmountCents, buyerEmail }
   }),
   createAfterSale: (orderNo: string, requestedRefundCents: string) => request<JsonRecord>("/api/user/after-sales", {
     method: "POST",
@@ -542,7 +569,7 @@ export const api = {
       description: "后台提交售后申请"
     }
   }),
-  createRefund: (afterSaleNo: string, order: JsonRecord, refundAmountCents: string, responsibility: "platform" | "agent" | "user" | "mixed") => {
+  createRefund: (afterSaleNo: string, order: JsonRecord, refundAmountCents: string, responsibility: "platform" | "merchant" | "user" | "mixed") => {
     const refundCents = requirePositiveCents(refundAmountCents, "退款金额");
     const split = mixedSplit(refundCents);
     return request<JsonRecord>(`/api/admin/after-sales/${afterSaleNo}/refunds`, {
@@ -550,9 +577,9 @@ export const api = {
       headers: adminHeaders(),
       body: {
         refundAmountCents: refundCents,
-        responsibility,
+        responsibility: responsibility,
         platformBearCents: responsibility === "mixed" ? split.platformBearCents : undefined,
-        agentBearCents: responsibility === "mixed" ? split.agentBearCents : undefined
+        merchantBearCents: responsibility === "mixed" ? split.merchantBearCents : undefined
       }
     });
   },
@@ -564,26 +591,26 @@ export const api = {
       channelRefundNo: requireText(voucherUrl, "人工退款凭证")
     }
   }),
-  agentShop: () => request<JsonRecord>("/api/agent/shop", {
-    headers: agentHeaders()
+  merchantShop: () => request<JsonRecord>("/api/merchant/shop", {
+    headers: merchantHeaders()
   }),
-  saveShopDecor: (input?: { themeColor?: string; bannerUrl?: string; shareTitle?: string; productGroups?: Array<{ name: string; agentProductIds: string[] }> }) => request<JsonRecord>("/api/agent/shop/decor", {
+  saveShopDecor: (input?: { themeColor?: string; bannerUrl?: string; shareTitle?: string; productGroups?: Array<{ name: string; merchantProductListingIds: string[] }> }) => request<JsonRecord>("/api/merchant/shop/decor", {
     method: "PATCH",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
     body: input ?? {}
   }),
-  saveAgentShop: (name: string, announcement: string, customerServiceWechat: string, customerServiceQrUrl: string) => request<JsonRecord>("/api/agent/shop", {
+  saveMerchantShop: (name: string, announcement: string, customerServiceWechat: string, customerServiceQrUrl: string) => request<JsonRecord>("/api/merchant/shop", {
     method: "PATCH",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
     body: { name, announcement, customerServiceWechat, customerServiceQrUrl }
   }),
-  submitAgentApplication: (input: { contactPhone: string; customerServiceWechat: string; inviteCode?: string }) => request<JsonRecord>("/api/agent/applications", {
+  submitMerchantApplication: (input: { contactPhone: string; customerServiceWechat: string; inviteCode?: string }) => request<JsonRecord>("/api/merchant/applications", {
     method: "POST",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
     body: { contactPhone: input.contactPhone, customerServiceWechat: input.customerServiceWechat, inviteCode: input.inviteCode || undefined }
   }),
-  platformProducts: () => request<JsonRecord[]>("/api/agent/products/platform", {
-    headers: agentHeaders()
+  platformProducts: () => request<JsonRecord[]>("/api/merchant/products/platform", {
+    headers: merchantHeaders()
   }),
   adminPlatformProducts: () => request<JsonRecord[]>("/api/admin/products", {
     headers: adminHeaders()
@@ -637,7 +664,16 @@ export const api = {
     headers: adminHeaders(),
     body: { status }
   }),
-  upsertPlatformShopProduct: (shopId: string, platformProductId: string, salePriceCents: string, fulfillmentCostCents: string) => request<JsonRecord>("/api/admin/platform-shop-products", {
+  grantCouponTemplate: (couponId: string, input: { target: string; userId: string; phone: string }) => request<JsonRecord>(`/api/admin/coupons/${encodeURIComponent(requireText(couponId, "优惠券"))}/grants`, {
+    method: "POST",
+    headers: adminHeaders(),
+    body: {
+      target: input.target,
+      userId: input.userId.trim() || undefined,
+      phone: input.phone.trim() || undefined
+    }
+  }),
+  upsertPlatformShopProduct: (shopId: string, platformProductId: string, salePriceCents: string, fulfillmentCostCents: string, status = "listed") => request<JsonRecord>("/api/admin/platform-shop-products", {
     method: "POST",
     headers: adminHeaders(),
     body: {
@@ -645,19 +681,38 @@ export const api = {
       platformProductId,
       salePriceCents: requirePositiveCents(salePriceCents, "店铺售价"),
       fulfillmentCostCents: requireNonNegativeCents(fulfillmentCostCents, "履约成本"),
-      status: "listed"
+      status: requireText(status, "上架状态")
     }
   }),
-  batchSelectProducts: (items: Array<{ platformProductId: string; salePriceCents: string }>) => request<JsonRecord>("/api/agent/products/platform/batch", {
+  updatePlatformShopProduct: (shopProductId: string, input: { salePriceCents: string; fulfillmentCostCents: string; status: string }) => request<JsonRecord>(`/api/admin/platform-shop-products/${encodeURIComponent(requireText(shopProductId, "自营商品ID"))}`, {
+    method: "PATCH",
+    headers: adminHeaders(),
+    body: {
+      salePriceCents: requirePositiveCents(input.salePriceCents, "平台自营售价"),
+      fulfillmentCostCents: requireNonNegativeCents(input.fulfillmentCostCents, "履约成本"),
+      status: requireText(input.status, "上架状态")
+    }
+  }),
+  batchSelectProducts: (items: Array<{ platformProductId: string; salePriceCents: string }>) => request<JsonRecord>("/api/merchant/products/platform/batch", {
     method: "POST",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
     body: { items }
   }),
-  upsertAgentChannelOffer: (downstreamAgentId: string, platformProductId: string, resellSupplyPriceCents: string) => request<JsonRecord>("/api/agent/channels/offers", {
+  selectPlatformProduct: (platformProductId: string, input: MerchantListingDisplayInput) => request<JsonRecord>("/api/merchant/products/platform", {
     method: "POST",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
+    body: merchantListingPayload(platformProductId, input)
+  }),
+  updateMerchantProductDetail: (merchantProductListingId: string, input: MerchantListingDisplayInput) => request<JsonRecord>(`/api/merchant/products/${encodeURIComponent(requireText(merchantProductListingId, "店铺商品"))}`, {
+    method: "PATCH",
+    headers: merchantHeaders(),
+    body: merchantListingPayload(undefined, input)
+  }),
+  upsertMerchantChannelOffer: (downstreamMerchantId: string, platformProductId: string, resellSupplyPriceCents: string) => request<JsonRecord>("/api/merchant/supply/offers", {
+    method: "POST",
+    headers: merchantHeaders(),
     body: {
-      downstreamAgentId: requireText(downstreamAgentId, "下游商户ID"),
+      downstreamMerchantId: requireText(downstreamMerchantId, "下游商户ID"),
       platformProductId: requireText(platformProductId, "平台商品ID"),
       resellSupplyPriceCents: requirePositiveCents(resellSupplyPriceCents, "转供价")
     }
@@ -665,11 +720,11 @@ export const api = {
   rightsCodes: () => request<JsonRecord[]>("/api/admin/rights-codes", {
     headers: adminHeaders()
   }).then((rows) => rows.map(stripRightsCodePlaintext)),
-  agentRightsCodes: (agentProductId?: string) => {
+  merchantRightsCodes: (merchantProductListingId?: string) => {
     const params = new URLSearchParams();
-    if (agentProductId) params.set("agentProductId", agentProductId);
-    return request<JsonRecord[]>(`/api/agent/rights-codes${params.size ? `?${params.toString()}` : ""}`, {
-      headers: agentHeaders()
+    if (merchantProductListingId) params.set("merchantProductListingId", merchantProductListingId);
+    return request<JsonRecord[]>(`/api/merchant/rights-codes${params.size ? `?${params.toString()}` : ""}`, {
+      headers: merchantHeaders()
     }).then((rows) => rows.map(stripRightsCodePlaintext));
   },
   rightsCodesPlaintext: (filters: { productId?: string; orderNo?: string; status?: string } = {}) => {
@@ -690,30 +745,30 @@ export const api = {
       codes: input.codes
     }
   }),
-  importAgentRightsCodes: (input: { agentProductId: string; batchNo: string; codes: string[] }) => request<JsonRecord>("/api/agent/rights-codes/import", {
+  importMerchantRightsCodes: (input: { merchantProductListingId: string; batchNo: string; codes: string[] }) => request<JsonRecord>("/api/merchant/rights-codes/import", {
     method: "POST",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
     body: {
-      agentProductId: input.agentProductId,
+      merchantProductListingId: input.merchantProductListingId,
       batchNo: input.batchNo,
       codes: input.codes
     }
   }),
-  notifications: () => request<JsonRecord[]>("/api/agent/notifications", {
-    headers: agentHeaders()
+  notifications: () => request<JsonRecord[]>("/api/merchant/notifications", {
+    headers: merchantHeaders()
   }),
-  agentProducts: () => request<JsonRecord[]>("/api/agent/products", {
-    headers: agentHeaders()
+  merchantProducts: () => request<JsonRecord[]>("/api/merchant/products", {
+    headers: merchantHeaders()
   }),
-  ownProducts: () => request<JsonRecord[]>("/api/agent/products/own", {
-    headers: agentHeaders()
+  ownProducts: () => request<JsonRecord[]>("/api/merchant/products/own", {
+    headers: merchantHeaders()
   }),
-  adminOwnProductReviews: () => request<JsonRecord[]>("/api/admin/agent-products/reviews", {
+  adminOwnProductReviews: () => request<JsonRecord[]>("/api/admin/merchant-products/reviews", {
     headers: adminHeaders()
   }),
-  submitOwnProduct: (input: { name: string; category?: string; tags?: string; subtitle?: string; description?: string; usageGuide?: string; imageUrl?: string; specs?: string; detailSections?: string; salePriceCents: string; minSalePriceCents: string; fulfillmentMode: string }) => request<JsonRecord>("/api/agent/products/own", {
+  submitOwnProduct: (input: { name: string; category?: string; tags?: string; subtitle?: string; description?: string; usageGuide?: string; imageUrl?: string; specs?: string; detailSections?: string; salePriceCents: string; minSalePriceCents: string; fulfillmentMode: string }) => request<JsonRecord>("/api/merchant/products/own", {
     method: "POST",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
     body: {
       name: requireText(input.name, "商品名称"),
       category: input.category || undefined,
@@ -729,7 +784,7 @@ export const api = {
       fulfillmentMode: requireText(input.fulfillmentMode, "交付方式")
     }
   }),
-  reviewOwnProduct: (ownProductId: string, approved = true) => request<JsonRecord>(`/api/admin/agent-products/reviews/${ownProductId}/review`, {
+  reviewOwnProduct: (ownProductId: string, approved = true) => request<JsonRecord>(`/api/admin/merchant-products/reviews/${ownProductId}/review`, {
     method: "POST",
     headers: adminHeaders(),
     body: {
@@ -737,35 +792,35 @@ export const api = {
       reason: approved ? "资料符合虚拟商品规则" : "资料需补充"
     }
   }),
-  updateAgentProductPrice: (agentProductId: string, salePriceCents: string) => request<JsonRecord>(`/api/agent/products/${agentProductId}/price`, {
+  updateMerchantProductPrice: (merchantProductListingId: string, salePriceCents: string) => request<JsonRecord>(`/api/merchant/products/${merchantProductListingId}/price`, {
     method: "PATCH",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
     body: { salePriceCents }
   }),
-  agentOrders: () => request<JsonRecord[]>("/api/agent/orders", {
-    headers: agentHeaders()
+  merchantOrders: () => request<JsonRecord[]>("/api/merchant/orders", {
+    headers: merchantHeaders()
   }),
-  fulfillAgentOrder: (orderNo: string, attemptNo: number) => request<JsonRecord>(`/api/agent/orders/${orderNo}/fulfillment`, {
+  fulfillMerchantOrder: (orderNo: string, attemptNo: number) => request<JsonRecord>(`/api/merchant/orders/${orderNo}/fulfillment`, {
     method: "POST",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
     body: { status: "success", evidence: `merchant-evidence-${attemptNo}`, attemptNo }
   }),
-  agentAfterSales: () => request<JsonRecord[]>("/api/agent/after-sales", {
-    headers: agentHeaders()
+  merchantAfterSales: () => request<JsonRecord[]>("/api/merchant/after-sales", {
+    headers: merchantHeaders()
   }),
-  assistAgentAfterSale: (afterSaleNo: string, note: string) => request<JsonRecord>(`/api/agent/after-sales/${afterSaleNo}/assist`, {
+  assistMerchantAfterSale: (afterSaleNo: string, note: string) => request<JsonRecord>(`/api/merchant/after-sales/${afterSaleNo}/assist`, {
     method: "POST",
-    headers: agentHeaders(),
+    headers: merchantHeaders(),
     body: { note: requireText(note, "协处理说明") }
   }),
-  agentSettlements: () => request<JsonRecord[]>("/api/agent/settlements", {
-    headers: agentHeaders()
+  merchantSettlements: () => request<JsonRecord[]>("/api/merchant/settlements", {
+    headers: merchantHeaders()
   }),
-  agentClawbacks: () => request<JsonRecord[]>("/api/agent/clawbacks", {
-    headers: agentHeaders()
+  merchantClawbacks: () => request<JsonRecord[]>("/api/merchant/clawbacks", {
+    headers: merchantHeaders()
   }),
-  agentDepositTransactions: () => request<JsonRecord[]>("/api/agent/deposit-transactions", {
-    headers: agentHeaders()
+  merchantDepositTransactions: () => request<JsonRecord[]>("/api/merchant/deposit-transactions", {
+    headers: merchantHeaders()
   })
 };
 
@@ -780,16 +835,16 @@ export function text(value: unknown, fallback = "-"): string {
   return fallback;
 }
 
-function mixedSplit(refundAmountCents: string): { platformBearCents: string; agentBearCents: string } {
+function mixedSplit(refundAmountCents: string): { platformBearCents: string; merchantBearCents: string } {
   const refundAmount = Number(refundAmountCents);
   const platformBear = Math.floor(refundAmount / 2);
   return {
     platformBearCents: String(platformBear),
-    agentBearCents: String(refundAmount - platformBear)
+    merchantBearCents: String(refundAmount - platformBear)
   };
 }
 
-function runtimeValue(storageKey: string, envKey: "VITE_AGENT_ID" | "VITE_SHOP_ID" | "VITE_BUYER_ID"): string {
+function runtimeValue(storageKey: string, envKey: "VITE_BUYER_ID"): string {
   const stored = typeof window === "undefined" ? null : window.localStorage.getItem(storageKey);
   return stored || String(import.meta.env[envKey] ?? "");
 }
@@ -815,12 +870,12 @@ function clearAdminSession() {
   window.localStorage.removeItem("tosell_admin_session");
 }
 
-function currentAgentSession(): AgentSession | undefined {
+function currentMerchantSession(): MerchantSession | undefined {
   if (typeof window === "undefined") return undefined;
   try {
-    const raw = window.localStorage.getItem("tosell_agent_session");
+    const raw = window.localStorage.getItem("tosell_merchant_session");
     if (!raw) return undefined;
-    const session = JSON.parse(raw) as AgentSession;
+    const session = JSON.parse(raw) as MerchantSession;
     if (!session.token || session.expiresAt * 1000 <= Date.now() + 30_000) return undefined;
     return session;
   } catch {
@@ -828,12 +883,12 @@ function currentAgentSession(): AgentSession | undefined {
   }
 }
 
-function saveAgentSession(session: AgentSession) {
-  window.localStorage.setItem("tosell_agent_session", JSON.stringify(session));
+function saveMerchantSession(session: MerchantSession) {
+  window.localStorage.setItem("tosell_merchant_session", JSON.stringify(session));
 }
 
-function clearAgentSession() {
-  window.localStorage.removeItem("tosell_agent_session");
+function clearMerchantSession() {
+  window.localStorage.removeItem("tosell_merchant_session");
 }
 
 function stripRightsCodePlaintext(row: JsonRecord): JsonRecord {
@@ -859,4 +914,21 @@ function parseDetailSections(value?: string): Array<{ title: string; items: stri
       };
     })
     .filter((section) => section.title && section.items.length > 0);
+}
+
+function merchantListingPayload(platformProductId: string | undefined, input: MerchantListingDisplayInput): JsonRecord {
+  return {
+    ...(platformProductId ? { platformProductId: requireText(platformProductId, "平台商品ID") } : {}),
+    salePriceCents: requirePositiveCents(input.salePriceCents, "销售价"),
+    ...(input.status ? { status: requireText(input.status, "上架状态") } : {}),
+    displayName: input.displayName?.trim() ?? "",
+    displaySubtitle: input.displaySubtitle?.trim() ?? "",
+    displayDescription: input.displayDescription?.trim() ?? "",
+    displayUsageGuide: input.displayUsageGuide?.trim() ?? "",
+    displayImageUrl: input.displayImageUrl?.trim() ?? "",
+    displayCategory: input.displayCategory?.trim() ?? "",
+    displayTags: splitLines(input.displayTags),
+    displaySpecs: splitLines(input.displaySpecs),
+    displayDetailSections: parseDetailSections(input.displayDetailSections)
+  };
 }

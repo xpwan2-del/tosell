@@ -6,8 +6,8 @@ export function refundCallbackKey(channel: string, channelRefundNo: string): str
   return `refund:${channel}:${channelRefundNo}`;
 }
 
-export function settlementKey(agentId: string, periodStart: string, periodEnd: string, batchNo: string): string {
-  return `settlement:${agentId}:${periodStart}:${periodEnd}:${batchNo}`;
+export function settlementKey(merchantId: string, periodStart: string, periodEnd: string, batchNo: string): string {
+  return `settlement:${merchantId}:${periodStart}:${periodEnd}:${batchNo}`;
 }
 
 export class IdempotencyRegistry {

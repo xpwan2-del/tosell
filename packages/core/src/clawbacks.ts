@@ -16,7 +16,7 @@ export type ClawbackResult = {
   deductions: ClawbackDeduction[];
   balances: ClawbackBalances;
   status: "completed" | "insufficient";
-  restrictAgent: boolean;
+  restrictMerchant: boolean;
 };
 
 export function applyClawback(
@@ -40,7 +40,7 @@ export function applyClawback(
     deductions,
     balances: mutable,
     status: remaining === 0n ? "completed" : "insufficient",
-    restrictAgent: remaining > 0n
+    restrictMerchant: remaining > 0n
   };
 }
 

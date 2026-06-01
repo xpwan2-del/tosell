@@ -20,17 +20,30 @@ type MerchantRegisterForm = {
 
 const orderTabs = ["全部", "待支付", "已支付", "售后"] as const;
 type OrderTab = (typeof orderTabs)[number];
-const defaultShopId = import.meta.env.VITE_DEFAULT_SHOP_ID ?? "";
+const defaultShopId = "default";
 const storeAiLogoSrc = "/brand/ai-store-logo.png";
+
+type PaymentGuideState = {
+  order: JsonRecord;
+  payment: JsonRecord;
+  channel?: JsonRecord;
+};
+
+type RechargeGuideState = {
+  recharge: JsonRecord;
+  channel?: JsonRecord;
+};
 
 function currentShopId() {
   const path = window.location.pathname;
   const match = path.match(/^\/s\/([^/]+)/);
-  return match?.[1] ?? new URLSearchParams(window.location.search).get("shopId") ?? defaultShopId;
+  return match?.[1] ?? new URLSearchParams(window.location.search).get("shopId") ?? "default";
 }
 
-function shopHref(shopId?: string) {
-  return shopId ? `/s/${shopId}` : "/";
+function shopHref(shopId?: string, shop?: JsonRecord) {
+  const publicPath = text(shop?.publicPath);
+  if (publicPath) return publicPath;
+  return shopId && shopId !== "default" ? `/s/${shopId}` : "/";
 }
 
 function App() {
@@ -52,23 +65,30 @@ function App() {
   const [shopId, setShopId] = useState(initialShopId);
   const [shop, setShop] = useState<JsonRecord>({});
   const [products, setProducts] = useState<JsonRecord[]>([]);
-  const [collectionChannels, setCollectionChannels] = useState<JsonRecord[]>([]);
+  const [paymentMethods, setPaymentMethods] = useState<JsonRecord[]>([]);
+  const [wallet, setWallet] = useState<JsonRecord | undefined>();
+  const [rechargeAmount, setRechargeAmount] = useState("10000");
   const [orderPayments, setOrderPayments] = useState<Record<string, JsonRecord>>({});
   const [userCoupons, setUserCoupons] = useState<JsonRecord[]>([]);
   const [orders, setOrders] = useState<JsonRecord[]>(() => readCachedOrders(currentShopId()));
   const [selectedProduct, setSelectedProduct] = useState<JsonRecord | undefined>();
   const [detailProduct, setDetailProduct] = useState<JsonRecord | undefined>();
+  const [detailCoupons, setDetailCoupons] = useState<JsonRecord[]>([]);
+  const [detailCouponId, setDetailCouponId] = useState("");
   const [checkout, setCheckout] = useState<CheckoutState | undefined>();
   const [selectedOrder, setSelectedOrder] = useState<JsonRecord | undefined>();
+  const [paymentGuide, setPaymentGuide] = useState<PaymentGuideState | undefined>();
+  const [rechargeGuide, setRechargeGuide] = useState<RechargeGuideState | undefined>();
   const [afterSaleOrder, setAfterSaleOrder] = useState<JsonRecord | undefined>();
   const [supportMaterialOrder, setSupportMaterialOrder] = useState<JsonRecord | undefined>();
-  const [selectedCollectionChannelId, setSelectedCollectionChannelId] = useState("");
+  const [selectedPaymentMethodId, setSelectedPaymentMethodId] = useState("");
   const [orderTab, setOrderTab] = useState<OrderTab>("全部");
   const [message, setMessage] = useState("正在打开店铺");
   const [loading, setLoading] = useState(false);
   const [afterSaleReason, setAfterSaleReason] = useState("权益无法正常使用");
   const [afterSaleDescription, setAfterSaleDescription] = useState("请协助核实权益使用情况");
   const [extractionCode, setExtractionCode] = useState("");
+  const [buyerPhone, setBuyerPhone] = useState("");
   const [buyerEmail, setBuyerEmail] = useState("");
   const [searchKeyword, setSearchKeyword] = useState("");
   const [category, setCategory] = useState("全部");
@@ -115,24 +135,29 @@ function App() {
   async function load(targetShopId = shopId) {
     setLoading(true);
     try {
-      const [nextShop, nextProducts, nextOrders, nextCollectionChannels] = await Promise.all([
+      const session = api.currentSession();
+      const [nextShop, nextProducts, nextPaymentMethods] = await Promise.all([
         api.shop(targetShopId),
         api.products(targetShopId),
-        api.orders(),
-        api.collectionChannels(targetShopId)
+        api.paymentMethods(targetShopId)
       ]);
+      const resolvedShopId = text(nextShop.id, targetShopId);
+      setShopId(resolvedShopId);
       setShop(nextShop);
       setProducts(nextProducts);
-      setCollectionChannels(nextCollectionChannels);
-      setSelectedCollectionChannelId((current) => nextCollectionChannels.some((item) => text(item.id) === current) ? current : text(nextCollectionChannels[0]?.id, ""));
+      setPaymentMethods(nextPaymentMethods);
+      setSelectedPaymentMethodId((current) =>
+        nextPaymentMethods.some((item) => text(item.id) === current)
+          ? current
+          : defaultPaymentMethodId(nextPaymentMethods, wallet)
+      );
       setSelectedProduct((current) => current ?? nextProducts[0]);
-      const mergedOrders = mergeOrders(readCachedOrders(targetShopId), nextOrders.filter((order) => belongsToShop(order, targetShopId)));
+      const mergedOrders = readCachedOrders(resolvedShopId).filter((order) => belongsToShop(order, resolvedShopId));
       setOrders(mergedOrders);
-      writeCachedOrders(targetShopId, mergedOrders);
-      const session = api.currentSession();
+      writeCachedOrders(resolvedShopId, mergedOrders);
       setAuth(session);
       if (session) {
-        setUserCoupons(await api.coupons(targetShopId));
+        void refreshUserState(resolvedShopId);
       } else {
         setUserCoupons([]);
       }
@@ -141,6 +166,23 @@ function App() {
       setMessage(error instanceof Error ? error.message : "店铺加载失败");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function refreshUserState(resolvedShopId = shopId) {
+    try {
+      const [nextOrders, nextWallet, nextCoupons] = await Promise.all([
+        api.orders().catch(() => [] as JsonRecord[]),
+        api.wallet().catch(() => undefined),
+        api.coupons(resolvedShopId).catch(() => [] as JsonRecord[])
+      ]);
+      setWallet(nextWallet);
+      setUserCoupons(nextCoupons);
+      const mergedOrders = mergeOrders(readCachedOrders(resolvedShopId), nextOrders.filter((order) => belongsToShop(order, resolvedShopId)));
+      setOrders(mergedOrders);
+      writeCachedOrders(resolvedShopId, mergedOrders);
+    } catch {
+      // User-specific data must not block browsing the shop catalog.
     }
   }
 
@@ -193,11 +235,30 @@ function App() {
   }
 
   useEffect(() => {
-    if (!window.location.pathname.startsWith("/s/") && shopId) {
+    if (!["/", "/index.html"].includes(window.location.pathname) && !window.location.pathname.startsWith("/s/") && shopId) {
       window.history.replaceState(null, "", `/s/${shopId}${window.location.hash}`);
     }
     void load(shopId);
   }, []);
+
+  useEffect(() => {
+    if (!checkout) return undefined;
+    let stopped = false;
+    const refreshWallet = async () => {
+      try {
+        const nextWallet = await api.wallet();
+        if (!stopped) setWallet(nextWallet);
+      } catch {
+        // Wallet polling is best-effort; the checkout can still use external payment.
+      }
+    };
+    void refreshWallet();
+    const timer = window.setInterval(() => void refreshWallet(), 2000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [checkout]);
 
   async function openShop(targetShopId: string) {
     setShopId(targetShopId);
@@ -207,11 +268,11 @@ function App() {
       setSelectedOrder(undefined);
       setAfterSaleOrder(undefined);
       setSupportMaterialOrder(undefined);
-      setSelectedCollectionChannelId("");
+      setSelectedPaymentMethodId("");
       setExtractOrder(undefined);
       setExtractResult(undefined);
       setOrders(readCachedOrders(targetShopId).filter((order) => belongsToShop(order, targetShopId)));
-    window.history.replaceState(null, "", `/s/${targetShopId}`);
+    window.history.replaceState(null, "", shopHref(targetShopId));
     await load(targetShopId);
   }
 
@@ -220,19 +281,24 @@ function App() {
     setShowNotice(false);
   }
 
-  async function startCheckout(product: JsonRecord) {
+  async function startCheckout(product: JsonRecord, preferredCouponId?: string) {
     try {
       setLoading(true);
       const productId = text(product.id);
-      const [detail, coupons] = await Promise.all([
+      const [detail, coupons, nextWallet] = await Promise.all([
         api.product(productId),
-        api.coupons(shopId, productId)
+        api.coupons(shopId, productId),
+        api.wallet().catch(() => wallet)
       ]);
-      const couponId = text(coupons.find((coupon) => text(coupon.status) === "available" && coupon.applicable !== false)?.id, "");
+      const preferredCoupon = coupons.find((coupon) => text(coupon.id) === preferredCouponId && text(coupon.status) === "available" && coupon.applicable !== false);
+      const couponId = text(preferredCoupon?.id, text(coupons.find((coupon) => text(coupon.status) === "available" && coupon.applicable !== false)?.id, ""));
       const quote = await api.quote(shopId, productId, couponId || undefined);
+      setWallet(nextWallet);
       setSelectedProduct(detail);
       setCheckout({ product: detail, quote, coupons, couponId: couponId || undefined });
+      setSelectedPaymentMethodId(defaultPaymentMethodId(paymentMethods, nextWallet, orderPayableAmount(quote)));
       setExtractionCode("");
+      setBuyerPhone("");
       setBuyerEmail("");
       setMessage("请确认订单信息");
     } catch (error) {
@@ -245,13 +311,22 @@ function App() {
   async function openProductDetail(product: JsonRecord) {
     try {
       setLoading(true);
-      const detail = await api.product(text(product.id));
+      const productId = text(product.id);
+      const [detail, coupons] = await Promise.all([
+        api.product(productId),
+        api.coupons(shopId, productId).catch(() => [])
+      ]);
+      const couponId = text(coupons.find((coupon) => text(coupon.status) === "available" && coupon.applicable !== false)?.id, "");
       setSelectedProduct(detail);
       setDetailProduct(detail);
+      setDetailCoupons(coupons);
+      setDetailCouponId(couponId);
       setMessage("商品详情已加载");
     } catch (error) {
       setSelectedProduct(product);
       setDetailProduct(product);
+      setDetailCoupons([]);
+      setDetailCouponId("");
       setMessage(error instanceof Error ? error.message : "商品详情加载失败");
     } finally {
       setLoading(false);
@@ -265,6 +340,7 @@ function App() {
       const nextCouponId = couponId || undefined;
       const quote = await api.quote(shopId, text(checkout.product.id), nextCouponId);
       setCheckout({ ...checkout, couponId: nextCouponId, quote });
+      setSelectedPaymentMethodId(defaultPaymentMethodId(paymentMethods, wallet, orderPayableAmount(quote)));
       setMessage(nextCouponId ? "优惠券已应用，金额已由后端重新计算" : "已取消使用优惠券");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "优惠券不可用");
@@ -277,8 +353,22 @@ function App() {
     if (!checkout) return;
     if (!await ensureAuth()) return;
     if (loading) return;
+    const needsPurchasePassword = requiresProductExtractionCode(checkout.product);
+    if (needsPurchasePassword && !/^\d{4,12}$/.test(extractionCode.trim())) {
+      setMessage("请设置 4-12 位纯数字购买密码。");
+      return;
+    }
+    if (needsPurchasePassword && !isMainlandChinaMobile(buyerPhone)) {
+      setMessage("请填写有效的中国大陆手机号，用于卡密商品订单核验。");
+      return;
+    }
+    if (buyerEmail.trim() && !isValidEmail(buyerEmail)) {
+      setMessage("请填写有效邮箱地址，或清空邮箱后继续下单。");
+      return;
+    }
     try {
       setLoading(true);
+      const paymentMethodId = effectivePaymentMethodId(paymentMethods, selectedPaymentMethodId, wallet, orderPayableAmount(checkout.quote));
       const order = await api.createOrder(
         shopId,
         text(checkout.product.id),
@@ -287,12 +377,13 @@ function App() {
           purchasePassword: requiresProductExtractionCode(checkout.product) ? extractionCode : undefined,
           couponId: checkout.couponId,
           buyerEmail: buyerEmail.trim() || undefined,
-          collectionChannelId: selectedCollectionChannelId || text(collectionChannels[0]?.id, "")
+          buyerPhone: needsPurchasePassword ? buyerPhone.trim() : undefined,
+          paymentMethodId
         }
       );
       let payment: JsonRecord | undefined;
       try {
-        payment = await api.createPayment(text(order.orderNo));
+        payment = await api.createPayment(text(order.orderNo), paymentMethodId);
       } catch (error) {
         setMessage(error instanceof Error ? `订单已创建，支付单创建失败：${error.message}` : "订单已创建，支付单创建失败");
       }
@@ -301,8 +392,23 @@ function App() {
       if (payment) {
         setOrderPayments((current) => ({ ...current, [text(order.orderNo)]: payment }));
       }
+      const selectedChannel = selectedPaymentMethod(paymentMethods, paymentMethodId);
       setCheckout(undefined);
-      setSelectedOrder(orderWithPayment);
+      if (payment && isPersonalPayment(payment, selectedChannel)) {
+        setSelectedOrder(undefined);
+        setPaymentGuide({ order: orderWithPayment, payment, channel: selectedChannel });
+      } else if (payment && isOfficialPayment(payment, selectedChannel)) {
+        const redirectUrl = paymentRedirectUrl(payment);
+        if (redirectUrl) {
+          setMessage("支付信息已生成，正在打开支付平台。");
+          window.location.assign(redirectUrl);
+          return;
+        }
+        setSelectedOrder(orderWithPayment);
+        setMessage("支付方式没有返回可跳转链接，请联系商户检查后台支付配置。");
+      } else {
+        setSelectedOrder(orderWithPayment);
+      }
       if (payment) {
         setMessage(paymentStatusMessage(payment));
       }
@@ -315,7 +421,36 @@ function App() {
 
   function showCollection(order: JsonRecord) {
     setSelectedOrder(order);
-    setMessage(`订单 ${text(order.orderNo)} 待收款确认，请使用当前店铺收款通道付款。`);
+    setMessage(`订单 ${text(order.orderNo)} 待收款确认，请使用当前店铺收款方式付款。`);
+  }
+
+  async function refreshOrderStatus(order: JsonRecord) {
+    const orderNo = text(order.orderNo);
+    if (!orderNo) return;
+    try {
+      setLoading(true);
+      const nextOrder = await api.order(orderNo);
+      updateOrders((current) => upsertOrder(current, nextOrder));
+      setSelectedOrder((current) => current && text(current.orderNo) === orderNo ? nextOrder : current);
+      setPaymentGuide((current) => current && text(current.order.orderNo) === orderNo ? { ...current, order: nextOrder } : current);
+      setMessage(text(nextOrder.paymentStatus) === "paid" ? "订单已确认收款，请查看卡密或等待交付。" : "订单还在等待确认收款。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "刷新订单失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function copyServiceContact() {
+    const wechat = text(shop.customerServiceWechat);
+    const qq = text(shop.customerServiceQq, text(shop.customerServiceQQ, text(shop.qq)));
+    const contact = wechat || qq;
+    if (!contact) {
+      setMessage("当前店铺还没有配置客服联系方式。");
+      return;
+    }
+    void navigator.clipboard?.writeText(contact);
+    setMessage(wechat ? "客服微信已复制。" : "客服 QQ 已复制。");
   }
 
   async function createOrderPayment(order: JsonRecord) {
@@ -323,11 +458,22 @@ function App() {
     if (!orderNo) return;
     try {
       setLoading(true);
-      const payment = await api.createPayment(orderNo);
+      const payment = await api.createPayment(orderNo, selectedPaymentMethodId || undefined);
       const nextOrder = attachPayment(order, payment);
       setOrderPayments((current) => ({ ...current, [orderNo]: payment }));
       updateOrders((current) => upsertOrder(current, nextOrder));
       setSelectedOrder(nextOrder);
+      const selectedChannel = selectedPaymentMethod(paymentMethods, selectedPaymentMethodId);
+      if (isOfficialPayment(payment, selectedChannel)) {
+        const redirectUrl = paymentRedirectUrl(payment);
+        if (redirectUrl) {
+          setMessage("支付信息已生成，正在打开支付平台。");
+          window.location.assign(redirectUrl);
+          return;
+        }
+        setMessage("支付方式没有返回可跳转链接，请联系商户检查后台支付配置。");
+        return;
+      }
       setMessage(paymentStatusMessage(payment));
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "支付单创建失败");
@@ -336,8 +482,33 @@ function App() {
     }
   }
 
+  async function createRecharge() {
+    if (!canRecharge(auth)) {
+      setShowLogin(true);
+      setMessage("请先用手机号注册或登录，登录后才能充值余额。");
+      return;
+    }
+    if (!isPositiveInteger(rechargeAmount)) {
+      setMessage("请输入正确的充值金额");
+      return;
+    }
+    try {
+      setLoading(true);
+      const channelId = defaultRechargePaymentMethodId(paymentMethods, selectedPaymentMethodId) || undefined;
+      const recharge = await api.createWalletRecharge(rechargeAmount, channelId);
+      const channel = selectedPaymentMethod(paymentMethods, text(recharge.paymentMethodId, channelId ?? ""));
+      setRechargeGuide({ recharge, channel });
+      setMessage(`充值单已生成，应付 ${cents(text(recharge.payableCents, rechargeAmount))}，付款后等待后台确认到账。`);
+      setWallet(await api.wallet());
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "充值失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function openPaymentVoucher(order: JsonRecord) {
-    const channel = inferPaymentVoucherChannel(selectedCollectionChannel(collectionChannels, selectedCollectionChannelId));
+    const channel = inferPaymentVoucherChannel(selectedPaymentMethod(paymentMethods, selectedPaymentMethodId));
     setPaymentVoucherForm({
       channel,
       payerName: "",
@@ -393,6 +564,23 @@ function App() {
       setMessage("订单已找回。");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "订单找回失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function openOrderDetail(order: JsonRecord) {
+    setSelectedOrder(order);
+    const orderNo = text(order.orderNo, "");
+    if (!orderNo) return;
+    try {
+      setLoading(true);
+      const detail = await api.order(orderNo);
+      updateOrders((current) => upsertOrder(current, detail));
+      setSelectedOrder(detail);
+      setMessage("订单详情已刷新");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "订单详情刷新失败");
     } finally {
       setLoading(false);
     }
@@ -491,20 +679,25 @@ function App() {
         </div>
 
         <aside className="shop-side desktop-side">
-          <section className="account-card">
-            <span>个人信息</span>
-            <strong>{text(auth?.user.displayName, "欢迎光临")}</strong>
-            <p>{auth ? authLabel(auth) : "登录后可在服务端查询订单和售后状态"}</p>
-            <AccountBenefits coupons={userCoupons} orders={filteredOrders} />
-            <div className="side-actions">
-              <button type="button" onClick={() => setShowLogin(true)}>登录/注册</button>
-              {auth ? <button type="button" className="ghost" onClick={() => {
-                api.logout();
-                setAuth(undefined);
-                setMessage("已退出登录");
-              }}>退出</button> : null}
-            </div>
-          </section>
+          <AccountPanel
+            auth={auth}
+            coupons={userCoupons}
+            orders={filteredOrders}
+            wallet={wallet}
+            channels={paymentMethods}
+            rechargeAmount={rechargeAmount}
+            selectedRechargeChannelId={defaultRechargePaymentMethodId(paymentMethods, selectedPaymentMethodId)}
+            loading={loading}
+            onRechargeAmountChange={setRechargeAmount}
+            onSelectRechargeChannel={setSelectedPaymentMethodId}
+            onRecharge={() => void createRecharge()}
+            onLogin={() => setShowLogin(true)}
+            onLogout={() => {
+              api.logout();
+              setAuth(undefined);
+              setMessage("已退出登录");
+            }}
+          />
 
           <section className="service">
             <ServiceContact shop={shop} />
@@ -564,7 +757,7 @@ function App() {
         </div>
         {filteredOrders.length === 0 ? <p className="empty">暂无订单</p> : filteredOrders.slice(0, 8).map((order) => (
           <article className="order" key={text(order.orderNo)}>
-            <button type="button" className="order-main" onClick={() => setSelectedOrder(order)}>
+            <button type="button" className="order-main" onClick={() => void openOrderDetail(order)}>
               <strong>{orderProductName(order)}</strong>
               <span>{text(order.orderNo)}</span>
             </button>
@@ -579,20 +772,25 @@ function App() {
       </section>
 
       <aside className="shop-side mobile-side" aria-label="个人信息和客服">
-        <section className="account-card">
-          <span>个人信息</span>
-          <strong>{text(auth?.user.displayName, "欢迎光临")}</strong>
-          <p>{auth ? authLabel(auth) : "登录后可在服务端查询订单和售后状态"}</p>
-          <AccountBenefits coupons={userCoupons} orders={filteredOrders} />
-          <div className="side-actions">
-            <button type="button" onClick={() => setShowLogin(true)}>登录/注册</button>
-            {auth ? <button type="button" className="ghost" onClick={() => {
-              api.logout();
-              setAuth(undefined);
-              setMessage("已退出登录");
-            }}>退出</button> : null}
-          </div>
-        </section>
+        <AccountPanel
+          auth={auth}
+          coupons={userCoupons}
+          orders={filteredOrders}
+          wallet={wallet}
+          channels={paymentMethods}
+          rechargeAmount={rechargeAmount}
+          selectedRechargeChannelId={defaultRechargePaymentMethodId(paymentMethods, selectedPaymentMethodId)}
+          loading={loading}
+          onRechargeAmountChange={setRechargeAmount}
+          onSelectRechargeChannel={setSelectedPaymentMethodId}
+          onRecharge={() => void createRecharge()}
+          onLogin={() => setShowLogin(true)}
+          onLogout={() => {
+            api.logout();
+            setAuth(undefined);
+            setMessage("已退出登录");
+          }}
+        />
 
         <section className="service">
           <ServiceContact shop={shop} />
@@ -611,26 +809,17 @@ function App() {
             </div>
             <div className="checkout-row"><span>店铺</span><strong>{text(shop.name)}</strong></div>
             <div className="checkout-row"><span>数量</span><strong>1</strong></div>
-            <div className="checkout-row"><span>商品金额</span><strong>{cents(checkout.quote.paidAmountCents)}</strong></div>
+            <div className="checkout-row"><span>商品原价</span><strong>{cents(quoteOriginalAmount(checkout.quote))}</strong></div>
             {Number(checkout.quote.couponDiscountCents ?? 0) > 0 ? (
               <div className="checkout-row"><span>优惠抵扣</span><strong>-{cents(checkout.quote.couponDiscountCents)}</strong></div>
             ) : null}
             <div className="checkout-row total"><span>应付金额</span><strong>{cents(orderPayableAmount(checkout.quote))}</strong></div>
             {checkout.coupons.length > 0 ? (
-              <label className="field">
-                <span>优惠券</span>
-                <select value={checkout.couponId ?? ""} onChange={(event) => void updateCheckoutCoupon(event.target.value)}>
-                  <option value="">不使用优惠券</option>
-                  {checkout.coupons.map((coupon) => {
-                    const template = coupon.template as JsonRecord | undefined;
-                    return (
-                      <option key={text(coupon.id)} value={text(coupon.id)} disabled={coupon.applicable === false || text(coupon.status) !== "available"}>
-                        {text(template?.name, "优惠券")} {cents(template?.discountCents)}{coupon.applicable === false ? "（当前商品不可用）" : ""}
-                      </option>
-                    );
-                  })}
-                </select>
-              </label>
+              <CouponPicker
+                coupons={checkout.coupons}
+                selectedCouponId={checkout.couponId ?? ""}
+                onSelect={(couponId) => void updateCheckoutCoupon(couponId)}
+              />
             ) : null}
             <label className="field">
               <span>接收邮箱（选填）</span>
@@ -642,35 +831,92 @@ function App() {
               />
             </label>
             {requiresProductExtractionCode(checkout.product) ? (
-              <label className="field">
-                <span>购买密码</span>
-                <input
-                  inputMode="numeric"
-                  value={extractionCode}
-                  onChange={(event) => setExtractionCode(event.target.value.replace(/\D/g, "").slice(0, 12))}
-                  placeholder="4-12 位纯数字"
-                  required
-                />
-              </label>
+              <>
+                <label className="field">
+                  <span>购买密码</span>
+                  <input
+                    inputMode="numeric"
+                    value={extractionCode}
+                    onChange={(event) => setExtractionCode(event.target.value.replace(/\D/g, "").slice(0, 12))}
+                    placeholder="4-12 位纯数字"
+                    required
+                  />
+                </label>
+                <label className="field">
+                  <span>联系电话</span>
+                  <input
+                    inputMode="tel"
+                    value={buyerPhone}
+                    onChange={(event) => setBuyerPhone(event.target.value.replace(/\D/g, "").slice(0, 11))}
+                    placeholder="中国大陆手机号"
+                    required
+                  />
+                </label>
+              </>
             ) : null}
             <p>{requiresProductExtractionCode(checkout.product)
               ? "后台确认收款并发码后，请使用购买时设置的购买密码查看。"
               : "本商品由客服人工交付，后台确认收款后请添加店铺客服领取账号资料或使用说明。"}</p>
-            <CollectionBox channels={collectionChannels} orderAmountCents={orderPayableAmount(checkout.quote)} selectedChannelId={selectedCollectionChannelId} onSelect={setSelectedCollectionChannelId} />
+            <PaymentAmountBreakdown
+              baseAmountCents={orderPayableAmount(checkout.quote)}
+              channel={selectedPaymentMethod(paymentMethods, effectivePaymentMethodId(paymentMethods, selectedPaymentMethodId, wallet, orderPayableAmount(checkout.quote)))}
+            />
+            <PaymentMethodPicker
+              channels={paymentMethods}
+              wallet={wallet}
+              orderAmountCents={orderPayableAmount(checkout.quote)}
+              selectedChannelId={effectivePaymentMethodId(paymentMethods, selectedPaymentMethodId, wallet, orderPayableAmount(checkout.quote))}
+              onSelect={setSelectedPaymentMethodId}
+            />
             <div className="checkout-actions">
               <button type="button" className="ghost" onClick={() => setCheckout(undefined)}>再看看</button>
-              <button type="button" disabled={loading || collectionChannels.length === 0 || (requiresProductExtractionCode(checkout.product) && extractionCode.trim().length < 4)} onClick={() => void submitOrder()}>提交订单</button>
+              <button type="button" disabled={loading || paymentMethods.length === 0 || (requiresProductExtractionCode(checkout.product) && (extractionCode.trim().length < 4 || !isMainlandChinaMobile(buyerPhone)))} onClick={() => void submitOrder()}>立即购买</button>
             </div>
           </section>
         </div>
+      ) : null}
+
+      {paymentGuide ? (
+        <PersonalPaymentGuide
+          order={paymentGuide.order}
+          payment={paymentGuide.payment}
+          channel={paymentGuide.channel}
+          shop={shop}
+          loading={loading}
+          onRefresh={() => void refreshOrderStatus(paymentGuide.order)}
+          onViewOrder={() => {
+            setSelectedOrder(paymentGuide.order);
+            setPaymentGuide(undefined);
+          }}
+          onContact={copyServiceContact}
+          onClose={() => setPaymentGuide(undefined)}
+        />
+      ) : null}
+
+      {rechargeGuide ? (
+        <RechargePaymentGuide
+          recharge={rechargeGuide.recharge}
+          channel={rechargeGuide.channel}
+          shop={shop}
+          loading={loading}
+          onRefresh={async () => {
+            setWallet(await api.wallet());
+            setMessage("已刷新余额；如果后台还没确认，请稍后再看。");
+          }}
+          onContact={copyServiceContact}
+          onClose={() => setRechargeGuide(undefined)}
+        />
       ) : null}
 
       {detailProduct ? (
         <ProductDetailPage
           product={detailProduct}
           shop={shop}
+          coupons={detailCoupons}
+          selectedCouponId={detailCouponId}
+          onSelectCoupon={setDetailCouponId}
           onClose={() => setDetailProduct(undefined)}
-          onBuy={() => void startCheckout(detailProduct)}
+          onBuy={() => void startCheckout(detailProduct, detailCouponId)}
         />
       ) : null}
 
@@ -681,7 +927,7 @@ function App() {
             <h2>重要提醒，请下单前仔细阅读</h2>
             <p>为减少虚拟商品售后争议，请在购买前确认商品名称、发放方式、使用说明和客服处理时效。</p>
             <NoticeItem index="1" title="请认真查看商品详情" text="确认规格、发放方式和使用限制；因未阅读说明造成的问题，按页面规则处理。" />
-            <NoticeItem index="2" title="付款请以订单金额为准" text="当前店铺收款通道由后台配置，付款后由商家或平台后台确认收款。" />
+            <NoticeItem index="2" title="付款请以订单金额为准" text="当前店铺收款方式由后台配置，付款后由商户或平台后台确认收款。" />
             <NoticeItem index="3" title="自动发码需设置购买密码" text="购买密码由你购买时自行输入，建议 4-12 位纯数字；人工交付商品请添加店铺客服领取。" />
             <NoticeItem index="4" title="售后请从订单中心提交" text="订单中心会保留支付、履约、卡密和售后记录，便于平台仲裁和追踪。" />
             <div className="checkout-actions">
@@ -738,13 +984,23 @@ function App() {
             <div className="checkout-row"><span>支付状态</span><strong>{statusLabel(selectedOrder)}</strong></div>
             <div className="checkout-row"><span>履约方式</span><strong>{text(selectedOrder.fulfillmentStatus, "待处理")}</strong></div>
             {text(selectedOrder.paymentStatus) === "unpaid" || text(selectedOrder.paymentStatus) === "paying" ? (
-              <CollectionBox
-                channels={collectionChannels}
-                orderAmountCents={orderPaidAmount(selectedOrder)}
-                selectedChannelId={selectedCollectionChannelId}
-                onSelect={setSelectedCollectionChannelId}
-                payment={orderPayments[text(selectedOrder.orderNo)] ?? paymentForOrder(selectedOrder)}
-              />
+              <>
+                {!paymentForOrder(selectedOrder) ? (
+                  <PaymentMethodPicker
+                    channels={paymentMethods}
+                    wallet={wallet}
+                    orderAmountCents={orderPaidAmount(selectedOrder)}
+                    selectedChannelId={effectivePaymentMethodId(paymentMethods, selectedPaymentMethodId, wallet, orderPaidAmount(selectedOrder))}
+                    onSelect={setSelectedPaymentMethodId}
+                  />
+                ) : null}
+                <PaymentBox
+                  channels={paymentMethods}
+                  orderAmountCents={orderPaidAmount(selectedOrder)}
+                  selectedChannelId={effectivePaymentMethodId(paymentMethods, selectedPaymentMethodId, wallet, orderPaidAmount(selectedOrder))}
+                  payment={orderPayments[text(selectedOrder.orderNo)] ?? paymentForOrder(selectedOrder)}
+                />
+              </>
             ) : null}
             {text(selectedOrder.disputeMaterialStatus, "") ? <div className="checkout-row"><span>异常材料</span><strong>{text(selectedOrder.disputeMaterialStatus)}</strong></div> : null}
             <DeliveryBlock order={selectedOrder} onExtract={(token) => {
@@ -760,7 +1016,7 @@ function App() {
             <p>虚拟权益订单会保留支付、履约和售后记录；遇到问题请联系店铺客服。</p>
             <div className="checkout-actions">
               {text(selectedOrder.paymentStatus) === "unpaid" && !paymentForOrder(selectedOrder) ? (
-                <button type="button" disabled={loading} onClick={() => void createOrderPayment(selectedOrder)}>生成支付信息</button>
+                <button type="button" disabled={loading} onClick={() => void createOrderPayment(selectedOrder)}>去支付</button>
               ) : null}
               <button type="button" className="ghost" onClick={() => openPaymentVoucher(selectedOrder)}>补充异常材料</button>
             </div>
@@ -779,15 +1035,26 @@ function App() {
               <button type="button" className="icon-button" onClick={() => setSupportMaterialOrder(undefined)}>关闭</button>
             </div>
             <div className="checkout-row"><span>订单金额</span><strong>{cents(orderPaidAmount(supportMaterialOrder))}</strong></div>
-            <label className="field">
+            <div className="field">
               <span>相关通道</span>
-              <select value={paymentVoucherForm.channel} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, channel: event.target.value })}>
-                <option value="">按收款码核验</option>
-                <option value="alipay_wap">支付宝</option>
-                <option value="wechat_h5">微信 H5</option>
-                <option value="wechat_h5_jsapi">微信 JSAPI</option>
-              </select>
-            </label>
+              <div className="support-channel-grid">
+                {[
+                  ["", "按收款码核验"],
+                  ["alipay_wap", "支付宝"],
+                  ["wechat_h5", "微信"],
+                  ["wechat_h5_jsapi", "微信 JSAPI"]
+                ].map(([value, label]) => (
+                  <button
+                    key={value || "auto"}
+                    type="button"
+                    className={paymentVoucherForm.channel === value ? "selected" : ""}
+                    onClick={() => setPaymentVoucherForm({ ...paymentVoucherForm, channel: value })}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <label className="field">
               <span>付款人</span>
               <input value={paymentVoucherForm.payerName} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, payerName: event.target.value })} placeholder="选填，付款账号名或姓名" />
@@ -1055,7 +1322,7 @@ function MerchantRegisterPage() {
         customerServiceWechat: form.customerServiceWechat.trim()
       });
       setResult(nextResult);
-      setMessage("入驻申请已提交，平台审核和保证金确认前不可销售或代理商品。");
+      setMessage("入驻申请已提交，平台审核和保证金确认前不可销售或店铺商品。");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "入驻提交失败");
     } finally {
@@ -1063,7 +1330,7 @@ function MerchantRegisterPage() {
     }
   }
 
-  const agent = result?.agent as JsonRecord | undefined;
+  const merchant = result?.merchant as JsonRecord | undefined;
   const shop = result?.shop as JsonRecord | undefined;
   const application = result?.application as JsonRecord | undefined;
   const credential = result?.credential as JsonRecord | undefined;
@@ -1082,7 +1349,7 @@ function MerchantRegisterPage() {
           <div className="merchant-rules">
             <div><strong>审核后开店</strong><span>平台审核资料和店铺信息</span></div>
             <div><strong>保证金门槛</strong><span>未确认保证金不能选品、上架和销售</span></div>
-            <div><strong>独立店铺</strong><span>前台只展示自己的商品、客服和收款通道</span></div>
+            <div><strong>独立店铺</strong><span>前台只展示自己的商品、客服和收款方式</span></div>
           </div>
         </div>
         <section className="merchant-form">
@@ -1114,11 +1381,11 @@ function MerchantRegisterPage() {
             <div className="merchant-result">
               <strong>提交成功</strong>
               <span>申请编号：{text(application?.applicationNo)}</span>
-              <span>商户ID：{text(agent?.id)}</span>
+              <span>商户ID：{text(merchant?.id ?? merchant?.merchantId)}</span>
               <span>店铺ID：{text(shop?.id)}</span>
               {credential ? <span>后台账号：{text(credential.account)} / 初始密码：{text(credential.initialPassword)}</span> : null}
-              <span>当前状态：{text(agent?.status)} / 保证金 {text(agent?.depositStatus)}</span>
-              <p>请等待平台后台审核，并在保证金确认后再配置商品、客服二维码和收款通道。</p>
+              <span>当前状态：{text(merchant?.status)} / 保证金 {text(merchant?.depositStatus)}</span>
+              <p>请等待平台后台审核，并在保证金确认后再配置商品、客服二维码和收款方式。</p>
             </div>
           ) : null}
         </section>
@@ -1134,6 +1401,118 @@ function AccountBenefits(props: { coupons: JsonRecord[]; orders: JsonRecord[] })
       <div><strong>{availableCoupons.length}</strong><span>可用优惠券</span></div>
       <div><strong>{props.orders.length}</strong><span>当前店铺订单</span></div>
     </div>
+  );
+}
+
+function CouponPicker(props: { coupons: JsonRecord[]; selectedCouponId: string; onSelect: (couponId: string) => void }) {
+  const availableCoupons = props.coupons.filter((coupon) => text(coupon.status) === "available");
+  if (props.coupons.length === 0) {
+    return (
+      <section className="coupon-picker empty">
+        <div className="coupon-title">
+          <span>优惠券</span>
+          <small>暂无可用优惠券</small>
+        </div>
+      </section>
+    );
+  }
+  return (
+    <section className="coupon-picker" aria-label="优惠券">
+      <div className="coupon-title">
+        <span>优惠券</span>
+        <small>一次只能使用一张，金额由后台重新计算。</small>
+      </div>
+      <div className="coupon-grid">
+        <button
+          type="button"
+          className={!props.selectedCouponId ? "coupon-card selected" : "coupon-card"}
+          onClick={() => props.onSelect("")}
+        >
+          <strong>不使用优惠券</strong>
+          <span>按原价结算</span>
+        </button>
+        {props.coupons.map((coupon) => {
+          const template = coupon.template as JsonRecord | undefined;
+          const disabled = coupon.applicable === false || text(coupon.status) !== "available";
+          return (
+            <button
+              key={text(coupon.id)}
+              type="button"
+              className={props.selectedCouponId === text(coupon.id) ? "coupon-card selected" : "coupon-card"}
+              disabled={disabled}
+              onClick={() => props.onSelect(text(coupon.id))}
+            >
+              <strong>{cents(template?.discountCents)}</strong>
+              <span>{text(template?.name, "平台优惠券")}</span>
+              <small>{disabled ? "当前不可用" : "可抵扣订单金额"}</small>
+            </button>
+          );
+        })}
+      </div>
+      {availableCoupons.length === 0 ? <small>当前商品暂无可用券。</small> : null}
+    </section>
+  );
+}
+
+function AccountPanel(props: {
+  auth?: AuthSession;
+  coupons: JsonRecord[];
+  orders: JsonRecord[];
+  wallet?: JsonRecord;
+  channels: JsonRecord[];
+  rechargeAmount: string;
+  selectedRechargeChannelId: string;
+  loading: boolean;
+  onRechargeAmountChange: (value: string) => void;
+  onSelectRechargeChannel: (channelId: string) => void;
+  onRecharge: () => void;
+  onLogin: () => void;
+  onLogout: () => void;
+}) {
+  const registered = canRecharge(props.auth);
+  const rechargeChannels = props.channels.filter((channel) => text(channel.provider) !== "balance" && text(channel.id) !== "balance");
+  return (
+    <section className="account-card">
+      <span>个人信息</span>
+      <strong>{text(props.auth?.user.displayName, "欢迎光临")}</strong>
+      <p>{props.auth ? authLabel(props.auth) : "登录后可在服务端查询订单、售后状态和余额。"}</p>
+      <AccountBenefits coupons={props.coupons} orders={props.orders} />
+      <div className={registered ? "account-wallet" : "account-wallet locked"}>
+        <div>
+          <span>账户余额</span>
+          <strong>{registered ? cents(text(props.wallet?.availableBalanceCents, "0")) : "登录后可充值"}</strong>
+          <small>余额支付按商品原价扣款，不加 1% 手续费。</small>
+        </div>
+        {registered ? (
+          <div className="account-recharge">
+            <label>
+              <span>充值金额(元)</span>
+              <input
+                inputMode="decimal"
+                value={yuanInputValue(props.rechargeAmount)}
+                onChange={(event) => props.onRechargeAmountChange(yuanToCentsInput(event.target.value))}
+                placeholder="例如 100"
+              />
+            </label>
+            <PaymentMethodPicker
+              channels={rechargeChannels}
+              orderAmountCents={props.rechargeAmount}
+              selectedChannelId={props.selectedRechargeChannelId}
+              onSelect={props.onSelectRechargeChannel}
+              title="充值方式"
+              note="充值到账后可用余额按原价消费"
+            />
+            <button type="button" disabled={props.loading} onClick={props.onRecharge}>充值</button>
+          </div>
+        ) : (
+          <button type="button" className="ghost" onClick={props.onLogin}>登录/注册后充值</button>
+        )}
+      </div>
+      <div className="side-actions">
+        <button type="button" onClick={props.onLogin}>登录/注册</button>
+        {props.auth ? <button type="button" className="ghost" onClick={props.onLogout}>退出</button> : null}
+      </div>
+    </section>
   );
 }
 
@@ -1162,56 +1541,277 @@ function ServiceContact(props: { shop: JsonRecord; compact?: boolean }) {
   );
 }
 
-function CollectionBox(props: { channels: JsonRecord[]; orderAmountCents: string; selectedChannelId?: string; onSelect?: (channelId: string) => void; payment?: JsonRecord }) {
-  const channel = selectedCollectionChannel(props.channels, props.selectedChannelId);
+function PaymentMethodPicker(props: {
+  channels: JsonRecord[];
+  wallet?: JsonRecord;
+  orderAmountCents: string;
+  selectedChannelId?: string;
+  onSelect: (channelId: string) => void;
+  title?: string;
+  note?: string;
+}) {
+  const orderedChannels = [...props.channels].sort((left, right) => {
+    const leftBalance = text(left.provider) === "balance" || text(left.id) === "balance";
+    const rightBalance = text(right.provider) === "balance" || text(right.id) === "balance";
+    if (leftBalance === rightBalance) return Number(right.isDefault === true) - Number(left.isDefault === true);
+    return leftBalance ? 1 : -1;
+  });
+  if (orderedChannels.length === 0) {
+    return (
+      <div className="payment-method-picker unavailable">
+        <strong>暂无可用支付方式</strong>
+        <span>当前店铺还没有启用收款方式，请联系店铺客服。</span>
+      </div>
+    );
+  }
+  return (
+    <section className="payment-method-picker" aria-label="支付方式">
+      <div className="payment-method-title">
+        <span>{props.title ?? "支付方式"}</span>
+        <small>{props.note ?? "余额支付不加手续费"}</small>
+      </div>
+      <div className="payment-method-grid">
+        {orderedChannels.map((channel) => {
+          const provider = text(channel.provider);
+          const channelId = text(channel.id);
+          const isBalance = provider === "balance" || channelId === "balance";
+          const balanceEnough = BigInt(text(props.wallet?.availableBalanceCents, "0")) >= BigInt(props.orderAmountCents || "0");
+          const disabled = isBalance && !balanceEnough;
+          const selected = props.selectedChannelId === channelId;
+          return (
+            <button
+              key={channelId}
+              type="button"
+              className={selected ? "payment-method-tile selected" : "payment-method-tile"}
+              disabled={disabled}
+              aria-pressed={selected}
+              onClick={() => props.onSelect(channelId)}
+            >
+              <PaymentIcon provider={provider || text(channel.channelType)} />
+              <span>{paymentTileTitle(channel)}</span>
+              <small>{disabled ? "余额不足" : paymentTileSubtitle(channel)}</small>
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function PaymentBox(props: { channels: JsonRecord[]; orderAmountCents: string; selectedChannelId?: string; payment?: JsonRecord }) {
+  const channel = selectedPaymentMethod(props.channels, props.selectedChannelId);
   const payment = props.payment;
   const paymentParams = payment?.paymentParams as JsonRecord | undefined;
   const paymentMethod = payment?.paymentMethod as JsonRecord | undefined;
   const paymentQr = text(paymentParams?.qrCodeUrl, text(paymentMethod?.qrUrl, ""));
-  const paymentUrl = text(paymentParams?.paymentUrl, text(paymentParams?.returnUrl, text(paymentMethod?.paymentUrl, "")));
+  const paymentUrl = text(paymentParams?.paymentUrl, text(paymentMethod?.paymentUrl, ""));
   const paymentProvider = text(payment?.provider, text(paymentMethod?.provider, ""));
+  const provider = paymentProvider || text(channel?.provider);
+  const baseAmountCents = props.orderAmountCents;
+  const feeCents = paymentMethodFeeCents(baseAmountCents, channel);
+  const payableCents = String(BigInt(baseAmountCents || "0") + BigInt(feeCents));
   if (!channel) {
     return (
-      <div className="collection-box unavailable">
-        <div>
-          <strong>暂无可用收款通道</strong>
-          <span>当前店铺还没有审核启用的商户收款通道。</span>
-          <small>请联系店铺客服，或等待商户在后台提交并由平台审核启用。</small>
-        </div>
+      <div className="payment-box unavailable">
+      <div>
+        <strong>暂无可用收款方式</strong>
+        <span>当前店铺暂时不能收款。</span>
+        <small>请联系店铺客服，或等待商户在后台提交并由平台审核启用。</small>
+      </div>
       </div>
     );
   }
-  const personalAlipay = paymentProvider === "personal_alipay" || isPersonalAlipayChannel(channel);
-  const interfaceCollection = ["alipay_merchant", "wechat_merchant", "epay"].includes(paymentProvider) || isInterfaceCollectionChannel(channel);
+  const personalPayment = isPersonalPaymentProvider(provider) || isPersonalPaymentMethod(channel);
+  const interfacePayment = ["alipay_merchant", "wechat_merchant", "epay"].includes(provider) || isInterfacePaymentMethod(channel);
+  const balancePayment = provider === "balance";
   const displayQr = paymentQr || text(channel.qrUrl);
+  const publicLabel = text(channel.publicLabel, paymentProviderPublicLabelForH5(provider, channel));
   return (
-    <div className="collection-box">
+    <div className="payment-box">
       <div>
-        <strong>{payment ? paymentProviderDisplayName(paymentProvider) : paymentChannelDisplayName(channel)}</strong>
-        <span>{text(paymentMethod?.displayName, text(channel.displayName, "商户收款"))} / {text(paymentMethod?.accountName, text(channel.accountName, "未填写账户名"))}</span>
-        <small>{interfaceCollection
+        <strong><PaymentIcon provider={provider} /> {publicLabel}</strong>
+        <small>{interfacePayment
           ? text(payment?.message, "请使用官方二维码或支付链接完成支付，订单以服务端回调或主动查单确认为准。")
-          : personalAlipay
-            ? text(payment?.message, "个人支付宝仅支持人工确认，请按订单金额付款后等待商户确认收款。")
-            : "请按订单金额付款，订单以后台确认结果为准。"}</small>
+          : balancePayment
+            ? "使用账户余额支付，按商品原价扣款，不加手续费。"
+            : personalPayment
+              ? text(payment?.message, "请截屏保存收款码，打开对应支付 App 扫码付款，付款后等待商户确认。")
+              : "请按订单金额付款，订单以后台确认结果为准。"}</small>
         {payment ? <small>支付单状态：{humanPaymentStatus(text(payment.status))}</small> : null}
-        {props.channels.length > 1 ? (
-          <select value={text(channel.id, "")} onChange={(event) => props.onSelect?.(event.target.value)} aria-label="选择收款通道">
-            {props.channels.map((item) => <option key={text(item.id)} value={text(item.id)}>{text(item.displayName, "商户收款")}</option>)}
-          </select>
-        ) : null}
       </div>
-      <strong className="collection-amount">{cents(props.orderAmountCents)}</strong>
+      <strong className="payment-amount">{cents(text(payment?.amountCents, payableCents))}</strong>
       {displayQr ? (
         usableImageSrc(displayQr)
-          ? <ImageWithFallback src={displayQr} alt={interfaceCollection ? "官方支付二维码" : "店铺收款码"} fallback={<div className="qr-empty">{interfaceCollection ? "支付二维码" : "收款码"}</div>} />
-          : <div className="qr-empty">{interfaceCollection ? "官方支付参数" : "收款信息"}</div>
+          ? <ImageWithFallback src={displayQr} alt={interfacePayment ? "官方支付二维码" : "店铺收款码"} fallback={<div className="qr-empty">{interfacePayment ? "支付二维码" : "收款码"}</div>} />
+          : <div className="qr-empty">{interfacePayment ? "官方支付参数" : "收款信息"}</div>
       ) : (
-        <div className="qr-empty">{interfaceCollection ? "支付二维码" : "收款码"}</div>
+        <div className="qr-empty">{interfacePayment ? "支付二维码" : "收款码"}</div>
       )}
-      {paymentUrl ? <a href={paymentUrl} target="_blank" rel="noreferrer">{interfaceCollection ? "打开官方支付链接" : "打开支付链接"}</a> : null}
+      {paymentUrl ? <a href={paymentUrl} target="_blank" rel="noreferrer">{interfacePayment ? "打开官方支付链接" : "打开支付链接"}</a> : null}
     </div>
   );
+}
+
+function PersonalPaymentGuide(props: {
+  order: JsonRecord;
+  payment: JsonRecord;
+  channel?: JsonRecord;
+  shop: JsonRecord;
+  loading: boolean;
+  onRefresh: () => void;
+  onViewOrder: () => void;
+  onContact: () => void;
+  onClose: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const provider = paymentProviderFrom(props.payment, props.channel);
+  const appName = provider.includes("wechat") ? "微信" : "支付宝";
+  const amountCents = text(props.payment.amountCents, orderPaidAmount(props.order));
+  const amount = cents(amountCents);
+  const amountForCopy = (Number(amountCents || 0) / 100).toFixed(2);
+  const qrUrl = paymentQrUrl(props.payment, props.channel);
+  const isPaid = text(props.order.paymentStatus) === "paid";
+
+  async function copyAmount() {
+    await navigator.clipboard?.writeText(amountForCopy);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
+  }
+
+  return (
+    <div className="modal-backdrop payment-guide-backdrop" role="dialog" aria-modal="true" aria-label={`${appName}付款`}>
+      <section className="personal-payment-guide">
+        <div className="payment-guide-head">
+          <div>
+            <span>订单已提交</span>
+            <h2>{appName}付款</h2>
+          </div>
+          <button type="button" className="icon-button" onClick={props.onClose}>关闭</button>
+        </div>
+
+        <div className="payment-guide-amount">
+          <span>请支付</span>
+          <strong>{amount}</strong>
+          <button type="button" className="ghost" onClick={() => void copyAmount()}>{copied ? "已复制" : "复制金额"}</button>
+        </div>
+
+        <div className="payment-guide-code">
+          {qrUrl ? (
+            <ImageWithFallback src={qrUrl} alt={`${appName}付款码`} fallback={<div className="qr-empty large">付款码</div>} />
+          ) : (
+            <div className="qr-empty large">付款码</div>
+          )}
+        </div>
+
+        <div className="payment-guide-steps">
+          <strong>{isPaid ? "订单已确认收款" : "请截图保存上方付款码"}</strong>
+          <p>打开{appName}扫一扫，选择刚保存的图片或扫码完成付款。</p>
+          <p>支付后请回到本页面等待订单刷新，后台确认收款后会自动发放卡密或进入人工交付。</p>
+        </div>
+
+        <div className="payment-guide-warning">
+          支付后 5 分钟如果订单状态还没刷新，或者没有发放卡密，请第一时间联系客服。
+        </div>
+
+        <div className="checkout-row"><span>订单号</span><strong>{text(props.order.orderNo)}</strong></div>
+        <div className="checkout-row"><span>订单状态</span><strong>{statusLabel(props.order)}</strong></div>
+
+        <div className="checkout-actions payment-guide-actions">
+          <button type="button" disabled={props.loading} onClick={props.onRefresh}>刷新订单状态</button>
+          <button type="button" className="ghost" onClick={props.onContact}>联系客服</button>
+          <button type="button" className="ghost" onClick={props.onViewOrder}>查看订单详情</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function RechargePaymentGuide(props: {
+  recharge: JsonRecord;
+  channel?: JsonRecord;
+  shop: JsonRecord;
+  loading: boolean;
+  onRefresh: () => void | Promise<void>;
+  onContact: () => void;
+  onClose: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const provider = text(props.recharge.provider, text((props.recharge.paymentMethod as JsonRecord | undefined)?.provider, text(props.channel?.provider)));
+  const appName = provider.includes("wechat") ? "微信" : provider.includes("alipay") ? "支付宝" : "支付平台";
+  const payableCents = text(props.recharge.payableCents, text(props.recharge.rechargeCents));
+  const amount = cents(payableCents);
+  const amountForCopy = (Number(payableCents || 0) / 100).toFixed(2);
+  const qrUrl = paymentQrUrl(props.recharge, props.channel);
+
+  async function copyAmount() {
+    await navigator.clipboard?.writeText(amountForCopy);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
+  }
+
+  return (
+    <div className="modal-backdrop payment-guide-backdrop" role="dialog" aria-modal="true" aria-label={`${appName}充值`}>
+      <section className="personal-payment-guide">
+        <div className="payment-guide-head">
+          <div>
+            <span>充值单已生成</span>
+            <h2>{appName}充值</h2>
+          </div>
+          <button type="button" className="icon-button" onClick={props.onClose}>关闭</button>
+        </div>
+
+        <div className="payment-guide-amount">
+          <span>请支付</span>
+          <strong>{amount}</strong>
+          <button type="button" className="ghost" onClick={() => void copyAmount()}>{copied ? "已复制" : "复制金额"}</button>
+        </div>
+
+        <div className="payment-guide-code">
+          {qrUrl ? (
+            <ImageWithFallback src={qrUrl} alt={`${appName}充值码`} fallback={<div className="qr-empty large">充值码</div>} />
+          ) : (
+            <div className="qr-empty large">充值码</div>
+          )}
+        </div>
+
+        <div className="payment-guide-steps">
+          <strong>请截图保存上方充值码</strong>
+          <p>打开{appName}扫一扫，选择刚保存的图片或扫码完成付款。</p>
+          <p>付款后回到商城等待后台确认，确认后余额会自动到账。</p>
+        </div>
+
+        <div className="payment-guide-warning">
+          支付后 5 分钟如果余额还没刷新，请第一时间联系客服。
+        </div>
+
+        <div className="checkout-row"><span>充值单号</span><strong>{text(props.recharge.rechargeNo)}</strong></div>
+        <div className="checkout-row"><span>充值到账</span><strong>{cents(text(props.recharge.rechargeCents))}</strong></div>
+
+        <div className="checkout-actions payment-guide-actions">
+          <button type="button" disabled={props.loading} onClick={() => void props.onRefresh()}>刷新余额</button>
+          <button type="button" className="ghost" onClick={props.onContact}>联系客服</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function PaymentAmountBreakdown(props: { baseAmountCents: string; channel?: JsonRecord }) {
+  const feeCents = paymentMethodFeeCents(props.baseAmountCents, props.channel);
+  const payableCents = String(BigInt(props.baseAmountCents || "0") + BigInt(feeCents));
+  return (
+    <div className="amount-breakdown">
+      <span>商品金额 {cents(props.baseAmountCents)}</span>
+      <span>支付手续费 {cents(feeCents)}</span>
+      <strong>应付 {cents(payableCents)}</strong>
+    </div>
+  );
+}
+
+function PaymentIcon(props: { provider: string }) {
+  const kind = props.provider.includes("wechat") ? "wechat" : props.provider.includes("alipay") || props.provider === "personal_alipay" ? "alipay" : props.provider === "balance" ? "balance" : "epay";
+  const label = kind === "wechat" ? "微" : kind === "alipay" ? "支" : kind === "balance" ? "余" : "e";
+  return <i className={`payment-icon ${kind}`} aria-hidden="true">{label}</i>;
 }
 
 function ExtractResult(props: { result: JsonRecord }) {
@@ -1230,6 +1830,8 @@ function DeliveryBlock(props: { order: JsonRecord; onExtract: (token?: string) =
   const delivery = props.order.delivery as JsonRecord | undefined;
   const codes = Array.isArray(delivery?.codes) ? delivery.codes as JsonRecord[] : [];
   const extractionToken = text(delivery?.extractionToken, "");
+  const emailDelivery = delivery?.emailDelivery as JsonRecord | undefined;
+  const passwordProtected = delivery?.purchasePasswordSet === true;
   if (text(props.order.refundStatus, "none") !== "none") {
     return (
       <div className="delivery-box unavailable">
@@ -1243,9 +1845,12 @@ function DeliveryBlock(props: { order: JsonRecord; onExtract: (token?: string) =
       <div className="delivery-box">
         <strong>自动卡密</strong>
         <span>{text(delivery?.message, "付款后自动发放卡密")}</span>
-        {delivery?.purchasePasswordSet ? <small>已设置购买密码</small> : null}
-        {delivery?.extractable && delivery?.purchasePasswordSet ? <button type="button" onClick={() => props.onExtract(extractionToken || undefined)}>提取卡密</button> : null}
-        {codes.length > 0 ? codes.map((item) => (
+        {passwordProtected ? <small>已设置购买密码</small> : null}
+        {props.order.buyerEmail || emailDelivery ? (
+          <small>邮件投递：{emailDeliveryStatusText(emailDelivery, text(props.order.buyerEmail, text(delivery?.buyerEmail, "")))}</small>
+        ) : null}
+        {passwordProtected && (delivery?.extractable || codes.length > 0) ? <button type="button" onClick={() => props.onExtract(extractionToken || undefined)}>提取卡密</button> : null}
+        {!passwordProtected && codes.length > 0 ? codes.map((item) => (
           <code key={text(item.codeId, text(item.code))}>{text(item.code)}</code>
         )) : null}
       </div>
@@ -1311,6 +1916,8 @@ function ProductCard(props: { item: JsonRecord; active: boolean; onDetail: () =>
   const tags = productTags(props.item)
     .filter((tag) => tag !== category)
     .slice(0, 2);
+  const stock = productStock(props.item);
+  const soldOut = isAutomaticProduct(props.item) && stock <= 0;
 
   return (
     <article className={props.active ? "product active" : "product"}>
@@ -1321,20 +1928,28 @@ function ProductCard(props: { item: JsonRecord; active: boolean; onDetail: () =>
       <div className="product-tags">
         <span>{category}</span>
         {tags.map((tag) => <span key={tag}>{tag}</span>)}
-        <span>库存 {productStock(props.item)}</span>
+        <span>{soldOut ? "库存不足" : `库存 ${stock}`}</span>
         <span>销量 {productSales(props.item)}</span>
       </div>
       <h2>{productName(props.item)}</h2>
       <strong>{cents(props.item.salePriceCents)}</strong>
       <div className="product-actions">
         <button type="button" className="ghost" onClick={props.onDetail}>详情</button>
-        <button type="button" onClick={props.onBuy}>购买</button>
+        <button type="button" disabled={soldOut} onClick={props.onBuy}>{soldOut ? "库存不足" : "购买"}</button>
       </div>
     </article>
   );
 }
 
-function ProductDetailPage(props: { product: JsonRecord; shop: JsonRecord; onClose: () => void; onBuy: () => void }) {
+function ProductDetailPage(props: {
+  product: JsonRecord;
+  shop: JsonRecord;
+  coupons: JsonRecord[];
+  selectedCouponId: string;
+  onSelectCoupon: (couponId: string) => void;
+  onClose: () => void;
+  onBuy: () => void;
+}) {
   const tags = productTags(props.product);
   const specs = productSpecs(props.product);
   const sections = productDetailSections(props.product);
@@ -1369,6 +1984,7 @@ function ProductDetailPage(props: { product: JsonRecord; shop: JsonRecord; onClo
                 {specs.map((spec) => <span key={spec}>{spec}</span>)}
               </div>
             ) : null}
+            <CouponPicker coupons={props.coupons} selectedCouponId={props.selectedCouponId} onSelect={props.onSelectCoupon} />
           </div>
         </section>
 
@@ -1475,8 +2091,32 @@ function isAutomaticProduct(item?: JsonRecord): boolean {
 }
 
 function requiresProductExtractionCode(item?: JsonRecord): boolean {
-  const rule = productRecord(item).fulfillmentRule as JsonRecord | undefined;
-  return isAutomaticProduct(item) && rule?.extractCodeRequired === true;
+  return isAutomaticProduct(item);
+}
+
+function isMainlandChinaMobile(value: string): boolean {
+  return /^1[3-9]\d{9}$/.test(value.trim());
+}
+
+function isValidEmail(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
+function emailDeliveryStatusText(delivery: JsonRecord | undefined, email: string): string {
+  if (!email) return "未填写邮箱";
+  const status = text(delivery?.status, "");
+  const masked = maskEmail(email);
+  if (status === "sent") return `${masked} 已记录发送`;
+  if (status === "provider_not_configured") return `${masked} 已记录，邮件服务未配置`;
+  if (status === "failed") return `${masked} 发送失败`;
+  if (status === "pending") return `${masked} 等待发送`;
+  return `${masked} 付款发码后记录投递状态`;
+}
+
+function maskEmail(value: string): string {
+  const [name, domain] = value.split("@");
+  if (!name || !domain) return value;
+  return `${name.slice(0, 2)}***@${domain}`;
 }
 
 function upsertOrder(orders: JsonRecord[], order: JsonRecord): JsonRecord[] {
@@ -1504,10 +2144,19 @@ function orderPayableAmount(quote: JsonRecord): string {
   return text(quote.buyerPaidAmountCents, text(quote.paidAmountCents, "0"));
 }
 
+function quoteOriginalAmount(quote: JsonRecord): string {
+  const quantity = BigInt(text(quote.quantity, "1") || "1");
+  const salePriceCents = text(quote.salePriceCents);
+  if (salePriceCents) return String(BigInt(salePriceCents) * quantity);
+  return text(quote.settlementBasisAmountCents, text(quote.paidAmountCents, "0"));
+}
+
 function attachPayment(order: JsonRecord, payment: JsonRecord): JsonRecord {
   const paymentSnapshot = isRecord(payment.paymentSnapshot) ? payment.paymentSnapshot : {};
+  const payableAmountCents = text(payment.amountCents, text(paymentSnapshot.amountCents));
   return {
     ...order,
+    ...(payableAmountCents ? { buyerPaidAmountCents: payableAmountCents } : {}),
     paymentClient: payment,
     paymentSnapshot,
     paymentStatus: text(payment.status) === "created" ? "paying" : text(order.paymentStatus, "unpaid")
@@ -1555,26 +2204,106 @@ function inferPaymentVoucherChannel(channel?: JsonRecord): string {
   return "";
 }
 
-function selectedCollectionChannel(channels: JsonRecord[], selectedChannelId?: string): JsonRecord | undefined {
+function selectedPaymentMethod(channels: JsonRecord[], selectedChannelId?: string): JsonRecord | undefined {
   return channels.find((item) => text(item.id) === selectedChannelId) ?? channels[0];
 }
 
-function isPersonalAlipayChannel(channel?: JsonRecord): boolean {
-  return text(channel?.channelType).startsWith("alipay_personal");
+function effectivePaymentMethodId(channels: JsonRecord[], selectedChannelId: string, wallet?: JsonRecord, baseAmountCents?: string): string {
+  const balanceDefault = defaultPaymentMethodId(channels, wallet, baseAmountCents);
+  if (balanceDefault === "balance") return balanceDefault;
+  return channels.some((item) => text(item.id) === selectedChannelId)
+    ? selectedChannelId
+    : balanceDefault;
 }
 
-function isInterfaceCollectionChannel(channel?: JsonRecord): boolean {
+function defaultPaymentMethodId(channels: JsonRecord[], wallet?: JsonRecord, baseAmountCents?: string): string {
+  const balance = channels.find((item) => text(item.id) === "balance" || text(item.provider) === "balance");
+  const base = BigInt(baseAmountCents || "0");
+  const available = BigInt(text(wallet?.availableBalanceCents, "0"));
+  if (balance && base > 0n && available >= base) return text(balance.id);
+  const personalFirst = channels.find((item) => {
+    const provider = text(item.provider);
+    return provider !== "balance" && (isPersonalPaymentProvider(provider) || isPersonalPaymentMethod(item));
+  });
+  if (personalFirst) return text(personalFirst.id);
+  const externalDefault = channels.find((item) => text(item.provider) !== "balance" && item.isDefault === true);
+  const externalFirst = channels.find((item) => text(item.provider) !== "balance");
+  return text((externalDefault ?? externalFirst ?? balance)?.id, "");
+}
+
+function defaultRechargePaymentMethodId(channels: JsonRecord[], selectedChannelId?: string): string {
+  const externalChannels = channels.filter((item) => text(item.id) !== "balance" && text(item.provider) !== "balance");
+  if (externalChannels.some((item) => text(item.id) === selectedChannelId)) return selectedChannelId ?? "";
+  const personalFirst = externalChannels.find((item) => isPersonalPaymentProvider(text(item.provider)) || isPersonalPaymentMethod(item));
+  const defaultExternal = externalChannels.find((item) => item.isDefault === true);
+  return text((personalFirst ?? defaultExternal ?? externalChannels[0])?.id, "");
+}
+
+function isPositiveInteger(value: string): boolean {
+  return /^[1-9]\d*$/.test(value);
+}
+
+function paymentMethodFeeCents(baseAmountCents: string, channel?: JsonRecord): string {
+  const base = BigInt(baseAmountCents || "0");
+  const bps = Number(text(channel?.paymentFeeBps, text(channel?.feeBps, "0")));
+  if (!Number.isFinite(bps) || bps <= 0) return "0";
+  return ((base * BigInt(Math.trunc(bps))) / 10000n).toString();
+}
+
+function isPersonalPaymentProvider(provider: string): boolean {
+  return provider === "personal_alipay" || provider === "wechat_personal";
+}
+
+function isPersonalPaymentMethod(channel?: JsonRecord): boolean {
+  const type = text(channel?.channelType);
+  return type.startsWith("alipay_personal") || type.startsWith("wechat_personal");
+}
+
+function isInterfacePaymentMethod(channel?: JsonRecord): boolean {
   const type = text(channel?.channelType);
   return type.startsWith("alipay_merchant") || type.startsWith("wechat_merchant") || type.startsWith("epay");
 }
 
+function isPersonalPayment(payment?: JsonRecord, channel?: JsonRecord): boolean {
+  return isPersonalPaymentProvider(paymentProviderFrom(payment, channel)) || isPersonalPaymentMethod(channel);
+}
+
+function isOfficialPayment(payment?: JsonRecord, channel?: JsonRecord): boolean {
+  const provider = paymentProviderFrom(payment, channel);
+  return provider === "alipay_merchant" || provider === "wechat_merchant" || provider === "epay" || isInterfacePaymentMethod(channel);
+}
+
+function paymentRedirectUrl(payment?: JsonRecord): string {
+  const paymentParams = payment?.paymentParams as JsonRecord | undefined;
+  const directAppUrl = text(paymentParams?.directAppUrl);
+  if (/^(alipays?:\/\/|weixin:\/\/)/i.test(directAppUrl)) return directAppUrl;
+  const explicitUrl = text(paymentParams?.paymentUrl);
+  if (explicitUrl) return explicitUrl;
+  const qrCodeUrl = text(paymentParams?.qrCodeUrl);
+  return /^https?:\/\//.test(qrCodeUrl) && !usableImageSrc(qrCodeUrl) ? qrCodeUrl : "";
+}
+
+function paymentProviderFrom(payment?: JsonRecord, channel?: JsonRecord): string {
+  const paymentMethod = payment?.paymentMethod as JsonRecord | undefined;
+  return text(payment?.provider, text(paymentMethod?.provider, text(channel?.provider, text(channel?.channelType))));
+}
+
+function paymentQrUrl(payment?: JsonRecord, channel?: JsonRecord): string {
+  const paymentParams = payment?.paymentParams as JsonRecord | undefined;
+  const paymentMethod = payment?.paymentMethod as JsonRecord | undefined;
+  return text(paymentParams?.qrCodeUrl, text(paymentMethod?.qrUrl, text(channel?.qrUrl)));
+}
+
 function paymentChannelDisplayName(channel?: JsonRecord): string {
+  const provider = text(channel?.provider);
+  if (provider) return paymentProviderDisplayName(provider);
   const type = text(channel?.channelType);
   if (type.startsWith("alipay_merchant")) return "支付宝商户收款";
   if (type.startsWith("wechat_merchant")) return "腾讯/微信商户收款";
   if (type.startsWith("epay")) return "e支付收款";
   if (type.startsWith("alipay_personal")) return "个人支付宝收款";
-  return "店铺收款通道";
+  if (type.startsWith("wechat_personal")) return "个人微信收款";
+  return "店铺收款方式";
 }
 
 function paymentProviderDisplayName(provider: string): string {
@@ -1582,7 +2311,52 @@ function paymentProviderDisplayName(provider: string): string {
   if (provider === "wechat_merchant") return "腾讯/微信商户收款";
   if (provider === "epay") return "e支付收款";
   if (provider === "personal_alipay") return "个人支付宝收款";
-  return "店铺收款通道";
+  if (provider === "wechat_personal") return "个人微信收款";
+  if (provider === "balance") return "余额支付";
+  return "店铺收款方式";
+}
+
+function paymentProviderPublicLabelForH5(provider: string, channel?: JsonRecord): string {
+  const serverLabel = text(channel?.publicLabel);
+  if (serverLabel) return serverLabel;
+  if (provider === "balance") return "余额支付";
+  const feeBps = Number(text(channel?.paymentFeeBps, text(channel?.feeBps, "0")));
+  const suffix = feeBps > 0 ? `+${(feeBps / 100).toFixed(0)}%` : "";
+  const type = provider || text(channel?.channelType);
+  if (type === "personal_alipay" || type.startsWith("alipay_personal")) return `支付宝${suffix}（个人）`;
+  if (type === "wechat_personal" || type.startsWith("wechat_personal")) return `微信${suffix}（个人）`;
+  if (type === "alipay_merchant" || type.startsWith("alipay_merchant")) return `支付宝${suffix}（商家）`;
+  if (type === "wechat_merchant" || type.startsWith("wechat_merchant")) return `微信${suffix}（商家）`;
+  if (type === "epay" || type.startsWith("epay")) return `e支付${suffix}（商家）`;
+  return paymentChannelDisplayName(channel);
+}
+
+function paymentTileTitle(channel: JsonRecord): string {
+  const provider = text(channel.provider);
+  const type = provider || text(channel.channelType);
+  if (type === "balance" || text(channel.id) === "balance") return "余额支付";
+  if (type.includes("wechat") || type.includes("alipay") || type.includes("epay")) return paymentProviderPublicLabelForH5(type, channel);
+  return paymentProviderPublicLabelForH5(provider, channel);
+}
+
+function paymentTileSubtitle(channel: JsonRecord): string {
+  const provider = text(channel.provider);
+  const type = provider || text(channel.channelType);
+  if (type === "balance" || text(channel.id) === "balance") return "原价扣款";
+  if (type === "personal_alipay" || type.startsWith("alipay_personal")) return "保存码后扫码";
+  if (type === "wechat_personal" || type.startsWith("wechat_personal")) return "保存码后扫码";
+  if (type.includes("alipay") || type.includes("wechat") || type.includes("epay")) return "跳转官方支付";
+  return "可用";
+}
+
+function paymentTypeLabel(provider: string, channel?: JsonRecord): string {
+  const type = provider || text(channel?.channelType);
+  if (type === "personal_alipay" || type.startsWith("alipay_personal")) return "个人";
+  if (type === "wechat_personal" || type.startsWith("wechat_personal")) return "个人";
+  if (type === "alipay_merchant" || type.startsWith("alipay_merchant")) return "商家";
+  if (type === "wechat_merchant" || type.startsWith("wechat_merchant")) return "商家";
+  if (type === "epay" || type.startsWith("epay")) return "商家";
+  return "收款方式";
 }
 
 function orderProductName(order: JsonRecord): string {
@@ -1596,9 +2370,10 @@ function statusLabel(order: JsonRecord): string {
   if (["refunded", "success", "succeeded"].includes(refundStatus)) return "已退款";
   if (refundStatus !== "none") return "售后处理中";
   if (text(order.paymentStatus) === "paid") return "已支付";
-  const channel = order.collectionChannelSnapshot as JsonRecord | undefined;
-  if (isPersonalAlipayChannel(channel)) return "待商户确认收款";
-  if (isInterfaceCollectionChannel(channel)) return "待官方确认支付";
+  const method = order.paymentMethodSnapshot as JsonRecord | undefined
+    ?? order.paymentSnapshot as JsonRecord | undefined;
+  if (isPersonalPaymentMethod(method)) return "待商户确认收款";
+  if (isInterfacePaymentMethod(method)) return "待官方确认支付";
   return "待支付";
 }
 
@@ -1607,6 +2382,25 @@ function authLabel(session: AuthSession): string {
   if (identityType === "h5_phone") return `手机号用户 ${text(session.user.phone)}`;
   if (identityType.startsWith("wechat")) return "微信用户";
   return "游客身份";
+}
+
+function canRecharge(session?: AuthSession): boolean {
+  const identityType = text(session?.user.identityType);
+  return identityType === "h5_phone" || identityType.startsWith("wechat");
+}
+
+function yuanInputValue(centsValue: string): string {
+  const centsNumber = Number(centsValue || 0);
+  if (!Number.isFinite(centsNumber) || centsNumber <= 0) return "";
+  return centsNumber % 100 === 0 ? String(centsNumber / 100) : (centsNumber / 100).toFixed(2);
+}
+
+function yuanToCentsInput(value: string): string {
+  const normalized = value.replace(/[^\d.]/g, "");
+  const [yuan = "", centsPart = ""] = normalized.split(".");
+  const centsDigits = centsPart.slice(0, 2).padEnd(2, "0");
+  const centsValue = `${yuan || "0"}${centsDigits}`.replace(/^0+(?=\d)/, "");
+  return centsValue || "0";
 }
 
 function cacheKey(shopId: string): string {
@@ -1643,4 +2437,7 @@ function redactCachedOrder(order: JsonRecord): JsonRecord {
   };
 }
 
-createRoot(document.getElementById("root")!).render(<App />);
+const h5RootElement = document.getElementById("root")!;
+const h5Runtime = globalThis as typeof globalThis & { __tosellH5Root?: ReturnType<typeof createRoot> };
+h5Runtime.__tosellH5Root ??= createRoot(h5RootElement);
+h5Runtime.__tosellH5Root.render(<App />);

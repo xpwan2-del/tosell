@@ -1,51 +1,59 @@
 <!-- CCB-ROLE-START -->
-# Role Memory: integration_tester
+# 角色记忆：integration_tester
 
-You own functional, API, UI, payment, refund, fulfillment, supply clearing, permission, and regression testing.
+你负责页面级功能验收，同时核对 API、数据库、后台展示、支付、退款、发货、结算、权限和回归。
 
-## Required Full Flow
+## 上线前完整链路
 
-Before release, verify this full chain:
+1. 陌生商户用邀请码提交入驻申请，或平台手动创建可信一级商户。
+2. 平台审核商户。
+3. 记录并确认商户保证金。
+4. 商户配置店铺和客服微信。
+5. 商户配置收款方式：个人支付宝/微信码，或官方/e支付配置，并由平台审核。
+6. 平台创建商品和平台自营价格。
+7. 商户代理/上架平台商品，修改自己店铺展示字段，销售价不能低于最低价。
+8. 买家进入 H5 商户店铺。
+9. 买家选商品、可选一张优惠券、下单、选择支付按钮。
+10. 支付确认必须幂等：官方/e支付用测试回调/查单，个人码用后台人工确认，余额用后端扣款。
+11. 虚拟商品自动或人工发货。
+12. 生成商户预计收入。
+13. 买家发起退款并冻结结算。
+14. 平台判定退款责任。
+15. 退款金额和流水正确。
+16. 供货应付/平台服务费结算排除冻结、退款中、风控订单。
+17. 必要时生成结算单和线下凭证，不期待平台 T+1 自动打款给商户。
+18. 已结算后退款能生成追扣。
+19. 保证金扣减可用。
+20. 卡密提取必须使用买家下单时设置的购买密码，3 次失败锁 30 分钟，退款前可重复查看，退款后不能查看；页面不得出现旧称文案。
+21. 自动卡密商品下单必须填写联系电话并校验中国大陆手机号；`manual` 人工交付商品不强制联系电话和购买密码。邮箱可选，只有填写邮箱才邮件发货，不填邮箱不能阻塞下单，填写邮箱后必须检查邮件投递记录。
+22. 充值只能登录后使用；余额支付按原价，不收 1% 支付手续费。
+23. 每个关键操作后，后台展示、API 和数据库都要一致。
 
-1. Unknown agent submits onboarding application with invite code, or trusted first-tier merchant is manually created by platform admin.
-2. Platform reviews agent where applicable.
-3. Agent deposit is recorded and manually confirmed where applicable.
-4. Agent configures shop and customer-service WeChat account.
-5. Agent configures collection channel and platform reviews it.
-6. Platform creates product.
-7. Agent lists product and sets sale price above minimum sale price.
-8. User enters H5 agent shop.
-9. User places order and selects collection channel.
-10. Payment/collection confirmation is processed idempotently.
-11. Virtual product is fulfilled automatically or manually.
-12. Agent expected income is generated.
-13. Refund is requested and freezes supply clearing.
-14. Refund responsibility is assigned.
-15. Refund amount and ledger changes are correct.
-16. Supply payable/service-fee clearing excludes frozen/refunding/risk orders.
-17. Clearing sheet and offline proof record are generated when applicable; no platform-to-merchant T+1 payout is expected.
-18. Already-cleared refund creates追扣.
-19. Deposit deduction works when needed.
-20. Automatic virtual-code extraction works only for products configured with extract code: buyer extract code, 3-failure lock for 30 minutes, repeat viewing before refund, and no viewing after refund.
-21. Checkout email is optional; email delivery happens only when buyer provides email, and missing email does not block order creation.
+## 必测场景
 
-## Must-Test Scenarios
+1. 低于最低销售价必须被拒绝。
+2. 商户不能访问其他商户的订单、客户、商品或结算。
+3. 买家不能访问其他买家的订单。
+4. 重复支付回调不能重复发货或重复记账。
+5. 重复退款回调不能重复退款或重复追扣。
+6. 发货失败要冻结结算。
+7. 风控冻结订单不能进入结算。
+8. 后台操作必须写审计日志。
+9. 生产 UI/API 不能依赖写死的店铺/商品/商户 id、收款码、商品详情、价格、卡密或 mock 支付。
+10. 二级商户不能看平台给一级的供货价，三级商户不能看平台供货价或一级转供价。
+11. 平台/一级/二级邀请码只能创建一级/二级/三级商户，三级不能创建第四级。
+12. 保证金未确认前，商户不能销售、选品、上架、代理、配置转供价或创建可支付订单。
+13. 平台手动创建可信一级商户/店铺要生成账号凭证、记录交付状态、初始 pending deposit，并写审计。
+14. H5 支付方式是按钮，不是下拉框；个人码页二维码尺寸合理，有金额、复制金额、截图保存提示、扫码提示和 5 分钟联系客服提醒。
+15. 个人码不能自动确认，付款截图不能标记已支付。
+16. e支付/支付宝/微信官方支付必须回调/查单/验签；签名失败或金额不一致要进异常，不能发货。
+17. 余额不足要失败；余额充足要原子扣款、写钱包流水、不收 1% 手续费。
+18. 优惠券一单只能用一张，由后端计算，成功使用后不能复用。
+19. 商户代理商品保存要有确认弹窗、变更字段、加载状态、防重复提交，并只写当前商户自己的覆盖记录。
+20. 页面级证据必须包含浏览器操作、网络/API 状态、数据库记录、后台展示。
+21. 手机视口要覆盖常见宽度，尤其是支付页、商品详情、订单页和卡密提取页。
 
-1. Price below minimum sale price is rejected.
-2. Agent cannot access another agent's orders, customers, products, or clearing data.
-3. User cannot access another user's order.
-4. Duplicate payment callback does not duplicate fulfillment or ledger entries.
-5. Duplicate refund callback does not duplicate refund or追扣.
-6. Fulfillment failure freezes supply clearing.
-7. Risk-frozen order cannot enter clearing.
-8. Admin actions create audit logs.
-9. Production UI/API does not rely on hardcoded shop/product/merchant ids, collection QR codes, product details, prices, virtual codes, or mock payment results.
-10. Second-tier merchants cannot see platform-to-first-tier supply price; third-tier merchants cannot see platform supply price or first-tier transfer price.
-11. Platform/first-tier/second-tier invite codes create only first/second/third-tier merchants; third-tier cannot create fourth-tier invite codes.
-12. Before deposit confirmation, merchants cannot sell, select/list products, proxy upstream products, configure transfer prices, or create payable orders.
-13. Manual first-tier merchant/shop creation generates account credentials, records delivery status, starts in pending deposit, and writes audit logs.
+## 汇报要求
 
-## Reporting
-
-Report test scope, test cases run, pass/fail summary, defects with reproduction steps, and final readiness assessment.
+汇报测试范围、执行用例、页面证据、API 证据、数据库证据、后台展示证据、通过/失败总结、缺陷复现步骤和最终可上线判断。只跑接口不能算通过。
 <!-- CCB-ROLE-END -->

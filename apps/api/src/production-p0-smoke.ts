@@ -59,13 +59,40 @@ function assertStatus(value: Record<string, any> | undefined, label: string, key
   }
 }
 
+const transientRetryDelaysMs = [1000, 2500, 5000] as const;
+
+function sleepMs(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientDatabaseError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("DATABASE_UNAVAILABLE")
+    || message.includes("configured PostgreSQL database is unavailable")
+    || message.includes("Can't reach database server");
+}
+
+async function withTransientRetry<T>(action: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= transientRetryDelaysMs.length; attempt += 1) {
+    try {
+      return await action();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientDatabaseError(error) || attempt === transientRetryDelaysMs.length) break;
+      await sleepMs(transientRetryDelaysMs[attempt]);
+    }
+  }
+  throw lastError;
+}
+
 async function createLimitedOperatorFixture(adminUsername: string) {
   const prisma = new PrismaClient();
   const username = `${adminUsername}-operator-${suffix}`;
   const password = `operator-${suffix}`;
   const passwordHash = `sha256:${createHash("sha256").update(password).digest("hex")}`;
   try {
-    const [operator, role] = await Promise.all([
+    const [operator, role] = await withTransientRetry(() => Promise.all([
       prisma.adminUser.upsert({
         where: { username },
         update: {
@@ -85,11 +112,11 @@ async function createLimitedOperatorFixture(adminUsername: string) {
         update: { name: "Operator" },
         create: { code: "operator", name: "Operator" }
       })
-    ]);
-    await prisma.adminUserRole.createMany({
+    ]));
+    await withTransientRetry(() => prisma.adminUserRole.createMany({
       data: [{ adminUserId: operator.id, roleId: role.id }],
       skipDuplicates: true
-    });
+    }));
     return { username, password };
   } finally {
     await prisma.$disconnect();
@@ -125,14 +152,18 @@ async function injectJson(app: SmokeApp, label: string, options: InjectOptions, 
   logSmoke("start", label, { method, path, timeoutMs: STEP_TIMEOUT_MS });
   const startedAt = Date.now();
   try {
-    const response = await withTimeout(
-      label,
-      `${method} ${path}`,
-      STEP_TIMEOUT_MS,
-      () => app.inject(options as never) as Promise<InjectResponse>
-    );
-    const body = await expectJson(response, expectedStatus, label);
-    logSmoke("pass", label, { method, path, statusCode: response.statusCode, durationMs: Date.now() - startedAt });
+    let statusCode = expectedStatus;
+    const body = await withTransientRetry(async () => {
+      const response = await withTimeout(
+        label,
+        `${method} ${path}`,
+        STEP_TIMEOUT_MS,
+        () => app.inject(options as never) as Promise<InjectResponse>
+      );
+      statusCode = response.statusCode;
+      return expectJson(response, expectedStatus, label);
+    });
+    logSmoke("pass", label, { method, path, statusCode, durationMs: Date.now() - startedAt });
     return body;
   } catch (error) {
     logSmoke("fail", label, {
@@ -246,9 +277,9 @@ async function runSmoke() {
     }
   });
 
-  const manualAgent = await injectJson(app, "manual first-tier merchant", {
+  const manualMerchant = await injectJson(app, "manual first-tier merchant", {
     method: "POST",
-    url: "/api/admin/agents/manual",
+    url: "/api/admin/merchants/manual",
     headers: adminHeaders,
     payload: {
       name: `P0一级商户-${suffix}`,
@@ -261,7 +292,7 @@ async function runSmoke() {
   });
   await injectJson(app, "deposit confirm", {
     method: "POST",
-    url: `/api/admin/deposits/${manualAgent.agent.id}/confirm`,
+    url: `/api/admin/deposits/${manualMerchant.merchant.id}/confirm`,
     headers: adminHeaders,
     payload: { amountCents: "50000", voucherUrl: `fixture://deposit/${suffix}` }
   });
@@ -279,9 +310,9 @@ async function runSmoke() {
     }
   });
 
-  const pendingDepositAgent = await injectJson(app, "deposit gate pending merchant create", {
+  const pendingDepositMerchant = await injectJson(app, "deposit gate pending merchant create", {
     method: "POST",
-    url: "/api/admin/agents/manual",
+    url: "/api/admin/merchants/manual",
     headers: adminHeaders,
     payload: {
       name: `P0待保证金商户-${suffix}`,
@@ -292,19 +323,19 @@ async function runSmoke() {
       depositAmountCents: "0"
     }
   });
-  const pendingAgentLogin = await injectJson(app, "deposit gate pending merchant login", {
+  const pendingMerchantLogin = await injectJson(app, "deposit gate pending merchant login", {
     method: "POST",
-    url: "/api/auth/agent/login",
+    url: "/api/auth/merchant/login",
     payload: {
-      account: pendingDepositAgent.credential.account,
-      password: pendingDepositAgent.credential.initialPassword
+      account: pendingDepositMerchant.credential.account,
+      password: pendingDepositMerchant.credential.initialPassword
     }
   });
-  const pendingAgentHeaders = { authorization: `Bearer ${pendingAgentLogin.token}` };
+  const pendingMerchantHeaders = { authorization: `Bearer ${pendingMerchantLogin.token}` };
   await injectErrorCode(app, "deposit gate blocks product listing", {
     method: "POST",
-    url: "/api/agent/products/platform",
-    headers: pendingAgentHeaders,
+    url: "/api/merchant/products/platform",
+    headers: pendingMerchantHeaders,
     payload: {
       platformProductId: platformProduct.id,
       salePriceCents: "1500"
@@ -320,8 +351,8 @@ async function runSmoke() {
     url: "/api/user/orders",
     headers: { authorization: `Bearer ${depositGateBuyer.token}` },
     payload: {
-      shopId: pendingDepositAgent.shop.id,
-      agentProductId: platformProduct.id,
+      shopId: pendingDepositMerchant.shop.id,
+      merchantProductListingId: platformProduct.id,
       clientPaidAmountCents: "1500"
     }
   }, 400, "DEPOSIT_INSUFFICIENT");
@@ -363,19 +394,19 @@ async function runSmoke() {
     throw new Error("rights code plaintext access audit was not recorded");
   }
 
-  const agentLogin = await injectJson(app, "manual merchant login", {
+  const merchantLogin = await injectJson(app, "manual merchant login", {
     method: "POST",
-    url: "/api/auth/agent/login",
+    url: "/api/auth/merchant/login",
     payload: {
-      account: manualAgent.credential.account,
-      password: manualAgent.credential.initialPassword
+      account: manualMerchant.credential.account,
+      password: manualMerchant.credential.initialPassword
     }
   });
-  const agentHeaders = { authorization: `Bearer ${agentLogin.token}` };
-  await injectJson(app, "agent session bearer", {
+  const merchantHeaders = { authorization: `Bearer ${merchantLogin.token}` };
+  await injectJson(app, "merchant session bearer", {
     method: "GET",
-    url: "/api/auth/agent/session",
-    headers: agentHeaders
+    url: "/api/auth/merchant/session",
+    headers: merchantHeaders
   });
 
   const inviteFirst = await injectJson(app, "invite first-tier create", {
@@ -389,7 +420,7 @@ async function runSmoke() {
   });
   const invitedFirst = await injectJson(app, "invite first-tier register", {
     method: "POST",
-    url: "/api/agent/register-by-invite",
+    url: "/api/merchant/register-by-invite",
     payload: {
       inviteCode: inviteFirst.code,
       name: `P0邀请一级-${suffix}`,
@@ -398,53 +429,53 @@ async function runSmoke() {
   });
   await injectJson(app, "invite first-tier review approve", {
     method: "POST",
-    url: `/api/admin/agents/${invitedFirst.agent.id}/review`,
+    url: `/api/admin/merchants/${invitedFirst.merchant.id}/review`,
     headers: adminHeaders,
     payload: { approved: true }
   });
   await injectJson(app, "invite first-tier deposit confirm", {
     method: "POST",
-    url: `/api/admin/deposits/${invitedFirst.agent.id}/confirm`,
+    url: `/api/admin/deposits/${invitedFirst.merchant.id}/confirm`,
     headers: adminHeaders,
     payload: { amountCents: "50000", voucherUrl: `fixture://deposit/invite-first-${suffix}` }
   });
   const invitedFirstLogin = await injectJson(app, "invite first-tier merchant login", {
     method: "POST",
-    url: "/api/auth/agent/login",
+    url: "/api/auth/merchant/login",
     payload: {
       account: invitedFirst.credential.account,
       password: invitedFirst.credential.initialPassword
     }
   });
   const invitedFirstHeaders = { authorization: `Bearer ${invitedFirstLogin.token}` };
-  await injectJson(app, "invite first-tier agent shop bearer", {
+  await injectJson(app, "invite first-tier merchant shop bearer", {
     method: "GET",
-    url: "/api/agent/shop",
+    url: "/api/merchant/shop",
     headers: invitedFirstHeaders
   });
-  await injectJson(app, "invite first-tier agent products bearer", {
+  await injectJson(app, "invite first-tier merchant products bearer", {
     method: "GET",
-    url: "/api/agent/products",
+    url: "/api/merchant/products",
     headers: invitedFirstHeaders
   });
 
   await injectJson(app, "first-tier channel authorization approve", {
     method: "POST",
-    url: `/api/admin/channels/${invitedFirst.agent.id}/review`,
+    url: `/api/admin/merchant-supply/${invitedFirst.merchant.id}/review`,
     headers: adminHeaders,
     payload: { approved: true }
   });
   const inviteSecond = await injectJson(app, "invite second-tier create", {
     method: "POST",
-    url: "/api/agent/invite-codes",
+    url: "/api/merchant/invite-codes",
     headers: invitedFirstHeaders,
     payload: { code: `P0-SECOND-${suffix}` }
   });
   if (
     inviteSecond.code !== `P0-SECOND-${suffix}`
     || inviteSecond.targetTier !== "second_tier"
-    || inviteSecond.issuer?.agentId !== invitedFirst.agent.id
-    || inviteSecond.currentMerchantScope?.agentId !== invitedFirst.agent.id
+    || inviteSecond.issuer?.merchantId !== invitedFirst.merchant.id
+    || inviteSecond.currentMerchantScope?.merchantId !== invitedFirst.merchant.id
     || inviteSecond.depositRequiredAmountCents === undefined
     || containsKey(inviteSecond, "codeHash")
   ) {
@@ -452,7 +483,7 @@ async function runSmoke() {
   }
   const firstInviteList = await injectJson(app, "first-tier invite list scoped", {
     method: "GET",
-    url: "/api/agent/invite-codes",
+    url: "/api/merchant/invite-codes",
     headers: invitedFirstHeaders
   });
   assertMissingKeys(firstInviteList, "first-tier invite list scoped", ["codeHash"]);
@@ -462,7 +493,7 @@ async function runSmoke() {
   }
   const invitedSecond = await injectJson(app, "invite second-tier register", {
     method: "POST",
-    url: "/api/agent/register-by-invite",
+    url: "/api/merchant/register-by-invite",
     payload: {
       inviteCode: inviteSecond.code,
       name: `P0邀请二级-${suffix}`,
@@ -471,19 +502,19 @@ async function runSmoke() {
   });
   await injectJson(app, "invite second-tier review approve", {
     method: "POST",
-    url: `/api/admin/agents/${invitedSecond.agent.id}/review`,
+    url: `/api/admin/merchants/${invitedSecond.merchant.id}/review`,
     headers: adminHeaders,
     payload: { approved: true }
   });
   await injectJson(app, "invite second-tier deposit confirm", {
     method: "POST",
-    url: `/api/admin/deposits/${invitedSecond.agent.id}/confirm`,
+    url: `/api/admin/deposits/${invitedSecond.merchant.id}/confirm`,
     headers: adminHeaders,
     payload: { amountCents: "50000", voucherUrl: `fixture://deposit/invite-second-${suffix}` }
   });
   const invitedSecondLogin = await injectJson(app, "invite second-tier merchant login", {
     method: "POST",
-    url: "/api/auth/agent/login",
+    url: "/api/auth/merchant/login",
     payload: {
       account: invitedSecond.credential.account,
       password: invitedSecond.credential.initialPassword
@@ -492,17 +523,17 @@ async function runSmoke() {
   const invitedSecondHeaders = { authorization: `Bearer ${invitedSecondLogin.token}` };
   const firstSecondRelation = await injectJson(app, "first-second channel relation active", {
     method: "POST",
-    url: "/api/admin/channels/relations",
+    url: "/api/admin/merchant-supply/relations",
     headers: adminHeaders,
     payload: {
-      firstTierAgentId: invitedFirst.agent.id,
-      secondTierAgentId: invitedSecond.agent.id,
+      firstTierMerchantId: invitedFirst.merchant.id,
+      secondTierMerchantId: invitedSecond.merchant.id,
       reason: "production smoke price isolation"
     }
   });
   await injectJson(app, "first-second transfer price offer", {
     method: "POST",
-    url: "/api/admin/channels/offers",
+    url: "/api/admin/merchant-supply/offers",
     headers: adminHeaders,
     payload: {
       channelRelationId: firstSecondRelation.id,
@@ -513,10 +544,10 @@ async function runSmoke() {
   });
   await injectJson(app, "merchant first-tier transfer price offer", {
     method: "POST",
-    url: "/api/agent/channels/offers",
+    url: "/api/merchant/supply/offers",
     headers: invitedFirstHeaders,
     payload: {
-      downstreamAgentId: invitedSecond.agent.id,
+      downstreamMerchantId: invitedSecond.merchant.id,
       platformProductId: platformProduct.id,
       resellSupplyPriceCents: "1100",
       status: "listed"
@@ -524,15 +555,15 @@ async function runSmoke() {
   });
   const inviteThird = await injectJson(app, "invite third-tier create", {
     method: "POST",
-    url: "/api/agent/invite-codes",
+    url: "/api/merchant/invite-codes",
     headers: invitedSecondHeaders,
     payload: { code: `P0-THIRD-${suffix}` }
   });
   if (
     inviteThird.code !== `P0-THIRD-${suffix}`
     || inviteThird.targetTier !== "third_tier"
-    || inviteThird.issuer?.agentId !== invitedSecond.agent.id
-    || inviteThird.currentMerchantScope?.agentId !== invitedSecond.agent.id
+    || inviteThird.issuer?.merchantId !== invitedSecond.merchant.id
+    || inviteThird.currentMerchantScope?.merchantId !== invitedSecond.merchant.id
     || inviteThird.depositRequiredAmountCents === undefined
     || containsKey(inviteThird, "codeHash")
   ) {
@@ -540,7 +571,7 @@ async function runSmoke() {
   }
   const secondInviteList = await injectJson(app, "second-tier invite list scoped", {
     method: "GET",
-    url: "/api/agent/invite-codes",
+    url: "/api/merchant/invite-codes",
     headers: invitedSecondHeaders
   });
   assertMissingKeys(secondInviteList, "second-tier invite list scoped", ["codeHash"]);
@@ -550,7 +581,7 @@ async function runSmoke() {
   }
   const invitedThird = await injectJson(app, "invite third-tier register", {
     method: "POST",
-    url: "/api/agent/register-by-invite",
+    url: "/api/merchant/register-by-invite",
     payload: {
       inviteCode: inviteThird.code,
       name: `P0邀请三级-${suffix}`,
@@ -559,19 +590,19 @@ async function runSmoke() {
   });
   await injectJson(app, "invite third-tier review approve", {
     method: "POST",
-    url: `/api/admin/agents/${invitedThird.agent.id}/review`,
+    url: `/api/admin/merchants/${invitedThird.merchant.id}/review`,
     headers: adminHeaders,
     payload: { approved: true }
   });
   await injectJson(app, "invite third-tier deposit confirm", {
     method: "POST",
-    url: `/api/admin/deposits/${invitedThird.agent.id}/confirm`,
+    url: `/api/admin/deposits/${invitedThird.merchant.id}/confirm`,
     headers: adminHeaders,
     payload: { amountCents: "50000", voucherUrl: `fixture://deposit/invite-third-${suffix}` }
   });
   const invitedThirdLogin = await injectJson(app, "invite third-tier merchant login", {
     method: "POST",
-    url: "/api/auth/agent/login",
+    url: "/api/auth/merchant/login",
     payload: {
       account: invitedThird.credential.account,
       password: invitedThird.credential.initialPassword
@@ -580,18 +611,18 @@ async function runSmoke() {
   const invitedThirdHeaders = { authorization: `Bearer ${invitedThirdLogin.token}` };
   const threeTierRelation = await injectJson(app, "first-second-third channel relation active", {
     method: "POST",
-    url: "/api/admin/channels/relations",
+    url: "/api/admin/merchant-supply/relations",
     headers: adminHeaders,
     payload: {
-      firstTierAgentId: invitedFirst.agent.id,
-      secondTierAgentId: invitedSecond.agent.id,
-      thirdTierAgentId: invitedThird.agent.id,
+      firstTierMerchantId: invitedFirst.merchant.id,
+      secondTierMerchantId: invitedSecond.merchant.id,
+      thirdTierMerchantId: invitedThird.merchant.id,
       reason: "production smoke price isolation"
     }
   });
   await injectJson(app, "second-third transfer price offer", {
     method: "POST",
-    url: "/api/admin/channels/offers",
+    url: "/api/admin/merchant-supply/offers",
     headers: adminHeaders,
     payload: {
       channelRelationId: threeTierRelation.id,
@@ -602,10 +633,10 @@ async function runSmoke() {
   });
   await injectJson(app, "merchant second-tier transfer price offer", {
     method: "POST",
-    url: "/api/agent/channels/offers",
+    url: "/api/merchant/supply/offers",
     headers: invitedSecondHeaders,
     payload: {
-      downstreamAgentId: invitedThird.agent.id,
+      downstreamMerchantId: invitedThird.merchant.id,
       platformProductId: platformProduct.id,
       resellSupplyPriceCents: "1300",
       status: "listed"
@@ -613,10 +644,10 @@ async function runSmoke() {
   });
   await injectErrorCode(app, "merchant third-tier transfer price rejected", {
     method: "POST",
-    url: "/api/agent/channels/offers",
+    url: "/api/merchant/supply/offers",
     headers: invitedThirdHeaders,
     payload: {
-      downstreamAgentId: invitedFirst.agent.id,
+      downstreamMerchantId: invitedFirst.merchant.id,
       platformProductId: platformProduct.id,
       resellSupplyPriceCents: "1500",
       status: "listed"
@@ -624,18 +655,18 @@ async function runSmoke() {
   }, 403, "FOURTH_TIER_FORBIDDEN");
   await injectErrorCode(app, "merchant cross-relation transfer price rejected", {
     method: "POST",
-    url: "/api/agent/channels/offers",
+    url: "/api/merchant/supply/offers",
     headers: invitedFirstHeaders,
     payload: {
-      downstreamAgentId: invitedThird.agent.id,
+      downstreamMerchantId: invitedThird.merchant.id,
       platformProductId: platformProduct.id,
       resellSupplyPriceCents: "1500",
       status: "listed"
     }
-  }, 403, "FORBIDDEN_AGENT_SCOPE");
+  }, 403, "FORBIDDEN_MERCHANT_SCOPE");
   const secondVisibleProducts = await injectJson(app, "second-tier price isolation products", {
     method: "GET",
-    url: "/api/agent/products/platform",
+    url: "/api/merchant/products/platform",
     headers: invitedSecondHeaders
   });
   assertMissingKeys(secondVisibleProducts, "second-tier price isolation products", ["supplyPriceCents", "platformSupplyPriceCents"]);
@@ -646,7 +677,7 @@ async function runSmoke() {
   }
   const thirdVisibleProducts = await injectJson(app, "third-tier price isolation products", {
     method: "GET",
-    url: "/api/agent/products/platform",
+    url: "/api/merchant/products/platform",
     headers: invitedThirdHeaders
   });
   assertMissingKeys(thirdVisibleProducts, "third-tier price isolation products", ["supplyPriceCents", "platformSupplyPriceCents", "ownTransferSupplyPriceCents"]);
@@ -657,42 +688,38 @@ async function runSmoke() {
   }
   await injectErrorCode(app, "third-tier fourth invite rejected", {
     method: "POST",
-    url: "/api/agent/invite-codes",
+    url: "/api/merchant/invite-codes",
     headers: invitedThirdHeaders,
     payload: { code: `P0-FOURTH-${suffix}` }
   }, 400, "FOURTH_TIER_FORBIDDEN");
   const thirdInviteList = await injectJson(app, "third-tier invite list scoped", {
     method: "GET",
-    url: "/api/agent/invite-codes",
+    url: "/api/merchant/invite-codes",
     headers: invitedThirdHeaders
   });
   if (assertArray(thirdInviteList, "third-tier invite list scoped").length !== 0) {
     throw new Error(`third-tier invite list should be empty: ${JSON.stringify(thirdInviteList).slice(0, 400)}`);
   }
 
-  const channel = await injectJson(app, "collection channel submit", {
+  const paymentMethod = await injectJson(app, "merchant payment method upsert", {
     method: "POST",
-    url: "/api/agent/collection-channels",
-    headers: agentHeaders,
+    url: "/api/merchant/payment-methods",
+    headers: merchantHeaders,
     payload: {
-      channelType: "alipay_personal_qr",
+      provider: "personal_alipay",
       displayName: `测试收款-${suffix}`,
       accountName: `收款人-${suffix}`,
       qrUrl: `https://example.test/pay-${suffix}.png`,
-      isDefault: true
+      isDefault: true,
+      enabled: true,
+      status: "enabled"
     }
   });
-  await injectJson(app, "collection channel review", {
-    method: "POST",
-    url: `/api/admin/collection-channels/${channel.id}/review`,
-    headers: adminHeaders,
-    payload: { approved: true }
-  });
 
-  const agentProduct = await injectJson(app, "product listing select", {
+  const merchantProductListing = await injectJson(app, "product listing select", {
     method: "POST",
-    url: "/api/agent/products/platform",
-    headers: agentHeaders,
+    url: "/api/merchant/products/platform",
+    headers: merchantHeaders,
     payload: {
       platformProductId: platformProduct.id,
       salePriceCents: "1500"
@@ -708,61 +735,72 @@ async function runSmoke() {
     throw new Error("grantedCoupon leaked a Promise-like value");
   }
   const userHeaders = { authorization: `Bearer ${register.token}` };
+  const orderQuote = await injectJson(app, "h5 shop/order quote", {
+    method: "POST",
+    url: "/api/user/orders/quote",
+    headers: userHeaders,
+    payload: {
+      shopId: manualMerchant.shop.id,
+      merchantProductListingId: merchantProductListing.id,
+      couponId: register.grantedCoupon?.id
+    }
+  });
 
   const order = await injectJson(app, "h5 shop/order create", {
     method: "POST",
     url: "/api/user/orders",
     headers: userHeaders,
     payload: {
-      shopId: manualAgent.shop.id,
-      agentProductId: agentProduct.id,
+      shopId: manualMerchant.shop.id,
+      merchantProductListingId: merchantProductListing.id,
       buyerEmail: `buyer-${suffix}@example.test`,
+      buyerPhone: `138${numericSuffix}`,
       extractionCode: "246810",
-      collectionChannelId: channel.id,
-      clientPaidAmountCents: register.grantedCoupon ? "1400" : "1500",
+      paymentMethodId: paymentMethod.id,
+      clientPaidAmountCents: orderQuote.buyerPaidAmountCents,
       couponId: register.grantedCoupon?.id
     }
   });
-  const agentOrders = await injectJson(app, "agent order list scoped", {
+  const merchantOrders = await injectJson(app, "merchant order list scoped", {
     method: "GET",
-    url: "/api/agent/orders",
-    headers: agentHeaders
+    url: "/api/merchant/orders",
+    headers: merchantHeaders
   });
-  if (!assertArray(agentOrders, "agent order list scoped").some((item) => item.orderNo === order.orderNo)) {
-    throw new Error("agent order list did not include own order");
+  if (!assertArray(merchantOrders, "merchant order list scoped").some((item) => item.orderNo === order.orderNo)) {
+    throw new Error("merchant order list did not include own order");
   }
-  await injectJson(app, "agent order detail scoped", {
+  await injectJson(app, "merchant order detail scoped", {
     method: "GET",
-    url: `/api/agent/orders/${order.orderNo}`,
-    headers: agentHeaders
+    url: `/api/merchant/orders/${order.orderNo}`,
+    headers: merchantHeaders
   });
-  await injectErrorCode(app, "agent order detail cross-scope rejected", {
+  await injectErrorCode(app, "merchant order detail cross-scope rejected", {
     method: "GET",
-    url: `/api/agent/orders/${order.orderNo}`,
+    url: `/api/merchant/orders/${order.orderNo}`,
     headers: invitedSecondHeaders
   }, 404, "RESOURCE_NOT_FOUND");
-  await injectErrorCode(app, "agent confirm collection cross-scope rejected", {
+  await injectErrorCode(app, "merchant confirm collection cross-scope rejected", {
     method: "POST",
-    url: `/api/agent/orders/${order.orderNo}/confirm-payment`,
+    url: `/api/merchant/orders/${order.orderNo}/confirm-payment`,
     headers: invitedSecondHeaders,
     payload: { amountCents: order.buyerPaidAmountCents ?? order.paidAmountCents, voucherUrl: `fixture://collection/cross-${suffix}` }
-  }, 403, "FORBIDDEN_AGENT_SCOPE");
+  }, 403, "FORBIDDEN_MERCHANT_SCOPE");
   await injectJson(app, "confirm collection", {
     method: "POST",
-    url: `/api/agent/orders/${order.orderNo}/confirm-payment`,
-    headers: agentHeaders,
+    url: `/api/merchant/orders/${order.orderNo}/confirm-payment`,
+    headers: merchantHeaders,
     payload: { amountCents: order.buyerPaidAmountCents ?? order.paidAmountCents, voucherUrl: `fixture://collection/${suffix}` }
   });
-  await injectErrorCode(app, "agent fulfillment cross-scope rejected", {
+  await injectErrorCode(app, "merchant fulfillment cross-scope rejected", {
     method: "POST",
-    url: `/api/agent/orders/${order.orderNo}/fulfillment`,
+    url: `/api/merchant/orders/${order.orderNo}/fulfillment`,
     headers: invitedSecondHeaders,
     payload: { status: "success", attemptNo: 1, evidence: `fixture://fulfillment/cross-${suffix}` }
-  }, 403, "FORBIDDEN_AGENT_SCOPE");
-  await injectJson(app, "agent fulfillment scoped", {
+  }, 403, "FORBIDDEN_MERCHANT_SCOPE");
+  await injectJson(app, "merchant fulfillment scoped", {
     method: "POST",
-    url: `/api/agent/orders/${order.orderNo}/fulfillment`,
-    headers: agentHeaders,
+    url: `/api/merchant/orders/${order.orderNo}/fulfillment`,
+    headers: merchantHeaders,
     payload: { status: "success", attemptNo: 1, evidence: `fixture://fulfillment/${suffix}` }
   });
   const extracted = await injectJson(app, "auto fulfillment/extract", {
@@ -780,27 +818,27 @@ async function runSmoke() {
   const guestHeaders = { authorization: `Bearer ${guest.token}` };
   const guestShop = await injectJson(app, "h5 guest browse shop", {
     method: "GET",
-    url: `/api/user/shops/${manualAgent.shop.id}`
+    url: `/api/user/shops/${manualMerchant.shop.id}`
   });
-  if (guestShop.id !== manualAgent.shop.id) throw new Error("guest shop browse returned the wrong shop");
+  if (guestShop.id !== manualMerchant.shop.id) throw new Error("guest shop browse returned the wrong shop");
   const guestProducts = await injectJson(app, "h5 guest browse shop products", {
     method: "GET",
-    url: `/api/user/shops/${manualAgent.shop.id}/products`
+    url: `/api/user/shops/${manualMerchant.shop.id}/products`
   });
-  if (!Array.isArray(guestProducts) || !guestProducts.some((item: Record<string, any>) => item.id === agentProduct.id)) {
+  if (!Array.isArray(guestProducts) || !guestProducts.some((item: Record<string, any>) => item.id === merchantProductListing.id)) {
     throw new Error("guest shop browse did not include listed product");
   }
   await injectJson(app, "h5 guest product detail", {
     method: "GET",
-    url: `/api/user/products/${agentProduct.id}`
+    url: `/api/user/products/${merchantProductListing.id}`
   });
   const guestQuote = await injectJson(app, "h5 guest quote", {
     method: "POST",
     url: "/api/user/orders/quote",
     headers: guestHeaders,
     payload: {
-      shopId: manualAgent.shop.id,
-      agentProductId: agentProduct.id
+      shopId: manualMerchant.shop.id,
+      merchantProductListingId: merchantProductListing.id
     }
   });
   const guestOrder = await injectJson(app, "h5 guest order create", {
@@ -808,17 +846,18 @@ async function runSmoke() {
     url: "/api/user/orders",
     headers: guestHeaders,
     payload: {
-      shopId: manualAgent.shop.id,
-      agentProductId: agentProduct.id,
+      shopId: manualMerchant.shop.id,
+      merchantProductListingId: merchantProductListing.id,
       extractionCode: "975310",
-      collectionChannelId: channel.id,
+      buyerPhone: `137${numericSuffix}`,
+      paymentMethodId: paymentMethod.id,
       clientPaidAmountCents: guestQuote.buyerPaidAmountCents ?? guestQuote.paidAmountCents
     }
   });
   await injectJson(app, "h5 guest confirm collection", {
     method: "POST",
-    url: `/api/agent/orders/${guestOrder.orderNo}/confirm-payment`,
-    headers: agentHeaders,
+    url: `/api/merchant/orders/${guestOrder.orderNo}/confirm-payment`,
+    headers: merchantHeaders,
     payload: {
       amountCents: guestOrder.buyerPaidAmountCents ?? guestOrder.paidAmountCents,
       voucherUrl: `fixture://collection/guest-${suffix}`
@@ -837,17 +876,18 @@ async function runSmoke() {
     url: "/api/user/orders",
     headers: userHeaders,
     payload: {
-      shopId: manualAgent.shop.id,
-      agentProductId: agentProduct.id,
+      shopId: manualMerchant.shop.id,
+      merchantProductListingId: merchantProductListing.id,
       extractionCode: "135790",
-      collectionChannelId: channel.id,
+      buyerPhone: `136${numericSuffix}`,
+      paymentMethodId: paymentMethod.id,
       clientPaidAmountCents: "1500"
     }
   });
   await injectJson(app, "wrong extract lock order confirm", {
     method: "POST",
-    url: `/api/agent/orders/${lockOrder.orderNo}/confirm-payment`,
-    headers: agentHeaders,
+    url: `/api/merchant/orders/${lockOrder.orderNo}/confirm-payment`,
+    headers: merchantHeaders,
     payload: { amountCents: "1500", voucherUrl: `fixture://collection/${suffix}-2` }
   });
   for (let index = 0; index < 3; index += 1) {
@@ -874,27 +914,27 @@ async function runSmoke() {
       requestedRefundCents: order.buyerPaidAmountCents ?? order.paidAmountCents
     }
   });
-  const agentAfterSales = await injectJson(app, "agent after-sale list scoped", {
+  const merchantAfterSales = await injectJson(app, "merchant after-sale list scoped", {
     method: "GET",
-    url: "/api/agent/after-sales",
-    headers: agentHeaders
+    url: "/api/merchant/after-sales",
+    headers: merchantHeaders
   });
-  if (!assertArray(agentAfterSales, "agent after-sale list scoped").some((item) => item.afterSaleNo === afterSale.afterSaleNo)) {
-    throw new Error("agent after-sale list did not include own after-sale");
+  if (!assertArray(merchantAfterSales, "merchant after-sale list scoped").some((item) => item.afterSaleNo === afterSale.afterSaleNo)) {
+    throw new Error("merchant after-sale list did not include own after-sale");
   }
-  await injectErrorCode(app, "agent after-sale assist cross-scope rejected", {
+  await injectErrorCode(app, "merchant after-sale assist cross-scope rejected", {
     method: "POST",
-    url: `/api/agent/after-sales/${afterSale.afterSaleNo}/assist`,
+    url: `/api/merchant/after-sales/${afterSale.afterSaleNo}/assist`,
     headers: invitedSecondHeaders,
     payload: {
       note: "production smoke cross-scope after-sale assistance",
       evidenceUrl: `fixture://after-sale-assist/cross-${suffix}`
     }
-  }, 403, "FORBIDDEN_AGENT_SCOPE");
-  await injectJson(app, "agent after-sale assist scoped", {
+  }, 403, "FORBIDDEN_MERCHANT_SCOPE");
+  await injectJson(app, "merchant after-sale assist scoped", {
     method: "POST",
-    url: `/api/agent/after-sales/${afterSale.afterSaleNo}/assist`,
-    headers: agentHeaders,
+    url: `/api/merchant/after-sales/${afterSale.afterSaleNo}/assist`,
+    headers: merchantHeaders,
     payload: {
       note: "production smoke merchant after-sale assistance",
       evidenceUrl: `fixture://after-sale-assist/${suffix}`
@@ -969,13 +1009,13 @@ async function runSmoke() {
   }
   await injectJson(app, "refund clawback readback", {
     method: "GET",
-    url: "/api/agent/clawbacks",
-    headers: agentHeaders
+    url: "/api/merchant/clawbacks",
+    headers: merchantHeaders
   });
   await injectJson(app, "refund deposit transactions readback", {
     method: "GET",
-    url: "/api/agent/deposit-transactions",
-    headers: agentHeaders
+    url: "/api/merchant/deposit-transactions",
+    headers: merchantHeaders
   });
 
   const settlement = await injectJson(app, "clearing settlement generate", {
@@ -983,7 +1023,7 @@ async function runSmoke() {
     url: "/api/admin/settlements/generate",
     headers: adminHeaders,
     payload: {
-      agentId: manualAgent.agent.id,
+      merchantId: manualMerchant.merchant.id,
       now: "2030-01-01T00:00:00.000Z",
       batchNo: `p0-${suffix}`
     }
@@ -1006,7 +1046,7 @@ async function runSmoke() {
   logSmoke("pass", "restart readback app");
   await injectJson(readbackApp, "read back shop after restart", {
     method: "GET",
-    url: `/api/user/shops/${manualAgent.shop.id}`
+    url: `/api/user/shops/${manualMerchant.shop.id}`
   });
   await injectJson(readbackApp, "read back order after restart", {
     method: "GET",
@@ -1019,10 +1059,10 @@ async function runSmoke() {
   logSmoke("pass", "production smoke summary", {
     ok: true,
     persistenceMode: health.persistenceMode,
-    shopId: manualAgent.shop.id,
-    agentId: manualAgent.agent.id,
+    shopId: manualMerchant.shop.id,
+    merchantId: manualMerchant.merchant.id,
     productId: platformProduct.id,
-    agentProductId: agentProduct.id,
+    merchantProductListingId: merchantProductListing.id,
     orderNo: order.orderNo,
     settlementNo: settlement.settlementNo
   });

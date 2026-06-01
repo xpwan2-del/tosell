@@ -13,11 +13,11 @@ export type PlatformProductQuote = {
   paidAmountCents: bigint;
   supplyAmountCents: bigint;
   serviceFeeCents: bigint;
-  agentExpectedIncomeCents: bigint;
+  merchantExpectedIncomeCents: bigint;
   serviceFeeBps: bigint;
 };
 
-export type AgentOwnedProductQuoteInput = {
+export type MerchantOwnedProductQuoteInput = {
   salePriceCents: bigint;
   minSalePriceCents?: bigint;
   quantity?: number;
@@ -42,22 +42,22 @@ export function quotePlatformProduct(input: PlatformProductQuoteInput): Platform
   const supplyAmountCents = input.supplyPriceCents * quantity;
   const serviceFeeBps = input.serviceFeeBps ?? SERVICE_FEE_BPS;
   const serviceFeeCents = calculateServiceFeeCents(paidAmountCents, serviceFeeBps);
-  const agentExpectedIncomeCents = paidAmountCents - supplyAmountCents - serviceFeeCents;
+  const merchantExpectedIncomeCents = paidAmountCents - supplyAmountCents - serviceFeeCents;
 
-  if (agentExpectedIncomeCents < 0n) {
-    throw new Error("agent income cannot be negative");
+  if (merchantExpectedIncomeCents < 0n) {
+    throw new Error("merchant income cannot be negative");
   }
 
   return {
     paidAmountCents,
     supplyAmountCents,
     serviceFeeCents,
-    agentExpectedIncomeCents,
+    merchantExpectedIncomeCents,
     serviceFeeBps
   };
 }
 
-export function quoteAgentOwnedProduct(input: AgentOwnedProductQuoteInput): PlatformProductQuote {
+export function quoteMerchantOwnedProduct(input: MerchantOwnedProductQuoteInput): PlatformProductQuote {
   const quantity = BigInt(input.quantity ?? 1);
   if (quantity <= 0n) throw new Error("quantity must be positive");
   if (input.minSalePriceCents !== undefined) {
@@ -74,7 +74,7 @@ export function quoteAgentOwnedProduct(input: AgentOwnedProductQuoteInput): Plat
     paidAmountCents,
     supplyAmountCents: 0n,
     serviceFeeCents,
-    agentExpectedIncomeCents: paidAmountCents - serviceFeeCents,
+    merchantExpectedIncomeCents: paidAmountCents - serviceFeeCents,
     serviceFeeBps
   };
 }

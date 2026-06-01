@@ -26,7 +26,7 @@ describe("frontend MVP static checks", () => {
       ...readFiles(join(root, "apps", "admin", "src"), [".ts", ".tsx", ".css"]),
       ...readFiles(join(root, "apps", "h5", "src"), [".ts", ".tsx", ".css"])
     ];
-    const prohibited = [/直播/u, /分销/u, /返佣/u, /团队奖/u, /邀请奖励/u, /代理等级/u, /下级/u, /commission_rate/u, /team_performance/u];
+    const prohibited = [/直播/u, /分销/u, /返佣/u, /团队奖/u, /邀请奖励/u, /代理等级/u, /commission_rate/u, /team_performance/u];
 
     for (const file of files) {
       for (const pattern of prohibited) {
@@ -51,13 +51,13 @@ describe("frontend MVP static checks", () => {
     const source = readFileSync(join(root, "apps", "admin", "src", "main.tsx"), "utf8");
     const required = [
       "基础看板",
-      "代理审核",
+      "商户审核",
       "保证金",
-      "渠道管理",
+      "下级供货",
       "店铺管理",
       "平台自营",
       "商品管理",
-      "代理商品审核",
+      "商户自有商品审核",
       "订单管理",
       "履约管理",
       "售后退款",

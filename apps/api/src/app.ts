@@ -6,15 +6,15 @@ import { isSettlementCandidate } from "../../../packages/core/src/index.js";
 import {
   ApiError,
   type AdminActor,
-  type AgentActor,
+  type MerchantActor,
   type UserActor,
   createBackendServices
 } from "./services.js";
 
 const bigintString = z.union([z.string(), z.number(), z.bigint()]).transform((value) => BigInt(value));
 const adminRole = z.enum(["operator", "finance", "admin"]);
-const paymentChannel = z.enum(["wechat_miniprogram", "wechat_h5_jsapi", "wechat_h5", "alipay_wap", "mock"]);
-const paymentProvider = z.enum(["alipay_merchant", "wechat_merchant", "epay", "personal_alipay"]);
+const paymentChannel = z.enum(["wechat_miniprogram", "wechat_h5_jsapi", "wechat_h5", "alipay_wap", "epay", "balance", "mock"]);
+const paymentProvider = z.enum(["alipay_merchant", "wechat_merchant", "epay", "personal_alipay", "wechat_personal", "balance"]);
 const paymentMethodBodySchema = z.object({
   id: z.string().optional(),
   provider: paymentProvider,
@@ -24,6 +24,7 @@ const paymentMethodBodySchema = z.object({
   appId: z.string().optional(),
   serviceProviderId: z.string().optional(),
   gatewayUrl: z.string().url().optional(),
+  apiMode: z.enum(["mapi_first", "submit"]).optional(),
   accountName: z.string().optional(),
   qrUrl: z.string().min(1).max(900_000).refine((value) => /^https?:\/\//.test(value) || /^data:image\/(png|jpeg|webp);base64,/.test(value), "qrUrl must be an image upload or http url").optional(),
   paymentUrl: z.string().url().optional(),
@@ -48,19 +49,10 @@ const paymentResultBodySchema = z.object({
   signature: z.string(),
   rawPayload: z.unknown().optional()
 });
-const collectionChannelType = z.enum([
-  "alipay_personal_qr",
-  "alipay_merchant_qr",
-  "alipay_merchant_link",
-  "wechat_personal_qr",
-  "wechat_merchant_qr",
-  "wechat_merchant_link",
-  "epay_qr",
-  "epay_link"
-]);
 const emailSchema = z.string().email().max(160);
 const extractionCodeSchema = z.string().regex(/^\d{4,12}$/).max(12);
-const agentTierSchema = z.enum(["first_tier", "second_tier", "third_tier"]);
+const mainlandPhoneSchema = z.string().regex(/^1[3-9]\d{9}$/);
+const merchantTierSchema = z.enum(["first_tier", "second_tier", "third_tier"]);
 const fulfillmentModeSchema = z.enum(["manual", "code_pool"]);
 const productDetailSectionSchema = z.object({
   title: z.string().min(1).max(60),
@@ -83,6 +75,17 @@ const productDetailUpdateSchema = z.object({
   afterSaleRule: z.unknown().optional(),
   status: z.string().optional()
 });
+const merchantProductListingDisplayOverrideSchema = z.object({
+  displayName: z.string().trim().max(120).optional(),
+  displaySubtitle: z.string().max(240).optional(),
+  displayDescription: z.string().max(4000).optional(),
+  displayUsageGuide: z.string().max(4000).optional(),
+  displayImageUrl: z.string().max(8000).optional(),
+  displayCategory: z.string().max(80).optional(),
+  displayTags: z.array(z.string().min(1).max(40)).max(12).optional(),
+  displaySpecs: z.array(z.string().min(1).max(60)).max(12).optional(),
+  displayDetailSections: z.array(productDetailSectionSchema).max(8).optional()
+});
 
 export function buildApp() {
   const app = Fastify({ logger: false });
@@ -92,11 +95,24 @@ export function buildApp() {
     if (error instanceof ApiError) {
       return reply.status(error.statusCode).send({ code: error.code, message: error.message });
     }
+    if (error instanceof z.ZodError) {
+      return reply.status(400).send({
+        code: "VALIDATION_FAILED",
+        message: "request validation failed",
+        issues: error.issues.map((issue) => ({
+          path: issue.path.join("."),
+          message: issue.message
+        }))
+      });
+    }
     if (error.message.startsWith("missing admin permission")) {
       return reply.status(403).send({ code: "FORBIDDEN_ADMIN_PERMISSION", message: error.message });
     }
-    if (error.message.includes("agent cannot access another") || error.message === "actor is not an agent") {
-      return reply.status(403).send({ code: "FORBIDDEN_AGENT_SCOPE", message: error.message });
+    if (error.message.includes("merchant cannot access another") || error.message === "actor is not a merchant") {
+      return reply.status(403).send({ code: "FORBIDDEN_MERCHANT_SCOPE", message: error.message });
+    }
+    if (error.message.includes("Can't reach database server") || error.message.includes("ECONNREFUSED") || error.message.includes("Connection refused")) {
+      return reply.status(503).send({ code: "DATABASE_UNAVAILABLE", message: "configured PostgreSQL database is unavailable" });
     }
     return reply.status(500).send({ code: "INTERNAL_ERROR", message: error.message });
   });
@@ -143,20 +159,20 @@ export function buildApp() {
     return createAdminAuthSession(await services.loginAdmin(body));
   });
 
-  app.post("/api/auth/agent/login", async (request) => {
+  app.post("/api/auth/merchant/login", async (request) => {
     const body = z.object({
       account: z.string().min(1).max(120),
       password: z.string().min(1).max(200)
     }).parse(request.body);
-    return createAgentAuthSession(await services.loginAgent(body));
+    return createMerchantAuthSession(await services.loginMerchant(body));
   });
 
-  app.get("/api/auth/agent/session", async (request) => {
-    const actor = getAgentActor(request);
-    const shop = await services.getAgentShop(actor);
+  app.get("/api/auth/merchant/session", async (request) => {
+    const actor = getMerchantActor(request);
+    const shop = await services.getMerchantShop(actor);
     return {
-      agent: {
-        agentId: actor.agentId
+      merchant: {
+        merchantId: actorMerchantId(actor)
       },
       shop: {
         shopId: actor.shopId,
@@ -201,37 +217,47 @@ export function buildApp() {
     return serializeBigInt(services.listShopProducts(shopId));
   });
 
-  app.get("/api/user/shops/:shopId/collection-channels", async (request) => {
+  app.get("/api/user/shops/:shopId/payment-methods", async (request) => {
     const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
-    return serializeBigInt(services.listPublicCollectionChannels(shopId));
+    return serializeBigInt(services.listPublicPaymentMethods(shopId));
   });
-  app.get("/api/h5/shops/:shopId/collection-channels", async (request) => {
+  app.get("/api/h5/shops/:shopId/payment-methods", async (request) => {
     const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
-    return serializeBigInt(services.listPublicCollectionChannels(shopId));
+    return serializeBigInt(services.listPublicPaymentMethods(shopId));
   });
 
-  app.get("/api/user/products/:agentProductId", async (request) => {
-    const { agentProductId } = z.object({ agentProductId: z.string() }).parse(request.params);
-    return serializeBigInt(services.getAgentProduct(agentProductId));
+  app.get("/api/user/products/:merchantProductListingId", async (request) => {
+    const { merchantProductListingId } = z.object({ merchantProductListingId: z.string() }).parse(request.params);
+    return serializeBigInt(services.getMerchantProduct(merchantProductListingId));
   });
 
   app.get("/api/user/coupons", async (request) => {
     const query = z.object({
       shopId: z.string().optional(),
-      agentProductId: z.string().optional()
+      merchantProductListingId: z.string().optional()
     }).parse(request.query);
-    return serializeBigInt(services.listUserCoupons(getUserActor(request), query));
+    return serializeBigInt(services.listUserCoupons(getUserActor(request), {
+      shopId: query.shopId,
+      ...internalProductRef(query.merchantProductListingId)
+    } as Parameters<typeof services.listUserCoupons>[1]));
   });
 
   app.post("/api/user/orders/quote", async (request) => {
     const body = z.object({
       shopId: z.string(),
-      agentProductId: z.string(),
+      merchantProductListingId: z.string().optional(),
       quantity: z.number().int().positive().optional(),
       couponId: z.string().optional()
     }).parse(request.body);
+    const listingId = body.merchantProductListingId;
+    if (!listingId) throw new ApiError(400, "PRODUCT_REQUIRED", "product required");
     try {
-      return serializeBigInt(services.quoteOrder(getUserActor(request), body));
+      return serializeBigInt(services.quoteOrder(getUserActor(request), {
+        shopId: body.shopId,
+        ...internalProductRef(listingId),
+        quantity: body.quantity,
+        couponId: body.couponId
+      } as Parameters<typeof services.quoteOrder>[1]));
     } catch (error) {
       if (error instanceof ApiError) {
         throw new ApiError(400, "PRICE_RULE_FAILED", error.message);
@@ -243,20 +269,25 @@ export function buildApp() {
   app.post("/api/user/orders", async (request) => {
     const body = z.object({
       shopId: z.string(),
-      agentProductId: z.string(),
+      merchantProductListingId: z.string().optional(),
       quantity: z.number().int().positive().optional(),
       buyerEmail: emailSchema.optional(),
+      buyerPhone: mainlandPhoneSchema.optional(),
       extractionCode: extractionCodeSchema.optional(),
       purchasePassword: extractionCodeSchema.optional(),
       couponId: z.string().optional(),
-      collectionChannelId: z.string().optional(),
+      paymentMethodId: z.string().optional(),
       clientPaidAmountCents: bigintString.optional()
     }).parse(request.body);
+    const listingId = body.merchantProductListingId;
+    if (!listingId) throw new ApiError(400, "PRODUCT_REQUIRED", "product required");
     try {
       return serializeBigInt(services.createOrder(getUserActor(request), {
         ...body,
+        ...internalProductRef(listingId),
+        paymentMethodId: body.paymentMethodId,
         extractionCode: body.purchasePassword ?? body.extractionCode
-      }));
+      } as Parameters<typeof services.createOrder>[1]));
     } catch (error) {
       if (error instanceof ApiError) throw error;
       throw new ApiError(400, "ORDER_CREATE_FAILED", error instanceof Error ? error.message : "order create failed");
@@ -266,9 +297,17 @@ export function buildApp() {
   app.post("/api/user/orders/:orderNo/payments", async (request) => {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
     const body = z.object({ channel: paymentChannel.optional(), paymentMethodId: z.string().optional() }).parse(request.body);
-    if (body.paymentMethodId) return serializeBigInt(services.createPaymentOrder(getUserActor(request), orderNo, { paymentMethodId: body.paymentMethodId }));
-    if (!body.channel) return serializeBigInt(services.createPaymentOrder(getUserActor(request), orderNo, {}));
+    if (body.paymentMethodId) return serializeBigInt(await services.createPaymentOrder(getUserActor(request), orderNo, { paymentMethodId: body.paymentMethodId }));
+    if (!body.channel) return serializeBigInt(await services.createPaymentOrder(getUserActor(request), orderNo, {}));
     return serializeBigInt(services.createPaymentIntent(getUserActor(request), orderNo, { channel: body.channel ?? "alipay_wap" }));
+  });
+  app.get("/api/user/wallet", async (request) => serializeBigInt(services.getUserWallet(getUserActor(request))));
+  app.post("/api/user/wallet/recharges", async (request) => {
+    const body = z.object({
+      amountCents: bigintString,
+      paymentMethodId: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.createWalletRecharge(getUserActor(request), body));
   });
 
   app.post("/api/user/orders/:orderNo/payment-vouchers", async (request) => {
@@ -319,16 +358,16 @@ export function buildApp() {
     return serializeBigInt(services.createAfterSale(getUserActor(request), body));
   });
 
-  app.post("/api/agent/applications", async (request) => {
+  app.post("/api/merchant/applications", async (request) => {
     const body = z.object({
       contactPhone: z.string(),
       customerServiceWechat: z.string(),
       inviteCode: z.string().optional()
     }).parse(request.body);
-    return services.submitAgentApplication(getAgentActor(request), body);
+    return services.submitMerchantApplication(getMerchantActor(request), body);
   });
 
-  app.post("/api/agent/register-by-invite", async (request) => {
+  app.post("/api/merchant/register-by-invite", async (request) => {
     const body = z.object({
       inviteCode: z.string().min(1).max(80),
       name: z.string().min(1).max(80),
@@ -336,25 +375,25 @@ export function buildApp() {
       customerServiceWechat: z.string().max(80).optional(),
       shopName: z.string().max(80).optional()
     }).parse(request.body);
-    return serializeBigInt(services.registerAgentByInvite(body));
+    return serializeBigInt(services.registerMerchantByInvite(body));
   });
 
-  app.get("/api/agent/invite-codes", async (request) => serializeBigInt(services.listInviteCodes(getAgentActor(request))));
-  app.post("/api/agent/invite-codes", async (request) => {
+  app.get("/api/merchant/invite-codes", async (request) => serializeBigInt(services.listInviteCodes(getMerchantActor(request))));
+  app.post("/api/merchant/invite-codes", async (request) => {
     const body = z.object({
       code: z.string().min(1).max(80).optional(),
       maxUses: z.number().int().positive().optional(),
       expiresAt: z.string().datetime().optional(),
       depositRequiredAmountCents: bigintString.optional()
     }).parse(request.body);
-    return serializeBigInt(services.createAgentInviteCode(getAgentActor(request), body));
+    return serializeBigInt(services.createMerchantInviteCode(getMerchantActor(request), body));
   });
 
-  app.get("/api/agent/shop", async (request) => services.getAgentShop(getAgentActor(request)));
+  app.get("/api/merchant/shop", async (request) => services.getMerchantShop(getMerchantActor(request)));
 
-  app.get("/api/agent/dashboard", async (request) => serializeBigInt(services.agentDashboard(getAgentActor(request))));
+  app.get("/api/merchant/dashboard", async (request) => serializeBigInt(services.merchantDashboard(getMerchantActor(request))));
 
-  app.patch("/api/agent/shop", async (request) => {
+  app.patch("/api/merchant/shop", async (request) => {
     const body = z.object({
       name: z.string().optional(),
       announcement: z.string().optional(),
@@ -364,56 +403,46 @@ export function buildApp() {
       customerServiceQqQrUrl: z.string().optional(),
       customerServiceNote: z.string().optional()
     }).parse(request.body);
-    return services.updateAgentShop(getAgentActor(request), body);
+    return services.updateMerchantShop(getMerchantActor(request), body);
   });
 
-  app.patch("/api/agent/shop/collection", async (request) => {
+  app.patch("/api/merchant/shop/collection", async (request) => {
     const body = z.object({
       collectionAccountName: z.string().optional(),
       collectionQrUrl: z.string().optional(),
       collectionNote: z.string().optional()
     }).parse(request.body);
-    return serializeBigInt(services.updateAgentShopCollection(getAgentActor(request), body));
+    return serializeBigInt(services.updateMerchantShopCollection(getMerchantActor(request), body));
   });
 
-  app.get("/api/agent/collection-channels", async (request) => serializeBigInt(services.listAgentCollectionChannels(getAgentActor(request))));
-  app.post("/api/agent/collection-channels", async (request) => {
-    const body = z.object({
-      channelType: collectionChannelType,
-      displayName: z.string().min(1).max(80),
-      accountName: z.string().max(120).optional(),
-      qrUrl: z.string().url().optional(),
-      paymentUrl: z.string().url().optional(),
-      isDefault: z.boolean().optional(),
-      sortOrder: z.number().int().optional(),
-      dailyLimitCents: bigintString.optional(),
-      singleOrderLimitCents: bigintString.optional()
-    }).parse(request.body);
-    return serializeBigInt(services.submitAgentCollectionChannel(getAgentActor(request), body));
-  });
-
-  app.patch("/api/agent/shop/decor", async (request) => {
+  app.patch("/api/merchant/shop/decor", async (request) => {
     const body = z.object({
       themeColor: z.string().optional(),
       bannerUrl: z.string().optional(),
       shareTitle: z.string().optional(),
       productGroups: z.array(z.object({
         name: z.string(),
-        agentProductIds: z.array(z.string())
+        merchantProductListingIds: z.array(z.string()).optional()
       })).optional()
     }).parse(request.body);
-    return serializeBigInt(services.updateShopDecor(getAgentActor(request), body));
+    return serializeBigInt(services.updateShopDecor(getMerchantActor(request), {
+      ...body,
+      productGroups: body.productGroups?.map((group) => ({
+        name: group.name,
+        ...internalProductGroupRef(group.merchantProductListingIds ?? [])
+      }))
+    } as Parameters<typeof services.updateShopDecor>[1]));
   });
 
-  app.get("/api/agent/products/platform", async (request) => serializeBigInt(services.listPlatformProducts(getAgentActor(request))));
-  app.get("/api/agent/products", async (request) => serializeBigInt(services.listAgentProducts(getAgentActor(request))));
-  app.get("/api/agent/products/own", async (request) => serializeBigInt(services.listOwnProductReviews(getAgentActor(request))));
-  app.get("/api/agent/products/own/:ownProductId", async (request) => {
+  app.get("/api/merchant/products/platform", async (request) => serializeBigInt(services.listPlatformProducts(getMerchantActor(request))));
+  app.get("/api/merchant/products", async (request) => serializeBigInt(services.listMerchantProducts(getMerchantActor(request))));
+  app.get("/api/merchant/products/own", async (request) => serializeBigInt(services.listOwnProductReviews(getMerchantActor(request))));
+  app.get("/api/merchant/products/own/:ownProductId", async (request) => {
     const { ownProductId } = z.object({ ownProductId: z.string() }).parse(request.params);
-    return serializeBigInt(services.getOwnProductDetail(getAgentActor(request), ownProductId));
+    return serializeBigInt(services.getOwnProductDetail(getMerchantActor(request), ownProductId));
   });
 
-  app.post("/api/agent/products/own", async (request) => {
+  app.post("/api/merchant/products/own", async (request) => {
     const body = z.object({
       name: z.string().trim().min(1),
       category: z.string().optional(),
@@ -429,7 +458,7 @@ export function buildApp() {
       fulfillmentMode: fulfillmentModeSchema.optional(),
       manualFulfillmentInstruction: z.string().max(1000).optional()
     }).parse(request.body);
-    return serializeBigInt(services.submitOwnProduct(getAgentActor(request), {
+    return serializeBigInt(services.submitOwnProduct(getMerchantActor(request), {
       ...body,
       fulfillmentRule: {
         mode: body.fulfillmentMode ?? "manual",
@@ -438,14 +467,14 @@ export function buildApp() {
       }
     }));
   });
-  app.patch("/api/agent/products/own/:ownProductId", async (request) => {
+  app.patch("/api/merchant/products/own/:ownProductId", async (request) => {
     const { ownProductId } = z.object({ ownProductId: z.string() }).parse(request.params);
     const body = productDetailUpdateSchema.extend({
       salePriceCents: bigintString.optional(),
       minSalePriceCents: bigintString.optional()
     }).parse(request.body);
     const { fulfillmentMode, manualFulfillmentInstruction, ...rest } = body;
-    return serializeBigInt(services.updateOwnProductDetail(getAgentActor(request), ownProductId, {
+    return serializeBigInt(services.updateOwnProductDetail(getMerchantActor(request), ownProductId, {
       ...rest,
       fulfillmentRule: fulfillmentMode || manualFulfillmentInstruction
         ? {
@@ -457,108 +486,122 @@ export function buildApp() {
     }));
   });
 
-  app.get("/api/agent/rights-codes", async (request) => {
+  app.get("/api/merchant/rights-codes", async (request) => {
     const query = z.object({
-      agentProductId: z.string().optional(),
-      status: z.enum(["available", "issued", "voided"]).optional()
+      merchantProductListingId: z.string().optional(),
+      status: z.enum(["available", "locked", "issued", "voided"]).optional()
     }).parse(request.query);
-    return serializeBigInt(services.listAgentRightsCodes(getAgentActor(request), query));
+    return serializeBigInt(services.listMerchantRightsCodes(getMerchantActor(request), {
+      ...internalProductRef(query.merchantProductListingId),
+      status: query.status
+    } as Parameters<typeof services.listMerchantRightsCodes>[1]));
   });
 
-  app.post("/api/agent/rights-codes/import", async (request) => {
+  app.post("/api/merchant/rights-codes/import", async (request) => {
     const body = z.object({
-      agentProductId: z.string(),
+      merchantProductListingId: z.string().optional(),
       codes: z.array(z.string()),
       batchNo: z.string().optional()
     }).parse(request.body);
-    return serializeBigInt(services.addAgentRightsCodes(getAgentActor(request), body));
+    const listingId = body.merchantProductListingId;
+    if (!listingId) throw new ApiError(400, "PRODUCT_REQUIRED", "product required");
+    return serializeBigInt(services.addMerchantRightsCodes(getMerchantActor(request), {
+      ...internalProductRef(listingId),
+      codes: body.codes,
+      batchNo: body.batchNo
+    } as Parameters<typeof services.addMerchantRightsCodes>[1]));
   });
-  app.post("/api/agent/rights-codes/precheck", async (request) => {
+  app.post("/api/merchant/rights-codes/precheck", async (request) => {
     const body = z.object({
-      agentProductId: z.string(),
+      merchantProductListingId: z.string().optional(),
       codes: z.array(z.string())
     }).parse(request.body);
-    return serializeBigInt(services.precheckAgentRightsCodes(getAgentActor(request), body));
+    const listingId = body.merchantProductListingId;
+    if (!listingId) throw new ApiError(400, "PRODUCT_REQUIRED", "product required");
+    return serializeBigInt(services.precheckMerchantRightsCodes(getMerchantActor(request), {
+      ...internalProductRef(listingId),
+      codes: body.codes
+    } as Parameters<typeof services.precheckMerchantRightsCodes>[1]));
   });
 
-  app.post("/api/agent/products/platform", async (request) => {
-    const body = z.object({ platformProductId: z.string(), salePriceCents: bigintString }).parse(request.body);
-    return serializeBigInt(services.selectPlatformProduct(getAgentActor(request), body));
+  app.post("/api/merchant/products/platform", async (request) => {
+    const body = merchantProductListingDisplayOverrideSchema.extend({ platformProductId: z.string(), salePriceCents: bigintString }).parse(request.body);
+    return serializeBigInt(services.selectPlatformProduct(getMerchantActor(request), body));
   });
-  app.get("/api/agent/products/:agentProductId", async (request) => {
-    const { agentProductId } = z.object({ agentProductId: z.string() }).parse(request.params);
-    return serializeBigInt(services.getAgentProductDetail(getAgentActor(request), agentProductId));
+  app.get("/api/merchant/products/:merchantProductListingId", async (request) => {
+    const { merchantProductListingId } = z.object({ merchantProductListingId: z.string() }).parse(request.params);
+    return serializeBigInt(services.getMerchantProductDetail(getMerchantActor(request), merchantProductListingId));
   });
-  app.patch("/api/agent/products/:agentProductId", async (request) => {
-    const { agentProductId } = z.object({ agentProductId: z.string() }).parse(request.params);
-    const body = z.object({
+  app.patch("/api/merchant/products/:merchantProductListingId", async (request) => {
+    const { merchantProductListingId } = z.object({ merchantProductListingId: z.string() }).parse(request.params);
+    const body = merchantProductListingDisplayOverrideSchema.extend({
       salePriceCents: bigintString.optional(),
       status: z.string().optional()
     }).parse(request.body);
-    return serializeBigInt(services.updateAgentProductDetail(getAgentActor(request), agentProductId, body));
+    return serializeBigInt(services.updateMerchantProductDetail(getMerchantActor(request), merchantProductListingId, body));
   });
 
-  app.post("/api/agent/products/platform/batch", async (request) => {
+  app.post("/api/merchant/products/platform/batch", async (request) => {
     const body = z.object({
-      items: z.array(z.object({ platformProductId: z.string(), salePriceCents: bigintString }))
+      items: z.array(merchantProductListingDisplayOverrideSchema.extend({ platformProductId: z.string(), salePriceCents: bigintString }))
     }).parse(request.body);
-    return serializeBigInt(services.batchSelectPlatformProducts(getAgentActor(request), body));
+    return serializeBigInt(services.batchSelectPlatformProducts(getMerchantActor(request), body));
   });
 
-  app.patch("/api/agent/products/:agentProductId/price", async (request) => {
-    const { agentProductId } = z.object({ agentProductId: z.string() }).parse(request.params);
+  app.patch("/api/merchant/products/:merchantProductListingId/price", async (request) => {
+    const { merchantProductListingId } = z.object({ merchantProductListingId: z.string() }).parse(request.params);
     const body = z.object({ salePriceCents: bigintString }).parse(request.body);
-    return serializeBigInt(services.setAgentProductPrice(getAgentActor(request), agentProductId, body.salePriceCents));
+    return serializeBigInt(services.setMerchantProductPrice(getMerchantActor(request), merchantProductListingId, body.salePriceCents));
   });
 
-  app.post("/api/agent/channels/offers", async (request) => {
+  app.post("/api/merchant/supply/offers", async (request) => {
     const body = z.object({
-      downstreamAgentId: z.string(),
+      downstreamMerchantId: z.string(),
       platformProductId: z.string(),
       resellSupplyPriceCents: bigintString,
       status: z.string().optional()
     }).parse(request.body);
-    return serializeBigInt(services.upsertAgentChannelProductOffer(getAgentActor(request), body));
+    return serializeBigInt(services.upsertMerchantChannelProductOffer(getMerchantActor(request), body));
   });
 
-  app.get("/api/agent/orders", async (request) => serializeBigInt(services.listAgentOrders(getAgentActor(request))));
-  app.get("/api/agent/payment-vouchers", async (request) => serializeBigInt(services.listAgentPaymentVouchers(getAgentActor(request))));
-  app.get("/api/agent/payment-methods", async (request) => serializeBigInt(services.listAgentPaymentMethods(getAgentActor(request))));
-  app.post("/api/agent/payment-methods", async (request) => {
+  app.get("/api/merchant/orders", async (request) => serializeBigInt(services.listMerchantOrders(getMerchantActor(request))));
+  app.get("/api/merchant/payment-vouchers", async (request) => serializeBigInt(services.listMerchantPaymentVouchers(getMerchantActor(request))));
+  app.get("/api/merchant/payment-methods", async (request) => serializeBigInt(services.listMerchantPaymentMethods(getMerchantActor(request))));
+  app.post("/api/merchant/payment-methods", async (request) => {
     const body = paymentMethodBodySchema.parse(request.body);
-    return serializeBigInt(services.upsertAgentPaymentMethod(getAgentActor(request), body));
+    return serializeBigInt(services.upsertMerchantPaymentMethod(getMerchantActor(request), body));
   });
-  app.patch("/api/agent/payment-methods/:methodId", async (request) => {
+  app.patch("/api/merchant/payment-methods/:methodId", async (request) => {
     const { methodId } = z.object({ methodId: z.string() }).parse(request.params);
     const body = paymentMethodBodySchema.partial().parse(request.body);
-    return serializeBigInt(services.upsertAgentPaymentMethod(getAgentActor(request), { ...body, id: methodId }));
+    return serializeBigInt(services.upsertMerchantPaymentMethod(getMerchantActor(request), { ...body, id: methodId }));
   });
-  app.delete("/api/agent/payment-methods/:methodId", async (request) => {
+  app.delete("/api/merchant/payment-methods/:methodId", async (request) => {
     const { methodId } = z.object({ methodId: z.string() }).parse(request.params);
-    return serializeBigInt(services.deleteAgentPaymentMethod(getAgentActor(request), methodId));
+    return serializeBigInt(services.deleteMerchantPaymentMethod(getMerchantActor(request), methodId));
   });
-  app.post("/api/agent/payment-methods/:methodId/default", async (request) => {
+  app.post("/api/merchant/payment-methods/:methodId/default", async (request) => {
     const { methodId } = z.object({ methodId: z.string() }).parse(request.params);
-    return serializeBigInt(services.setAgentPaymentMethodDefault(getAgentActor(request), methodId));
+    return serializeBigInt(services.setMerchantPaymentMethodDefault(getMerchantActor(request), methodId));
   });
-  app.post("/api/agent/payment-methods/:methodId/test", async (request) => {
+  app.post("/api/merchant/payment-methods/:methodId/test", async (request) => {
     const { methodId } = z.object({ methodId: z.string() }).parse(request.params);
-    return serializeBigInt(services.testAgentPaymentMethod(getAgentActor(request), methodId));
+    return serializeBigInt(services.testMerchantPaymentMethod(getMerchantActor(request), methodId));
   });
-  app.get("/api/agent/orders/:orderNo", async (request) => {
+  app.get("/api/merchant/orders/:orderNo", async (request) => {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
-    return serializeBigInt(services.getAgentOrder(getAgentActor(request), orderNo));
+    return serializeBigInt(services.getMerchantOrder(getMerchantActor(request), orderNo));
   });
-  app.post("/api/agent/orders/:orderNo/confirm-payment", async (request) => {
+  app.post("/api/merchant/orders/:orderNo/confirm-payment", async (request) => {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
     const body = z.object({
       amountCents: bigintString,
       voucherUrl: z.string().optional(),
       note: z.string().optional()
     }).parse(request.body);
-    return serializeBigInt(services.confirmAgentOfflinePayment(getAgentActor(request), orderNo, body));
+    return serializeBigInt(services.confirmMerchantOfflinePayment(getMerchantActor(request), orderNo, body));
   });
-  app.post("/api/agent/orders/:orderNo/fulfillment", async (request) => {
+  app.post("/api/merchant/orders/:orderNo/fulfillment", async (request) => {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
     const body = z.object({
       status: z.enum(["success", "failed"]),
@@ -566,46 +609,46 @@ export function buildApp() {
       evidence: z.string().optional(),
       failReason: z.string().optional()
     }).parse(request.body);
-    return serializeBigInt(services.fulfillAgentOrder(getAgentActor(request), orderNo, body));
+    return serializeBigInt(services.fulfillMerchantOrder(getMerchantActor(request), orderNo, body));
   });
-  app.get("/api/agent/after-sales", async (request) => serializeBigInt(services.listAgentAfterSales(getAgentActor(request))));
-  app.post("/api/agent/after-sales/:afterSaleNo/assist", async (request) => {
+  app.get("/api/merchant/after-sales", async (request) => serializeBigInt(services.listMerchantAfterSales(getMerchantActor(request))));
+  app.post("/api/merchant/after-sales/:afterSaleNo/assist", async (request) => {
     const { afterSaleNo } = z.object({ afterSaleNo: z.string() }).parse(request.params);
     const body = z.object({
       note: z.string().min(1).max(500),
       evidenceUrl: z.string().optional()
     }).parse(request.body);
-    return serializeBigInt(services.updateAgentAfterSaleAssist(getAgentActor(request), afterSaleNo, body));
+    return serializeBigInt(services.updateMerchantAfterSaleAssist(getMerchantActor(request), afterSaleNo, body));
   });
-  app.get("/api/agent/settlements", async (request) => serializeBigInt(services.listAgentSettlements(getAgentActor(request))));
-  app.get("/api/agent/clawbacks", async (request) => serializeBigInt(services.listAgentClawbacks(getAgentActor(request))));
-  app.get("/api/agent/deposit-transactions", async (request) => serializeBigInt(services.listAgentDepositTransactions(getAgentActor(request))));
-  app.get("/api/agent/notifications", async (request) => serializeBigInt(services.listNotifications(getAgentActor(request))));
+  app.get("/api/merchant/settlements", async (request) => serializeBigInt(services.listMerchantSettlements(getMerchantActor(request))));
+  app.get("/api/merchant/clawbacks", async (request) => serializeBigInt(services.listMerchantClawbacks(getMerchantActor(request))));
+  app.get("/api/merchant/deposit-transactions", async (request) => serializeBigInt(services.listMerchantDepositTransactions(getMerchantActor(request))));
+  app.get("/api/merchant/notifications", async (request) => serializeBigInt(services.listNotifications(getMerchantActor(request))));
 
-  app.post("/api/agent/notifications/:notificationId/read", async (request) => {
+  app.post("/api/merchant/notifications/:notificationId/read", async (request) => {
     const { notificationId } = z.object({ notificationId: z.string() }).parse(request.params);
-    return serializeBigInt(services.markNotificationRead(getAgentActor(request), notificationId));
+    return serializeBigInt(services.markNotificationRead(getMerchantActor(request), notificationId));
   });
 
-  app.post("/api/agent/scope-check", async (request) => {
-    const body = z.object({ resourceAgentId: z.string(), resourceShopId: z.string().optional() }).parse(request.body);
-    const actor = getAgentActor(request);
-    if (actor.agentId !== body.resourceAgentId || (body.resourceShopId && actor.shopId !== body.resourceShopId)) {
-      throw new ApiError(403, "FORBIDDEN_AGENT_SCOPE", "agent cannot access another agent resource");
+  app.post("/api/merchant/scope-check", async (request) => {
+    const body = z.object({ resourceMerchantId: z.string(), resourceShopId: z.string().optional() }).parse(request.body);
+    const actor = getMerchantActor(request);
+    if (actorMerchantId(actor) !== body.resourceMerchantId || (body.resourceShopId && actor.shopId !== body.resourceShopId)) {
+      throw new ApiError(403, "FORBIDDEN_MERCHANT_SCOPE", "merchant cannot access another merchant resource");
     }
     return { ok: true };
   });
 
-  app.post("/api/admin/agents/:agentId/review", async (request) => {
-    const { agentId } = z.object({ agentId: z.string() }).parse(request.params);
+  app.post("/api/admin/merchants/:merchantId/review", async (request) => {
+    const { merchantId } = z.object({ merchantId: z.string() }).parse(request.params);
     const body = z.object({ approved: z.boolean(), reason: z.string().optional() }).parse(request.body);
-    return services.reviewAgent(getAdminActor(request), agentId, body);
+    return services.reviewMerchant(getAdminActor(request), merchantId, body);
   });
-  app.get("/api/admin/agent-applications", async (request) => serializeBigInt(services.listAgentApplications(getAdminActor(request))));
-  app.post("/api/admin/agents/manual", async (request) => {
+  app.get("/api/admin/merchant-applications", async (request) => serializeBigInt(services.listMerchantApplications(getAdminActor(request))));
+  app.post("/api/admin/merchants/manual", async (request) => {
     const body = z.object({
       name: z.string().min(1),
-      targetTier: agentTierSchema.optional(),
+      targetTier: merchantTierSchema.optional(),
       contactPhone: z.string().optional(),
       shopName: z.string().optional(),
       customerServiceWechat: z.string().optional(),
@@ -614,14 +657,14 @@ export function buildApp() {
       depositPaid: z.boolean().optional(),
       depositAmountCents: bigintString.optional()
     }).parse(request.body);
-    return serializeBigInt(services.createAgentByAdmin(getAdminActor(request), body));
+    return serializeBigInt(services.createMerchantByAdmin(getAdminActor(request), body));
   });
 
   app.get("/api/admin/invite-codes", async (request) => serializeBigInt(services.listInviteCodes(getAdminActor(request))));
   app.post("/api/admin/invite-codes", async (request) => {
     const body = z.object({
       code: z.string().min(1).max(80).optional(),
-      targetTier: agentTierSchema.optional(),
+      targetTier: merchantTierSchema.optional(),
       maxUses: z.number().int().positive().optional(),
       expiresAt: z.string().datetime().optional(),
       depositRequiredAmountCents: bigintString.optional()
@@ -629,21 +672,21 @@ export function buildApp() {
     return serializeBigInt(services.createPlatformInviteCode(getAdminActor(request), body));
   });
 
-  app.post("/api/admin/deposits/:agentId/confirm", async (request) => {
-    const { agentId } = z.object({ agentId: z.string() }).parse(request.params);
+  app.post("/api/admin/deposits/:merchantId/confirm", async (request) => {
+    const { merchantId } = z.object({ merchantId: z.string() }).parse(request.params);
     const body = z.object({ amountCents: bigintString, requiredAmountCents: bigintString.optional(), voucherUrl: z.string().optional() }).parse(request.body);
-    return serializeBigInt(services.confirmDeposit(getAdminActor(request), agentId, body));
+    return serializeBigInt(services.confirmDeposit(getAdminActor(request), merchantId, body));
   });
 
-  app.post("/api/admin/deposits/:agentId/deduct", async (request) => {
-    const { agentId } = z.object({ agentId: z.string() }).parse(request.params);
+  app.post("/api/admin/deposits/:merchantId/deduct", async (request) => {
+    const { merchantId } = z.object({ merchantId: z.string() }).parse(request.params);
     const body = z.object({
       amountCents: bigintString,
       sourceType: z.string(),
       sourceId: z.string(),
       reasonCode: z.string()
     }).parse(request.body);
-    return serializeBigInt(services.deductDeposit(getAdminActor(request), agentId, body));
+    return serializeBigInt(services.deductDeposit(getAdminActor(request), merchantId, body));
   });
 
   app.post("/api/admin/products", async (request) => {
@@ -740,13 +783,22 @@ export function buildApp() {
     const body = z.object({ status: z.string() }).parse(request.body);
     return serializeBigInt(services.updateCouponTemplateStatus(getAdminActor(request), couponId, body));
   });
+  app.post("/api/admin/coupons/:couponId/grants", async (request) => {
+    const { couponId } = z.object({ couponId: z.string() }).parse(request.params);
+    const body = z.object({
+      target: z.enum(["all_users", "single_user"]),
+      userId: z.string().optional(),
+      phone: z.string().optional()
+    }).parse(request.body);
+    return serializeBigInt(services.grantCouponTemplate(getAdminActor(request), couponId, body));
+  });
 
   app.get("/api/admin/rights-codes", async (request) => {
     const query = z.object({
       productId: z.string().optional(),
       orderNo: z.string().optional(),
       shopId: z.string().optional(),
-      status: z.enum(["available", "issued", "voided"]).optional()
+      status: z.enum(["available", "locked", "issued", "voided"]).optional()
     }).parse(request.query);
     return serializeBigInt(services.listRightsCodes(getAdminActor(request), query));
   });
@@ -785,11 +837,11 @@ export function buildApp() {
     return serializeBigInt(services.precheckRightsCodes(getAdminActor(request), body));
   });
 
-  app.get("/api/admin/agent-products/reviews", async (request) => {
+  app.get("/api/admin/merchant-products/reviews", async (request) => {
     const query = z.object({
       reviewStatus: z.string().optional(),
       status: z.string().optional(),
-      agentId: z.string().optional(),
+      merchantId: z.string().optional(),
       shopId: z.string().optional(),
       page: z.coerce.number().int().positive().optional(),
       pageSize: z.coerce.number().int().positive().max(100).optional(),
@@ -798,12 +850,12 @@ export function buildApp() {
     }).parse(request.query);
     return serializeBigInt(services.listAdminOwnProductReviews(getAdminActor(request), query));
   });
-  app.get("/api/admin/agent-products/reviews/:ownProductId", async (request) => {
+  app.get("/api/admin/merchant-products/reviews/:ownProductId", async (request) => {
     const { ownProductId } = z.object({ ownProductId: z.string() }).parse(request.params);
     return serializeBigInt(services.getAdminOwnProductReviewDetail(getAdminActor(request), ownProductId));
   });
 
-  app.post("/api/admin/agent-products/reviews/:ownProductId/review", async (request) => {
+  app.post("/api/admin/merchant-products/reviews/:ownProductId/review", async (request) => {
     const { ownProductId } = z.object({ ownProductId: z.string() }).parse(request.params);
     const body = z.object({ approved: z.boolean(), reason: z.string().optional() }).parse(request.body);
     return serializeBigInt(services.reviewOwnProduct(getAdminActor(request), ownProductId, body));
@@ -832,22 +884,27 @@ export function buildApp() {
   app.get("/api/admin/refunds", async (request) => serializeBigInt(services.listAdminRefunds(getAdminActor(request))));
   app.get("/api/admin/settlements", async (request) => serializeBigInt(services.listAdminSettlements(getAdminActor(request))));
   app.get("/api/admin/deposits", async (request) => serializeBigInt(services.listAdminDeposits(getAdminActor(request))));
-  app.get("/api/admin/channels", async (request) => serializeBigInt(services.listAdminChannels(getAdminActor(request))));
-  app.post("/api/admin/channels/:agentId/review", async (request) => {
-    const { agentId } = z.object({ agentId: z.string() }).parse(request.params);
+  app.get("/api/admin/merchant-supply", async (request) => serializeBigInt(services.listAdminChannels(getAdminActor(request))));
+  app.post("/api/admin/merchant-supply/:merchantId/review", async (request) => {
+    const { merchantId } = z.object({ merchantId: z.string() }).parse(request.params);
     const body = z.object({ approved: z.boolean(), reason: z.string().optional() }).parse(request.body);
-    return serializeBigInt(services.reviewChannelAuthorization(getAdminActor(request), agentId, body));
+    return serializeBigInt(services.reviewChannelAuthorization(getAdminActor(request), merchantId, body));
   });
-  app.post("/api/admin/channels/relations", async (request) => {
+  app.post("/api/admin/merchant-supply/relations", async (request) => {
     const body = z.object({
-      firstTierAgentId: z.string(),
-      secondTierAgentId: z.string(),
-      thirdTierAgentId: z.string().optional(),
+      firstTierMerchantId: z.string(),
+      secondTierMerchantId: z.string(),
+      thirdTierMerchantId: z.string().optional(),
       reason: z.string().optional()
     }).parse(request.body);
-    return serializeBigInt(services.createChannelRelation(getAdminActor(request), body));
+    return serializeBigInt(services.createChannelRelation(getAdminActor(request), {
+      firstTierMerchantId: body.firstTierMerchantId,
+      secondTierMerchantId: body.secondTierMerchantId,
+      thirdTierMerchantId: body.thirdTierMerchantId,
+      reason: body.reason
+    }));
   });
-  app.post("/api/admin/channels/offers", async (request) => {
+  app.post("/api/admin/merchant-supply/offers", async (request) => {
     const body = z.object({
       channelRelationId: z.string(),
       platformProductId: z.string(),
@@ -871,7 +928,7 @@ export function buildApp() {
   app.post("/api/admin/refunds/allocate", async (request) => {
     try {
       const actor = getAdminActor(request);
-      return serializeBigInt(services.allocateRefundForAdmin(actor, refundAllocationSchema().parse(request.body)));
+      return serializeBigInt(services.allocateRefundForAdmin(actor, mapRefundAllocation(refundAllocationSchema().parse(normalizeRefundRequest(request.body))) as never));
     } catch (error) {
       if (error instanceof ApiError) throw error;
       throw new ApiError(400, "REFUND_ALLOCATION_FAILED", error instanceof Error ? error.message : "refund allocation failed");
@@ -884,10 +941,10 @@ export function buildApp() {
       refundAmountCents: true,
       responsibility: true,
       platformBearCents: true,
-      agentBearCents: true,
+      merchantBearCents: true,
       serviceFeeBearer: true
-    }).parse(request.body);
-    return serializeBigInt(services.approveRefund(getAdminActor(request), afterSaleNo, body));
+    }).parse(normalizeRefundRequest(request.body));
+    return serializeBigInt(services.approveRefund(getAdminActor(request), afterSaleNo, mapRefundAllocation(body) as never));
   });
 
   app.post("/api/admin/refunds/:refundNo/manual-confirm", async (request) => {
@@ -921,11 +978,12 @@ export function buildApp() {
   });
 
   app.post("/api/admin/settlements/generate", async (request) => {
-    const body = z.object({ agentId: z.string(), now: z.string().optional(), batchNo: z.string().default("default") }).parse(request.body);
+    const body = z.object({ merchantId: z.string(), now: z.string().optional(), batchNo: z.string().default("default") }).parse(request.body);
     const result = services.generateSettlement(getAdminActor(request), {
-      ...body,
+      ...internalMerchantRef(body.merchantId),
+      batchNo: body.batchNo,
       now: body.now ? new Date(body.now) : undefined
-    });
+    } as Parameters<typeof services.generateSettlement>[1]);
     return serializeBigInt(result.status === "processed" ? result.sheet : { ...result.sheet, status: result.status });
   });
 
@@ -940,7 +998,7 @@ export function buildApp() {
 
   app.post("/api/admin/risk-freezes", async (request) => {
     const body = z.object({
-      targetType: z.enum(["order", "shop", "agent", "product", "settlement"]),
+      targetType: z.enum(["order", "shop", "merchant", "product", "settlement"]),
       targetId: z.string(),
       freezeType: z.enum(["order_frozen", "shop_frozen", "settlement_restricted", "product_removed", "disabled"]),
       reasonCode: z.string()
@@ -958,12 +1016,6 @@ export function buildApp() {
   app.get("/api/admin/sales-dashboard", async (request) => serializeBigInt(services.adminSalesDashboard(getAdminActor(request))));
   app.get("/api/admin/risk-dashboard", async (request) => serializeBigInt(services.adminRiskDashboard(getAdminActor(request))));
   app.get("/api/admin/service-qrcodes", async (request) => serializeBigInt(services.listServiceQrCodes(getAdminActor(request))));
-  app.get("/api/admin/collection-channels", async (request) => serializeBigInt(services.listCollectionChannels(getAdminActor(request))));
-  app.post("/api/admin/collection-channels/:channelId/review", async (request) => {
-    const { channelId } = z.object({ channelId: z.string() }).parse(request.params);
-    const body = z.object({ approved: z.boolean(), reason: z.string().optional() }).parse(request.body);
-    return serializeBigInt(services.reviewCollectionChannel(getAdminActor(request), channelId, body));
-  });
   app.patch("/api/admin/shops/:shopId/collection", async (request) => {
     const { shopId } = z.object({ shopId: z.string() }).parse(request.params);
     const body = z.object({
@@ -988,7 +1040,7 @@ export function buildApp() {
   app.get("/api/admin/payment-methods", async (request) => serializeBigInt(services.listAdminPaymentMethods(getAdminActor(request))));
   app.post("/api/admin/payment-methods", async (request) => {
     const body = paymentMethodBodySchema.extend({
-      agentId: z.string().optional(),
+      merchantId: z.string().optional(),
       shopId: z.string().optional()
     }).parse(request.body);
     return serializeBigInt(services.upsertAdminPaymentMethod(getAdminActor(request), body));
@@ -1033,6 +1085,22 @@ export function buildApp() {
     return serializeBigInt(services.updatePaymentConfigMetadata(getAdminActor(request), body));
   });
   app.post("/api/admin/payment-config/check", async (request) => serializeBigInt(services.checkPaymentConfig(getAdminActor(request))));
+  app.get("/api/admin/platform-service-fee", async (request) => serializeBigInt(services.getPlatformServiceFeeConfig(getAdminActor(request))));
+  app.patch("/api/admin/platform-service-fee", async (request) => {
+    const body = z.object({
+      enabled: z.boolean().optional(),
+      feeBps: z.number().int().nonnegative().max(10_000).optional()
+    }).parse(request.body);
+    return serializeBigInt(services.updatePlatformServiceFeeConfig(getAdminActor(request), body));
+  });
+  app.get("/api/admin/wallets", async (request) => serializeBigInt(services.listWallets(getAdminActor(request))));
+  app.get("/api/admin/wallet-transactions", async (request) => serializeBigInt(services.listWalletTransactions(getAdminActor(request))));
+  app.get("/api/admin/wallet-recharges", async (request) => serializeBigInt(services.listWalletRecharges(getAdminActor(request))));
+  app.post("/api/admin/wallet-recharges/:rechargeNo/confirm", async (request) => {
+    const { rechargeNo } = z.object({ rechargeNo: z.string() }).parse(request.params);
+    const body = z.object({ voucherUrl: z.string().optional(), note: z.string().optional() }).parse(request.body);
+    return serializeBigInt(services.confirmWalletRecharge(getAdminActor(request), rechargeNo, body));
+  });
   app.get("/api/admin/payment-onboarding-guide", async (request) => {
     getAdminActor(request);
     return services.paymentOnboardingGuide();
@@ -1051,8 +1119,16 @@ export function buildApp() {
     const body = z.object({ channel: z.string().default("mock"), channelTradeNo: z.string(), orderNo: z.string(), amountCents: bigintString }).parse(request.body);
     return serializeBigInt(services.paymentCallback(body));
   });
+  app.get("/api/callbacks/payments/epay", async (request) => {
+    const result = services.epayProviderCallback(recordPayload(request.query));
+    return result.status === "processed" || result.status === "duplicate" ? "success" : serializeBigInt(result);
+  });
   app.post("/api/callbacks/payments/:provider", async (request) => {
     const { provider } = z.object({ provider: paymentProvider }).parse(request.params);
+    if (provider === "epay") {
+      const result = services.epayProviderCallback(recordPayload(request.body));
+      return result.status === "processed" || result.status === "duplicate" ? "success" : serializeBigInt(result);
+    }
     const body = paymentResultBodySchema.parse(request.body);
     return serializeBigInt(services.paymentProviderCallback(provider, body));
   });
@@ -1071,14 +1147,70 @@ function refundAllocationSchema() {
   return z.object({
     paidAmountCents: bigintString,
     supplyAmountCents: bigintString,
-    agentIncomeCents: bigintString,
+    merchantIncomeCents: bigintString,
     alreadyRefundedCents: bigintString.optional(),
     refundAmountCents: bigintString,
-    responsibility: z.enum(["platform", "agent", "user", "mixed"]),
+    responsibility: z.enum(["platform", "merchant", "user", "mixed"]),
     platformBearCents: bigintString.optional(),
-    agentBearCents: bigintString.optional(),
-    serviceFeeBearer: z.enum(["platform", "agent", "mixed", "none"]).optional()
+    merchantBearCents: bigintString.optional(),
+    serviceFeeBearer: z.enum(["platform", "merchant", "mixed", "none"]).optional()
   });
+}
+
+function normalizeRefundRequest(body: unknown) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const record = body as Record<string, unknown>;
+  return {
+    ...record,
+    merchantIncomeCents: record.merchantIncomeCents ?? record.merchantIncomeCents,
+    merchantBearCents: record.merchantBearCents ?? record.merchantBearCents,
+    responsibility: record.responsibility === "merchant" ? "merchant" : record.responsibility,
+    serviceFeeBearer: record.serviceFeeBearer === "merchant" ? "merchant" : record.serviceFeeBearer
+  };
+}
+
+function mapRefundAllocation<T extends {
+  merchantIncomeCents?: bigint;
+  merchantBearCents?: bigint;
+  responsibility: "platform" | "merchant" | "user" | "mixed";
+  serviceFeeBearer?: "platform" | "merchant" | "mixed" | "none";
+}>(body: T) {
+  return {
+    ...body,
+    merchantIncomeCents: body.merchantIncomeCents,
+    responsibility: body.responsibility === "merchant" ? "merchant" as const : body.responsibility,
+    merchantBearCents: body.merchantBearCents,
+    serviceFeeBearer: body.serviceFeeBearer === "merchant" ? "merchant" as const : body.serviceFeeBearer
+  };
+}
+
+function internalMerchantRef(merchantId: string) {
+  return { merchantId };
+}
+
+function internalProductRef(merchantProductListingId: string | undefined) {
+  return merchantProductListingId ? { merchantProductListingId } : {};
+}
+
+function internalProductGroupRef(merchantProductListingIds: string[]) {
+  return { merchantProductListingIds };
+}
+
+function merchantActorFromMerchant(merchantId: string, shopId: string): MerchantActor {
+  return { role: "merchant", ...internalMerchantRef(merchantId), shopId } as MerchantActor;
+}
+
+function actorMerchantId(actor: MerchantActor): string {
+  return merchantIdFromRecord(actor);
+}
+
+function merchantIdFromRecord(input: object): string {
+  const record = input as Record<string, unknown>;
+  const merchantId = record.merchantId;
+  if (typeof merchantId !== "string" || !merchantId) {
+    throw new ApiError(401, "AUTH_INVALID", "merchant actor is missing required id");
+  }
+  return merchantId;
 }
 
 function getUserActor(request: FastifyRequest): UserActor {
@@ -1087,14 +1219,10 @@ function getUserActor(request: FastifyRequest): UserActor {
   return { role: "user", userId: requiredHeader(request, "x-user-id") };
 }
 
-function getAgentActor(request: FastifyRequest): AgentActor {
-  if (hasBearerToken(request)) return parseSignedActor(request, "agent");
-  if (!allowDemoAuth()) return parseSignedActor(request, "agent");
-  return {
-    role: "agent",
-    agentId: requiredHeader(request, "x-agent-id"),
-    shopId: requiredHeader(request, "x-shop-id")
-  };
+function getMerchantActor(request: FastifyRequest): MerchantActor {
+  if (hasBearerToken(request)) return parseSignedActor(request, "merchant");
+  if (!allowDemoAuth()) return parseSignedActor(request, "merchant");
+  return merchantActorFromMerchant(requiredHeader(request, "x-merchant-id"), requiredHeader(request, "x-shop-id"));
 }
 
 function getAdminActor(request: FastifyRequest): AdminActor {
@@ -1156,8 +1284,8 @@ function createAdminAuthSession(input: {
   };
 }
 
-function createAgentAuthSession(input: {
-  agentId: string;
+function createMerchantAuthSession(input: {
+  merchantId?: string;
   shopId: string;
   username: string;
   displayName: string;
@@ -1168,18 +1296,19 @@ function createAgentAuthSession(input: {
   shopStatus: string;
   mustChangePassword: boolean;
 }) {
+  const merchantId = merchantIdFromRecord(input);
   const expiresAt = Math.floor(Date.now() / 1000) + 60 * 60 * 12;
   const token = signToken({
-    role: "agent",
-    agentId: input.agentId,
+    role: "merchant",
+    merchantId,
     shopId: input.shopId,
     exp: expiresAt
   });
   return {
     token,
     expiresAt,
-    agent: {
-      agentId: input.agentId,
+    merchant: {
+      merchantId,
       username: input.username,
       displayName: input.displayName,
       tier: input.tier,
@@ -1201,6 +1330,10 @@ function signToken(payload: Record<string, unknown>): string {
   return `${body}.${signature}`;
 }
 
+function recordPayload(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
 function hasBearerToken(request: FastifyRequest): boolean {
   const authorization = request.headers.authorization;
   return typeof authorization === "string" && authorization.startsWith("Bearer ");
@@ -1219,7 +1352,7 @@ function isProductionRuntime(): boolean {
     || process.env.VERCEL_ENV === "production";
 }
 
-function parseSignedActor<T extends UserActor | AgentActor | AdminActor>(
+function parseSignedActor<T extends UserActor | MerchantActor | AdminActor>(
   request: FastifyRequest,
   expectedRole: T["role"]
 ): T {
@@ -1239,8 +1372,8 @@ function parseSignedActor<T extends UserActor | AgentActor | AdminActor>(
     throw new ApiError(401, "AUTH_EXPIRED", "bearer token expired");
   }
   if (expectedRole === "user" && typeof payload.userId === "string") return { role: "user", userId: payload.userId } as T;
-  if (expectedRole === "agent" && typeof payload.agentId === "string" && typeof payload.shopId === "string") {
-    return { role: "agent", agentId: payload.agentId, shopId: payload.shopId } as T;
+  if (expectedRole === "merchant" && typeof payload.merchantId === "string" && typeof payload.shopId === "string") {
+    return merchantActorFromMerchant(payload.merchantId, payload.shopId) as unknown as T;
   }
   if (expectedRole === "admin" && typeof payload.adminId === "string") {
     return {

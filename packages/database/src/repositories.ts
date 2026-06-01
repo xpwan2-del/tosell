@@ -13,16 +13,16 @@ export type RepositoryContext = {
 
 export const P0_WRITE_CHAIN_CONTRACT = {
   manualFirstTierMerchant: ["merchants", "merchant_accounts", "shops", "deposit_accounts", "audit_logs"],
-  merchantApplication: ["merchant_applications", "merchant_invite_codes", "channel_relations", "audit_logs"],
+  merchantApplication: ["merchant_applications", "merchant_invite_codes", "merchants", "audit_logs"],
   depositConfirmation: ["deposit_accounts", "deposit_transactions", "ledger_entries", "audit_logs"],
-  productAndOffer: ["platform_products", "merchant_products", "merchant_product_reviews", "channel_product_offers", "audit_logs"],
-  collectionChannel: ["shop_collection_channels", "shops", "audit_logs"],
+  productAndOffer: ["platform_products", "merchant_product_listings", "merchant_products", "merchant_product_reviews", "audit_logs"],
+  collectionPaymentConfig: ["collection_payment_configs", "shops", "audit_logs"],
   order: ["users", "orders", "order_items", "order_amount_snapshots", "coupon_usage", "ledger_entries", "audit_logs"],
   collectionConfirmation: ["payment_confirmations", "payments", "orders", "fulfillment_records", "fulfillment_attempts", "virtual_codes", "ledger_entries", "audit_logs"],
   fulfillment: ["fulfillment_records", "fulfillment_attempts", "virtual_codes", "order_extract_secrets", "order_extract_logs", "audit_logs"],
   afterSaleRefund: ["after_sales", "refunds", "refund_callbacks", "order_extract_secrets", "ledger_entries", "audit_logs"],
   coupons: ["coupon_templates", "coupon_scopes", "user_coupons", "coupon_grant_records", "coupon_usage", "coupon_void_records"],
-  clearing: ["clearing_records", "clearing_items", "clearing_confirmations", "ledger_entries", "audit_logs"]
+  settlement: ["settlement_sheets", "settlement_items", "settlement_confirmations", "ledger_entries", "audit_logs"]
 } as const;
 
 export class TransactionService {
@@ -51,10 +51,6 @@ export class TransactionService {
     return this.transaction(fn);
   }
 
-  createChannelRelation<T>(fn: (tx: PrismaTx) => Promise<T>) {
-    return this.transaction(fn);
-  }
-
   confirmDeposit<T>(fn: (tx: PrismaTx) => Promise<T>) {
     return this.transaction(fn);
   }
@@ -63,7 +59,7 @@ export class TransactionService {
     return this.transaction(fn);
   }
 
-  configureCollectionChannel<T>(fn: (tx: PrismaTx) => Promise<T>) {
+  configureCollectionPaymentConfig<T>(fn: (tx: PrismaTx) => Promise<T>) {
     return this.transaction(fn);
   }
 
@@ -99,9 +95,6 @@ export class TransactionService {
     return this.transaction(fn);
   }
 
-  createClearing<T>(fn: (tx: PrismaTx) => Promise<T>) {
-    return this.transaction(fn);
-  }
 }
 
 class BaseRepository {
@@ -116,7 +109,7 @@ export class ShopRepository extends BaseRepository {
   findPublicShopById(shopId: string) {
     return this.prisma.shop.findFirst({
       where: { id: shopId },
-      include: { collectionChannels: { where: { status: "active" }, orderBy: { isDefault: "desc" } } }
+      include: { collectionPaymentConfigs: { where: { status: "active" }, orderBy: { isDefault: "desc" } } }
     });
   }
 
@@ -184,34 +177,6 @@ export class MerchantInviteRepository extends BaseRepository {
   }
 }
 
-export class ChannelRelationRepository extends BaseRepository {
-  create(data: Prisma.ChannelRelationUncheckedCreateInput, tx?: PrismaTx) {
-    return this.db(tx).channelRelation.create({ data });
-  }
-
-  createOffer(data: Prisma.ChannelProductOfferUncheckedCreateInput, tx?: PrismaTx) {
-    return this.db(tx).channelProductOffer.create({ data });
-  }
-
-  upsertOffer(input: {
-    channelRelationId: string;
-    platformProductId: string;
-    create: Prisma.ChannelProductOfferUncheckedCreateInput;
-    update: Prisma.ChannelProductOfferUncheckedUpdateInput;
-  }, tx?: PrismaTx) {
-    return this.db(tx).channelProductOffer.upsert({
-      where: {
-        channelRelationId_platformProductId: {
-          channelRelationId: input.channelRelationId,
-          platformProductId: input.platformProductId
-        }
-      },
-      create: input.create,
-      update: input.update
-    });
-  }
-}
-
 export class AdminAuthRepository extends BaseRepository {
   findAdminWithRoles(adminId: string) {
     return this.prisma.adminUser.findUnique({
@@ -261,18 +226,16 @@ export class ProductRepository extends BaseRepository {
     });
   }
 
-  upsertAgentProduct(input: {
+  upsertMerchantProductListing(input: {
     shopId: string;
-    productType: Prisma.AgentProductUncheckedCreateInput["productType"];
     platformProductId: string;
-    create: Prisma.AgentProductUncheckedCreateInput;
-    update: Prisma.AgentProductUncheckedUpdateInput;
+    create: Prisma.MerchantProductListingUncheckedCreateInput;
+    update: Prisma.MerchantProductListingUncheckedUpdateInput;
   }, tx?: PrismaTx) {
-    return this.db(tx).agentProduct.upsert({
+    return this.db(tx).merchantProductListing.upsert({
       where: {
-        shopId_productType_platformProductId: {
+        shopId_platformProductId: {
           shopId: input.shopId,
-          productType: input.productType,
           platformProductId: input.platformProductId
         }
       },
@@ -282,21 +245,21 @@ export class ProductRepository extends BaseRepository {
   }
 }
 
-export class CollectionChannelRepository extends BaseRepository {
-  create(data: Prisma.ShopCollectionChannelUncheckedCreateInput, tx?: PrismaTx) {
-    return this.db(tx).shopCollectionChannel.create({ data });
+export class CollectionPaymentConfigRepository extends BaseRepository {
+  create(data: Prisma.CollectionPaymentConfigUncheckedCreateInput, tx?: PrismaTx) {
+    return this.db(tx).collectionPaymentConfig.create({ data });
   }
 
-  review(id: string, data: Prisma.ShopCollectionChannelUncheckedUpdateInput, tx?: PrismaTx) {
-    return this.db(tx).shopCollectionChannel.update({ where: { id }, data });
+  review(id: string, data: Prisma.CollectionPaymentConfigUncheckedUpdateInput, tx?: PrismaTx) {
+    return this.db(tx).collectionPaymentConfig.update({ where: { id }, data });
   }
 
-  async setDefault(shopId: string, channelId: string, tx?: PrismaTx) {
+  async setDefault(shopId: string, configId: string, tx?: PrismaTx) {
     const run = async (db: DbClient) => {
-      await db.shopCollectionChannel.updateMany({ where: { shopId }, data: { isDefault: false } });
-      return db.shopCollectionChannel.update({ where: { id: channelId }, data: { isDefault: true } });
+      await db.collectionPaymentConfig.updateMany({ where: { shopId }, data: { isDefault: false } });
+      return db.collectionPaymentConfig.update({ where: { id: configId }, data: { isDefault: true } });
     };
-    return tx ? run(tx) : new TransactionService(this.prisma).configureCollectionChannel(run);
+    return tx ? run(tx) : new TransactionService(this.prisma).configureCollectionPaymentConfig(run);
   }
 }
 
@@ -578,7 +541,6 @@ export class DepositRepository extends BaseRepository {
   async confirmPayment(input: {
     accountId: string;
     merchantId?: string | null;
-    agentId?: string | null;
     transaction: Omit<Prisma.DepositTransactionUncheckedCreateInput, "accountId">;
     ledger: Prisma.LedgerEntryUncheckedCreateInput;
     auditLog: Prisma.AuditLogUncheckedCreateInput;
@@ -594,7 +556,6 @@ export class DepositRepository extends BaseRepository {
         data: {
           ...input.transaction,
           accountId: input.accountId,
-          agentId: input.agentId ?? null,
           merchantId: input.merchantId ?? null,
           balanceBeforeCents: account.availableAmountCents,
           balanceAfterCents: nextAvailable,
@@ -610,43 +571,6 @@ export class DepositRepository extends BaseRepository {
 
   createTransaction(data: Prisma.DepositTransactionUncheckedCreateInput, tx?: PrismaTx) {
     return this.db(tx).depositTransaction.create({ data });
-  }
-}
-
-export class ClearingRepository extends BaseRepository {
-  createClearingGraph(input: {
-    clearing: Prisma.ClearingRecordUncheckedCreateInput;
-    items: Prisma.ClearingItemUncheckedCreateInput[];
-    ledgers?: Prisma.LedgerEntryUncheckedCreateInput[];
-    auditLog: Prisma.AuditLogUncheckedCreateInput;
-  }, tx?: PrismaTx) {
-    const run = async (db: DbClient) => {
-      const clearing = await db.clearingRecord.create({ data: input.clearing });
-      const items = await Promise.all(input.items.map((data) => db.clearingItem.create({ data: { ...data, clearingId: clearing.id } })));
-      const ledgers = input.ledgers?.length
-        ? await Promise.all(input.ledgers.map((data) => db.ledgerEntry.create({ data: { ...data, clearingId: clearing.id } })))
-        : [];
-      const auditLog = await db.auditLog.create({ data: input.auditLog });
-      return { clearing, items, ledgers, auditLog };
-    };
-    return tx ? run(tx) : new TransactionService(this.prisma).createClearing(run);
-  }
-
-  confirm(input: {
-    clearingId: string;
-    confirmation: Prisma.ClearingConfirmationUncheckedCreateInput;
-    auditLog: Prisma.AuditLogUncheckedCreateInput;
-  }, tx?: PrismaTx) {
-    const run = async (db: DbClient) => {
-      const clearing = await db.clearingRecord.update({
-        where: { id: input.clearingId },
-        data: { status: "confirmed", confirmedAt: new Date(), confirmedById: input.confirmation.confirmedById }
-      });
-      const confirmation = await db.clearingConfirmation.create({ data: { ...input.confirmation, clearingId: input.clearingId } });
-      const auditLog = await db.auditLog.create({ data: input.auditLog });
-      return { clearing, confirmation, auditLog };
-    };
-    return tx ? run(tx) : new TransactionService(this.prisma).createClearing(run);
   }
 }
 
@@ -674,10 +598,9 @@ export function createPrismaRepositories(prisma: PrismaClient) {
     shops: new ShopRepository(prisma),
     merchants: new MerchantRepository(prisma),
     merchantInvites: new MerchantInviteRepository(prisma),
-    channelRelations: new ChannelRelationRepository(prisma),
     adminAuth: new AdminAuthRepository(prisma),
     products: new ProductRepository(prisma),
-    collectionChannels: new CollectionChannelRepository(prisma),
+    collectionPaymentConfigs: new CollectionPaymentConfigRepository(prisma),
     orders: new OrderRepository(prisma),
     paymentConfirmations: new PaymentConfirmationRepository(prisma),
     inventory: new InventoryRepository(prisma),
@@ -686,7 +609,6 @@ export function createPrismaRepositories(prisma: PrismaClient) {
     coupons: new CouponRepository(prisma),
     afterSales: new AfterSaleRepository(prisma),
     deposits: new DepositRepository(prisma),
-    clearing: new ClearingRepository(prisma),
     ledger: new LedgerRepository(prisma),
     audit: new AuditRepository(prisma)
   };

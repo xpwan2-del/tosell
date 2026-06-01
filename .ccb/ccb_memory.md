@@ -1,99 +1,91 @@
 <!-- CCB-WORKFLOW-START -->
-# Project Memory: B2B2C H5 Virtual Shop Platform
+# 项目记忆：ToSell H5 虚拟商品商城
 
-## Project Direction
+## 项目方向
 
-This project is now an H5 independent virtual-product shop platform with a platform admin, merchant admin, and per-merchant storefronts. The WeChat mini-program is no longer a P0 delivery target and should be removed from the build/delivery scope. WeChat and Alipay are payment/collection channels only.
+ToSell 是一个 H5 独立虚拟商品商城，不是小程序优先项目。项目包含平台后台、商户后台、每个商户自己的 H5 店铺页。微信、支付宝在这里是支付/收款方式，不是小程序交付目标。
 
-The platform provides product supply, review, merchant collection-channel binding, fulfillment, supply payable/service-fee reconciliation, audit, and risk controls. Agents/merchants are reviewed before onboarding, pay a deposit, operate their own shop page, bind their own customer-service contact and collection channels, promote their own shop, set their own sale prices, collect buyer payments through their own collection channels, and earn the difference between sale price and upstream supply price.
+平台负责商品供给、商品审核、商户收款配置、余额充值、履约发货、供货应付/平台服务费核算、优惠券补贴记录、审计和风控。商户审核通过并确认保证金后，经营自己的店铺链接、商品、客服联系方式和收款配置，可以推广自己的店铺并通过差价赚钱。
 
-This project must not be designed as commission-based multi-level distribution, downline commission, team reward, invitation reward, ranking reward, or any model centered on recruiting agents. The allowed channel model is controlled B2B2C price-spread supply up to three tiers: platform -> first-tier merchant -> second-tier merchant -> third-tier merchant -> buyer. Fourth-tier channels and recruiting-based income are forbidden.
+这个项目不是多级分销，不做下线佣金、团队奖励、邀请奖励、排行榜奖励，也不做靠拉人赚钱的模式。允许的是受控的 B2B2C 价差供货，最多三层：平台 -> 一级商户 -> 二级商户 -> 三级商户 -> 买家。禁止第四级。
 
-## Source Of Truth
+## 必读文档
 
-All agents must read these files before planning or implementing:
+所有员工规划或开发前必须先看这些文件：
 
 1. `README.md`
-2. `docs/01-product-requirements.md`
-3. `docs/02-business-rules.md`
-4. `docs/03-development-cards.md`
-5. `docs/04-testing-and-release.md`
-6. `docs/05-open-questions.md`
-7. `docs/06-system-architecture.md`
-8. `docs/07-admin-backend-database-plan.md`
-9. `docs/08-state-machines-and-permissions.md`
-10. `docs/09-api-testing-release-plan.md`
-11. `docs/12-h5-and-three-tier-channel-plan.md`
-12. `docs/13-virtual-commerce-reference.md`
-13. `docs/14-h5-production-realignment-plan.md`
+2. `docs/00-canonical-development-baseline.md`
+3. `docs/01-product-requirements.md`
+4. `docs/02-business-rules.md`
+5. `docs/16-page-level-production-acceptance-test-plan.md`
 
-Historical reference only, not P0 source of truth:
+如果任务和文档冲突，先停下来交给 `main` 和 `pm_architect` 处理，不要自己硬写。
 
-1. `docs/10-v2-payment-onboarding.md`
-2. `docs/11-v2-non-payment-release.md`
+## 已确认业务规则
 
-If a task conflicts with these documents, stop and route the conflict to `main` and `pm_architect` before implementing.
+1. 陌生商户必须通过入驻申请页加邀请码注册。可信内部一级商户可以由平台后台手动创建账号，但必须有审计记录。
+2. 商户正式销售前必须确认保证金。平台可以人工确认线下保证金，但要记录金额、凭证、操作人、时间和审计日志。
+3. 每个商户都有自己的店铺页、店铺链接、商品列表、客服微信、订单和收入记录。
+4. 平台商品有平台供货价、最低销售价、建议销售价。
+5. 商户可以自己定销售价，但不能低于最低销售价。
+6. 平台服务费必须后台可配置：可开启、可关闭、比例可改。当前业务目标默认是 0.5%，但代码不能写死。
+7. 商户收入是价差，不是佣金。
+8. 商户可以提交自己的虚拟商品，但必须平台审核后才可销售。
+9. 退款按买家实付金额处理。供货成本、商户价差、责任损失都要按规则记录。
+10. 当前版本不是平台先代收买家款再 T+1 打款给商户。商户用自己的收款码、支付链接或支付通道收款；系统记录供货应付、平台服务费、追扣、保证金和对账。
+11. 当前版本不做商户自助提现或平台自动打款给商户；如有线下结算，只记录凭证和审计。
+12. 支付/收款按商户配置。支持支付宝商户、微信/腾讯商户、e支付、个人支付宝、个人微信、余额支付和充值。商户/官方/e支付通道需要回调、查单、验签后确认；个人码只能人工确认；余额支付由后端扣款后确认。
+13. 平台管理员能看全局数据；一级/二级/三级商户只能看自己权限内的店铺、订单、商品、收款配置和下级范围。
+14. H5 店铺页不能暴露无关店铺切换。
+15. 商品信息可以向下游展示，但上游成本价必须隔离：二级看不到平台给一级的供货价，三级看不到平台供货价和一级转供价。
+16. 邀请码只定义商户上下级归属：平台码创建一级，一级码创建二级，二级码创建三级，三级不能创建第四级。邀请码不能产生奖励或佣金。
+17. 优惠券是平台补贴。优惠券不能减少上游供货价、转供价或商户价差结算基础。退款订单的已用券作废，默认不退回。
+18. 买家购买有卡密的虚拟卡密商品，也就是 `code_pool` 自动发码商品时，必须填写购买密码和联系电话。联系电话必须校验为合法中国大陆手机号并写入订单快照。邮箱选填；填写邮箱后，确认收款并发码时必须走邮件投递记录。`manual` 人工交付商品不强制购买密码和联系电话。购买密码是用户可见概念；如历史后端字段仍叫 `extractionCode`，只能内部兼容，不得在页面、测试、任务描述中使用旧称。
+19. 保证金确认是硬门槛：未确认前不能销售、选择/上架平台商品、代理上游商品、配置转供价、启用收款配置或创建可支付订单。
+20. 付款截图不是主支付流程，不能触发已支付，也不能自动发货。
+21. H5 支付方式必须用按钮展示，不用下拉框。支付宝、微信、e支付收 1% 支付手续费；余额支付不收 1%。
+22. 商户代理平台商品时，只能改自己店铺里的展示信息和销售价，不能改平台源商品、库存来源、商品归属或结算链路。
 
-## Confirmed Business Rules
+## 工作顺序
 
-1. Unknown merchants must register through the onboarding application page with an invite code. Trusted/internal first-tier merchants may be created manually from platform admin, with an initial account/password generated and delivery audited.
-2. Agents must pay a deposit before formal sales. The platform admin may manually confirm deposit payment for offline/trusted cases, but the confirmation must record amount, proof, operator, timestamp, and audit log.
-3. Each agent must have an independent shop page, shop link, product list, customer-service WeChat account, and order/revenue records.
-4. Platform products have a platform supply price, minimum sale price, and suggested sale price.
-5. Agents may set sale prices freely, but never below the minimum sale price.
-6. The platform charges 0.5% service fee per order. P0 defaults to the pre-coupon sale amount as the clearing basis; buyer-paid amount and platform coupon subsidy must be snapshotted separately.
-7. Agent income is price difference, not commission.
-8. Agents may submit their own virtual products, but the platform must review them before sale.
-9. Refunds are based on the user's paid amount. The platform bears the supply-price part, the agent bears the price-difference part, and responsibility determines additional loss allocation.
-10. P0 does not use platform-collected buyer funds followed by T+1 merchant payout. Merchants collect through their own QR/link. The system generates supply payable, service-fee, clawback, deposit, and reconciliation records; refunding, complaint, risk-frozen, or abnormal orders must freeze those records.
-11. Version 1 does not build merchant self-service withdrawal or platform-to-merchant payout. If offline upstream clearing happens, record proof and audit only.
-12. Payment is configurable per merchant. P0 supports Alipay personal QR, Alipay merchant QR/link, WeChat personal QR, and WeChat merchant QR/link. Mock payment is development-only and cannot be the production default.
-13. Platform admins can see all merchants and shops. First/second/third-tier merchants can only see and manage their own permitted storefronts, orders, products, collection channels, and downstream scope.
-14. Public H5 storefronts must not expose unrelated merchant/shop switching.
-15. Product information may flow downstream for selection and selling, but upstream prices are strictly isolated: the platform-to-first-tier supply price is visible only to platform and that first-tier merchant; second-tier merchants only see their first-tier transfer price; third-tier merchants only see their second-tier transfer price.
-16. Merchant invitation codes define channel ownership only: platform invite code creates first-tier merchants, first-tier invite code creates second-tier merchants, second-tier invite code creates third-tier merchants, and third-tier merchants cannot create fourth-tier invite codes. Invite codes must not create invite rewards or commissions.
-17. Platform coupons are platform subsidy. Coupons must not reduce upstream supply prices, transfer prices, or merchant price-spread clearing basis. Refunded orders void used coupons and do not return them to the buyer unless a later policy explicitly changes this.
-18. Buyer email is optional at checkout. If provided, automatic fulfillment sends activation code/card secret by email after collection confirmation. Extract codes are product-level configurable and mainly for recharge cards/vouchers; not every virtual product requires an extract code.
-19. Deposit confirmation is a hard gate: before deposit is confirmed, merchants cannot sell, select/list platform products, proxy upstream merchant products, configure transfer prices, or create payable orders.
+不要把这个项目当成一个前端页面。数据库、后端、支付/收款模型、后台、权限、H5 店铺必须一起动。
 
-## Work Order
+正确顺序：
 
-Do not treat this as a frontend-only H5 page. The backend, database, payment/collection-channel model, admin, merchant backend, permissions, and storefront must move together.
+1. `main` 接收需求并协调。
+2. `pm_architect` 先明确产品范围、后台范围、后端范围、状态、权限、风险和验收标准。
+3. `database_expert` 设计表、流水、约束、索引和事务边界。
+4. `backend_worker` 实现 API、业务服务、回调、发货、退款、结算、风控和权限。
+5. `frontend_dev` 在接口和数据契约清楚后实现 H5、商户后台、平台后台和交互。
+6. `reviewer` 检查质量、安全、权限、支付金额和财务正确性。
+7. `integration_tester` 用页面实际操作验收，并核对 API、数据库、后台展示一致。
+8. `main` 汇总结果并向用户汇报。
 
-The required sequence is:
+跨层开发优先按：数据库 -> 后端 -> 前端 -> 复审 -> 页面级验收。
 
-1. `main` receives the user request and coordinates.
-2. `pm_architect` clarifies product scope, admin scope, backend scope, state machines, permissions, risks, and acceptance criteria.
-3. `database_expert` designs core entities, ledgers, constraints, indexes, and transaction boundaries.
-4. `backend_worker` designs and implements APIs, domain services, callbacks, fulfillment, refunds, supply clearing/reconciliation, risk freezes, and permission checks.
-5. `frontend_dev` implements H5 storefront, merchant/admin UI, responsive behavior, and Amazon-style storefront polish after API/data contracts are clear.
-6. `reviewer` reviews quality, security, architecture, permission isolation, and financial correctness risks.
-7. `integration_tester` verifies the full business flow before delivery.
-8. `main` integrates the results and reports to the user.
+## 金额和数据规则
 
-Parallel work is allowed only after ownership boundaries and contracts are clear. For cross-layer work, prefer database -> backend -> frontend -> reviewer -> integration_tester.
+1. 所有最终金额计算必须在后端完成。
+2. 前端只能展示后端返回的金额，不能决定价格、手续费、退款、结算或流水。
+3. 订单必须保存快照：券前销售金额、优惠券抵扣、买家实付、支付手续费、平台券补贴、销售价、平台供货价、各级转供价、平台服务费、商户预计收入、店铺、商户、商品、收款配置、发货规则；自动卡密订单还必须保存联系电话、可选邮箱和购买密码哈希。
+4. 退款、结算、保证金扣减、追扣都要有可审计流水，不能只改余额。
+5. 支付回调、退款回调、发货、结算生成必须幂等，重复请求不能重复发货或重复记账。
+6. 商户不能访问其他商户的店铺、订单、客户、结算或私有商品数据。
+7. 风控冻结、退款中、投诉中、发货失败订单不能进入结算。
+8. 平台后台和 H5 必须使用同一套数据库 API。生产代码不能依赖固定演示 id，例如 `shop-1`、`merchant-1`、`prod-1`、`ap-code`。
+9. 成本价隔离必须在服务端执行，不能只靠前端隐藏字段。
+10. 生产业务数据不能硬编码。商品、店铺、商户、库存、卡密、客服二维码、收款码、支付链接、商户供货关系、优惠券、mock 支付结果都必须来自数据库、API 或配置。测试、种子文件、环境示例和文档示例除外。
+11. 密钥、支付 key、数据库 URL、签名 secret 不得打印到日志、文档、截图或最终汇报里。
 
-## Financial And Data Rules
+## 文档要求
 
-1. Final monetary calculation must happen on the backend.
-2. Frontend may display calculated amounts but must not be trusted for final prices, fees, refunds, clearing, or ledger changes.
-3. Orders must store snapshots: pre-coupon sale amount, coupon discount, buyer paid amount, platform coupon subsidy, sale price, platform supply price, transfer prices, service fee, agent expected income, shop, agent, product, fulfillment rules, optional buyer email, and product extract-code requirement.
-4. Refunds, clearing records, deposit deductions, and追扣 must be recorded as auditable ledger-like records. Do not only mutate balances.
-5. Payment callbacks, refund callbacks, fulfillment, and clearing generation must be idempotent.
-6. Agents must never access other agents' shops, orders, customers, clearing data, or private product data.
-7. Risk-frozen, refunding, complaint, or fulfillment-failed orders must not enter clearing.
-8. Admin and H5 frontend must share the same database-backed APIs. No production runtime code may rely on fixed demo ids such as shop-1, agent-1, prod-1, or ap-code.
-9. Price isolation must be enforced server-side. Hidden UI fields are not enough; API responses, exports, order lists, and admin tables must not leak upstream costs to downstream merchants.
-10. No hardcoded production business data is allowed. Product titles/details/images/prices, shop info, merchant ids, inventory, virtual codes, customer-service QR codes, collection QR codes, payment links, channel relations, coupons, and mock payment results must come from the database/API/configuration. Hardcoded values are allowed only in tests, seed files, env examples, and documentation examples.
+开发前和交付前都要确认文档覆盖：
 
-## Documentation Requirements
-
-Before coding starts, the team must ensure documentation covers:
-
-1. Admin modules and pages.
-2. Backend domain modules and API groups.
-3. Database entities and key fields.
-4. Order/payment/fulfillment/refund/clearing/deposit state machines.
-5. Permission and data isolation.
-6. Test and release acceptance criteria.
+1. 平台后台和商户后台页面。
+2. 后端业务模块和 API 分组。
+3. 数据库表和关键字段。
+4. 订单、支付、发货、退款、结算、保证金状态流。
+5. 权限和数据隔离。
+6. 页面级测试和发布验收标准。
+7. 已完成的实现必须更新对应文档；过期跟踪文档要删除或明确标记为历史。
 <!-- CCB-WORKFLOW-END -->

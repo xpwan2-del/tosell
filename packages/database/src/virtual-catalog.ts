@@ -19,8 +19,8 @@ export type VirtualCatalogProduct = {
   minSalePriceCents: bigint;
   suggestedSalePriceCents: bigint;
   fulfillmentMode: "manual" | "code_pool";
-  agentProductId: string;
-  agentSalePriceCents: bigint;
+  merchantListingSeedId: string;
+  merchantSalePriceCents: bigint;
   groupName: string;
   platformShopProductId?: string;
   platformSalePriceCents?: bigint;
@@ -52,8 +52,8 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
     minSalePriceCents: 12_000n,
     suggestedSalePriceCents: 15_000n,
     fulfillmentMode: "manual",
-    agentProductId: "ap-1",
-    agentSalePriceCents: 15_000n,
+    merchantListingSeedId: "mpl-1",
+    merchantSalePriceCents: 15_000n,
     groupName: "人工交付",
     platformShopProductId: "psp-1",
     platformSalePriceCents: 14_900n,
@@ -82,8 +82,8 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
     minSalePriceCents: 3_000n,
     suggestedSalePriceCents: 4_900n,
     fulfillmentMode: "code_pool",
-    agentProductId: "ap-code",
-    agentSalePriceCents: 4_900n,
+    merchantListingSeedId: "mpl-code",
+    merchantSalePriceCents: 4_900n,
     groupName: "自动履约",
     platformShopProductId: "psp-code",
     platformSalePriceCents: 4_900n,
@@ -113,8 +113,8 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
     minSalePriceCents: 2_900n,
     suggestedSalePriceCents: 3_900n,
     fulfillmentMode: "manual",
-    agentProductId: "ap-video",
-    agentSalePriceCents: 3_900n,
+    merchantListingSeedId: "mpl-video",
+    merchantSalePriceCents: 3_900n,
     groupName: "热门推荐",
     platformShopProductId: "psp-video",
     platformSalePriceCents: 3_900n,
@@ -143,8 +143,8 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
     minSalePriceCents: 3_600n,
     suggestedSalePriceCents: 5_900n,
     fulfillmentMode: "code_pool",
-    agentProductId: "ap-cloud-code",
-    agentSalePriceCents: 5_900n,
+    merchantListingSeedId: "mpl-cloud-code",
+    merchantSalePriceCents: 5_900n,
     groupName: "自动履约",
     rightsCodes: ["CLOUD-MEMBER-001", "CLOUD-MEMBER-002"]
   },
@@ -171,8 +171,8 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
     minSalePriceCents: 2_000n,
     suggestedSalePriceCents: 2_900n,
     fulfillmentMode: "manual",
-    agentProductId: "ap-design",
-    agentSalePriceCents: 2_900n,
+    merchantListingSeedId: "mpl-design",
+    merchantSalePriceCents: 2_900n,
     groupName: "账号成品"
   },
   {
@@ -198,8 +198,8 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
     minSalePriceCents: 4_900n,
     suggestedSalePriceCents: 6_900n,
     fulfillmentMode: "manual",
-    agentProductId: "ap-learn",
-    agentSalePriceCents: 6_900n,
+    merchantListingSeedId: "mpl-learn",
+    merchantSalePriceCents: 6_900n,
     groupName: "账号成品"
   },
   {
@@ -225,8 +225,8 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
     minSalePriceCents: 4_900n,
     suggestedSalePriceCents: 7_900n,
     fulfillmentMode: "manual",
-    agentProductId: "ap-ip",
-    agentSalePriceCents: 7_900n,
+    merchantListingSeedId: "mpl-ip",
+    merchantSalePriceCents: 7_900n,
     groupName: "网络服务"
   },
   {
@@ -252,8 +252,8 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
     minSalePriceCents: 6_900n,
     suggestedSalePriceCents: 9_900n,
     fulfillmentMode: "code_pool",
-    agentProductId: "ap-api-code",
-    agentSalePriceCents: 9_900n,
+    merchantListingSeedId: "mpl-api-code",
+    merchantSalePriceCents: 9_900n,
     groupName: "自动履约",
     rightsCodes: ["CODEX-API-100K-001", "CODEX-API-100K-002"]
   }
@@ -269,9 +269,9 @@ export const virtualShopSeed = {
   bannerUrl: "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?auto=format&fit=crop&w=1200&q=80",
   shareTitle: "账号、卡密、会员权益一站式购买",
   productGroups: [
-    { name: "热门推荐", agentProductIds: ["ap-1", "ap-video", "ap-code"] },
-    { name: "自动发码", agentProductIds: ["ap-code", "ap-cloud-code", "ap-api-code"] },
-    { name: "账号成品", agentProductIds: ["ap-design", "ap-learn"] },
-    { name: "网络服务", agentProductIds: ["ap-ip"] }
+    { name: "热门推荐", merchantListingSeedIds: ["mpl-1", "mpl-video", "mpl-code"] },
+    { name: "自动发码", merchantListingSeedIds: ["mpl-code", "mpl-cloud-code", "mpl-api-code"] },
+    { name: "账号成品", merchantListingSeedIds: ["mpl-design", "mpl-learn"] },
+    { name: "网络服务", merchantListingSeedIds: ["mpl-ip"] }
   ]
 };

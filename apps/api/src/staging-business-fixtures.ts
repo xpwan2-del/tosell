@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { Prisma } from "@prisma/client";
 import { PrismaClient } from "../../../packages/database/src/index.js";
 import { buildApp } from "./app.js";
 
@@ -16,7 +17,7 @@ type InjectOptions = {
 };
 type MerchantFixture = {
   label: string;
-  agent: any;
+  merchant: any;
   shop: any;
   credential: { account: string; initialPassword: string };
   headers?: Record<string, string>;
@@ -32,7 +33,7 @@ const runMarkerKey = `e2e-business-fixtures:${runId}`;
 const READINESS_RETRY_ATTEMPTS = Number(process.env.E2E_FIXTURE_READINESS_RETRY_ATTEMPTS ?? 5);
 const READINESS_RETRY_DELAY_MS = Number(process.env.E2E_FIXTURE_READINESS_RETRY_DELAY_MS ?? 1500);
 const requiredPermissions = [
-  "agent.review",
+  "merchant.review",
   "product.manage",
   "after_sale.arbitrate",
   "settlement.generate",
@@ -45,13 +46,12 @@ const requiredPermissions = [
   "rbac.manage",
   "merchant.manage",
   "shop.manage",
-  "collection_channel.review",
   "order.read",
   "payment.confirm",
   "fulfillment.manage",
   "after_sale.manage",
   "coupon.manage",
-  "clearing.manage",
+  "settlement.manage",
   "ledger.read",
   "risk.manage",
   "rights_code.secret.read"
@@ -220,7 +220,7 @@ async function main() {
           readiness = await withFreshPrismaRetry("business fixture existing readiness", (client) => verifyFixtureReadiness(client, existingMarker.afterJson));
         } catch (error) {
           if (process.env.E2E_FIXTURE_REPAIR_EXISTING !== "true") throw error;
-          await withFreshPrismaRetry("business fixture relation repair", (client) => repairExistingFixtureChannelRelations(client, existingMarker.afterJson));
+          await withFreshPrismaRetry("business fixture relation repair", (client) => repairExistingFixtureMerchantRelations(client, existingMarker.afterJson));
           readiness = await withFreshPrismaRetry("business fixture repaired readiness", (client) => verifyFixtureReadiness(client, existingMarker.afterJson));
           await withFreshPrismaRetry("business fixture repaired marker", (client) => writeFixtureMarker(client, {
             ...(existingMarker.afterJson && typeof existingMarker.afterJson === "object" && !Array.isArray(existingMarker.afterJson)
@@ -261,7 +261,7 @@ async function main() {
 
     await injectJson(app, "M1 channel authorization approve", {
       method: "POST",
-      url: `/api/admin/channels/${m1.agent.id}/review`,
+      url: `/api/admin/merchant-supply/${m1.merchant.id}/review`,
       headers: adminHeaders,
       payload: { approved: true, reason: "controlled business fixture" }
     });
@@ -270,11 +270,11 @@ async function main() {
     const m2p = await createInvitedMerchant(app, adminHeaders, m1, "M2P", false);
     const firstSecondRelation = await injectJson(app, "M1-M2 channel relation active", {
       method: "POST",
-      url: "/api/admin/channels/relations",
+      url: "/api/admin/merchant-supply/relations",
       headers: adminHeaders,
       payload: {
-        firstTierAgentId: m1.agent.id,
-        secondTierAgentId: m2.agent.id,
+        firstTierMerchantId: m1.merchant.id,
+        secondTierMerchantId: m2.merchant.id,
         reason: "controlled business fixture"
       }
     });
@@ -283,19 +283,19 @@ async function main() {
     const m3p = await createInvitedMerchant(app, adminHeaders, m2, "M3P", false);
     const firstSecondThirdRelation = await injectJson(app, "M1-M2-M3 channel relation active", {
       method: "POST",
-      url: "/api/admin/channels/relations",
+      url: "/api/admin/merchant-supply/relations",
       headers: adminHeaders,
       payload: {
-        firstTierAgentId: m1.agent.id,
-        secondTierAgentId: m2.agent.id,
-        thirdTierAgentId: m3.agent.id,
+        firstTierMerchantId: m1.merchant.id,
+        secondTierMerchantId: m2.merchant.id,
+        thirdTierMerchantId: m3.merchant.id,
         reason: "controlled business fixture"
       }
     });
 
     await injectErrorCode(app, "M3 fourth-tier invite rejected", {
       method: "POST",
-      url: "/api/agent/invite-codes",
+      url: "/api/merchant/invite-codes",
       headers: m3.headers,
       payload: { code: code("FIX-M4") }
     }, 400, "FOURTH_TIER_FORBIDDEN");
@@ -311,12 +311,12 @@ async function main() {
       headers: adminHeaders,
       payload: { productId: p3.id, batchNo: `P3-${runId}`, codes: [`P3-${runId}-001`] }
     });
-    await injectJson(app, "duplicate rights code sample", {
+    await injectErrorCode(app, "duplicate rights code sample rejected", {
       method: "POST",
       url: "/api/admin/rights-codes/import",
       headers: adminHeaders,
       payload: { productId: p1.id, batchNo: `P1-DUP-${runId}`, codes: [`P1-${runId}-001`, `P1-${runId}-001`] }
-    });
+    }, 400, "RIGHTS_CODE_EMPTY");
     await injectErrorCode(app, "illegal blank rights code sample rejected", {
       method: "POST",
       url: "/api/admin/rights-codes/import",
@@ -326,7 +326,7 @@ async function main() {
 
     await injectJson(app, "M1-M2 transfer offer", {
       method: "POST",
-      url: "/api/admin/channels/offers",
+      url: "/api/admin/merchant-supply/offers",
       headers: adminHeaders,
       payload: {
         channelRelationId: firstSecondRelation.id,
@@ -337,7 +337,7 @@ async function main() {
     });
     await injectJson(app, "M2-M3 transfer offer", {
       method: "POST",
-      url: "/api/admin/channels/offers",
+      url: "/api/admin/merchant-supply/offers",
       headers: adminHeaders,
       payload: {
         channelRelationId: firstSecondThirdRelation.id,
@@ -352,7 +352,7 @@ async function main() {
     const o3 = await createOwnProduct(app, adminHeaders, m3, "O3", "code_pool", "7600", 5);
 
     for (const merchant of [m1, m2, m3]) {
-      await createCollectionChannelStates(app, prisma, adminHeaders, merchant);
+      await createPaymentMethodStates(app, prisma, merchant);
     }
 
     const coupons = await createCouponFixtures(app, prisma, adminHeaders, p1.id);
@@ -360,12 +360,12 @@ async function main() {
     const fixtureSummary = {
       runId,
       merchants: {
-        M1: m1.agent.id,
-        M2: m2.agent.id,
-        M3: m3.agent.id,
-        M1P: m1p.agent.id,
-        M2P: m2p.agent.id,
-        M3P: m3p.agent.id
+        M1: m1.merchant.id,
+        M2: m2.merchant.id,
+        M3: m3.merchant.id,
+        M1P: m1p.merchant.id,
+        M2P: m2p.merchant.id,
+        M3P: m3p.merchant.id
       },
       shops: {
         M1: m1.shop.id,
@@ -376,7 +376,7 @@ async function main() {
         M3P: m3p.shop.id
       },
       platformProducts: { P1: p1.id, P2: p2.id, P3: p3.id },
-      ownProducts: { O1: o1.agentProduct.id, O2: o2.agentProduct.id, O3: o3.agentProduct.id },
+      ownProducts: { O1: o1.merchantProductListing.id, O2: o2.merchantProductListing.id, O3: o3.merchantProductListing.id },
       channelRelations: {
         M1_M2: firstSecondRelation.id,
         M1_M2_M3: firstSecondThirdRelation.id
@@ -387,7 +387,7 @@ async function main() {
         p3RightsCodes: 1,
         o1RightsCodes: 5,
         o3RightsCodes: 5,
-        collectionChannelsPerMerchant: 4
+        paymentMethodsPerMerchant: 4
       }
     };
     const readiness = await withFreshPrismaRetry("business fixture readiness", (client) => verifyFixtureReadiness(client, fixtureSummary));
@@ -408,23 +408,23 @@ async function main() {
       readiness,
       ids: {
         merchants: {
-          M1: m1.agent.id,
-          M2: m2.agent.id,
-          M3: m3.agent.id,
-          M1P: m1p.agent.id,
-          M2P: m2p.agent.id,
-          M3P: m3p.agent.id
+          M1: m1.merchant.id,
+          M2: m2.merchant.id,
+          M3: m3.merchant.id,
+          M1P: m1p.merchant.id,
+          M2P: m2p.merchant.id,
+          M3P: m3p.merchant.id
         },
         platformProducts: { P1: p1.id, P2: p2.id, P3: p3.id },
-        ownProducts: { O1: o1.agentProduct.id, O2: o2.agentProduct.id, O3: o3.agentProduct.id }
+        ownProducts: { O1: o1.merchantProductListing.id, O2: o2.merchantProductListing.id, O3: o3.merchantProductListing.id }
       },
       readinessChecks: [
         "GET /api/admin/audit-logs contains action=database.business_fixtures and businessFixturesCreated=true",
         "GET /api/admin/products includes P1/P2/P3 fixture product ids",
         "GET /api/admin/rights-codes?productId=<P1>&status=available returns at least 8",
-        "GET /api/agent/rights-codes?agentProductId=<O1>&status=available returns at least 5",
-        "GET /api/agent/rights-codes?agentProductId=<O3>&status=available returns at least 5",
-        "GET /api/admin/collection-channels includes active/pending_review/rejected/disabled fixture channels"
+        "GET /api/merchant/rights-codes?merchantProductListingId=<O1>&status=available returns at least 5",
+        "GET /api/merchant/rights-codes?merchantProductListingId=<O3>&status=available returns at least 5",
+        "GET /api/admin/payment-methods includes enabled/pending/paused/disabled fixture methods"
       ]
     });
   } finally {
@@ -502,7 +502,7 @@ async function createRbacSamples(prisma: PrismaClient, password: string) {
   const restrictedSamples = [
     { suffix: "no-code-secret", excluded: ["rights_code.secret.read"] },
     { suffix: "no-refund", excluded: ["after_sale.arbitrate"] },
-    { suffix: "no-clearing", excluded: ["settlement.generate", "settlement.confirm", "payout.confirm", "clearing.manage"] },
+    { suffix: "no-clearing", excluded: ["settlement.generate", "settlement.confirm", "payout.confirm", "settlement.manage"] },
     { suffix: "no-product", excluded: ["product.manage"] }
   ];
   for (const sample of restrictedSamples) {
@@ -533,7 +533,7 @@ async function createRbacSamples(prisma: PrismaClient, password: string) {
 async function createManualMerchant(app: FixtureApp, adminHeaders: Record<string, string>, label: string, depositPaid: boolean): Promise<MerchantFixture> {
   const merchant = await injectJson(app, `${label} manual merchant create`, {
     method: "POST",
-    url: "/api/admin/agents/manual",
+    url: "/api/admin/merchants/manual",
     headers: adminHeaders,
     payload: {
       name: `${label} Fixture Merchant ${runId}`,
@@ -547,10 +547,10 @@ async function createManualMerchant(app: FixtureApp, adminHeaders: Record<string
   });
 
   if (depositPaid) {
-    await confirmDeposit(app, adminHeaders, `${label} deposit confirm`, merchant.agent.id);
+    await confirmDeposit(app, adminHeaders, `${label} deposit confirm`, merchant.merchant.id);
   }
 
-  return { label, agent: merchant.agent, shop: merchant.shop, credential: merchant.credential };
+  return { label, merchant: merchant.merchant, shop: merchant.shop, credential: merchant.credential };
 }
 
 async function createInvitedMerchant(
@@ -563,7 +563,7 @@ async function createInvitedMerchant(
   if (!issuer.headers) throw new Error(`${issuer.label} must be logged in before creating invites`);
   const invite = await injectJson(app, `${label} invite create`, {
     method: "POST",
-    url: "/api/agent/invite-codes",
+    url: "/api/merchant/invite-codes",
     headers: issuer.headers,
     payload: {
       code: code(`FIX-${label}`),
@@ -572,7 +572,7 @@ async function createInvitedMerchant(
   });
   const registered = await injectJson(app, `${label} invite register`, {
     method: "POST",
-    url: "/api/agent/register-by-invite",
+    url: "/api/merchant/register-by-invite",
     payload: {
       inviteCode: invite.code,
       name: `${label} Fixture Merchant ${runId}`,
@@ -582,14 +582,14 @@ async function createInvitedMerchant(
   });
   await injectJson(app, `${label} review approve`, {
     method: "POST",
-    url: `/api/admin/agents/${registered.agent.id}/review`,
+    url: `/api/admin/merchants/${registered.merchant.id}/review`,
     headers: adminHeaders,
     payload: { approved: true, reason: "controlled business fixture" }
   });
   if (depositPaid) {
-    await confirmDeposit(app, adminHeaders, `${label} deposit confirm`, registered.agent.id);
+    await confirmDeposit(app, adminHeaders, `${label} deposit confirm`, registered.merchant.id);
   }
-  const merchant = { label, agent: registered.agent, shop: registered.shop, credential: registered.credential };
+  const merchant = { label, merchant: registered.merchant, shop: registered.shop, credential: registered.credential };
   await loginMerchant(app, merchant);
   return merchant;
 }
@@ -597,7 +597,7 @@ async function createInvitedMerchant(
 async function loginMerchant(app: FixtureApp, merchant: MerchantFixture) {
   const login = await injectJson(app, `${merchant.label} merchant login`, {
     method: "POST",
-    url: "/api/auth/agent/login",
+    url: "/api/auth/merchant/login",
     payload: {
       account: merchant.credential.account,
       password: merchant.credential.initialPassword
@@ -607,14 +607,14 @@ async function loginMerchant(app: FixtureApp, merchant: MerchantFixture) {
   return login;
 }
 
-async function confirmDeposit(app: FixtureApp, adminHeaders: Record<string, string>, label: string, agentId: string) {
+async function confirmDeposit(app: FixtureApp, adminHeaders: Record<string, string>, label: string, merchantId: string) {
   return injectJson(app, label, {
     method: "POST",
-    url: `/api/admin/deposits/${agentId}/confirm`,
+    url: `/api/admin/deposits/${merchantId}/confirm`,
     headers: adminHeaders,
     payload: {
       amountCents: fixtureDepositCents,
-      voucherUrl: `fixture://deposit/${runId}/${agentId}`
+      voucherUrl: `fixture://deposit/${runId}/${merchantId}`
     }
   });
 }
@@ -710,7 +710,7 @@ async function createOwnProduct(
   if (!merchant.headers) throw new Error(`${merchant.label} must be logged in before creating own products`);
   const review = await injectJson(app, `${merchant.label}/${label} own product submit`, {
     method: "POST",
-    url: "/api/agent/products/own",
+    url: "/api/merchant/products/own",
     headers: merchant.headers,
     payload: {
       name: `${merchant.label} ${label} Fixture Own Product ${runId}`,
@@ -721,17 +721,17 @@ async function createOwnProduct(
   });
   const approved = await injectJson(app, `${merchant.label}/${label} own product review`, {
     method: "POST",
-    url: `/api/admin/agent-products/reviews/${review.id}/review`,
+    url: `/api/admin/merchant-products/reviews/${review.id}/review`,
     headers: adminHeaders,
     payload: { approved: true, reason: "controlled business fixture" }
   });
   if (rightsCodeCount > 0) {
     await injectJson(app, `${merchant.label}/${label} own rights code import`, {
       method: "POST",
-      url: "/api/agent/rights-codes/import",
+      url: "/api/merchant/rights-codes/import",
       headers: merchant.headers,
       payload: {
-        agentProductId: approved.agentProduct.id,
+        merchantProductListingId: approved.merchantProductListing.id,
         batchNo: `${merchant.label}-${label}-${runId}`,
         codes: Array.from({ length: rightsCodeCount }, (_unused, index) => `${merchant.label}-${label}-${runId}-${String(index + 1).padStart(3, "0")}`)
       }
@@ -740,57 +740,41 @@ async function createOwnProduct(
   return approved;
 }
 
-async function createCollectionChannelStates(
+async function createPaymentMethodStates(
   app: FixtureApp,
   prisma: PrismaClient,
-  adminHeaders: Record<string, string>,
   merchant: MerchantFixture
 ) {
-  if (!merchant.headers) throw new Error(`${merchant.label} must be logged in before creating collection channels`);
+  if (!merchant.headers) throw new Error(`${merchant.label} must be logged in before creating payment methods`);
   const states = [
-    { suffix: "active", review: "approved" },
-    { suffix: "pending", review: "pending" },
-    { suffix: "rejected", review: "rejected" },
-    { suffix: "disabled", review: "disabled" }
+    { suffix: "active", status: "enabled", enabled: true },
+    { suffix: "pending", status: "pending_test", enabled: false },
+    { suffix: "rejected", status: "paused", enabled: false },
+    { suffix: "disabled", status: "disabled", enabled: false }
   ];
 
   for (const state of states) {
-    const channel = await injectJson(app, `${merchant.label} collection channel ${state.suffix} submit`, {
+    const method = await injectJson(app, `${merchant.label} payment method ${state.suffix} upsert`, {
       method: "POST",
-      url: "/api/agent/collection-channels",
+      url: "/api/merchant/payment-methods",
       headers: merchant.headers,
       payload: {
-        channelType: "alipay_personal_qr",
+        provider: "personal_alipay",
         displayName: `${merchant.label} ${state.suffix} ${runId}`,
         accountName: `${merchant.label} Payee ${runId}`,
         qrUrl: `https://example.test/fixtures/${runId}/${merchant.label}-${state.suffix}.png`,
-        isDefault: state.suffix === "active"
+        isDefault: state.suffix === "active",
+        enabled: state.enabled,
+        status: state.status
       }
     });
-
-    if (state.review === "approved" || state.review === "disabled") {
-      await injectJson(app, `${merchant.label} collection channel ${state.suffix} approve`, {
-        method: "POST",
-        url: `/api/admin/collection-channels/${channel.id}/review`,
-        headers: adminHeaders,
-        payload: { approved: true, reason: "controlled business fixture" }
-      });
-    }
-    if (state.review === "rejected") {
-      await injectJson(app, `${merchant.label} collection channel rejected review`, {
-        method: "POST",
-        url: `/api/admin/collection-channels/${channel.id}/review`,
-        headers: adminHeaders,
-        payload: { approved: false, reason: "controlled business fixture rejected state" }
-      });
-    }
-    if (state.review === "disabled") {
-      await prisma.shopCollectionChannel.update({
-        where: { id: channel.id },
+    if (state.suffix === "disabled") {
+      await prisma.collectionPaymentConfig.update({
+        where: { id: method.id },
         data: {
           status: "disabled",
           isDefault: false,
-          note: "controlled business fixture disabled state"
+          instruction: "controlled business fixture disabled state"
         }
       });
     }
@@ -975,37 +959,11 @@ async function writeFixtureMarker(prisma: PrismaClient, summary: Record<string, 
   });
 }
 
-async function repairExistingFixtureChannelRelations(prisma: PrismaClient, rawSummary: unknown) {
-  const summary = rawSummary && typeof rawSummary === "object" && !Array.isArray(rawSummary)
-    ? rawSummary as Record<string, any>
-    : {};
-  const relationIds = Object.values(summary.channelRelations ?? {}).filter((value): value is string => typeof value === "string");
-  const merchantIds = summary.merchants && typeof summary.merchants === "object"
-    ? summary.merchants as Record<string, unknown>
-    : {};
-  const activeUniqueKeys = [merchantIds.M2, merchantIds.M3]
-    .filter((value): value is string => typeof value === "string")
-    .map((agentId, index) => `${index === 0 ? "second" : "third"}-tier:${agentId}`);
-  if (relationIds.length === 0 && activeUniqueKeys.length === 0) {
-    throw new Error("existing business fixture marker does not include channel relation identifiers");
-  }
-  const updated = await prisma.channelRelation.updateMany({
-    where: {
-      OR: [
-        relationIds.length > 0 ? { id: { in: relationIds } } : undefined,
-        activeUniqueKeys.length > 0 ? { activeUniqueKey: { in: activeUniqueKeys } } : undefined
-      ].filter((item): item is NonNullable<typeof item> => Boolean(item))
-    },
-    data: {
-      status: "active",
-      reviewedAt: new Date(),
-      reason: "controlled business fixture repair"
-    }
-  });
-  logFixture("pass", "business fixture channel relation repair", {
-    updated: updated.count,
-    relationIds: relationIds.length,
-    activeUniqueKeys: activeUniqueKeys.length
+async function repairExistingFixtureMerchantRelations(prisma: PrismaClient, rawSummary: unknown) {
+  void prisma;
+  void rawSummary;
+  logFixture("pass", "business fixture merchant relation repair skipped", {
+    reason: "merchants-only schema no longer persists legacy relation tables"
   });
 }
 
@@ -1023,13 +981,12 @@ async function verifyFixtureReadiness(prisma: PrismaClient, rawSummary: unknown)
   const platformProductIds = Object.values(platformProducts).filter((value): value is string => typeof value === "string");
   const registeredUserIds = [coupons.registeredUser].filter((value): value is string => typeof value === "string");
   const restrictedRoleCodes = ["no-code-secret", "no-refund", "no-clearing", "no-product"].map((suffix) => `fixture-${suffix}-${runId}`);
-  const channelRelationIds = Object.values(summary.channelRelations ?? {}).filter((value): value is string => typeof value === "string");
 
-  const merchantCount = await prisma.agent.count({ where: { id: { in: merchantIds } } });
-  const paidDeposits = await prisma.depositAccount.count({ where: { agentId: { in: merchantIds }, status: "paid" } });
-  const pendingDeposits = await prisma.depositAccount.count({ where: { agentId: { in: merchantIds }, status: "pending_payment" } });
+  const merchantCount = await countRowsByIds(prisma, "merchants", "id", merchantIds);
+  const paidDeposits = await countRowsByIds(prisma, "deposit_accounts", "merchant_id", merchantIds, Prisma.sql`status = 'paid'`);
+  const pendingDeposits = await countRowsByIds(prisma, "deposit_accounts", "merchant_id", merchantIds, Prisma.sql`status = 'pending_payment'`);
   const platformProductCount = await prisma.platformProduct.count({ where: { id: { in: platformProductIds } } });
-  const ownProductCount = await prisma.agentProduct.count({ where: { id: { in: ownProductIds }, productType: "agent_owned" } });
+  const ownProductCount = await countRowsByIds(prisma, "merchant_products", "id", ownProductIds, Prisma.sql`product_type = 'merchant_owned'`);
   const p1RightsCodes = typeof platformProducts.P1 === "string"
     ? await prisma.rightsCode.count({ where: { productId: platformProducts.P1, status: "available" } })
     : 0;
@@ -1037,29 +994,26 @@ async function verifyFixtureReadiness(prisma: PrismaClient, rawSummary: unknown)
     ? await prisma.rightsCode.count({ where: { productId: platformProducts.P3, status: "available" } })
     : 0;
   const o1RightsCodes = typeof ownProducts.O1 === "string"
-    ? await prisma.rightsCode.count({ where: { agentProductId: ownProducts.O1, status: "available" } })
+    ? await prisma.rightsCode.count({ where: { merchantProductListingId: ownProducts.O1, status: "available" } })
     : 0;
   const o3RightsCodes = typeof ownProducts.O3 === "string"
-    ? await prisma.rightsCode.count({ where: { agentProductId: ownProducts.O3, status: "available" } })
+    ? await prisma.rightsCode.count({ where: { merchantProductListingId: ownProducts.O3, status: "available" } })
     : 0;
-  const activeChannels = await prisma.shopCollectionChannel.count({ where: { accountName: { contains: runId }, status: "active" } });
-  const pendingChannels = await prisma.shopCollectionChannel.count({ where: { accountName: { contains: runId }, status: "pending_review" } });
-  const rejectedChannels = await prisma.shopCollectionChannel.count({ where: { accountName: { contains: runId }, status: "rejected" } });
-  const disabledChannels = await prisma.shopCollectionChannel.count({ where: { accountName: { contains: runId }, status: "disabled" } });
+  const activeChannels = await countCollectionPaymentConfigs(prisma, "active");
+  const pendingChannels = await countCollectionPaymentConfigs(prisma, "pending_test");
+  const rejectedChannels = await countCollectionPaymentConfigs(prisma, "paused");
+  const disabledChannels = await countCollectionPaymentConfigs(prisma, "disabled");
   const couponTemplateCount = await prisma.couponTemplate.count({ where: { id: { in: couponIds } } });
   const userCouponCount = await prisma.userCoupon.count({ where: { userId: { in: registeredUserIds } } });
   const rbacRestrictedRoles = await prisma.role.count({ where: { code: { in: restrictedRoleCodes } } });
-  const channelRelations = await prisma.channelRelation.count({ where: { id: { in: channelRelationIds }, status: "active" } });
-
   const readiness = {
     merchants: merchantCount,
     deposits: { paid: paidDeposits, pending: pendingDeposits },
     products: { platform: platformProductCount, own: ownProductCount },
     rightsCodes: { P1: p1RightsCodes, P3: p3RightsCodes, O1: o1RightsCodes, O3: o3RightsCodes },
-    collectionChannels: { active: activeChannels, pending: pendingChannels, rejected: rejectedChannels, disabled: disabledChannels },
+    paymentMethods: { active: activeChannels, pending: pendingChannels, rejected: rejectedChannels, disabled: disabledChannels },
     coupons: { templates: couponTemplateCount, userCoupons: userCouponCount },
-    rbacRestrictedRoles,
-    channelRelations
+    rbacRestrictedRoles
   };
   const failures = [
     merchantCount >= 6,
@@ -1077,13 +1031,39 @@ async function verifyFixtureReadiness(prisma: PrismaClient, rawSummary: unknown)
     disabledChannels >= 1,
     couponTemplateCount >= 6,
     userCouponCount >= 1,
-    rbacRestrictedRoles >= 4,
-    channelRelations >= 2
+    rbacRestrictedRoles >= 4
   ].filter((passed) => !passed);
   if (failures.length > 0) {
     throw new Error(`business fixture readiness check failed: ${JSON.stringify(readiness)}`);
   }
   return readiness;
+}
+
+async function countRowsByIds(
+  prisma: PrismaClient,
+  tableName: string,
+  columnName: string,
+  ids: string[],
+  extraWhere?: Prisma.Sql
+) {
+  if (ids.length === 0) return 0;
+  const rows = await prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+    SELECT COUNT(*)::bigint AS count
+      FROM ${Prisma.raw(tableName)}
+     WHERE ${Prisma.raw(columnName)} IN (${Prisma.join(ids)})
+       ${extraWhere ? Prisma.sql`AND ${extraWhere}` : Prisma.empty}
+  `);
+  return Number(rows[0]?.count ?? 0n);
+}
+
+async function countCollectionPaymentConfigs(prisma: PrismaClient, status: "active" | "pending_test" | "paused" | "disabled") {
+  const rows = await prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+    SELECT COUNT(*)::bigint AS count
+      FROM collection_payment_configs
+     WHERE account_masked LIKE ${`%${runId}%`}
+       AND status = ${status}
+  `);
+  return Number(rows[0]?.count ?? 0n);
 }
 
 async function closeApp(app: FixtureApp, label: string) {

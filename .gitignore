@@ -21,5 +21,6 @@ coverage/
 .env
 .env.local
 .env*.local
+.env*.bak-*
 *.log
 .vercel

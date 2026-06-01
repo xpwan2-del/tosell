@@ -7,14 +7,14 @@ import {
   applyClawback,
   applyFulfillmentAttempt,
   assertAdminPermission,
-  assertAgentScope,
+  assertMerchantScope,
   buildOrderSnapshot,
   buildSettlementItems,
   calculateServiceFeeCents,
   deductDeposit,
   hasAdminPermission,
   processPaymentCallback,
-  quoteAgentOwnedProduct,
+  quoteMerchantOwnedProduct,
   quotePlatformProduct,
   refundCallbackKey,
   shouldRestrictForDeposit
@@ -29,7 +29,7 @@ import {
   type PrismaRepositoryRegistry,
   type PrismaTx
 } from "../../../packages/database/src/index.js";
-import { createHash, createHmac, randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 
 export class ApiError extends Error {
   constructor(
@@ -42,7 +42,7 @@ export class ApiError extends Error {
 }
 
 export type UserActor = Extract<Actor, { role: "user" }>;
-export type AgentActor = Extract<Actor, { role: "agent" }>;
+export type MerchantActor = Extract<Actor, { role: "merchant" }>;
 export type AdminActor = Extract<Actor, { role: "operator" | "finance" | "admin" }>;
 
 export function createBackendServices() {
@@ -82,11 +82,67 @@ function toPrismaApiError(error: unknown): Error {
   return error instanceof Error ? error : new Error("unknown persistence error");
 }
 
+const prismaRetryDelaysMs = [400, 1200, 2500] as const;
+
+async function withPrismaRetry<T>(operation: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= prismaRetryDelaysMs.length; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isPrismaConnectionError(error) || attempt === prismaRetryDelaysMs.length) break;
+      await sleepMs(prismaRetryDelaysMs[attempt]);
+    }
+  }
+  throw lastError;
+}
+
+function sleepMs(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function isPrismaConnectionError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const candidate = error as { code?: unknown; message?: unknown };
   return candidate.code === "P1001"
-    || (typeof candidate.message === "string" && candidate.message.includes("Can't reach database server"));
+    || (typeof candidate.message === "string" && (
+      candidate.message.includes("Can't reach database server")
+      || candidate.message.includes("ECONNREFUSED")
+      || candidate.message.includes("Connection refused")
+    ));
+}
+
+function normalizeShopIdentifier(value: string): string {
+  const decoded = safeDecodeURIComponent(value.trim());
+  return stripShopPath(decoded);
+}
+
+function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function stripShopPath(value?: string): string {
+  if (!value) return "";
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "/") return "";
+  const shopMatch = trimmed.match(/^\/?s\/([^/?#]+)/);
+  if (shopMatch) return safeDecodeURIComponent(shopMatch[1]);
+  const legacyMatch = trimmed.match(/^\/?shops\/([^/?#]+)/);
+  if (legacyMatch) return safeDecodeURIComponent(legacyMatch[1]);
+  const miniProgramShopNo = new URLSearchParams(trimmed.split("?")[1] ?? "").get("shopNo");
+  if (miniProgramShopNo) return miniProgramShopNo;
+  return trimmed.replace(/^\/+|\/+$/g, "");
+}
+
+function publicShopPath(shop: DemoShop): string {
+  if ((shop.ownerType ?? "merchant") === "platform") return "/";
+  const handle = shop.shopNo && !shop.shopNo.startsWith("shop-") ? shop.shopNo : stripShopPath(shop.sharePath) || shop.id;
+  return `/s/${handle}`;
 }
 
 function createPrismaProductionServices() {
@@ -95,72 +151,279 @@ function createPrismaProductionServices() {
   const repository = new PrismaStateRepository(prisma, repositories);
   const service = new BackendServices(createEmptyMemoryStore(), {
     persistenceMode: "prisma",
-    adminAuth: (input) => repository.verifyAdmin(input),
-    agentAuth: (input) => repository.verifyAgent(input)
+    adminAuth: (input) => withPrismaRetry(() => repository.verifyAdmin(input)),
+    merchantAuth: (input) => withPrismaRetry(() => repository.verifyMerchant(input))
   });
   let hydrated = false;
+  let hydrationPromise: Promise<void> | undefined;
   async function hydrate() {
     if (hydrated) return;
-    try {
-      service.store = await repository.load();
+    if (hydrationPromise) {
+      await hydrationPromise;
+      return;
+    }
+    hydrationPromise = (async () => {
+      service.store = await withPrismaRetry(() => repository.load());
       service.store.sequence = Math.max(service.store.sequence, Date.now());
       hydrated = true;
+    })().catch((error) => {
+      hydrationPromise = undefined;
+      throw error;
+    });
+    try {
+      await hydrationPromise;
     } catch (error) {
       throw toPrismaApiError(error);
     }
   }
-  return new Proxy(service, {
+  const proxy = new Proxy(service, {
     get(target, property) {
       if (property === "health") {
-        return async () => ({
-          ok: true,
-          service: "tosell-api",
-          runtime: runtimeMode(),
-          persistenceMode: "prisma",
-          databaseConfigured: Boolean(process.env.DATABASE_URL),
-          repositories: Object.keys(repositories).filter((key) => key !== "tx"),
-          demoAuthEnabled: allowDemoAuth(),
-          mockPaymentEnabled: mockPaymentEnabled()
-        });
+        return async () => {
+          return {
+            ok: true,
+            service: "tosell-api",
+            runtime: runtimeMode(),
+            persistenceMode: "prisma",
+            databaseConfigured: Boolean(process.env.DATABASE_URL),
+            repositories: Object.keys(repositories).filter((key) => key !== "tx"),
+            demoAuthEnabled: allowDemoAuth(),
+            mockPaymentEnabled: mockPaymentEnabled(),
+            schemaRepairVersion: 2,
+            schemaRepairReady: true
+          };
+        };
       }
       const value = target[property as keyof typeof target];
       if (typeof value !== "function") return value;
       if (property === "loginAdmin") {
         return async (...args: unknown[]) => target.loginAdmin(...(args as Parameters<BackendServices["loginAdmin"]>));
       }
-      if (property === "loginAgent") {
-        return async (...args: unknown[]) => target.loginAgent(...(args as Parameters<BackendServices["loginAgent"]>));
+      if (property === "loginMerchant") {
+        return async (...args: unknown[]) => target.loginMerchant(...(args as Parameters<BackendServices["loginMerchant"]>));
       }
-      if (property === "createOrder") {
+      if (property === "getMerchantShop") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.getMerchantShop(args[0] as MerchantActor));
+      }
+      if (property === "getPublicShop") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.getPublicShop(String(args[0] ?? "default")));
+      }
+      if (property === "listShopProducts") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listPublicShopProducts(String(args[0] ?? "default")));
+      }
+      if (property === "listPublicPaymentMethods") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listPublicPaymentMethods(String(args[0] ?? "default")));
+      }
+      if (property === "listPlatformProducts") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listPlatformProducts(args[0] as MerchantActor | undefined));
+      }
+      if (property === "listMerchantProducts") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listMerchantProducts(args[0] as MerchantActor));
+      }
+      if (property === "getMerchantProductDetail") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.getMerchantProductDetail(
+          args[0] as MerchantActor,
+          String(args[1] ?? "")
+        ));
+      }
+      if (property === "updateMerchantProductDetail") {
         return async (...args: unknown[]) => {
-          await hydrate();
-          const result = target.createOrder(...(args as Parameters<BackendServices["createOrder"]>));
-          try {
-            await repository.saveForMethod("createOrder", service.store);
-          } catch (error) {
-            throw toPrismaApiError(error);
-          }
+          const result = await withPrismaRetry(() => repository.updateMerchantProductDetail(
+            args[0] as MerchantActor,
+            String(args[1] ?? ""),
+            args[2] as MerchantProductListingDetailUpdateInput
+          ));
+          hydrated = false;
+          hydrationPromise = undefined;
           return result;
         };
       }
+      if (property === "getUserWallet") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.getDirectUserWallet(args[0] as UserActor));
+      }
+      if (property === "quoteOrder") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.quoteOrder(args[0] as UserActor, args[1] as Parameters<BackendServices["quoteOrder"]>[1]));
+      }
+      if (property === "createCouponTemplate") {
+        return async (...args: unknown[]) => {
+          const actor = args[0] as AdminActor;
+          const input = args[1] as Parameters<BackendServices["createCouponTemplate"]>[1];
+          assertAdminPermission(actor, "product.manage");
+          if (input.discountCents <= 0n) throw new ApiError(400, "COUPON_INVALID", "coupon discount must be positive");
+          const id = `coupon-template-${Date.now()}-${randomUUID().slice(0, 8)}`;
+          const createdAt = new Date();
+          const validDays = input.validDays ?? 30;
+          const validTo = new Date(createdAt.getTime() + validDays * 24 * 60 * 60 * 1000);
+          const status = mapCouponTemplateStatus(input.status ?? "active");
+          await withPrismaRetry(() => prisma.$transaction(async (tx) => {
+            await tx.$executeRaw`
+              INSERT INTO coupon_templates (
+                id, coupon_no, name, discount_type, discount_amount_cents,
+                platform_subsidy_cents, threshold_amount_cents, stackable,
+                first_registration_only, status, valid_from, valid_to,
+                idempotency_key, created_by, created_at, updated_at
+              )
+              VALUES (
+                ${id}, ${id}, ${input.name}, CAST('fixed_amount' AS "CouponDiscountType"),
+                ${input.discountCents}, 0, 0, false, ${input.grantOnFirstRegister ?? false},
+                CAST(${status} AS "CouponTemplateStatus"), ${createdAt}, ${validTo},
+                ${`coupon-template:${id}`}, ${actor.adminId}, ${createdAt}, now()
+              )
+            `;
+            const productIds = input.productIds ?? [];
+            if (productIds.length === 0) {
+              await tx.$executeRaw`
+                INSERT INTO coupon_scopes (id, coupon_template_id, scope_type, created_at)
+                VALUES (${stableDbId("coupon_scope", `${id}:all`)}, ${id},
+                        CAST('all_products' AS "CouponScopeType"), now())
+              `;
+            }
+            for (const productId of productIds) {
+              await tx.$executeRaw`
+                INSERT INTO coupon_scopes (id, coupon_template_id, scope_type, platform_product_id, created_at)
+                VALUES (${stableDbId("coupon_scope", `${id}:${productId}`)}, ${id},
+                        CAST('platform_product' AS "CouponScopeType"), ${productId}, now())
+              `;
+            }
+            await tx.$executeRaw`
+              INSERT INTO audit_logs (
+                id, actor_type, actor_id, action, target_type, target_id,
+                after_json, idempotency_key, request_id, ip, created_at
+              )
+              VALUES (
+                ${stableDbId("audit", `coupon_template.create:${id}`)}, CAST('admin' AS "ActorType"), ${actor.adminId},
+                'coupon_template.create', 'coupon_template', ${id},
+                ${jsonForDb({ id, name: input.name, discountCents: input.discountCents, productIds })}::jsonb,
+                ${`audit:coupon_template.create:${id}`}, ${`coupon_template.create:${id}`}, '127.0.0.1', now()
+              )
+              ON CONFLICT (idempotency_key) DO NOTHING
+            `;
+          }, { maxWait: 10_000, timeout: 30_000 }));
+          hydrated = false;
+          hydrationPromise = undefined;
+          return {
+            id,
+            name: input.name,
+            discountCents: input.discountCents,
+            productIds: input.productIds ?? [],
+            validDays,
+            grantOnFirstRegister: input.grantOnFirstRegister ?? false,
+            status,
+            createdAt
+          };
+        };
+      }
+      if (property === "createMerchantByAdmin") {
+        return async (...args: unknown[]) => {
+          const result = await withPrismaRetry(() => repository.createMerchantByAdmin(
+            args[0] as AdminActor,
+            args[1] as Parameters<BackendServices["createMerchantByAdmin"]>[1]
+          ));
+          hydrated = false;
+          hydrationPromise = undefined;
+          return result;
+        };
+      }
+      if (property === "createPaymentOrder") {
+        return async (...args: unknown[]) => {
+          const result = await withPrismaRetry(() => repository.createPaymentOrder(args[0] as UserActor, String(args[1] ?? ""), args[2] as { paymentMethodId?: string } | undefined ?? {}));
+          hydrated = false;
+          hydrationPromise = undefined;
+          return result;
+        };
+      }
+      if (property === "createOrder") {
+        return async (...args: unknown[]) => {
+          try {
+            const result = await withPrismaRetry(() => repository.createOrder(args[0] as UserActor, args[1] as Parameters<BackendServices["createOrder"]>[1]));
+            hydrated = false;
+            hydrationPromise = undefined;
+            return result;
+          } catch (error) {
+            throw toPrismaApiError(error);
+          }
+        };
+      }
+      if (property === "confirmMerchantOfflinePayment") {
+        return async (...args: unknown[]) => {
+          const result = await withPrismaRetry(() => repository.confirmMerchantOfflinePayment(
+            args[0] as MerchantActor,
+            String(args[1] ?? ""),
+            args[2] as { amountCents: bigint; voucherUrl?: string; note?: string }
+          ));
+          hydrated = false;
+          hydrationPromise = undefined;
+          return result;
+        };
+      }
+      if (property === "selectPlatformProduct") {
+        return async (...args: unknown[]) => {
+          const result = await withPrismaRetry(() => repository.selectPlatformProduct(
+            args[0] as MerchantActor,
+            args[1] as MerchantProductListingSelectionInput
+          ));
+          hydrated = false;
+          hydrationPromise = undefined;
+          return result;
+        };
+      }
+      if (property === "upsertMerchantPaymentMethod") {
+        return async (...args: unknown[]) => {
+          const result = await withPrismaRetry(() => repository.upsertMerchantPaymentMethod(
+            args[0] as MerchantActor,
+            args[1] as PaymentMethodUpsertInput
+          ));
+          hydrated = false;
+          hydrationPromise = undefined;
+          return result;
+        };
+      }
+      if (property === "listMerchantOrders") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listMerchantOrders(args[0] as MerchantActor));
+      }
+      if (property === "getMerchantOrder") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.getMerchantOrder(
+          args[0] as MerchantActor,
+          String(args[1] ?? "")
+        ));
+      }
+      if (property === "fulfillMerchantOrder") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.fulfillMerchantOrder(
+          args[0] as MerchantActor,
+          String(args[1] ?? ""),
+          args[2] as { status: "success" | "failed"; attemptNo: number; evidence?: string; failReason?: string }
+        ));
+      }
+      if (property === "extractOrderCodes") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.extractOrderCodes(
+          args[0] as UserActor,
+          String(args[1] ?? ""),
+          String(args[2] ?? "")
+        ));
+      }
       return async (...args: unknown[]) => {
         await hydrate();
+        const actor = args[0] as Partial<MerchantActor> | undefined;
+        if (actor?.role === "merchant" && actor.shopId && !target.store.shops.has(actor.shopId)) {
+          const shop = await withPrismaRetry(() => repository.getMerchantShop(actor as MerchantActor));
+          target.store.shops.set(shop.id, shop);
+        }
         let result: unknown;
         try {
-          result = (value as (...methodArgs: unknown[]) => unknown).apply(target, args);
+          result = await (value as (...methodArgs: unknown[]) => unknown).apply(target, args);
         } catch (error) {
           if (property === "paymentProviderCallback" || property === "queryPaymentOrder") {
             try {
-              await repository.saveForMethod(String(property), service.store);
+              await withPrismaRetry(() => repository.saveForMethod(String(property), service.store));
             } catch (persistError) {
               throw toPrismaApiError(persistError);
             }
           }
-          throw error;
+          throw toPrismaApiError(error);
         }
         if (isMutatingServiceMethod(String(property))) {
           try {
-            await repository.saveForMethod(String(property), service.store);
+            await withPrismaRetry(() => repository.saveForMethod(String(property), service.store));
           } catch (error) {
             throw toPrismaApiError(error);
           }
@@ -169,6 +432,14 @@ function createPrismaProductionServices() {
       };
     }
   });
+  if (process.env.PRISMA_PREHYDRATE !== "false") {
+    setTimeout(() => {
+      void hydrate().catch(() => {
+        hydrationPromise = undefined;
+      });
+    }, 0);
+  }
+  return proxy;
 }
 
 function createPersistenceDisabledServices(message: string) {
@@ -198,7 +469,7 @@ function isMutatingServiceMethod(name: string) {
 type BackendServicesOptions = {
   persistenceMode: "memory" | "prisma";
   adminAuth?: (input: { username: string; password: string }) => Promise<AdminLoginResult>;
-  agentAuth?: (input: { account: string; password: string }) => Promise<AgentLoginResult>;
+  merchantAuth?: (input: { account: string; password: string }) => Promise<MerchantLoginResult>;
 };
 
 export type AdminLoginResult = {
@@ -208,12 +479,12 @@ export type AdminLoginResult = {
   role: "operator" | "finance" | "admin";
 };
 
-export type AgentLoginResult = {
-  agentId: string;
+export type MerchantLoginResult = {
+  merchantId: string;
   shopId: string;
   username: string;
   displayName: string;
-  tier?: AgentTier;
+  tier?: MerchantTier;
   status: string;
   depositStatus: string;
   shopName: string;
@@ -238,10 +509,19 @@ class BackendServices {
     };
   }
 
+  private activeServiceFeeConfig() {
+    return this.store.serviceFeeConfig;
+  }
+
+  private activeServiceFeeBps() {
+    const config = this.activeServiceFeeConfig();
+    return config.enabled ? BigInt(config.feeBps) : 0n;
+  }
+
   async loginAdmin(input: { username: string; password: string }): Promise<AdminLoginResult> {
     if (this.options.adminAuth) return this.options.adminAuth(input);
     const username = process.env.ADMIN_USERNAME ?? "admin";
-    const password = process.env.ADMIN_PASSWORD ?? "admin";
+    const password = process.env.ADMIN_PASSWORD ?? "123";
     if (input.username !== username || input.password !== password) {
       throw new ApiError(401, "AUTH_INVALID", "invalid admin credentials");
     }
@@ -253,49 +533,50 @@ class BackendServices {
     };
   }
 
-  async loginAgent(input: { account: string; password: string }): Promise<AgentLoginResult> {
-    if (this.options.agentAuth) return this.options.agentAuth(input);
+  async loginMerchant(input: { account: string; password: string }): Promise<MerchantLoginResult> {
+    if (this.options.merchantAuth) return this.options.merchantAuth(input);
     const account = input.account.trim();
-    const agent = requireEntity(
-      [...this.store.agents.values()].find((candidate) =>
+    const merchant = requireEntity(
+      [...this.store.merchants.values()].find((candidate) =>
         candidate.merchantUsername === account || candidate.id === account || candidate.contactPhone === account
       ),
       "AUTH_INVALID",
       "invalid merchant credentials"
     );
-    if (!agent.passwordHash || !verifyPassword(input.password, agent.passwordHash)) {
+    if (!merchant.passwordHash || !verifyPassword(input.password, merchant.passwordHash)) {
       throw new ApiError(401, "AUTH_INVALID", "invalid merchant credentials");
     }
-    if (agent.status !== "active" && agent.status !== "pending_deposit") {
+    if (merchant.status !== "active" && merchant.status !== "pending_deposit") {
       throw new ApiError(403, "AUTH_DISABLED", "merchant account is not active");
     }
-    const shop = requireEntity([...this.store.shops.values()].find((candidate) => candidate.agentId === agent.id), "AUTH_INVALID", "merchant shop not found");
+    const shop = requireEntity([...this.store.shops.values()].find((candidate) => candidate.merchantId === merchant.id), "AUTH_INVALID", "merchant shop not found");
     return {
-      agentId: agent.id,
+      merchantId: merchant.id,
       shopId: shop.id,
-      username: agent.merchantUsername ?? agent.id,
-      displayName: agent.name,
-      tier: agent.tier,
-      status: agent.status,
-      depositStatus: agent.depositStatus,
+      username: merchant.merchantUsername ?? merchant.id,
+      displayName: merchant.name,
+      tier: merchant.tier,
+      status: merchant.status,
+      depositStatus: merchant.depositStatus,
       shopName: shop.name,
       shopStatus: shop.status,
       mustChangePassword: true
     };
   }
 
-  listInviteCodes(actor: AdminActor | AgentActor) {
-    if (actor.role === "agent") {
+
+  listInviteCodes(actor: AdminActor | MerchantActor) {
+    if (actor.role === "merchant") {
       return [...this.store.inviteCodes.values()]
-        .filter((code) => code.issuerAgentId === actor.agentId)
+        .filter((code) => code.issuerMerchantId === actor.merchantId)
         .map((code) => this.serializeInviteCode(code, actor));
     }
-    assertAdminPermission(actor, "agent.review");
+    assertAdminPermission(actor, "merchant.review");
     return [...this.store.inviteCodes.values()].map((code) => this.serializeInviteCode(code));
   }
 
-  createPlatformInviteCode(actor: AdminActor, input: { code?: string; targetTier?: AgentTier; maxUses?: number; expiresAt?: string; depositRequiredAmountCents?: bigint }) {
-    assertAdminPermission(actor, "agent.review");
+  createPlatformInviteCode(actor: AdminActor, input: { code?: string; targetTier?: MerchantTier; maxUses?: number; expiresAt?: string; depositRequiredAmountCents?: bigint }) {
+    assertAdminPermission(actor, "merchant.review");
     if (input.targetTier && input.targetTier !== "first_tier") {
       throw new ApiError(400, "PLATFORM_INVITE_FIRST_TIER_ONLY", "platform invite codes can only create first-tier merchants");
     }
@@ -312,29 +593,30 @@ class BackendServices {
     return this.serializeInviteCode(invite);
   }
 
-  createAgentInviteCode(actor: AgentActor, input: { code?: string; maxUses?: number; expiresAt?: string; depositRequiredAmountCents?: bigint } = {}) {
-    const agent = requireEntity(this.store.agents.get(actor.agentId), "RESOURCE_NOT_FOUND", "agent not found");
-    const tier = this.agentTier(agent.id);
+  createMerchantInviteCode(actor: MerchantActor, input: { code?: string; maxUses?: number; expiresAt?: string; depositRequiredAmountCents?: bigint } = {}) {
+    const merchant = requireEntity(this.store.merchants.get(actor.merchantId), "RESOURCE_NOT_FOUND", "merchant not found");
+    const tier = this.merchantTier(merchant.id);
     if (tier === "third_tier") {
-      this.audit("agent", "invite_code.create.rejected_fourth_tier", "agent", agent.id, { tier });
+      this.audit("merchant", "invite_code.create.rejected_fourth_tier", "merchant", merchant.id, { tier });
       throw new ApiError(400, "FOURTH_TIER_FORBIDDEN", "third-tier merchants cannot create fourth-tier invite codes");
     }
-    this.assertAgentDepositConfirmed(agent.id, "create invite code");
+    this.assertMerchantDepositConfirmed(merchant.id, "create invite code");
     const invite = this.createInviteCode({
       code: input.code,
-      issuerType: "agent",
-      issuerAgentId: agent.id,
+      issuerType: "merchant",
+      issuerMerchantId: merchant.id,
       targetTier: tier === "first_tier" ? "second_tier" : "third_tier",
       maxUses: input.maxUses,
       expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
-      createdBy: agent.id,
-      depositRequiredAmountCents: input.depositRequiredAmountCents ?? this.depositRequirementForAgentInvite(agent.id)
+      createdBy: merchant.id,
+      depositRequiredAmountCents: input.depositRequiredAmountCents ?? this.depositRequirementForMerchantInvite(merchant.id)
     });
-    this.audit("agent", "invite_code.create.agent", "invite_code", invite.id, invite);
+    this.audit("merchant", "invite_code.create.merchant", "invite_code", invite.id, invite);
     return this.serializeInviteCode(invite, actor);
   }
 
-  registerAgentByInvite(input: {
+
+  registerMerchantByInvite(input: {
     inviteCode: string;
     name: string;
     contactPhone?: string;
@@ -348,72 +630,72 @@ class BackendServices {
     );
     this.assertInviteUsable(invite);
     if (invite.targetTier === "second_tier" || invite.targetTier === "third_tier") {
-      requireEntity(invite.issuerAgentId ? this.store.agents.get(invite.issuerAgentId) : undefined, "INVITE_CODE_INVALID", "upstream merchant not found");
+      requireEntity(invite.issuerMerchantId ? this.store.merchants.get(invite.issuerMerchantId) : undefined, "INVITE_CODE_INVALID", "upstream merchant not found");
     }
-    const agentId = nextId(this.store, "agent");
+    const merchantId = nextId(this.store, "merchant");
     const shopId = nextId(this.store, "shop");
-    const userId = nextId(this.store, "agent-user");
+    const userId = nextId(this.store, "merchant-user");
     const initialPassword = `TS${Date.now().toString().slice(-6)}`;
-    const agent: DemoAgent = {
-      id: agentId,
+    const merchant: DemoMerchant = {
+      id: merchantId,
       userId,
       name: input.name,
       contactPhone: input.contactPhone,
       tier: invite.targetTier,
-      parentAgentId: invite.issuerAgentId,
+      parentMerchantId: invite.issuerMerchantId,
       status: "pending_review",
       riskStatus: "normal",
       depositStatus: "pending_payment",
       initialPasswordSet: true,
-      merchantUsername: agentId,
+      merchantUsername: merchantId,
       passwordHash: `sha256:${hashSecret(initialPassword)}`
     };
     const shop: DemoShop = {
       id: shopId,
-      agentId,
-      ownerType: "agent",
+      merchantId,
+      ownerType: "merchant",
       name: input.shopName ?? `${input.name} 小店`,
       status: "not_opened",
       riskStatus: "normal",
       customerServiceWechat: input.customerServiceWechat
     };
-    const application: AgentApplication = {
-      applicationNo: nextId(this.store, "agent-app"),
-      agentId,
+    const application: MerchantApplication = {
+      applicationNo: nextId(this.store, "merchant-app"),
+      merchantId,
       userId,
       status: "pending_review",
       contactPhone: input.contactPhone ?? "",
       customerServiceWechat: input.customerServiceWechat ?? "",
       inviteCodeId: invite.id,
       targetTier: invite.targetTier,
-      parentAgentId: invite.issuerAgentId
+      parentMerchantId: invite.issuerMerchantId
     };
-    this.store.agents.set(agentId, agent);
+    this.store.merchants.set(merchantId, merchant);
     this.store.shops.set(shopId, shop);
-    this.store.agentApplications.set(application.applicationNo, application);
+    this.store.merchantApplications.set(application.applicationNo, application);
     const requiredAmount = invite.depositRequiredAmountCents;
     if (requiredAmount === undefined || requiredAmount <= 0n) {
       throw new ApiError(400, "DEPOSIT_REQUIREMENT_MISSING", "invite code is missing deposit requirement");
     }
-    this.store.depositAccounts.set(agentId, {
-      agentId,
+    this.store.depositAccounts.set(merchantId, {
+      merchantId,
       requiredAmountCents: requiredAmount,
       availableAmountCents: 0n,
       frozenAmountCents: 0n,
       deductedAmountCents: 0n,
       status: "pending_payment"
     });
-    this.createPendingRelationForInvite(invite, agentId);
+    this.createPendingRelationForInvite(invite, merchantId);
     invite.usedCount += 1;
     if (invite.maxUses !== null && invite.usedCount >= invite.maxUses) invite.status = "used_up";
-    this.audit("system", "agent.register_by_invite", "agent", agentId, { inviteCodeId: invite.id, targetTier: invite.targetTier });
+    this.audit("system", "merchant.register_by_invite", "merchant", merchantId, { inviteCodeId: invite.id, targetTier: invite.targetTier });
     return {
-      agent,
+      merchant,
       shop,
       application,
       inviteCode: this.serializeInviteCode(invite),
       credential: {
-        account: agent.merchantUsername,
+        account: merchant.merchantUsername,
         initialPassword,
         mustResetPassword: true
       }
@@ -442,23 +724,28 @@ class BackendServices {
     return coupon;
   }
 
-  listUserCoupons(actor: UserActor, input: { shopId?: string; agentProductId?: string } = {}) {
+  listUserCoupons(actor: UserActor, input: { shopId?: string; merchantProductListingId?: string } = {}) {
     return [...this.store.userCoupons.values()]
       .filter((coupon) => coupon.userId === actor.userId)
       .map((coupon) => this.serializeUserCoupon(coupon, input))
       .filter((coupon) => coupon.visible);
   }
 
-  getShop(shopId: string) {
-    return requireEntity(this.store.shops.get(shopId), "RESOURCE_NOT_FOUND", "shop not found");
+  getShop(shopIdentifier: string) {
+    const shop = this.resolveShop(shopIdentifier);
+    return requireEntity(shop, "RESOURCE_NOT_FOUND", "shop not found");
   }
 
-  getPublicShop(shopId: string) {
-    const shop = this.getShop(shopId);
+  getPublicShop(shopIdentifier: string) {
+    const shop = this.getShop(shopIdentifier);
+    const publicPath = publicShopPath(shop);
     return {
       id: shop.id,
-      agentId: shop.agentId,
-      ownerType: shop.ownerType ?? "agent",
+      merchantId: shop.merchantId,
+      ownerType: shop.ownerType ?? "merchant",
+      shopNo: shop.shopNo,
+      sharePath: shop.sharePath,
+      publicPath,
       name: shop.name,
       status: shop.status,
       announcement: shop.announcement,
@@ -477,33 +764,34 @@ class BackendServices {
     };
   }
 
-  listShopProducts(shopId: string) {
-    const shop = this.getShop(shopId);
-    if ((shop.ownerType ?? "agent") === "platform") {
+  listShopProducts(shopIdentifier: string) {
+    const shop = this.getShop(shopIdentifier);
+    if ((shop.ownerType ?? "merchant") === "platform") {
       return [...this.store.platformShopProducts.values()]
-        .filter((shopProduct) => shopProduct.shopId === shopId && shopProduct.status === "listed")
+        .filter((shopProduct) => shopProduct.shopId === shop.id && shopProduct.status === "listed")
         .map((shopProduct) => this.serializePublicShopProduct(shopProduct));
     }
-    return [...this.store.agentProducts.values()]
-      .filter((agentProduct) => agentProduct.shopId === shopId && agentProduct.status === "listed")
-      .map((agentProduct) => this.serializePublicAgentProduct(agentProduct));
+    return [...this.store.merchantProductListings.values()]
+      .filter((merchantProductListing) => merchantProductListing.shopId === shop.id && merchantProductListing.status === "listed")
+      .map((merchantProductListing) => this.serializePublicMerchantProduct(merchantProductListing));
   }
 
-  getAgentProduct(agentProductId: string) {
-    const platformShopProduct = this.store.platformShopProducts.get(agentProductId);
+  getMerchantProduct(merchantProductListingId: string) {
+    const platformShopProduct = this.store.platformShopProducts.get(merchantProductListingId);
     if (platformShopProduct) return this.serializePublicShopProduct(platformShopProduct);
-    return this.serializePublicAgentProduct(
-      requireEntity(this.store.agentProducts.get(agentProductId), "RESOURCE_NOT_FOUND", "product not found")
+    return this.serializePublicMerchantProduct(
+      requireEntity(this.store.merchantProductListings.get(merchantProductListingId), "RESOURCE_NOT_FOUND", "product not found")
     );
   }
 
-  quoteOrder(actor: UserActor, input: { shopId: string; agentProductId: string; quantity?: number; couponId?: string }) {
+
+  quoteOrder(actor: UserActor, input: { shopId: string; merchantProductListingId: string; quantity?: number; couponId?: string }) {
     try {
       const snapshot = this.buildSnapshot({
         orderNo: "quote-only",
         userId: actor.userId,
         shopId: input.shopId,
-        agentProductId: input.agentProductId,
+        merchantProductListingId: input.merchantProductListingId,
         quantity: input.quantity
       });
       return this.serializePublicQuote(snapshot, this.resolveCouponDiscount(actor, snapshot, input.couponId));
@@ -517,23 +805,26 @@ class BackendServices {
 
   createOrder(actor: UserActor, input: {
     shopId: string;
-    agentProductId: string;
+    merchantProductListingId: string;
     quantity?: number;
     buyerEmail?: string;
+    buyerPhone?: string;
     extractionCode?: string;
     couponId?: string;
-    collectionChannelId?: string;
+    paymentMethodId?: string;
     clientPaidAmountCents?: bigint;
   }) {
     try {
+      this.releaseExpiredRightsCodeLocks();
       const orderNo = nextId(this.store, "order");
       const snapshot = this.buildSnapshot({
         orderNo,
         userId: actor.userId,
         shopId: input.shopId,
-        agentProductId: input.agentProductId,
+        merchantProductListingId: input.merchantProductListingId,
         quantity: input.quantity,
-        entrySource: "user_api"
+        entrySource: "user_api",
+        serviceFeeBps: this.activeServiceFeeBps()
       });
       if (input.clientPaidAmountCents !== undefined && input.clientPaidAmountCents !== snapshot.amountSnapshot.paidAmountCents) {
         const quoteDiscount = this.resolveCouponDiscount(actor, snapshot, input.couponId);
@@ -545,14 +836,19 @@ class BackendServices {
       if (requiresExtractionCode(snapshot) && !input.extractionCode) {
         throw new ApiError(400, "PURCHASE_PASSWORD_REQUIRED", "this product requires a purchase password");
       }
-      const collectionChannel = this.resolvePublicCollectionChannel(snapshot.shopId, input.collectionChannelId);
+      if (requiresExtractionCode(snapshot) && !/^1[3-9]\d{9}$/.test(input.buyerPhone ?? "")) {
+        throw new ApiError(400, "BUYER_PHONE_REQUIRED", "code_pool products require a valid mainland China mobile phone");
+      }
+      const selectedPaymentMethod = input.paymentMethodId === "balance"
+        ? this.balancePaymentMethod()
+        : input.paymentMethodId ? this.store.paymentMethods.get(input.paymentMethodId) : undefined;
       const order: DemoOrder = {
         orderNo,
         userId: actor.userId,
-        agentId: snapshot.agentId,
+        merchantId: snapshot.merchantId,
         shopId: snapshot.shopId,
-        agentProductId: snapshot.agentProductId,
-        salesChannelType: "salesChannelType" in snapshot ? snapshot.salesChannelType : "single_agent",
+        merchantProductListingId: snapshot.merchantProductListingId,
+        salesChannelType: "salesChannelType" in snapshot ? snapshot.salesChannelType : "single_merchant",
         status: "pending_payment_confirmation",
         paymentStatus: "unpaid",
         fulfillmentStatus: "not_started",
@@ -563,6 +859,7 @@ class BackendServices {
         fulfilledAt: null,
         paidAt: null,
         buyerEmail: input.buyerEmail,
+        buyerPhone: input.buyerPhone,
         extractionCodeSet: Boolean(input.extractionCode),
         extractionCodeHash: input.extractionCode ? hashSecret(input.extractionCode) : undefined,
         extractionAttemptCount: 0,
@@ -570,19 +867,21 @@ class BackendServices {
         couponId: coupon.userCoupon?.id,
         couponDiscountCents: coupon.discountCents,
         buyerPaidAmountCents: coupon.buyerPaidAmountCents,
-        collectionChannelId: collectionChannel.id,
-        collectionChannelSnapshot: this.serializePublicCollectionChannel(collectionChannel),
+        collectionPaymentConfigId: undefined,
+        collectionPaymentSnapshot: undefined,
+        preferredPaymentMethodId: selectedPaymentMethod?.id,
         refundedAmountCents: 0n,
         snapshot
       };
+      this.reserveRightsCodesForOrder(order);
       this.store.orders.set(orderNo, order);
       if (coupon.userCoupon) {
         coupon.userCoupon.status = "used";
         coupon.userCoupon.orderNo = orderNo;
         coupon.userCoupon.usedAt = new Date();
       }
-      this.audit("system", "order.create", "order", orderNo, { agentId: order.agentId, shopId: order.shopId });
-      this.ledger("ORDER_CREATED", { orderNo: order.orderNo, agentId: order.agentId }, order.snapshot.amountSnapshot.paidAmountCents, {
+      this.audit("system", "order.create", "order", orderNo, { merchantId: order.merchantId, shopId: order.shopId });
+      this.ledger("ORDER_CREATED", { orderNo: order.orderNo, merchantId: order.merchantId }, order.snapshot.amountSnapshot.paidAmountCents, {
         salesChannelType: order.salesChannelType,
         channel: getChannelSnapshot(order.snapshot)
       });
@@ -631,7 +930,7 @@ class BackendServices {
     };
   }
 
-  createPaymentOrder(actor: UserActor, orderNo: string, input: { paymentMethodId?: string }) {
+  async createPaymentOrder(actor: UserActor, orderNo: string, input: { paymentMethodId?: string }) {
     const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
     assertUserOrderScope(actor, order);
     if (order.paymentStatus === "paid") {
@@ -640,8 +939,8 @@ class BackendServices {
     if (order.refundStatus !== "none" || order.status === "refunded") {
       throw new ApiError(400, "PAYMENT_ORDER_NOT_ALLOWED", "refunded orders cannot create payment");
     }
-    const method = this.resolvePaymentMethodForOrder(order, input.paymentMethodId);
-    const amountCents = payableAmount(order);
+    const method = this.resolvePaymentMethodForOrder(order, input.paymentMethodId ?? order.preferredPaymentMethodId);
+    const amountCents = this.applyPaymentFeeSnapshot(order, method);
     const paymentNo = `payment:${order.orderNo}`;
     const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
     const maskedIdentity = this.paymentMethodMaskedIdentity(method);
@@ -656,11 +955,14 @@ class BackendServices {
       amountCents,
       currency: "CNY",
       orderNo: order.orderNo,
-      status: method.provider === "personal_alipay" ? "pending_manual_confirmation" : "created",
+      status: isManualPaymentProvider(method.provider) ? "pending_manual_confirmation" : "created",
       expiresAt,
       createdAt: new Date()
     };
-    if (method.provider === "personal_alipay") {
+    if (method.provider === "balance") {
+      return this.captureBalancePayment(actor, order, method, paymentNo);
+    }
+    if (isManualPaymentProvider(method.provider)) {
       order.status = "pending_payment_confirmation";
       order.paymentStatus = "unpaid";
       this.audit("user", "payment.manual.create", "order", order.orderNo, {
@@ -675,14 +977,15 @@ class BackendServices {
         amountCents,
         paymentMethod: this.serializePaymentMethod(method),
         paymentSnapshot: order.paymentSnapshot,
-        message: "请使用个人支付宝收款信息付款，付款后等待商户人工确认收款。"
+        message: `${paymentProviderDisplay(method.provider)}仅支持人工确认，请按订单金额付款后等待商户确认收款。`
       };
     }
     order.paymentStatus = "paying";
-    const providerTradeNo = `tp_${order.orderNo}_${Date.now()}`;
+    const providerTradeNo = method.provider === "epay" ? order.orderNo : `tp_${order.orderNo}_${Date.now()}`;
     order.paymentSnapshot.providerPaymentNo = providerTradeNo;
     order.paymentSnapshot.status = "paying";
     const signaturePayload = this.paymentSignaturePayload(method.provider, order.orderNo, amountCents, providerTradeNo, method.merchantNo);
+    const epayParams = method.provider === "epay" ? await this.buildEpayPaymentParams(method, order, amountCents) : undefined;
     this.audit("user", "payment.order.create", "order", order.orderNo, {
       paymentMethodId: method.id,
       provider: method.provider,
@@ -699,12 +1002,185 @@ class BackendServices {
       expiresAt,
       paymentSnapshot: order.paymentSnapshot,
       paymentParams: {
-        qrCodeUrl: `tosell-pay://${method.provider}/${encodeURIComponent(providerTradeNo)}`,
-        returnUrl: method.returnUrl,
-        notifyUrl: this.providerCallbackUrl(method.provider),
-        signaturePayload
+        qrCodeUrl: epayParams?.paymentUrl ?? `tosell-pay://${method.provider}/${encodeURIComponent(providerTradeNo)}`,
+        paymentUrl: epayParams?.paymentUrl,
+        gatewayUrl: epayParams?.gatewayUrl,
+        method: epayParams?.method,
+        apiMode: epayParams?.apiMode,
+        mapiStatus: epayParams?.mapiStatus,
+        mapiMessage: epayParams?.mapiMessage,
+        directAppUrl: epayParams?.directAppUrl,
+        cashierUrl: epayParams?.cashierUrl,
+        submitPaymentUrl: epayParams?.submitPaymentUrl,
+        submitParams: epayParams?.submitParams,
+        returnUrl: epayParams?.returnUrl ?? method.returnUrl,
+        notifyUrl: epayParams?.notifyUrl ?? this.providerCallbackUrl(method.provider),
+        signaturePayload: method.provider === "epay" ? undefined : signaturePayload
       },
       message: "支付状态只以服务端回调或后台查单结果为准，前端返回页不能确认支付成功。"
+    };
+  }
+
+  getUserWallet(actor: UserActor) {
+    const wallet = this.ensureUserWallet(actor.userId);
+    return this.serializeWallet(wallet);
+  }
+
+  createWalletRecharge(actor: UserActor, input: { amountCents: bigint; paymentMethodId?: string }) {
+    if (input.amountCents <= 0n) throw new ApiError(400, "WALLET_RECHARGE_AMOUNT_INVALID", "recharge amount must be positive");
+    const wallet = this.ensureUserWallet(actor.userId);
+    const method = this.resolvePaymentMethodForRecharge(input.paymentMethodId);
+    if (!method || method.provider === "balance") throw new ApiError(400, "WALLET_RECHARGE_METHOD_UNAVAILABLE", "wallet recharge needs an external payment method");
+    const feeBps = this.paymentFeeBpsForProvider(method.provider);
+    const feeCents = calculateServiceFeeCents(input.amountCents, BigInt(feeBps));
+    const recharge: WalletRecharge = {
+      rechargeNo: nextId(this.store, "recharge"),
+      userId: actor.userId,
+      walletId: wallet.id,
+      paymentMethodId: method.id,
+      provider: method.provider,
+      confirmationMode: method.confirmationMode,
+      rechargeCents: input.amountCents,
+      feeBps,
+      feeCents,
+      payableCents: input.amountCents + feeCents,
+      status: "pending_payment",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      idempotencyKey: `wallet-recharge:${actor.userId}:${Date.now()}`
+    };
+    this.store.walletRecharges.set(recharge.rechargeNo, recharge);
+    this.audit("user", "wallet.recharge.create", "wallet_recharge", recharge.rechargeNo, {
+      userId: actor.userId,
+      amountCents: input.amountCents,
+      feeCents
+    });
+    return { ...recharge, wallet: this.serializeWallet(wallet), paymentMethod: this.serializePaymentMethod(method) };
+  }
+
+  confirmWalletRecharge(actor: AdminActor, rechargeNo: string, input: { providerTradeNo?: string; note?: string }) {
+    assertAdminPermission(actor, "settlement.confirm");
+    const recharge = requireEntity(this.store.walletRecharges.get(rechargeNo), "RESOURCE_NOT_FOUND", "wallet recharge not found");
+    const wallet = requireEntity(this.store.userWallets.get(recharge.userId), "RESOURCE_NOT_FOUND", "wallet not found");
+    if (recharge.status === "paid") return { status: "already_paid" as const, recharge, wallet: this.serializeWallet(wallet) };
+    const before = wallet.availableBalanceCents;
+    wallet.availableBalanceCents += recharge.rechargeCents;
+    wallet.totalRechargeCents += recharge.rechargeCents;
+    wallet.version += 1;
+    wallet.updatedAt = new Date();
+    recharge.status = "paid";
+    recharge.paidAt = new Date();
+    recharge.updatedAt = new Date();
+    this.recordWalletTransaction({
+      userId: recharge.userId,
+      wallet,
+      type: "recharge",
+      direction: "credit",
+      amountCents: recharge.rechargeCents,
+      balanceBeforeCents: before,
+      balanceAfterCents: wallet.availableBalanceCents,
+      sourceType: "wallet_recharge",
+      sourceId: recharge.rechargeNo,
+      rechargeNo: recharge.rechargeNo,
+      note: input.note ?? input.providerTradeNo
+    });
+    this.ledger("WALLET_RECHARGE_PAID", {}, recharge.rechargeCents, {
+      rechargeNo: recharge.rechargeNo,
+      userId: recharge.userId,
+      operatorId: actor.adminId
+    });
+    this.audit(actor.role, "wallet.recharge.confirm", "wallet_recharge", recharge.rechargeNo, {
+      providerTradeNo: input.providerTradeNo
+    });
+    return { status: "processed" as const, recharge, wallet: this.serializeWallet(wallet) };
+  }
+
+  listWallets(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return [...this.store.userWallets.values()].map((wallet) => this.serializeWallet(wallet));
+  }
+
+  listWalletTransactions(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return this.store.walletTransactions;
+  }
+
+  listWalletRecharges(actor: AdminActor) {
+    assertAdminPermission(actor, "settlement.confirm");
+    return [...this.store.walletRecharges.values()].sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime());
+  }
+
+  private captureBalancePayment(actor: UserActor, order: DemoOrder, method: PaymentMethodConfig, paymentNo: string) {
+    const wallet = this.ensureUserWallet(actor.userId);
+    const amountCents = payableAmount(order);
+    if (wallet.availableBalanceCents < amountCents) {
+      throw new ApiError(400, "WALLET_BALANCE_INSUFFICIENT", "wallet balance is not enough for this order");
+    }
+    const before = wallet.availableBalanceCents;
+    wallet.availableBalanceCents -= amountCents;
+    wallet.totalSpendCents += amountCents;
+    wallet.version += 1;
+    wallet.updatedAt = new Date();
+    const hold: WalletPaymentHold = {
+      holdNo: nextId(this.store, "wallet-hold"),
+      userId: actor.userId,
+      walletId: wallet.id,
+      orderNo: order.orderNo,
+      paymentNo,
+      amountCents,
+      status: "captured",
+      capturedAt: new Date(),
+      idempotencyKey: `wallet-payment:${order.orderNo}`
+    };
+    this.store.walletHolds.set(hold.holdNo, hold);
+    this.recordWalletTransaction({
+      userId: actor.userId,
+      wallet,
+      type: "payment_capture",
+      direction: "debit",
+      amountCents,
+      balanceBeforeCents: before,
+      balanceAfterCents: wallet.availableBalanceCents,
+      sourceType: "order",
+      sourceId: order.orderNo,
+      orderNo: order.orderNo,
+      paymentNo,
+      holdNo: hold.holdNo,
+      note: "余额支付"
+    });
+    this.applyPaidOrder(order, amountCents, "balance", {
+      provider: "balance",
+      paymentMethodId: method.id,
+      walletId: wallet.id
+    });
+    order.paymentSnapshot = {
+      ...(order.paymentSnapshot ?? {}),
+      paymentNo,
+      paymentMethodId: method.id,
+      provider: "balance",
+      confirmationMode: "automatic",
+      amountCents,
+      currency: "CNY",
+      orderNo: order.orderNo,
+      status: "paid",
+      confirmationSource: "balance",
+      paidAt: order.paidAt ?? new Date()
+    };
+    this.audit("user", "wallet.payment.capture", "order", order.orderNo, {
+      paymentMethodId: method.id,
+      provider: method.provider,
+      amountCents,
+      walletId: wallet.id,
+      holdNo: hold.holdNo
+    });
+    return {
+      status: "paid" as const,
+      orderNo: order.orderNo,
+      provider: "balance" as const,
+      amountCents,
+      wallet: this.serializeWallet(wallet),
+      order: this.serializePublicOrder(order, { includeDeliveryCodes: false }),
+      message: "余额支付成功，订单已进入发货流程。"
     };
   }
 
@@ -808,7 +1284,7 @@ class BackendServices {
       afterSaleNo,
       orderNo: order.orderNo,
       userId: actor.userId,
-      agentId: order.agentId,
+      merchantId: order.merchantId,
       shopId: order.shopId,
       status: "pending",
       reasonCode: input.reasonCode,
@@ -823,31 +1299,33 @@ class BackendServices {
     return afterSale;
   }
 
-  submitAgentApplication(actor: AgentActor, input: { contactPhone: string; customerServiceWechat: string; inviteCode?: string }) {
-    const agent = requireEntity(this.store.agents.get(actor.agentId), "RESOURCE_NOT_FOUND", "agent not found");
-    agent.status = "pending_review";
-    agent.contactPhone = input.contactPhone;
-    const application: AgentApplication = {
-      applicationNo: nextId(this.store, "agent-app"),
-      agentId: agent.id,
-      userId: agent.userId,
+  submitMerchantApplication(actor: MerchantActor, input: { contactPhone: string; customerServiceWechat: string; inviteCode?: string }) {
+    const merchant = requireEntity(this.store.merchants.get(actor.merchantId), "RESOURCE_NOT_FOUND", "merchant not found");
+    merchant.status = "pending_review";
+    merchant.contactPhone = input.contactPhone;
+    const application: MerchantApplication = {
+      applicationNo: nextId(this.store, "merchant-app"),
+      merchantId: merchant.id,
+      userId: merchant.userId,
       status: "pending_review",
       contactPhone: input.contactPhone,
       customerServiceWechat: input.customerServiceWechat,
       inviteCode: input.inviteCode
     };
-    this.store.agentApplications.set(application.applicationNo, application);
-    this.audit("agent", "agent.application.submit", "agent", agent.id, application);
+    this.store.merchantApplications.set(application.applicationNo, application);
+    this.audit("merchant", "merchant.application.submit", "merchant", merchant.id, application);
     return application;
   }
 
-  getAgentShop(actor: AgentActor) {
+
+  getMerchantShop(actor: MerchantActor) {
     const shop = requireEntity(this.store.shops.get(actor.shopId), "RESOURCE_NOT_FOUND", "shop not found");
-    assertAgentScope(actor, { agentId: required(shop.agentId, "agentId"), shopId: shop.id });
+    assertMerchantScope(actor, { merchantId: required(shop.merchantId, "merchantId"), shopId: shop.id });
     return shop;
   }
 
-  updateAgentShop(actor: AgentActor, input: {
+
+  updateMerchantShop(actor: MerchantActor, input: {
     name?: string;
     announcement?: string;
     customerServiceWechat?: string;
@@ -856,50 +1334,51 @@ class BackendServices {
     customerServiceQqQrUrl?: string;
     customerServiceNote?: string;
   }) {
-    const shop = this.getAgentShop(actor);
+    const shop = this.getMerchantShop(actor);
     Object.assign(shop, input);
-    this.audit("agent", "shop.update", "shop", shop.id, input);
+    this.audit("merchant", "shop.update", "shop", shop.id, input);
     return shop;
   }
 
-  updateAgentShopCollection(actor: AgentActor, input: { collectionAccountName?: string; collectionQrUrl?: string; collectionNote?: string }) {
-    const shop = this.getAgentShop(actor);
+  updateMerchantShopCollection(actor: MerchantActor, input: { collectionAccountName?: string; collectionQrUrl?: string; collectionNote?: string }) {
+    const shop = this.getMerchantShop(actor);
     shop.collectionAccountName = input.collectionAccountName ?? shop.collectionAccountName;
     shop.collectionQrUrl = input.collectionQrUrl ?? shop.collectionQrUrl;
     shop.collectionNote = input.collectionNote ?? shop.collectionNote;
-    this.audit("agent", "shop.collection.update", "shop", shop.id, input);
+    this.audit("merchant", "shop.collection.update", "shop", shop.id, input);
     return shop;
   }
 
-  updateShopDecor(actor: AgentActor, input: {
+
+  updateShopDecor(actor: MerchantActor, input: {
     themeColor?: string;
     bannerUrl?: string;
     shareTitle?: string;
-    productGroups?: Array<{ name: string; agentProductIds: string[] }>;
+    productGroups?: Array<{ name: string; merchantProductListingIds: string[] }>;
   }) {
-    const shop = this.getAgentShop(actor);
+    const shop = this.getMerchantShop(actor);
     if (input.themeColor && !/^#[0-9a-fA-F]{6}$/.test(input.themeColor)) {
       throw new ApiError(400, "SHOP_DECOR_INVALID", "themeColor must be a hex color");
     }
     if (input.productGroups) {
       for (const group of input.productGroups) {
-        for (const agentProductId of group.agentProductIds) {
-          const agentProduct = requireEntity(this.store.agentProducts.get(agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
-          assertAgentScope(actor, agentProduct);
+        for (const merchantProductListingId of group.merchantProductListingIds) {
+          const merchantProductListing = requireEntity(this.store.merchantProductListings.get(merchantProductListingId), "RESOURCE_NOT_FOUND", "merchant product not found");
+          assertMerchantScope(actor, merchantProductListing);
         }
       }
     }
     Object.assign(shop, input);
-    this.notify(actor.agentId, "shop.decor.updated", "店铺装修已更新", "新的店铺主题、分享标题或商品分组已经保存。");
-    this.audit("agent", "shop.decor.update", "shop", shop.id, input);
+    this.notify(actor.merchantId, "shop.decor.updated", "店铺装修已更新", "新的店铺主题、分享标题或商品分组已经保存。");
+    this.audit("merchant", "shop.decor.update", "shop", shop.id, input);
     return shop;
   }
 
-  listPlatformProducts(actor?: AgentActor) {
+  listPlatformProducts(actor?: MerchantActor) {
     if (actor) {
-      this.getAgentShop(actor);
-      this.assertAgentDepositConfirmed(actor.agentId, "select platform products");
-      if (this.findActiveChannelRelationForSellingAgent(actor.agentId) || this.isSecondTierSupplier(actor.agentId)) {
+      this.getMerchantShop(actor);
+      this.assertMerchantDepositConfirmed(actor.merchantId, "select platform products");
+      if (this.findActiveChannelRelationForSellingMerchant(actor.merchantId) || this.isSecondTierSupplier(actor.merchantId)) {
         return this.listVisibleUpstreamProducts(actor);
       }
     }
@@ -997,7 +1476,7 @@ class BackendServices {
   }) {
     assertAdminPermission(actor, "product.manage");
     const shop = this.getShop(input.shopId);
-    if ((shop.ownerType ?? "agent") !== "platform") throw new ApiError(400, "SHOP_SCOPE_INVALID", "shop is not platform-owned");
+    if ((shop.ownerType ?? "merchant") !== "platform") throw new ApiError(400, "SHOP_SCOPE_INVALID", "shop is not platform-owned");
     const product = requireEntity(this.store.platformProducts.get(input.platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
     if (input.salePriceCents < product.minSalePriceCents) throw new ApiError(400, "PRICE_RULE_FAILED", "sale price is below minimum sale price");
     const existing = [...this.store.platformShopProducts.values()]
@@ -1018,117 +1497,130 @@ class BackendServices {
     return shopProduct;
   }
 
-  agentDashboard(actor: AgentActor) {
-    const orders = this.listAgentScopedOrders(actor);
+  merchantDashboard(actor: MerchantActor) {
+    const orders = this.listMerchantScopedOrders(actor);
     const paidOrders = orders.filter((order) => order.paymentStatus === "paid");
     const fulfilledOrders = orders.filter((order) => order.fulfillmentStatus === "success");
     const refundedOrders = orders.filter((order) => order.refundStatus === "refunded");
-    const account = this.store.depositAccounts.get(actor.agentId);
+    const account = this.store.depositAccounts.get(actor.merchantId);
     return {
       orderCount: orders.length,
       paidOrderCount: paidOrders.length,
       fulfilledOrderCount: fulfilledOrders.length,
       refundOrderCount: refundedOrders.length,
       gmvCents: sum(paidOrders.map((order) => order.snapshot.amountSnapshot.paidAmountCents)),
-      expectedIncomeCents: sum(paidOrders.map((order) => order.snapshot.amountSnapshot.agentExpectedIncomeCents)),
-      pendingIncomeCents: this.store.pendingIncomeByAgent.get(actor.agentId) ?? 0n,
-      payableIncomeCents: this.store.payableIncomeByAgent.get(actor.agentId) ?? 0n,
-      paidIncomeCents: this.store.paidIncomeByAgent.get(actor.agentId) ?? 0n,
+      expectedIncomeCents: sum(paidOrders.map((order) => order.snapshot.amountSnapshot.merchantExpectedIncomeCents)),
+      pendingIncomeCents: this.store.pendingIncomeByMerchant.get(actor.merchantId) ?? 0n,
+      payableIncomeCents: this.store.payableIncomeByMerchant.get(actor.merchantId) ?? 0n,
+      paidIncomeCents: this.store.paidIncomeByMerchant.get(actor.merchantId) ?? 0n,
       refundRateBps: paidOrders.length === 0 ? 0 : Math.round((refundedOrders.length / paidOrders.length) * 10_000),
       depositAvailableCents: account?.availableAmountCents ?? 0n,
-      activeProductCount: this.listAgentProducts(actor).filter((item) => item.status === "listed").length,
+      activeProductCount: this.listMerchantProducts(actor).filter((item) => item.status === "listed").length,
       noticeCount: this.listNotifications(actor).filter((item) => !item.readAt).length
     };
   }
 
-  listAgentProducts(actor: AgentActor) {
-    return [...this.store.agentProducts.values()]
-      .filter((agentProduct) => agentProduct.agentId === actor.agentId && agentProduct.shopId === actor.shopId)
-      .map((agentProduct) => this.serializeAgentProductForActor(actor, agentProduct));
+
+  listMerchantProducts(actor: MerchantActor) {
+    return [...this.store.merchantProductListings.values()]
+      .filter((merchantProductListing) => merchantProductListing.merchantId === actor.merchantId && merchantProductListing.shopId === actor.shopId)
+      .map((merchantProductListing) => this.serializeMerchantProductForActor(actor, merchantProductListing));
   }
 
-  getAgentProductDetail(actor: AgentActor, agentProductId: string) {
-    const agentProduct = requireEntity(this.store.agentProducts.get(agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
-    assertAgentScope(actor, agentProduct);
-    return this.serializeAgentProductDetailForActor(actor, agentProduct);
+
+  getMerchantProductDetail(actor: MerchantActor, merchantProductListingId: string) {
+    const merchantProductListing = requireEntity(this.store.merchantProductListings.get(merchantProductListingId), "RESOURCE_NOT_FOUND", "merchant product not found");
+    assertMerchantScope(actor, merchantProductListing);
+    return this.serializeMerchantProductDetailForActor(actor, merchantProductListing);
   }
 
-  updateAgentProductDetail(actor: AgentActor, agentProductId: string, input: { salePriceCents?: bigint; status?: string }) {
-    const agentProduct = requireEntity(this.store.agentProducts.get(agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
-    assertAgentScope(actor, agentProduct);
-    if (input.salePriceCents !== undefined) this.setAgentProductPrice(actor, agentProductId, input.salePriceCents);
-    if (input.status !== undefined) agentProduct.status = input.status;
-    this.audit("agent", "agent_product.detail_update", "agent_product", agentProduct.id, input);
-    return this.serializeAgentProductDetailForActor(actor, agentProduct);
+
+  updateMerchantProductDetail(actor: MerchantActor, merchantProductListingId: string, input: MerchantProductListingDetailUpdateInput) {
+    const merchantProductListing = requireEntity(this.store.merchantProductListings.get(merchantProductListingId), "RESOURCE_NOT_FOUND", "merchant product not found");
+    assertMerchantScope(actor, merchantProductListing);
+    if (input.salePriceCents !== undefined) this.setMerchantProductPrice(actor, merchantProductListingId, input.salePriceCents);
+    if (input.status !== undefined) merchantProductListing.status = input.status;
+    this.applyMerchantProductListingDisplayOverrides(merchantProductListing, input);
+    this.audit("merchant", "merchant_product_listing.detail_update", "merchant_product_listing", merchantProductListing.id, input);
+    return this.serializeMerchantProductDetailForActor(actor, merchantProductListing);
   }
 
-  listAgentOrders(actor: AgentActor) {
-    return this.listAgentScopedOrders(actor).map((order) => this.serializeAgentOrderForActor(actor, order));
+
+  listMerchantOrders(actor: MerchantActor) {
+    return this.listMerchantScopedOrders(actor).map((order) => this.serializeMerchantOrderForActor(actor, order));
   }
 
-  getAgentOrder(actor: AgentActor, orderNo: string) {
-    const order = this.listAgentScopedOrders(actor).find((item) => item.orderNo === orderNo);
+
+  getMerchantOrder(actor: MerchantActor, orderNo: string) {
+    const order = this.listMerchantScopedOrders(actor).find((item) => item.orderNo === orderNo);
     if (!order) throw new ApiError(404, "RESOURCE_NOT_FOUND", "order not found");
-    return this.serializeAgentOrderForActor(actor, order);
+    return this.serializeMerchantOrderForActor(actor, order);
   }
 
-  private listAgentScopedOrders(actor: AgentActor) {
+
+  private listMerchantScopedOrders(actor: MerchantActor) {
     return [...this.store.orders.values()].filter((order) => {
-      if (order.agentId === actor.agentId && order.shopId === actor.shopId) return true;
+      if (order.merchantId === actor.merchantId && order.shopId === actor.shopId) return true;
       const channel = getChannelSnapshot(order.snapshot);
-      return (channel?.firstTierAgentId === actor.agentId && channel.firstTierShopId === actor.shopId)
-        || (channel?.secondTierAgentId === actor.agentId && channel.secondTierShopId === actor.shopId);
+      return (channel?.firstTierMerchantId === actor.merchantId && channel.firstTierShopId === actor.shopId)
+        || (channel?.secondTierMerchantId === actor.merchantId && channel.secondTierShopId === actor.shopId);
     });
   }
 
-  listAgentSettlements(actor: AgentActor) {
-    return this.store.settlementSheets.filter((sheet) => sheet.agentId === actor.agentId);
+  listMerchantSettlements(actor: MerchantActor) {
+    return this.store.settlementSheets.filter((sheet) => sheet.merchantId === actor.merchantId);
   }
 
-  listAgentClawbacks(actor: AgentActor) {
-    return this.store.clawbacks.filter((clawback) => clawback.agentId === actor.agentId);
+
+  listMerchantClawbacks(actor: MerchantActor) {
+    return this.store.clawbacks.filter((clawback) => clawback.merchantId === actor.merchantId);
   }
 
-  listAgentDepositTransactions(actor: AgentActor) {
-    return this.store.depositTransactions.filter((transaction) => transaction.agentId === actor.agentId);
+
+  listMerchantDepositTransactions(actor: MerchantActor) {
+    return this.store.depositTransactions.filter((transaction) => transaction.merchantId === actor.merchantId);
   }
 
-  setAgentProductPrice(actor: AgentActor, agentProductId: string, salePriceCents: bigint) {
-    this.assertAgentDepositConfirmed(actor.agentId, "change product price");
-    const agentProduct = requireEntity(this.store.agentProducts.get(agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
-    assertAgentScope(actor, agentProduct);
+
+  setMerchantProductPrice(actor: MerchantActor, merchantProductListingId: string, salePriceCents: bigint) {
+    this.assertMerchantDepositConfirmed(actor.merchantId, "change product price");
+    const merchantProductListing = requireEntity(this.store.merchantProductListings.get(merchantProductListingId), "RESOURCE_NOT_FOUND", "merchant product not found");
+    assertMerchantScope(actor, merchantProductListing);
     try {
-      if (agentProduct.productType === "platform") {
-        const pricing = this.platformSelectionPricingForActor(actor, required(agentProduct.platformProductId, "platformProductId"));
+      if (merchantProductListing.productType === "platform") {
+        const pricing = this.platformSelectionPricingForActor(actor, required(merchantProductListing.platformProductId, "platformProductId"));
         quotePlatformProduct({
           salePriceCents,
           supplyPriceCents: pricing.supplyPriceCents,
           minSalePriceCents: pricing.minSalePriceCents
         });
       } else {
-        const ownProduct = requireEntity(this.store.ownProducts.get(required(agentProduct.ownProductReviewId, "ownProductReviewId")), "RESOURCE_NOT_FOUND", "own product not found");
-        quoteAgentOwnedProduct({ salePriceCents, minSalePriceCents: ownProduct.minSalePriceCents });
+        const ownProduct = requireEntity(this.store.ownProducts.get(required(merchantProductListing.ownProductReviewId, "ownProductReviewId")), "RESOURCE_NOT_FOUND", "own product not found");
+        quoteMerchantOwnedProduct({ salePriceCents, minSalePriceCents: ownProduct.minSalePriceCents });
       }
     } catch (error) {
       if (error instanceof ApiError) throw error;
       throw new ApiError(400, "PRICE_RULE_FAILED", getErrorMessage(error));
     }
-    agentProduct.salePriceCents = salePriceCents;
-    this.audit("agent", "agent_product.price_update", "agent_product", agentProduct.id, { salePriceCents });
-    return agentProduct;
+    merchantProductListing.salePriceCents = salePriceCents;
+    this.audit("merchant", "merchant_product_listing.price_update", "merchant_product_listing", merchantProductListing.id, { salePriceCents });
+    return merchantProductListing;
   }
 
-  listOwnProductReviews(actor: AgentActor) {
-    return [...this.store.ownProducts.values()].filter((product) => product.agentId === actor.agentId && product.shopId === actor.shopId);
+
+  listOwnProductReviews(actor: MerchantActor) {
+    return [...this.store.ownProducts.values()]
+      .filter((product) => product.merchantId === actor.merchantId && product.shopId === actor.shopId)
+      .map((product) => this.serializeOwnProductDetail(product, "merchant"));
   }
 
-  getOwnProductDetail(actor: AgentActor, ownProductId: string) {
+  getOwnProductDetail(actor: MerchantActor, ownProductId: string) {
     const product = requireEntity(this.store.ownProducts.get(ownProductId), "RESOURCE_NOT_FOUND", "own product not found");
-    assertAgentScope(actor, product);
+    assertMerchantScope(actor, product);
     return this.serializeOwnProductDetail(product, "merchant");
   }
 
-  updateOwnProductDetail(actor: AgentActor, ownProductId: string, input: {
+  updateOwnProductDetail(actor: MerchantActor, ownProductId: string, input: {
     name?: string;
     category?: string;
     tags?: string[];
@@ -1147,7 +1639,7 @@ class BackendServices {
     status?: string;
   }) {
     const product = requireEntity(this.store.ownProducts.get(ownProductId), "RESOURCE_NOT_FOUND", "own product not found");
-    assertAgentScope(actor, product);
+    assertMerchantScope(actor, product);
     if (product.reviewStatus !== "pending_review" && (input.name || input.category || input.fulfillmentRule)) {
       throw new ApiError(400, "OWN_PRODUCT_EDIT_LOCKED", "approved or rejected own product core fields cannot be changed");
     }
@@ -1157,14 +1649,14 @@ class BackendServices {
     }
     const nextSalePrice = input.salePriceCents ?? product.salePriceCents;
     const nextMinSalePrice = input.minSalePriceCents ?? product.minSalePriceCents;
-    quoteAgentOwnedProduct({ salePriceCents: nextSalePrice, minSalePriceCents: nextMinSalePrice });
+    quoteMerchantOwnedProduct({ salePriceCents: nextSalePrice, minSalePriceCents: nextMinSalePrice });
     assignDefined(product, input);
     product.updatedAt = new Date();
-    this.audit("agent", "own_product.update", "own_product", product.id, input);
+    this.audit("merchant", "own_product.update", "own_product", product.id, input);
     return this.serializeOwnProductDetail(product, "merchant");
   }
 
-  submitOwnProduct(actor: AgentActor, input: {
+  submitOwnProduct(actor: MerchantActor, input: {
     name: string;
     category?: string;
     tags?: string[];
@@ -1179,17 +1671,18 @@ class BackendServices {
     fulfillmentRule?: unknown;
     afterSaleRule?: unknown;
   }) {
-    this.assertAgentDepositConfirmed(actor.agentId, "submit own product");
-    const shop = this.getAgentShop(actor);
+    this.assertMerchantDepositConfirmed(actor.merchantId, "submit own product");
+    const shop = this.getMerchantShop(actor);
+    const minSalePriceCents = input.minSalePriceCents ?? input.salePriceCents;
     try {
-      quoteAgentOwnedProduct({ salePriceCents: input.salePriceCents, minSalePriceCents: input.minSalePriceCents });
+      quoteMerchantOwnedProduct({ salePriceCents: input.salePriceCents, minSalePriceCents });
     } catch (error) {
       throw new ApiError(400, "PRICE_RULE_FAILED", getErrorMessage(error));
     }
     const now = new Date();
     const review: DemoOwnProduct = {
       id: nextId(this.store, "own"),
-      agentId: actor.agentId,
+      merchantId: actor.merchantId,
       shopId: shop.id,
       name: input.name,
       category: input.category,
@@ -1201,7 +1694,7 @@ class BackendServices {
       specs: input.specs,
       detailSections: input.detailSections,
       salePriceCents: input.salePriceCents,
-      minSalePriceCents: input.minSalePriceCents,
+      minSalePriceCents,
       fulfillmentRule: input.fulfillmentRule ?? { mode: "manual" },
       afterSaleRule: input.afterSaleRule ?? { platformReviewRequired: true },
       reviewStatus: "pending_review",
@@ -1210,13 +1703,13 @@ class BackendServices {
       updatedAt: now
     };
     this.store.ownProducts.set(review.id, review);
-    this.audit("agent", "own_product.submit", "own_product", review.id, review);
+    this.audit("merchant", "own_product.submit", "own_product", review.id, review);
     return review;
   }
 
-  selectPlatformProduct(actor: AgentActor, input: { platformProductId: string; salePriceCents: bigint }) {
-    this.getAgentShop(actor);
-    this.assertAgentDepositConfirmed(actor.agentId, "select platform product");
+  selectPlatformProduct(actor: MerchantActor, input: MerchantProductListingSelectionInput) {
+    this.getMerchantShop(actor);
+    this.assertMerchantDepositConfirmed(actor.merchantId, "select platform product");
     const pricing = this.platformSelectionPricingForActor(actor, input.platformProductId);
     try {
       quotePlatformProduct({
@@ -1227,11 +1720,11 @@ class BackendServices {
     } catch (error) {
       throw new ApiError(400, "PRICE_RULE_FAILED", getErrorMessage(error));
     }
-    const existing = [...this.store.agentProducts.values()]
-      .find((agentProduct) => agentProduct.shopId === actor.shopId && agentProduct.platformProductId === pricing.product.id);
-    const agentProduct: DemoAgentProduct = existing ?? {
+    const existing = [...this.store.merchantProductListings.values()]
+      .find((merchantProductListing) => merchantProductListing.shopId === actor.shopId && merchantProductListing.platformProductId === pricing.product.id);
+    const merchantProductListing: DemoMerchantProductListing = existing ?? {
       id: nextId(this.store, "ap"),
-      agentId: actor.agentId,
+      merchantId: actor.merchantId,
       shopId: actor.shopId,
       productType: "platform",
       platformProductId: pricing.product.id,
@@ -1239,30 +1732,32 @@ class BackendServices {
       salePriceCents: input.salePriceCents,
       status: "listed"
     };
-    agentProduct.salePriceCents = input.salePriceCents;
-    agentProduct.status = "listed";
-    this.store.agentProducts.set(agentProduct.id, agentProduct);
-    this.audit("agent", "agent_product.select_platform", "agent_product", agentProduct.id, agentProduct);
-    return agentProduct;
+    merchantProductListing.salePriceCents = input.salePriceCents;
+    merchantProductListing.status = "listed";
+    this.applyMerchantProductListingDisplayOverrides(merchantProductListing, input);
+    this.store.merchantProductListings.set(merchantProductListing.id, merchantProductListing);
+    this.audit("merchant", "merchant_product_listing.select_platform", "merchant_product_listing", merchantProductListing.id, merchantProductListing);
+    return merchantProductListing;
   }
 
-  upsertAgentChannelProductOffer(actor: AgentActor, input: { downstreamAgentId: string; platformProductId: string; resellSupplyPriceCents: bigint; status?: string }) {
-    this.assertAgentDepositConfirmed(actor.agentId, "configure transfer price");
-    const relation = this.findDirectDownstreamRelation(actor.agentId, input.downstreamAgentId);
+  upsertMerchantChannelProductOffer(actor: MerchantActor, input: { downstreamMerchantId: string; platformProductId: string; resellSupplyPriceCents: bigint; status?: string }) {
+    this.assertMerchantDepositConfirmed(actor.merchantId, "configure transfer price");
+    const relation = this.findDirectDownstreamRelation(actor.merchantId, input.downstreamMerchantId);
     if (!relation) {
-      if (this.agentTier(actor.agentId) === "third_tier") {
+      if (this.merchantTier(actor.merchantId) === "third_tier") {
         throw new ApiError(403, "FOURTH_TIER_FORBIDDEN", "third-tier merchants cannot configure downstream transfer price");
       }
-      throw new ApiError(403, "FORBIDDEN_AGENT_SCOPE", "downstream merchant is not directly related to current merchant");
+      throw new ApiError(403, "FORBIDDEN_MERCHANT_SCOPE", "downstream merchant is not directly related to current merchant");
     }
     if (relation.status !== "active") throw new ApiError(400, "CHANNEL_RULE_FAILED", "channel relation is not active");
-    return this.upsertChannelOfferForRelation("agent", relation, input);
+    return this.upsertChannelOfferForRelation("merchant", relation, input);
   }
 
-  batchSelectPlatformProducts(actor: AgentActor, input: { items: Array<{ platformProductId: string; salePriceCents: bigint }> }) {
+
+  batchSelectPlatformProducts(actor: MerchantActor, input: { items: MerchantProductListingSelectionInput[] }) {
     if (input.items.length === 0) throw new ApiError(400, "BATCH_EMPTY", "items are required");
     if (input.items.length > 50) throw new ApiError(400, "BATCH_TOO_LARGE", "batch size cannot exceed 50");
-    this.assertAgentDepositConfirmed(actor.agentId, "batch select platform products");
+    this.assertMerchantDepositConfirmed(actor.merchantId, "batch select platform products");
     for (const item of input.items) {
       const pricing = this.platformSelectionPricingForActor(actor, item.platformProductId);
       try {
@@ -1276,43 +1771,45 @@ class BackendServices {
       }
     }
     const results = input.items.map((item) => this.selectPlatformProduct(actor, item));
-    this.notify(actor.agentId, "product.batch_listed", "批量选品已完成", `已处理 ${results.length} 个商品。`);
-    this.audit("agent", "agent_product.batch_select_platform", "agent_product", actor.shopId, { count: results.length });
+    this.notify(actor.merchantId, "product.batch_listed", "批量选品已完成", `已处理 ${results.length} 个商品。`);
+    this.audit("merchant", "merchant_product_listing.batch_select_platform", "merchant_product_listing", actor.shopId, { count: results.length });
     return { count: results.length, items: results };
   }
 
-  reviewAgent(actor: AdminActor, agentId: string, input: { approved: boolean; reason?: string }) {
-    assertAdminPermission(actor, "agent.review");
-    const agent = requireEntity(this.store.agents.get(agentId), "RESOURCE_NOT_FOUND", "agent not found");
-    agent.status = input.approved ? "pending_deposit" : "rejected";
+  reviewMerchant(actor: AdminActor, merchantId: string, input: { approved: boolean; reason?: string }) {
+    assertAdminPermission(actor, "merchant.review");
+    const merchant = requireEntity(this.store.merchants.get(merchantId), "RESOURCE_NOT_FOUND", "merchant not found");
+    merchant.status = input.approved ? "pending_deposit" : "rejected";
     let credential: { account: string; initialPassword: string; mustResetPassword: boolean } | undefined;
-    if (input.approved && !agent.initialPasswordSet) {
+    if (input.approved && !merchant.initialPasswordSet) {
       const initialPassword = `TS${Date.now().toString().slice(-6)}`;
-      agent.initialPasswordSet = true;
-      agent.merchantUsername = agent.id;
-      agent.passwordHash = `sha256:${hashSecret(initialPassword)}`;
+      merchant.initialPasswordSet = true;
+      merchant.merchantUsername = merchant.id;
+      merchant.passwordHash = `sha256:${hashSecret(initialPassword)}`;
       credential = {
-        account: agent.merchantUsername,
+        account: merchant.merchantUsername,
         initialPassword,
         mustResetPassword: true
       };
     }
     for (const relation of this.store.channelRelations) {
-      if (relation.status === "pending_review" && (relation.secondTierAgentId === agentId || relation.thirdTierAgentId === agentId)) {
+      if (relation.status === "pending_review" && (relation.secondTierMerchantId === merchantId || relation.thirdTierMerchantId === merchantId)) {
         relation.status = input.approved ? "pending_deposit" : "closed";
         relation.reason = input.reason ?? relation.reason;
       }
     }
-    this.audit(actor.role, "agent.review", "agent", agentId, input);
-    return credential ? { ...agent, credential } : agent;
+    this.audit(actor.role, "merchant.review", "merchant", merchantId, input);
+    return credential ? { ...merchant, credential } : merchant;
   }
 
-  listAgentApplications(actor: AdminActor) {
-    assertAdminPermission(actor, "agent.review");
-    return [...this.store.agentApplications.values()];
+
+  listMerchantApplications(actor: AdminActor) {
+    assertAdminPermission(actor, "merchant.review");
+    return [...this.store.merchantApplications.values()];
   }
 
-  createAgentByAdmin(actor: AdminActor, input: {
+
+  createMerchantByAdmin(actor: AdminActor, input: {
     name: string;
     targetTier?: "first_tier" | "second_tier" | "third_tier";
     contactPhone?: string;
@@ -1323,17 +1820,17 @@ class BackendServices {
     depositPaid?: boolean;
     depositAmountCents?: bigint;
   }) {
-    assertAdminPermission(actor, "agent.review");
+    assertAdminPermission(actor, "merchant.review");
     if (input.targetTier && input.targetTier !== "first_tier") {
-      this.audit(actor.role, "agent.admin_create_rejected_non_first_tier", "agent", input.targetTier, {
+      this.audit(actor.role, "merchant.admin_create_rejected_non_first_tier", "merchant", input.targetTier, {
         targetTier: input.targetTier,
         operatorId: actor.adminId
       });
       throw new ApiError(400, "ADMIN_CREATE_FIRST_TIER_ONLY", "admin manual creation can only create first-tier merchants");
     }
-    const agentId = nextId(this.store, "agent");
+    const merchantId = nextId(this.store, "merchant");
     const shopId = nextId(this.store, "shop");
-    const userId = nextId(this.store, "agent-user");
+    const userId = nextId(this.store, "merchant-user");
     const initialPassword = input.initialPassword ?? `TS${Date.now().toString().slice(-6)}`;
     const requiredAmount = input.depositRequiredAmountCents ?? input.depositAmountCents;
     if (requiredAmount === undefined || requiredAmount <= 0n) {
@@ -1341,8 +1838,8 @@ class BackendServices {
     }
     const paidAmount = input.depositPaid ? (input.depositAmountCents ?? requiredAmount) : 0n;
     const paid = paidAmount >= requiredAmount;
-    const agent: DemoAgent = {
-      id: agentId,
+    const merchant: DemoMerchant = {
+      id: merchantId,
       userId,
       name: input.name,
       contactPhone: input.contactPhone,
@@ -1352,13 +1849,13 @@ class BackendServices {
       depositStatus: paid ? "paid" : "pending_payment",
       createdByAdminId: actor.adminId,
       initialPasswordSet: true,
-      merchantUsername: agentId,
+      merchantUsername: merchantId,
       passwordHash: `sha256:${hashSecret(initialPassword)}`
     };
     const shop: DemoShop = {
       id: shopId,
-      agentId,
-      ownerType: "agent",
+      merchantId,
+      ownerType: "merchant",
       name: input.shopName ?? `${input.name} 小店`,
       status: paid ? "open" : "not_opened",
       riskStatus: "normal",
@@ -1368,10 +1865,10 @@ class BackendServices {
       shareTitle: `${input.name} 官方小店`,
       createdByAdminId: actor.adminId
     };
-    this.store.agents.set(agentId, agent);
+    this.store.merchants.set(merchantId, merchant);
     this.store.shops.set(shopId, shop);
-    this.store.depositAccounts.set(agentId, {
-      agentId,
+    this.store.depositAccounts.set(merchantId, {
+      merchantId,
       requiredAmountCents: requiredAmount,
       availableAmountCents: paidAmount,
       frozenAmountCents: 0n,
@@ -1379,69 +1876,69 @@ class BackendServices {
       status: paid ? "paid" : "pending_payment"
     });
     if (paidAmount > 0n) {
-      this.addDepositTransaction(agentId, {
+      this.addDepositTransaction(merchantId, {
         type: "pay",
         amountCents: paidAmount,
         balanceBeforeCents: 0n,
         balanceAfterCents: paidAmount,
         reasonCode: "admin_manual_create",
-        relatedType: "agent",
-        relatedId: agentId,
-        idempotencyKey: `admin-create-agent:${agentId}:deposit`,
+        relatedType: "merchant",
+        relatedId: merchantId,
+        idempotencyKey: `admin-create-merchant:${merchantId}:deposit`,
         proofUrl: "admin://manual-first-tier",
         operatorId: actor.adminId,
         remark: "后台手工开一级商户并确认保证金"
       });
     }
-    this.audit(actor.role, "agent.admin_create_first_tier", "agent", agentId, {
-      agentId,
+    this.audit(actor.role, "merchant.admin_create_first_tier", "merchant", merchantId, {
+      merchantId,
       shopId,
       depositPaid: paid,
       operatorId: actor.adminId
     });
     return {
-      agent,
+      merchant,
       shop,
       credential: {
-        account: agentId,
+        account: merchantId,
         initialPassword,
         mustResetPassword: true
       }
     };
   }
 
-  confirmDeposit(actor: AdminActor, agentId: string, input: { amountCents: bigint; requiredAmountCents?: bigint; voucherUrl?: string; remark?: string }) {
+  confirmDeposit(actor: AdminActor, merchantId: string, input: { amountCents: bigint; requiredAmountCents?: bigint; voucherUrl?: string; remark?: string }) {
     assertAdminPermission(actor, "deposit.manage");
-    const agent = requireEntity(this.store.agents.get(agentId), "RESOURCE_NOT_FOUND", "agent not found");
-    const account = requireEntity(this.store.depositAccounts.get(agentId), "RESOURCE_NOT_FOUND", "deposit account not found");
-    const idempotencyKey = `deposit:pay:manual:${agentId}:${input.voucherUrl ?? input.amountCents.toString()}`;
+    const merchant = requireEntity(this.store.merchants.get(merchantId), "RESOURCE_NOT_FOUND", "merchant not found");
+    const account = requireEntity(this.store.depositAccounts.get(merchantId), "RESOURCE_NOT_FOUND", "deposit account not found");
+    const idempotencyKey = `deposit:pay:manual:${merchantId}:${input.voucherUrl ?? input.amountCents.toString()}`;
     const result = this.registry.runOnce(idempotencyKey, () => {
       account.requiredAmountCents = input.requiredAmountCents ?? account.requiredAmountCents;
       const before = account.availableAmountCents;
       account.availableAmountCents += input.amountCents;
       account.status = account.availableAmountCents < account.requiredAmountCents ? "insufficient" : "paid";
-      agent.depositStatus = account.status;
-      if (agent.status === "pending_deposit" && account.status === "paid") {
-        agent.status = "active";
-        const shop = [...this.store.shops.values()].find((candidate) => candidate.agentId === agent.id);
+      merchant.depositStatus = account.status;
+      if (merchant.status === "pending_deposit" && account.status === "paid") {
+        merchant.status = "active";
+        const shop = [...this.store.shops.values()].find((candidate) => candidate.merchantId === merchant.id);
         if (shop) shop.status = "open";
-        this.activateEligibleInviteRelations(agent.id);
+        this.activateEligibleInviteRelations(merchant.id);
       }
-      const transaction = this.addDepositTransaction(agentId, {
+      const transaction = this.addDepositTransaction(merchantId, {
         type: "pay",
         amountCents: input.amountCents,
         balanceBeforeCents: before,
         balanceAfterCents: account.availableAmountCents,
         reasonCode: "manual_confirm",
         relatedType: "deposit",
-        relatedId: agentId,
+        relatedId: merchantId,
         idempotencyKey,
         proofUrl: input.voucherUrl,
         operatorId: actor.adminId,
         remark: input.remark
       });
-      this.ledger("DEPOSIT_CONFIRMED", { agentId }, input.amountCents, { transactionNo: transaction.transactionNo });
-      this.audit(actor.role, "deposit.confirm", "agent", agentId, transaction);
+      this.ledger("DEPOSIT_CONFIRMED", { merchantId }, input.amountCents, { transactionNo: transaction.transactionNo });
+      this.audit(actor.role, "deposit.confirm", "merchant", merchantId, transaction);
       return { status: "processed" as const, idempotencyKey, account, transaction };
     });
     return result ?? { status: "duplicate" as const, idempotencyKey, account };
@@ -1512,7 +2009,7 @@ class BackendServices {
   listAdminOwnProductReviews(actor: AdminActor, filters: {
     reviewStatus?: string;
     status?: string;
-    agentId?: string;
+    merchantId?: string;
     shopId?: string;
     page?: number;
     pageSize?: number;
@@ -1523,7 +2020,7 @@ class BackendServices {
     const rows = [...this.store.ownProducts.values()]
       .filter((product) => !filters.reviewStatus || product.reviewStatus === filters.reviewStatus)
       .filter((product) => !filters.status || product.status === filters.status || product.reviewStatus === filters.status)
-      .filter((product) => !filters.agentId || product.agentId === filters.agentId)
+      .filter((product) => !filters.merchantId || product.merchantId === filters.merchantId)
       .filter((product) => !filters.shopId || product.shopId === filters.shopId)
       .sort((left, right) => {
         if (left.reviewStatus === right.reviewStatus) return left.id.localeCompare(right.id);
@@ -1532,12 +2029,12 @@ class BackendServices {
         return left.reviewStatus.localeCompare(right.reviewStatus);
       })
       .map((product) => {
-        const agent = this.store.agents.get(product.agentId);
+        const merchant = this.store.merchants.get(product.merchantId);
         const shop = this.store.shops.get(product.shopId);
         return {
           id: product.id,
           ownProductId: product.id,
-          agentId: product.agentId,
+          merchantId: product.merchantId,
           shopId: product.shopId,
           name: product.name,
           salePriceCents: product.salePriceCents,
@@ -1549,7 +2046,7 @@ class BackendServices {
           status: product.status,
           createdAt: product.createdAt,
           updatedAt: product.updatedAt,
-          agent: agent ? { id: agent.id, name: agent.name, tier: agent.tier, status: agent.status } : undefined,
+          merchant: merchant ? { id: merchant.id, name: merchant.name, tier: merchant.tier, status: merchant.status } : undefined,
           shop: shop ? { id: shop.id, name: shop.name, status: shop.status } : undefined
         };
       });
@@ -1578,23 +2075,23 @@ class BackendServices {
     ownProduct.reviewStatus = input.approved ? "approved" : "rejected";
     ownProduct.status = ownProduct.reviewStatus;
     ownProduct.updatedAt = new Date();
-    let agentProduct: DemoAgentProduct | undefined;
+    let merchantProductListing: DemoMerchantProductListing | undefined;
     if (input.approved) {
-      agentProduct = {
+      merchantProductListing = {
         id: nextId(this.store, "ap"),
-        agentId: ownProduct.agentId,
+        merchantId: ownProduct.merchantId,
         shopId: ownProduct.shopId,
-        productType: "agent_owned",
+        productType: "merchant_owned",
         platformProductId: null,
         ownProductReviewId: ownProduct.id,
         salePriceCents: ownProduct.salePriceCents,
         status: "listed"
       };
       ownProduct.status = "listed";
-      this.store.agentProducts.set(agentProduct.id, agentProduct);
+      this.store.merchantProductListings.set(merchantProductListing.id, merchantProductListing);
     }
     this.audit(actor.role, "own_product.review", "own_product", ownProduct.id, input);
-    return { ownProduct, agentProduct };
+    return { ownProduct, merchantProductListing };
   }
 
   listAdminOrders(actor: AdminActor, filters: { page?: number; pageSize?: number; status?: string; shopId?: string; orderNo?: string } = {}) {
@@ -1634,12 +2131,12 @@ class BackendServices {
     assertAdminPermission(actor, "deposit.manage");
     return [...this.store.depositAccounts.values()].map((account) => ({
       ...account,
-      transactions: this.store.depositTransactions.filter((transaction) => transaction.agentId === account.agentId)
+      transactions: this.store.depositTransactions.filter((transaction) => transaction.merchantId === account.merchantId)
     }));
   }
 
   listAdminChannels(actor: AdminActor) {
-    assertAdminPermission(actor, "agent.review");
+    assertAdminPermission(actor, "merchant.review");
     return {
       authorizations: this.store.channelAuthorizations,
       relations: this.store.channelRelations,
@@ -1647,13 +2144,13 @@ class BackendServices {
     };
   }
 
-  reviewChannelAuthorization(actor: AdminActor, agentId: string, input: { approved: boolean; reason?: string }) {
-    assertAdminPermission(actor, "agent.review");
-    const agent = requireEntity(this.store.agents.get(agentId), "RESOURCE_NOT_FOUND", "agent not found");
-    const existing = this.store.channelAuthorizations.find((item) => item.firstTierAgentId === agent.id);
+  reviewChannelAuthorization(actor: AdminActor, merchantId: string, input: { approved: boolean; reason?: string }) {
+    assertAdminPermission(actor, "merchant.review");
+    const merchant = requireEntity(this.store.merchants.get(merchantId), "RESOURCE_NOT_FOUND", "merchant not found");
+    const existing = this.store.channelAuthorizations.find((item) => item.firstTierMerchantId === merchant.id);
     const authorization = existing ?? {
       id: nextId(this.store, "channel-auth"),
-      firstTierAgentId: agent.id,
+      firstTierMerchantId: merchant.id,
       status: "pending_review",
       reason: null,
       reviewedAt: null
@@ -1662,29 +2159,29 @@ class BackendServices {
     authorization.reason = input.reason ?? null;
     authorization.reviewedAt = new Date();
     if (!existing) this.store.channelAuthorizations.push(authorization);
-    this.audit(actor.role, "channel.authorization.review", "agent", agent.id, authorization);
+    this.audit(actor.role, "channel.authorization.review", "merchant", merchant.id, authorization);
     return authorization;
   }
 
-  createChannelRelation(actor: AdminActor, input: { firstTierAgentId: string; secondTierAgentId: string; thirdTierAgentId?: string; reason?: string }) {
-    assertAdminPermission(actor, "agent.review");
-    if (input.firstTierAgentId === input.secondTierAgentId || input.thirdTierAgentId === input.firstTierAgentId || input.thirdTierAgentId === input.secondTierAgentId) {
-      throw new ApiError(400, "CHANNEL_RULE_FAILED", "channel agents cannot be same agent");
+  createChannelRelation(actor: AdminActor, input: { firstTierMerchantId: string; secondTierMerchantId: string; thirdTierMerchantId?: string; reason?: string }) {
+    assertAdminPermission(actor, "merchant.review");
+    if (input.firstTierMerchantId === input.secondTierMerchantId || input.thirdTierMerchantId === input.firstTierMerchantId || input.thirdTierMerchantId === input.secondTierMerchantId) {
+      throw new ApiError(400, "MERCHANT_SUPPLY_RULE_FAILED", "upstream and downstream merchants cannot be the same merchant");
     }
-    const firstTier = requireEntity(this.store.agents.get(input.firstTierAgentId), "RESOURCE_NOT_FOUND", "first tier agent not found");
-    const secondTier = requireEntity(this.store.agents.get(input.secondTierAgentId), "RESOURCE_NOT_FOUND", "second tier agent not found");
-    const thirdTier = input.thirdTierAgentId ? requireEntity(this.store.agents.get(input.thirdTierAgentId), "RESOURCE_NOT_FOUND", "third tier agent not found") : undefined;
-    const authorization = this.store.channelAuthorizations.find((item) => item.firstTierAgentId === firstTier.id && item.status === "active");
-    if (!authorization) throw new ApiError(400, "CHANNEL_RULE_FAILED", "first tier agent is not authorized");
-    if (this.store.channelRelations.some((item) => item.status === "active" && (item.secondTierAgentId === firstTier.id || item.thirdTierAgentId === firstTier.id))) {
-      throw new ApiError(400, "CHANNEL_RULE_FAILED", "fourth-tier channel creation is forbidden");
+    const firstTier = requireEntity(this.store.merchants.get(input.firstTierMerchantId), "RESOURCE_NOT_FOUND", "first tier merchant not found");
+    const secondTier = requireEntity(this.store.merchants.get(input.secondTierMerchantId), "RESOURCE_NOT_FOUND", "second tier merchant not found");
+    const thirdTier = input.thirdTierMerchantId ? requireEntity(this.store.merchants.get(input.thirdTierMerchantId), "RESOURCE_NOT_FOUND", "third tier merchant not found") : undefined;
+    const authorization = this.store.channelAuthorizations.find((item) => item.firstTierMerchantId === firstTier.id && item.status === "active");
+    if (!authorization) throw new ApiError(400, "MERCHANT_SUPPLY_RULE_FAILED", "first tier merchant is not authorized for downstream supply");
+    if (this.store.channelRelations.some((item) => item.status === "active" && (item.secondTierMerchantId === firstTier.id || item.thirdTierMerchantId === firstTier.id))) {
+      throw new ApiError(400, "MERCHANT_SUPPLY_RULE_FAILED", "fourth-tier merchant creation is forbidden");
     }
     if (firstTier.status !== "active" || secondTier.status !== "active" || (thirdTier && thirdTier.status !== "active")) {
-      throw new ApiError(400, "CHANNEL_RULE_FAILED", "channel agents must be active");
+      throw new ApiError(400, "MERCHANT_SUPPLY_RULE_FAILED", "merchant supply participants must be active");
     }
-    this.assertAgentDepositConfirmed(firstTier.id, "create channel relation");
-    this.assertAgentDepositConfirmed(secondTier.id, "create channel relation");
-    if (thirdTier) this.assertAgentDepositConfirmed(thirdTier.id, "create channel relation");
+    this.assertMerchantDepositConfirmed(firstTier.id, "create channel relation");
+    this.assertMerchantDepositConfirmed(secondTier.id, "create channel relation");
+    if (thirdTier) this.assertMerchantDepositConfirmed(thirdTier.id, "create channel relation");
     const activeUniqueKey = thirdTier ? `third-tier:${thirdTier.id}` : `second-tier:${secondTier.id}`;
     const existing = this.store.channelRelations.find((item) => item.activeUniqueKey === activeUniqueKey && item.status === "active");
     if (existing) {
@@ -1693,9 +2190,9 @@ class BackendServices {
     }
     const relation = {
       id: nextId(this.store, "channel-rel"),
-      firstTierAgentId: firstTier.id,
-      secondTierAgentId: secondTier.id,
-      thirdTierAgentId: thirdTier?.id,
+      firstTierMerchantId: firstTier.id,
+      secondTierMerchantId: secondTier.id,
+      thirdTierMerchantId: thirdTier?.id,
       status: "active",
       reason: input.reason ?? null,
       reviewedAt: new Date(),
@@ -1718,9 +2215,9 @@ class BackendServices {
     relation: ChannelRelation,
     input: { platformProductId: string; resellSupplyPriceCents: bigint; status?: string }
   ) {
-    this.assertAgentDepositConfirmed(relation.firstTierAgentId, "configure channel offer");
-    this.assertAgentDepositConfirmed(relation.secondTierAgentId, "configure channel offer");
-    if (relation.thirdTierAgentId) this.assertAgentDepositConfirmed(relation.thirdTierAgentId, "configure channel offer");
+    this.assertMerchantDepositConfirmed(relation.firstTierMerchantId, "configure channel offer");
+    this.assertMerchantDepositConfirmed(relation.secondTierMerchantId, "configure channel offer");
+    if (relation.thirdTierMerchantId) this.assertMerchantDepositConfirmed(relation.thirdTierMerchantId, "configure channel offer");
     const product = requireEntity(this.store.platformProducts.get(input.platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
     const upstreamSupplyPriceCents = this.upstreamSupplyPriceForRelation(relation, product.id);
     if (input.resellSupplyPriceCents < upstreamSupplyPriceCents) {
@@ -1918,49 +2415,51 @@ class BackendServices {
     };
   }
 
-  listAgentRightsCodes(actor: AgentActor, filters: { agentProductId?: string; status?: RightsCode["status"] } = {}) {
-    const products = [...this.store.agentProducts.values()]
-      .filter((product) => product.agentId === actor.agentId && product.shopId === actor.shopId && product.productType === "agent_owned");
+  listMerchantRightsCodes(actor: MerchantActor, filters: { merchantProductListingId?: string; status?: RightsCode["status"] } = {}) {
+    const products = [...this.store.merchantProductListings.values()]
+      .filter((product) => product.merchantId === actor.merchantId && product.shopId === actor.shopId && product.productType === "merchant_owned");
     const allowedIds = new Set(products.map((product) => product.id));
     return this.store.rightsCodes
-      .filter((code) => allowedIds.has(code.agentProductId ?? code.productId))
-      .filter((code) => !filters.agentProductId || code.productId === filters.agentProductId || code.agentProductId === filters.agentProductId)
+      .filter((code) => allowedIds.has(code.merchantProductListingId ?? code.productId))
+      .filter((code) => !filters.merchantProductListingId || code.productId === filters.merchantProductListingId || code.merchantProductListingId === filters.merchantProductListingId)
       .filter((code) => !filters.status || code.status === filters.status)
       .map((code) => this.redactRightsCode(code));
   }
 
-  precheckAgentRightsCodes(actor: AgentActor, input: { agentProductId: string; codes: string[] }) {
-    this.assertAgentDepositConfirmed(actor.agentId, "import own rights codes");
-    const agentProduct = requireEntity(this.store.agentProducts.get(input.agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
-    assertAgentScope(actor, agentProduct);
-    if (agentProduct.productType !== "agent_owned") {
+
+  precheckMerchantRightsCodes(actor: MerchantActor, input: { merchantProductListingId: string; codes: string[] }) {
+    this.assertMerchantDepositConfirmed(actor.merchantId, "import own rights codes");
+    const merchantProductListing = requireEntity(this.store.merchantProductListings.get(input.merchantProductListingId), "RESOURCE_NOT_FOUND", "merchant product not found");
+    assertMerchantScope(actor, merchantProductListing);
+    if (merchantProductListing.productType !== "merchant_owned") {
       throw new ApiError(400, "RIGHTS_CODE_PRODUCT_SCOPE_INVALID", "merchant can only import card codes for own reviewed products");
     }
-    const ownProduct = requireEntity(this.store.ownProducts.get(required(agentProduct.ownProductReviewId, "ownProductReviewId")), "RESOURCE_NOT_FOUND", "own product not found");
+    const ownProduct = requireEntity(this.store.ownProducts.get(required(merchantProductListing.ownProductReviewId, "ownProductReviewId")), "RESOURCE_NOT_FOUND", "own product not found");
     if (fulfillmentRuleMode(ownProduct.fulfillmentRule) !== "code_pool") {
       throw new ApiError(400, "RIGHTS_CODE_PRODUCT_MODE_INVALID", "own product must use automatic card-code fulfillment");
     }
     const precheck = this.analyzeRightsCodeImport(input.codes, (code) =>
-      this.store.rightsCodes.some((item) => (item.agentProductId ?? item.productId) === agentProduct.id && item.code === code)
+      this.store.rightsCodes.some((item) => (item.merchantProductListingId ?? item.productId) === merchantProductListing.id && item.code === code)
     );
     return this.redactRightsCodeImportPrecheck(precheck);
   }
 
-  addAgentRightsCodes(actor: AgentActor, input: { agentProductId: string; codes: string[]; batchNo?: string }) {
-    this.assertAgentDepositConfirmed(actor.agentId, "import own rights codes");
-    const agentProduct = requireEntity(this.store.agentProducts.get(input.agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
-    assertAgentScope(actor, agentProduct);
-    if (agentProduct.productType !== "agent_owned") {
+
+  addMerchantRightsCodes(actor: MerchantActor, input: { merchantProductListingId: string; codes: string[]; batchNo?: string }) {
+    this.assertMerchantDepositConfirmed(actor.merchantId, "import own rights codes");
+    const merchantProductListing = requireEntity(this.store.merchantProductListings.get(input.merchantProductListingId), "RESOURCE_NOT_FOUND", "merchant product not found");
+    assertMerchantScope(actor, merchantProductListing);
+    if (merchantProductListing.productType !== "merchant_owned") {
       throw new ApiError(400, "RIGHTS_CODE_PRODUCT_SCOPE_INVALID", "merchant can only import card codes for own reviewed products");
     }
-    const ownProduct = requireEntity(this.store.ownProducts.get(required(agentProduct.ownProductReviewId, "ownProductReviewId")), "RESOURCE_NOT_FOUND", "own product not found");
+    const ownProduct = requireEntity(this.store.ownProducts.get(required(merchantProductListing.ownProductReviewId, "ownProductReviewId")), "RESOURCE_NOT_FOUND", "own product not found");
     const rule = ownProduct.fulfillmentRule;
     if (!isRecord(rule) || rule.mode !== "code_pool") {
       throw new ApiError(400, "RIGHTS_CODE_PRODUCT_MODE_INVALID", "own product must use automatic card-code fulfillment");
     }
     ownProduct.fulfillmentRule = { ...rule, mode: "code_pool", extractCodeRequired: true };
     const precheck = this.analyzeRightsCodeImport(input.codes, (code) =>
-      this.store.rightsCodes.some((item) => (item.agentProductId ?? item.productId) === agentProduct.id && item.code === code)
+      this.store.rightsCodes.some((item) => (item.merchantProductListingId ?? item.productId) === merchantProductListing.id && item.code === code)
     );
     const importableCodes = precheck.details
       .filter((item) => item.action === "create")
@@ -1971,8 +2470,8 @@ class BackendServices {
     for (const code of importableCodes) {
       const item: RightsCode = {
         codeId: nextId(this.store, "code"),
-        productId: agentProduct.id,
-        agentProductId: agentProduct.id,
+        productId: merchantProductListing.id,
+        merchantProductListingId: merchantProductListing.id,
         code,
         batchNo: input.batchNo ?? "merchant",
         status: "available",
@@ -1981,7 +2480,7 @@ class BackendServices {
       this.store.rightsCodes.push(item);
       created.push(item);
     }
-    this.audit("agent", "rights_code.agent_import", "agent_product", agentProduct.id, {
+    this.audit("merchant", "rights_code.merchant_import", "merchant_product_listing", merchantProductListing.id, {
       count: created.length,
       batchNo: input.batchNo ?? "merchant",
       codeIds: created.map((code) => code.codeId)
@@ -1991,7 +2490,7 @@ class BackendServices {
       createdCount: created.length,
       skippedCount: precheck.summary.skipped,
       failedCount: precheck.summary.failed,
-      agentProduct,
+      merchantProductListing,
       codes: created.map((code) => this.redactRightsCode(code)),
       details: this.redactRightsCodeImportPrecheck({
         ...precheck,
@@ -2004,6 +2503,7 @@ class BackendServices {
       summary: precheck.summary
     };
   }
+
 
   fulfillOrder(actor: AdminActor, orderNo: string, input: { status: "success" | "failed"; attemptNo: number; evidence?: string; failReason?: string }) {
     assertAdminPermission(actor, "after_sale.arbitrate");
@@ -2024,9 +2524,9 @@ class BackendServices {
     return { ...result, order };
   }
 
-  fulfillAgentOrder(actor: AgentActor, orderNo: string, input: { status: "success" | "failed"; attemptNo: number; evidence?: string; failReason?: string }) {
+  fulfillMerchantOrder(actor: MerchantActor, orderNo: string, input: { status: "success" | "failed"; attemptNo: number; evidence?: string; failReason?: string }) {
     const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
-    assertAgentScope(actor, { agentId: order.agentId, shopId: order.shopId });
+    assertMerchantScope(actor, { merchantId: order.merchantId, shopId: order.shopId });
     if (order.paymentStatus !== "paid") throw new ApiError(400, "STATE_NOT_ALLOWED", "only paid orders can be fulfilled");
     const record = this.store.fulfillmentRecords.get(orderNo) ?? {
       fulfillmentId: `fulfillment-${orderNo}`,
@@ -2039,24 +2539,27 @@ class BackendServices {
     order.fulfillmentStatus = record.status;
     order.status = result.orderStatus;
     if (record.status === "success" && !order.fulfilledAt) order.fulfilledAt = new Date();
-    this.audit("agent", "fulfillment.update", "order", orderNo, input);
+    this.audit("merchant", "fulfillment.update", "order", orderNo, input);
     return { ...result, order };
   }
 
-  listAgentAfterSales(actor: AgentActor) {
+
+  listMerchantAfterSales(actor: MerchantActor) {
     return [...this.store.afterSales.values()].filter((afterSale) => {
       const order = this.store.orders.get(afterSale.orderNo);
-      return order?.agentId === actor.agentId && order.shopId === actor.shopId;
+      return order?.merchantId === actor.merchantId && order.shopId === actor.shopId;
     });
   }
 
-  updateAgentAfterSaleAssist(actor: AgentActor, afterSaleNo: string, input: { note: string; evidenceUrl?: string }) {
+
+  updateMerchantAfterSaleAssist(actor: MerchantActor, afterSaleNo: string, input: { note: string; evidenceUrl?: string }) {
     const afterSale = requireEntity(this.store.afterSales.get(afterSaleNo), "RESOURCE_NOT_FOUND", "after sale not found");
     const order = requireEntity(this.store.orders.get(afterSale.orderNo), "RESOURCE_NOT_FOUND", "order not found");
-    assertAgentScope(actor, { agentId: order.agentId, shopId: order.shopId });
-    this.audit("agent", "after_sale.agent_assist", "after_sale", afterSale.afterSaleNo, input);
+    assertMerchantScope(actor, { merchantId: order.merchantId, shopId: order.shopId });
+    this.audit("merchant", "after_sale.merchant_assist", "after_sale", afterSale.afterSaleNo, input);
     return { status: "recorded" as const, afterSale };
   }
+
 
   allocateRefundForAdmin(actor: AdminActor, input: RefundAllocationRequest) {
     assertAdminPermission(actor, "after_sale.arbitrate");
@@ -2071,8 +2574,8 @@ class BackendServices {
     refundAmountCents: bigint;
     responsibility: RefundResponsibility;
     platformBearCents?: bigint;
-    agentBearCents?: bigint;
-    serviceFeeBearer?: "platform" | "agent" | "mixed" | "none";
+    merchantBearCents?: bigint;
+    serviceFeeBearer?: "platform" | "merchant" | "mixed" | "none";
   }) {
     assertAdminPermission(actor, "after_sale.arbitrate");
     const afterSale = requireEntity(this.store.afterSales.get(afterSaleNo), "RESOURCE_NOT_FOUND", "after sale not found");
@@ -2082,12 +2585,12 @@ class BackendServices {
       allocation = allocateRefund({
         paidAmountCents: order.snapshot.amountSnapshot.paidAmountCents,
         supplyAmountCents: order.snapshot.amountSnapshot.supplyAmountCents,
-        agentIncomeCents: order.snapshot.amountSnapshot.agentExpectedIncomeCents,
+        merchantIncomeCents: order.snapshot.amountSnapshot.merchantExpectedIncomeCents,
         alreadyRefundedCents: order.refundedAmountCents,
         refundAmountCents: input.refundAmountCents,
         responsibility: input.responsibility,
         platformBearCents: input.platformBearCents,
-        agentBearCents: input.agentBearCents,
+        merchantBearCents: input.merchantBearCents,
         serviceFeeBearer: input.serviceFeeBearer
       });
     } catch (error) {
@@ -2104,15 +2607,12 @@ class BackendServices {
       afterSaleNo,
       orderNo: order.orderNo,
       amountCents: allocation.refundAmountCents,
-      agentClawbackCents: allocation.agentTotalCostCents,
+      merchantClawbackCents: allocation.merchantTotalCostCents,
       wasSettled: wasSettlementGenerated,
       status: "pending"
     };
     this.store.refunds.set(refund.refundNo, refund);
-    if (order.couponId) {
-      const coupon = this.store.userCoupons.get(order.couponId);
-      if (coupon) coupon.status = "voided_after_refund";
-    }
+    this.voidCouponForRefundedOrder(order);
     this.audit(actor.role, "refund.approve", "after_sale", afterSaleNo, allocation);
     return { refund, allocation };
   }
@@ -2159,10 +2659,10 @@ class BackendServices {
       order.fulfillmentStatus = "processing";
       order.paidAt = new Date();
       if (order.salesChannelType !== "platform_self_operated") {
-        this.store.pendingIncomeByAgent.set(order.agentId, (this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n) + order.snapshot.amountSnapshot.agentExpectedIncomeCents);
+        this.store.pendingIncomeByMerchant.set(order.merchantId, (this.store.pendingIncomeByMerchant.get(order.merchantId) ?? 0n) + order.snapshot.amountSnapshot.merchantExpectedIncomeCents);
         this.addChannelPendingIncome(order);
       }
-      this.ledger("OFFLINE_PAYMENT_CONFIRMED", { orderNo: order.orderNo, agentId: order.agentId }, expectedAmount, {
+      this.ledger("OFFLINE_PAYMENT_CONFIRMED", { orderNo: order.orderNo, merchantId: order.merchantId }, expectedAmount, {
         voucherUrl: input.voucherUrl,
         note: input.note,
         operatorId: actor.adminId
@@ -2199,10 +2699,10 @@ class BackendServices {
           order.fulfillmentStatus = "processing";
           order.paidAt = new Date();
           if (order.salesChannelType !== "platform_self_operated") {
-            this.store.pendingIncomeByAgent.set(order.agentId, (this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n) + order.snapshot.amountSnapshot.agentExpectedIncomeCents);
+            this.store.pendingIncomeByMerchant.set(order.merchantId, (this.store.pendingIncomeByMerchant.get(order.merchantId) ?? 0n) + order.snapshot.amountSnapshot.merchantExpectedIncomeCents);
             this.addChannelPendingIncome(order);
           }
-          this.ledger("PAYMENT_SUCCEEDED", { orderNo: order.orderNo, agentId: order.agentId }, order.snapshot.amountSnapshot.paidAmountCents, { channel: input.channel });
+          this.ledger("PAYMENT_SUCCEEDED", { orderNo: order.orderNo, merchantId: order.merchantId }, order.snapshot.amountSnapshot.paidAmountCents, { channel: input.channel });
           this.tryAutoFulfillWithRightsCode(order);
         }
       });
@@ -2268,6 +2768,62 @@ class BackendServices {
       merchantNo: input.merchantNo,
       appId: input.appId,
       serviceProviderId: input.serviceProviderId,
+      tradeStatus: input.tradeStatus,
+      source: "callback",
+      logBase
+    });
+    this.store.paymentCallbackLogs.push({
+      ...logBase,
+      orderNo: orderEntity.orderNo,
+      verified: true,
+      status: result.status === "processed" || result.status === "duplicate" ? "accepted" : "exception",
+      exceptionId: "exception" in result ? result.exception.id : undefined
+    });
+    return result;
+  }
+
+  epayProviderCallback(rawPayload: Record<string, unknown>) {
+    const input = normalizeEpayCallbackPayload(rawPayload);
+    const order = input.orderNo ? this.store.orders.get(input.orderNo) : undefined;
+    const method = this.findPaymentMethodForCallback("epay", { merchantNo: input.merchantNo }, order);
+    const logBase = {
+      id: nextId(this.store, "pay-callback"),
+      provider: "epay" as const,
+      orderNo: input.orderNo,
+      providerTradeNo: input.providerTradeNo,
+      amountCents: input.amountCents,
+      merchantNoMasked: maskSecret(input.merchantNo),
+      rawPayloadMasked: this.maskPaymentPayload(rawPayload),
+      receivedAt: new Date()
+    };
+    if (!method || !this.verifyEpaySignature(method, rawPayload)) {
+      const exception = this.recordPaymentException({
+        ...logBase,
+        orderNo: input.orderNo,
+        reasonCode: "SIGNATURE_INVALID",
+        reason: "epay callback signature verification failed",
+        handled: false
+      });
+      this.store.paymentCallbackLogs.push({ ...logBase, verified: false, status: "rejected", exceptionId: exception.id });
+      throw new ApiError(400, "PAYMENT_CALLBACK_SIGNATURE_INVALID", "epay callback signature verification failed");
+    }
+    const orderEntity = order ?? this.store.orders.get(input.orderNo ?? "");
+    if (!orderEntity) {
+      const exception = this.recordPaymentException({
+        ...logBase,
+        reasonCode: "ORDER_NOT_FOUND",
+        reason: "epay callback order not found",
+        handled: false
+      });
+      this.store.paymentCallbackLogs.push({ ...logBase, verified: true, status: "exception", exceptionId: exception.id });
+      throw new ApiError(404, "PAYMENT_CALLBACK_ORDER_NOT_FOUND", "epay callback order not found");
+    }
+    const result = this.applyVerifiedPaymentResult({
+      order: orderEntity,
+      method,
+      providerTradeNo: input.providerTradeNo,
+      amountCents: input.amountCents,
+      merchantNo: input.merchantNo,
       tradeStatus: input.tradeStatus,
       source: "callback",
       logBase
@@ -2385,7 +2941,7 @@ class BackendServices {
     order.refundStatus = "refunded";
     order.status = "refunded";
     order.settlementStatus = "frozen";
-    this.ledger("REFUND_SUCCEEDED", { orderNo: order.orderNo, agentId: order.agentId }, refund.amountCents, {
+    this.ledger("REFUND_SUCCEEDED", { orderNo: order.orderNo, merchantId: order.merchantId }, refund.amountCents, {
       refundNo: refund.refundNo,
       source: input.source,
       channelRefundNo: input.channelRefundNo,
@@ -2395,23 +2951,31 @@ class BackendServices {
     if (order.salesChannelType === "platform_self_operated") {
       refund.pendingIncomeDeductedCents = 0n;
     } else if (refund.wasSettled) {
-      this.createClawback(order, refund.agentClawbackCents, "refund", refund.refundNo);
+      this.createClawback(order, refund.merchantClawbackCents, "refund", refund.refundNo);
     } else {
-      const pending = this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n;
-      const deduction = pending > refund.agentClawbackCents ? refund.agentClawbackCents : pending;
-      this.store.pendingIncomeByAgent.set(order.agentId, pending - deduction);
+      const pending = this.store.pendingIncomeByMerchant.get(order.merchantId) ?? 0n;
+      const deduction = pending > refund.merchantClawbackCents ? refund.merchantClawbackCents : pending;
+      this.store.pendingIncomeByMerchant.set(order.merchantId, pending - deduction);
       refund.pendingIncomeDeductedCents = deduction;
     }
-    if (order.couponId) {
-      const coupon = this.store.userCoupons.get(order.couponId);
-      if (coupon) coupon.status = "voided_after_refund";
-    }
+    this.voidCouponForRefundedOrder(order);
     return { refund, order, afterSale };
   }
 
-  generateSettlement(actor: AdminActor, input: { agentId: string; now?: Date; batchNo: string }) {
+  private voidCouponForRefundedOrder(order: DemoOrder) {
+    const coupon = order.couponId
+      ? this.store.userCoupons.get(order.couponId)
+      : [...this.store.userCoupons.values()].find((item) => item.orderNo === order.orderNo);
+    if (!coupon) return;
+    coupon.status = "voided_after_refund";
+    coupon.orderNo = order.orderNo;
+    coupon.usedAt ??= new Date();
+    order.couponId = coupon.id;
+  }
+
+  generateSettlement(actor: AdminActor, input: { merchantId: string; now?: Date; batchNo: string }) {
     assertAdminPermission(actor, "settlement.generate");
-    const idempotencyKey = `settlement:${input.agentId}:all:${input.batchNo}`;
+    const idempotencyKey = `settlement:${input.merchantId}:all:${input.batchNo}`;
     const duplicate = this.store.settlementSheets.find((sheet) => sheet.idempotencyKey === idempotencyKey);
     if (duplicate) return { status: "duplicate" as const, sheet: duplicate };
     const now = input.now ?? new Date();
@@ -2420,11 +2984,11 @@ class BackendServices {
       .flatMap((order) => {
         const channel = getChannelSnapshot(order.snapshot);
         const drafts: Array<SettlementCandidateDraft & { settlementRole: string }> = [];
-        if (channel?.firstTierAgentId === input.agentId) {
+        if (channel?.firstTierMerchantId === input.merchantId) {
           drafts.push({
             orderId: order.orderNo,
             settlementRole: "first_tier",
-            agentId: channel.firstTierAgentId,
+            merchantId: channel.firstTierMerchantId,
             shopId: channel.firstTierShopId,
             paymentStatus: order.paymentStatus,
             fulfillmentStatus: order.fulfillmentStatus,
@@ -2437,14 +3001,14 @@ class BackendServices {
             paidAmountCents: order.snapshot.amountSnapshot.paidAmountCents,
             supplyAmountCents: channel.platformSupplyPriceCents,
             serviceFeeCents: 0n,
-            agentIncomeCents: channel.firstTierIncomeCents
+            merchantIncomeCents: channel.firstTierIncomeCents
           });
         }
-        if (channel?.thirdTierAgentId && channel.secondTierAgentId === input.agentId) {
+        if (channel?.thirdTierMerchantId && channel.secondTierMerchantId === input.merchantId) {
           drafts.push({
             orderId: order.orderNo,
             settlementRole: "second_tier",
-            agentId: channel.secondTierAgentId,
+            merchantId: channel.secondTierMerchantId,
             shopId: channel.secondTierShopId,
             paymentStatus: order.paymentStatus,
             fulfillmentStatus: order.fulfillmentStatus,
@@ -2457,13 +3021,13 @@ class BackendServices {
             paidAmountCents: order.snapshot.amountSnapshot.paidAmountCents,
             supplyAmountCents: channel.firstTierSupplyPriceCents,
             serviceFeeCents: 0n,
-            agentIncomeCents: channel.secondTierIncomeCents
+            merchantIncomeCents: channel.secondTierIncomeCents
           });
         }
-        if (order.agentId === input.agentId) drafts.push({
+        if (order.merchantId === input.merchantId) drafts.push({
           orderId: order.orderNo,
-          settlementRole: channel?.thirdTierAgentId ? "third_tier" : channel ? "second_tier" : "single_agent",
-          agentId: order.agentId,
+          settlementRole: channel?.thirdTierMerchantId ? "third_tier" : channel ? "second_tier" : "single_merchant",
+          merchantId: order.merchantId,
           shopId: order.shopId,
           paymentStatus: order.paymentStatus,
           fulfillmentStatus: order.fulfillmentStatus,
@@ -2476,42 +3040,42 @@ class BackendServices {
           paidAmountCents: order.snapshot.amountSnapshot.paidAmountCents,
           supplyAmountCents: order.snapshot.amountSnapshot.supplyAmountCents,
           serviceFeeCents: order.snapshot.amountSnapshot.serviceFeeCents,
-          agentIncomeCents: order.snapshot.amountSnapshot.agentExpectedIncomeCents
+          merchantIncomeCents: order.snapshot.amountSnapshot.merchantExpectedIncomeCents
         });
         return drafts;
       });
-    const candidates = orders.filter((order) => !this.store.settlementItemKeys.has(`${order.orderId}:${order.settlementRole}:${order.agentId}`));
-    const items = buildSettlementItems(candidates, [], input.agentId).map((item) => {
-      const source = candidates.find((candidate) => candidate.orderId === item.orderId && candidate.agentId === item.agentId);
-      return { ...item, settlementRole: source?.settlementRole ?? "single_agent" };
+    const candidates = orders.filter((order) => !this.store.settlementItemKeys.has(`${order.orderId}:${order.settlementRole}:${order.merchantId}`));
+    const items = buildSettlementItems(candidates, [], input.merchantId).map((item) => {
+      const source = candidates.find((candidate) => candidate.orderId === item.orderId && candidate.merchantId === item.merchantId);
+      return { ...item, settlementRole: source?.settlementRole ?? "single_merchant" };
     });
     const sheet: SettlementSheet = {
       settlementNo: nextId(this.store, "settlement"),
-      agentId: input.agentId,
+      merchantId: input.merchantId,
       idempotencyKey,
       status: "confirmed",
       items,
       totalOrderCount: items.length,
       totalPaidCents: sum(items.map((item) => item.paidAmountCents)),
       totalServiceFeeCents: sum(items.map((item) => item.serviceFeeCents)),
-      totalAgentIncomeCents: sum(items.map((item) => item.agentIncomeCents))
+      totalMerchantIncomeCents: sum(items.map((item) => item.merchantIncomeCents))
     };
     for (const item of items) {
-      this.store.settlementItemKeys.add(`${item.orderId}:${item.settlementRole}:${item.agentId}`);
+      this.store.settlementItemKeys.add(`${item.orderId}:${item.settlementRole}:${item.merchantId}`);
       const order = this.store.orders.get(item.orderId);
       if (order) {
         const channel = getChannelSnapshot(order.snapshot);
-        if (!channel || (!channel.thirdTierAgentId && item.settlementRole === "second_tier") || (channel.thirdTierAgentId && item.settlementRole === "third_tier")) {
+        if (!channel || (!channel.thirdTierMerchantId && item.settlementRole === "second_tier") || (channel.thirdTierMerchantId && item.settlementRole === "third_tier")) {
           order.settlementStatus = "settling";
         }
       }
     }
-    const pending = this.store.pendingIncomeByAgent.get(input.agentId) ?? 0n;
-    this.store.pendingIncomeByAgent.set(input.agentId, pending > sheet.totalAgentIncomeCents ? pending - sheet.totalAgentIncomeCents : 0n);
-    this.store.payableIncomeByAgent.set(input.agentId, (this.store.payableIncomeByAgent.get(input.agentId) ?? 0n) + sheet.totalAgentIncomeCents);
+    const pending = this.store.pendingIncomeByMerchant.get(input.merchantId) ?? 0n;
+    this.store.pendingIncomeByMerchant.set(input.merchantId, pending > sheet.totalMerchantIncomeCents ? pending - sheet.totalMerchantIncomeCents : 0n);
+    this.store.payableIncomeByMerchant.set(input.merchantId, (this.store.payableIncomeByMerchant.get(input.merchantId) ?? 0n) + sheet.totalMerchantIncomeCents);
     this.store.settlementSheets.push(sheet);
     this.audit(actor.role, "settlement.generate", "settlement", sheet.settlementNo, { count: items.length });
-    this.ledger("SETTLEMENT_GENERATED", { agentId: input.agentId }, sheet.totalAgentIncomeCents, { settlementNo: sheet.settlementNo });
+    this.ledger("SETTLEMENT_GENERATED", { merchantId: input.merchantId }, sheet.totalMerchantIncomeCents, { settlementNo: sheet.settlementNo });
     return { status: "processed" as const, sheet };
   }
 
@@ -2524,32 +3088,32 @@ class BackendServices {
       const order = this.store.orders.get(item.orderId);
       if (order) order.settlementStatus = "settled";
     }
-    const payable = this.store.payableIncomeByAgent.get(sheet.agentId) ?? 0n;
-    this.store.payableIncomeByAgent.set(sheet.agentId, payable > sheet.totalAgentIncomeCents ? payable - sheet.totalAgentIncomeCents : 0n);
-    this.store.paidIncomeByAgent.set(sheet.agentId, (this.store.paidIncomeByAgent.get(sheet.agentId) ?? 0n) + sheet.totalAgentIncomeCents);
+    const payable = this.store.payableIncomeByMerchant.get(sheet.merchantId) ?? 0n;
+    this.store.payableIncomeByMerchant.set(sheet.merchantId, payable > sheet.totalMerchantIncomeCents ? payable - sheet.totalMerchantIncomeCents : 0n);
+    this.store.paidIncomeByMerchant.set(sheet.merchantId, (this.store.paidIncomeByMerchant.get(sheet.merchantId) ?? 0n) + sheet.totalMerchantIncomeCents);
     const payout = {
       payoutNo: nextId(this.store, "payout"),
       settlementNo,
-      agentId: sheet.agentId,
-      amountCents: sheet.totalAgentIncomeCents,
+      merchantId: sheet.merchantId,
+      amountCents: sheet.totalMerchantIncomeCents,
       status: "paid",
       voucherUrl: input.voucherUrl,
       payoutMethod: input.payoutMethod ?? "manual"
     };
     this.store.manualPayouts.push(payout);
     this.audit(actor.role, "manual_payout.confirm", "settlement", settlementNo, payout);
-    this.ledger("PAYOUT_CONFIRMED", { agentId: sheet.agentId }, sheet.totalAgentIncomeCents, { settlementNo });
+    this.ledger("PAYOUT_CONFIRMED", { merchantId: sheet.merchantId }, sheet.totalMerchantIncomeCents, { settlementNo });
     return { status: "processed" as const, sheet, payout };
   }
 
-  deductDeposit(actor: AdminActor, agentId: string, input: { amountCents: bigint; sourceType: string; sourceId: string; reasonCode: string }) {
+  deductDeposit(actor: AdminActor, merchantId: string, input: { amountCents: bigint; sourceType: string; sourceId: string; reasonCode: string }) {
     assertAdminPermission(actor, "deposit.manage");
-    const account = requireEntity(this.store.depositAccounts.get(agentId), "RESOURCE_NOT_FOUND", "deposit account not found");
+    const account = requireEntity(this.store.depositAccounts.get(merchantId), "RESOURCE_NOT_FOUND", "deposit account not found");
     const result = deductDeposit({ registry: this.registry, account, ...input });
     if (result.status === "processed") {
-      const agent = this.store.agents.get(agentId);
-      if (agent && result.restricted) agent.depositStatus = "insufficient";
-      this.addDepositTransaction(agentId, {
+      const merchant = this.store.merchants.get(merchantId);
+      if (merchant && result.restricted) merchant.depositStatus = "insufficient";
+      this.addDepositTransaction(merchantId, {
         type: "deduct",
         amountCents: result.deductedAmountCents,
         balanceBeforeCents: result.balanceBeforeCents,
@@ -2560,13 +3124,13 @@ class BackendServices {
         idempotencyKey: result.idempotencyKey
       });
     }
-    this.audit(actor.role, "deposit.deduct", "agent", agentId, result);
-    this.ledger("DEPOSIT_DEDUCTED", { agentId }, result.status === "processed" ? result.deductedAmountCents : 0n, { sourceType: input.sourceType, sourceId: input.sourceId });
+    this.audit(actor.role, "deposit.deduct", "merchant", merchantId, result);
+    this.ledger("DEPOSIT_DEDUCTED", { merchantId }, result.status === "processed" ? result.deductedAmountCents : 0n, { sourceType: input.sourceType, sourceId: input.sourceId });
     return result;
   }
 
   createRiskFreeze(actor: AdminActor, input: {
-    targetType: "order" | "shop" | "agent" | "product" | "settlement";
+    targetType: "order" | "shop" | "merchant" | "product" | "settlement";
     targetId: string;
     freezeType: "order_frozen" | "shop_frozen" | "settlement_restricted" | "product_removed" | "disabled";
     reasonCode: string;
@@ -2588,18 +3152,18 @@ class BackendServices {
       if (input.freezeType === "shop_frozen") shop.status = "frozen";
       if (input.freezeType === "disabled") shop.status = "disabled";
     }
-    if (input.targetType === "agent") {
-      const agent = requireEntity(this.store.agents.get(input.targetId), "RESOURCE_NOT_FOUND", "agent not found");
-      agent.riskStatus = input.freezeType;
-      if (input.freezeType === "disabled") agent.status = "disabled";
-      if (input.freezeType === "shop_frozen") agent.status = "frozen";
+    if (input.targetType === "merchant") {
+      const merchant = requireEntity(this.store.merchants.get(input.targetId), "RESOURCE_NOT_FOUND", "merchant not found");
+      merchant.riskStatus = input.freezeType;
+      if (input.freezeType === "disabled") merchant.status = "disabled";
+      if (input.freezeType === "shop_frozen") merchant.status = "frozen";
     }
     if (input.targetType === "product") {
       const product = this.store.platformProducts.get(input.targetId);
-      const agentProduct = this.store.agentProducts.get(input.targetId);
+      const merchantProductListing = this.store.merchantProductListings.get(input.targetId);
       if (product) product.status = "risk_removed";
-      if (agentProduct) agentProduct.status = "risk_removed";
-      if (!product && !agentProduct) throw new ApiError(404, "RESOURCE_NOT_FOUND", "product not found");
+      if (merchantProductListing) merchantProductListing.status = "risk_removed";
+      if (!product && !merchantProductListing) throw new ApiError(404, "RESOURCE_NOT_FOUND", "product not found");
     }
     this.audit(actor.role, "risk.freeze", input.targetType, input.targetId, input);
     return { status: "processed" as const, key, freeze };
@@ -2638,7 +3202,7 @@ class BackendServices {
       totalPaidCents: sum(orders.filter((order) => order.paymentStatus === "paid").map((order) => order.snapshot.amountSnapshot.paidAmountCents)),
       totalRefundedCents: sum(orders.map((order) => order.refundedAmountCents)),
       totalServiceFeeCents: sum(orders.filter((order) => order.paymentStatus === "paid").map((order) => order.snapshot.amountSnapshot.serviceFeeCents)),
-      totalAgentIncomeCents: sum(orders.filter((order) => order.paymentStatus === "paid").map((order) => order.snapshot.amountSnapshot.agentExpectedIncomeCents)),
+      totalMerchantIncomeCents: sum(orders.filter((order) => order.paymentStatus === "paid").map((order) => order.snapshot.amountSnapshot.merchantExpectedIncomeCents)),
       platformSelfOperatedPaidCents: sum(platformSelfOperatedOrders.map((order) => order.snapshot.amountSnapshot.paidAmountCents)),
       platformSelfOperatedGrossMarginCents: sum(platformSelfOperatedOrders.map((order) => getPlatformSelfGrossMargin(order.snapshot))),
       settlementCount: this.store.settlementSheets.length,
@@ -2688,7 +3252,7 @@ class BackendServices {
       return {
         shopId: shop.id,
         name: shop.name,
-        ownerType: shop.ownerType ?? "agent",
+        ownerType: shop.ownerType ?? "merchant",
         orderCount: shopOrders.length,
         paidOrderCount: paid.length,
         totalPaidCents: sum(paid.map((order) => order.snapshot.amountSnapshot.paidAmountCents)),
@@ -2713,9 +3277,9 @@ class BackendServices {
     const orders = [...this.store.orders.values()];
     const paidOrders = orders.filter((order) => order.paymentStatus === "paid");
     const refundOrders = orders.filter((order) => order.refundStatus === "refunded" || order.refundStatus === "refunding");
-    const lowDepositAgents = [...this.store.depositAccounts.values()]
+    const lowDepositMerchants = [...this.store.depositAccounts.values()]
       .filter((account) => account.availableAmountCents < account.requiredAmountCents / 5n)
-      .map((account) => ({ agentId: account.agentId, availableAmountCents: account.availableAmountCents, requiredAmountCents: account.requiredAmountCents }));
+      .map((account) => ({ merchantId: account.merchantId, availableAmountCents: account.availableAmountCents, requiredAmountCents: account.requiredAmountCents }));
     const lowStockProducts = this.listPlatformProducts()
       .map((product) => ({
         productId: product.id,
@@ -2730,19 +3294,19 @@ class BackendServices {
       refundOrderCount: refundOrders.length,
       refundRateBps: paidOrders.length === 0 ? 0 : Math.round((refundOrders.length / paidOrders.length) * 10_000),
       activeRiskFreezeCount: this.store.riskFreezes.filter((freeze) => freeze.status === "active").length,
-      lowDepositAgents,
+      lowDepositMerchants,
       lowStockProducts,
       pendingAfterSaleCount: [...this.store.afterSales.values()].filter((item) => item.status === "pending").length
     };
   }
 
-  listNotifications(actor: AgentActor) {
-    return this.store.notifications.filter((item) => item.agentId === actor.agentId);
+  listNotifications(actor: MerchantActor) {
+    return this.store.notifications.filter((item) => item.merchantId === actor.merchantId);
   }
 
-  markNotificationRead(actor: AgentActor, notificationId: string) {
+  markNotificationRead(actor: MerchantActor, notificationId: string) {
     const notification = requireEntity(
-      this.store.notifications.find((item) => item.id === notificationId && item.agentId === actor.agentId),
+      this.store.notifications.find((item) => item.id === notificationId && item.merchantId === actor.merchantId),
       "RESOURCE_NOT_FOUND",
       "notification not found"
     );
@@ -2753,7 +3317,7 @@ class BackendServices {
   paymentOnboardingGuide() {
     return {
       status: "not_configured",
-      reason: "微信/支付宝商户收款能力尚未开通；生产环境只展示已审核启用的商户收款通道。",
+      reason: "微信/支付宝商户收款能力尚未开通；生产环境只展示已审核启用的商户收款方式。",
       requiredAccounts: [
         "已认证微信 H5/公众号 JSAPI 支付或支付宝商户主体",
         "微信支付商户号 MCH_ID",
@@ -2781,13 +3345,38 @@ class BackendServices {
         "WECHAT_PAY_NOTIFY_URL",
         "WECHAT_REFUND_NOTIFY_URL"
       ],
-      productionRule: "生产环境必须拒绝未验签的支付/退款回调，并只允许已审核启用的商户收款通道。"
+      productionRule: "生产环境必须拒绝未验签的支付/退款回调，并只允许已审核启用的商户收款方式。"
     };
   }
 
   paymentConfigStatus(actor: AdminActor) {
     assertAdminPermission(actor, "audit.read");
-    return this.store.paymentChannelConfigs;
+    const methodProviders: PaymentProviderType[] = ["alipay_merchant", "wechat_merchant", "epay", "personal_alipay", "wechat_personal", "balance"];
+    const methodRows = methodProviders.map((provider) => {
+      const methods = [...this.store.paymentMethods.values()].filter((method) => method.provider === provider);
+      const enabled = provider === "balance" || methods.some((method) => method.enabled && method.status === "enabled");
+      return {
+        channel: provider,
+        provider,
+        enabled,
+        feeBps: this.paymentFeeBpsForProvider(provider),
+        fixedFeeCents: 0n,
+        statusNote: enabled ? "configured" : "not_configured",
+        updatedAt: methods[0]?.updatedAt ?? new Date(0),
+        defaultMethod: methods.some((method) => method.isDefault),
+        confirmationMode: provider === "balance" ? "automatic" : isManualPaymentProvider(provider) ? "manual" : "automatic",
+        methodCount: provider === "balance" ? 1 : methods.length,
+        label: paymentProviderDisplay(provider)
+      };
+    });
+    const legacyRows = this.store.paymentChannelConfigs
+      .filter((config) => config.channel !== "mock" || mockPaymentEnabled())
+      .map((config) => ({
+        ...config,
+        provider: paymentChannelProvider(config.channel),
+        label: paymentChannelDisplay(config.channel)
+      }));
+    return [...legacyRows, ...methodRows];
   }
 
   updatePaymentConfigMetadata(actor: AdminActor, input: { channel: PaymentChannel; enabled?: boolean; feeBps?: number; fixedFeeCents?: bigint; statusNote?: string }) {
@@ -2819,8 +3408,26 @@ class BackendServices {
       productionReady: missing.length === 0 && !mockPaymentEnabled() && !allowDemoAuth(),
       missing,
       demoAuthEnabled: allowDemoAuth(),
-      channels: this.store.paymentChannelConfigs
+      channels: this.store.paymentChannelConfigs.filter((config) => config.channel !== "mock" || mockPaymentEnabled())
     };
+  }
+
+  getPlatformServiceFeeConfig(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return this.store.serviceFeeConfig;
+  }
+
+  updatePlatformServiceFeeConfig(actor: AdminActor, input: { enabled?: boolean; feeBps?: number }) {
+    assertAdminPermission(actor, "payment_config.manage");
+    this.store.serviceFeeConfig = {
+      ...this.store.serviceFeeConfig,
+      enabled: input.enabled ?? this.store.serviceFeeConfig.enabled,
+      feeBps: input.feeBps ?? this.store.serviceFeeConfig.feeBps,
+      updatedBy: actor.adminId,
+      updatedAt: new Date()
+    };
+    this.audit(actor.role, "platform_service_fee.update", "platform_service_fee", "active", this.store.serviceFeeConfig);
+    return this.store.serviceFeeConfig;
   }
 
   listAdminPaymentMethods(actor: AdminActor) {
@@ -2863,59 +3470,64 @@ class BackendServices {
     return result;
   }
 
-  listAgentPaymentMethods(actor: AgentActor) {
-    this.getAgentShop(actor);
+  listMerchantPaymentMethods(actor: MerchantActor) {
+    this.getMerchantShop(actor);
     return [...this.store.paymentMethods.values()]
-      .filter((method) => method.ownerType === "agent" && method.agentId === actor.agentId && method.shopId === actor.shopId)
+      .filter((method) => method.ownerType === "merchant" && method.merchantId === actor.merchantId && method.shopId === actor.shopId)
       .map((method) => this.serializePaymentMethod(method));
   }
 
-  upsertAgentPaymentMethod(actor: AgentActor, input: PaymentMethodUpsertInput) {
-    this.getAgentShop(actor);
-    const method = this.upsertPaymentMethod("agent", actor.agentId, {
+
+  upsertMerchantPaymentMethod(actor: MerchantActor, input: PaymentMethodUpsertInput) {
+    this.getMerchantShop(actor);
+    const method = this.upsertPaymentMethod("merchant", actor.merchantId, {
       ...input,
-      agentId: actor.agentId,
+      merchantId: actor.merchantId,
       shopId: actor.shopId
     });
-    this.audit("agent", "payment_method.upsert", "payment_method", method.id, this.serializePaymentMethod(method));
+    this.audit("merchant", "payment_method.upsert", "payment_method", method.id, this.serializePaymentMethod(method));
     return this.serializePaymentMethod(method);
   }
 
-  setAgentPaymentMethodDefault(actor: AgentActor, methodId: string) {
-    this.getAgentShop(actor);
+
+  setMerchantPaymentMethodDefault(actor: MerchantActor, methodId: string) {
+    this.getMerchantShop(actor);
     const method = requireEntity(this.store.paymentMethods.get(methodId), "RESOURCE_NOT_FOUND", "payment method not found");
-    assertAgentScope(actor, { agentId: required(method.agentId, "agentId"), shopId: method.shopId });
+    assertMerchantScope(actor, { merchantId: required(method.merchantId, "merchantId"), shopId: method.shopId });
     this.setPaymentMethodDefault(method);
-    this.audit("agent", "payment_method.default", "payment_method", method.id, this.serializePaymentMethod(method));
+    this.audit("merchant", "payment_method.default", "payment_method", method.id, this.serializePaymentMethod(method));
     return this.serializePaymentMethod(method);
   }
 
-  deleteAgentPaymentMethod(actor: AgentActor, methodId: string) {
-    this.getAgentShop(actor);
+
+  deleteMerchantPaymentMethod(actor: MerchantActor, methodId: string) {
+    this.getMerchantShop(actor);
     const method = requireEntity(this.store.paymentMethods.get(methodId), "RESOURCE_NOT_FOUND", "payment method not found");
-    assertAgentScope(actor, { agentId: required(method.agentId, "agentId"), shopId: method.shopId });
+    assertMerchantScope(actor, { merchantId: required(method.merchantId, "merchantId"), shopId: method.shopId });
     method.status = "disabled";
     method.enabled = false;
     method.updatedAt = new Date();
-    this.audit("agent", "payment_method.disable", "payment_method", method.id, this.serializePaymentMethod(method));
+    this.audit("merchant", "payment_method.disable", "payment_method", method.id, this.serializePaymentMethod(method));
     return this.serializePaymentMethod(method);
   }
 
-  testAgentPaymentMethod(actor: AgentActor, methodId: string) {
-    this.getAgentShop(actor);
+
+  testMerchantPaymentMethod(actor: MerchantActor, methodId: string) {
+    this.getMerchantShop(actor);
     const method = requireEntity(this.store.paymentMethods.get(methodId), "RESOURCE_NOT_FOUND", "payment method not found");
-    assertAgentScope(actor, { agentId: required(method.agentId, "agentId"), shopId: method.shopId });
+    assertMerchantScope(actor, { merchantId: required(method.merchantId, "merchantId"), shopId: method.shopId });
     const result = this.testPaymentMethod(method);
-    this.audit("agent", "payment_method.test", "payment_method", method.id, result);
+    this.audit("merchant", "payment_method.test", "payment_method", method.id, result);
     return result;
   }
+
 
   listServiceQrCodes(actor: AdminActor) {
     assertAdminPermission(actor, "audit.read");
     return [...this.store.shops.values()].map((shop) => ({
       shopId: shop.id,
-      ownerType: shop.ownerType ?? "agent",
-      agentId: shop.agentId,
+      ownerType: shop.ownerType ?? "merchant",
+      merchantId: shop.merchantId,
       name: shop.name,
       customerServiceWechat: shop.customerServiceWechat,
       customerServiceQrUrl: shop.customerServiceQrUrl,
@@ -2926,81 +3538,20 @@ class BackendServices {
     }));
   }
 
-  listCollectionChannels(actor: AdminActor) {
-    assertAdminPermission(actor, "audit.read");
-    return [...this.store.collectionChannels.values()];
-  }
-
-  listPublicCollectionChannels(shopId: string) {
-    this.getShop(shopId);
-    return [...this.store.collectionChannels.values()]
-      .filter((channel) => channel.shopId === shopId && channel.status === "active" && channel.reviewStatus === "approved")
-      .sort((left, right) => Number(right.isDefault) - Number(left.isDefault) || left.sortOrder - right.sortOrder)
-      .map((channel) => this.serializePublicCollectionChannel(channel));
-  }
-
-  listAgentCollectionChannels(actor: AgentActor) {
-    this.getAgentShop(actor);
-    return [...this.store.collectionChannels.values()].filter((channel) => channel.shopId === actor.shopId && channel.agentId === actor.agentId);
-  }
-
-  submitAgentCollectionChannel(actor: AgentActor, input: {
-    channelType: CollectionChannelType;
-    displayName: string;
-    accountName?: string;
-    qrUrl?: string;
-    paymentUrl?: string;
-    isDefault?: boolean;
-    sortOrder?: number;
-    dailyLimitCents?: bigint;
-    singleOrderLimitCents?: bigint;
-  }) {
-    this.getAgentShop(actor);
-    const channel: CollectionChannel = {
-      id: nextId(this.store, "collection"),
-      shopId: actor.shopId,
-      agentId: actor.agentId,
-      ownerType: "agent",
-      channelType: input.channelType,
-      displayName: input.displayName,
-      accountName: input.accountName,
-      qrUrl: input.qrUrl,
-      paymentUrl: input.paymentUrl,
-      status: "pending_review",
-      reviewStatus: "pending_review",
-      reviewedBy: null,
-      reviewedAt: null,
-      isDefault: input.isDefault ?? false,
-      sortOrder: input.sortOrder ?? 100,
-      dailyLimitCents: input.dailyLimitCents,
-      singleOrderLimitCents: input.singleOrderLimitCents,
-      createdAt: new Date(),
-      updatedAt: new Date()
-    };
-    this.store.collectionChannels.set(channel.id, channel);
-    this.audit("agent", "collection_channel.submit", "collection_channel", channel.id, channel);
-    return channel;
-  }
-
-  reviewCollectionChannel(actor: AdminActor, channelId: string, input: { approved: boolean; reason?: string }) {
-    assertAdminPermission(actor, "agent.review");
-    const channel = requireEntity(this.store.collectionChannels.get(channelId), "RESOURCE_NOT_FOUND", "collection channel not found");
-    channel.status = input.approved ? "active" : "rejected";
-    channel.reviewStatus = input.approved ? "approved" : "rejected";
-    channel.rejectReason = input.approved ? undefined : input.reason;
-    channel.reviewedBy = actor.adminId;
-    channel.reviewedAt = new Date();
-    channel.updatedAt = new Date();
-    if (input.approved && channel.isDefault) {
-      for (const candidate of this.store.collectionChannels.values()) {
-        if (candidate.id !== channel.id && candidate.shopId === channel.shopId && candidate.status === "active") {
-          candidate.isDefault = false;
-          candidate.updatedAt = new Date();
-        }
-      }
-    }
-    this.audit(actor.role, "collection_channel.review", "collection_channel", channel.id, channel);
-    return channel;
+  listPublicPaymentMethods(shopIdentifier: string) {
+    const shop = this.getShop(shopIdentifier);
+    const shopOwnsPaymentMethods = (shop.ownerType ?? "merchant") === "platform";
+    const paymentMethods = [...this.store.paymentMethods.values()]
+      .filter((method) => method.enabled && method.status === "enabled")
+      .filter((method) => method.provider !== "balance")
+      .filter((method) => this.paymentMethodIsPublicComplete(method))
+      .filter((method) => this.paymentMethodMatchesShopScope(method, shop, shopOwnsPaymentMethods))
+      .sort((left, right) => Number(right.isDefault) - Number(left.isDefault) || paymentProviderSort(left.provider) - paymentProviderSort(right.provider))
+      .map((method, index) => this.serializePublicPaymentMethodAsChannel(method, index));
+    return [
+      this.serializePublicPaymentMethodAsChannel(this.balancePaymentMethod(), -1),
+      ...paymentMethods
+    ];
   }
 
   createPaymentVoucher(actor: UserActor, orderNo: string, input: { channel?: PaymentChannel; payerName?: string; voucherUrl?: string; note?: string }) {
@@ -3032,15 +3583,16 @@ class BackendServices {
     return [...this.store.paymentVouchers.values()];
   }
 
-  listAgentPaymentVouchers(actor: AgentActor) {
-    this.getAgentShop(actor);
+  listMerchantPaymentVouchers(actor: MerchantActor) {
+    this.getMerchantShop(actor);
     return [...this.store.paymentVouchers.values()]
       .filter((voucher) => voucher.shopId === actor.shopId)
       .filter((voucher) => {
         const order = this.store.orders.get(voucher.orderNo);
-        return order?.agentId === actor.agentId && order.shopId === actor.shopId;
+        return order?.merchantId === actor.merchantId && order.shopId === actor.shopId;
       });
   }
+
 
   confirmPaymentVoucher(actor: AdminActor, voucherId: string, input: { approved: boolean; reason?: string }) {
     assertAdminPermission(actor, "settlement.confirm");
@@ -3061,19 +3613,20 @@ class BackendServices {
     return voucher;
   }
 
-  confirmAgentOfflinePayment(actor: AgentActor, orderNo: string, input: { amountCents: bigint; voucherUrl?: string; note?: string }) {
+  confirmMerchantOfflinePayment(actor: MerchantActor, orderNo: string, input: { amountCents: bigint; voucherUrl?: string; note?: string }) {
     const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
-    assertAgentScope(actor, { agentId: order.agentId, shopId: order.shopId });
+    assertMerchantScope(actor, { merchantId: order.merchantId, shopId: order.shopId });
     return this.confirmCollectedPayment({
-      actor: "agent",
-      operatorId: actor.agentId,
+      actor: "merchant",
+      operatorId: actor.merchantId,
       order,
       amountCents: input.amountCents,
       voucherUrl: input.voucherUrl,
       note: input.note,
-      auditRole: "agent"
+      auditRole: "merchant"
     });
   }
+
 
   listAdminCoupons(actor: AdminActor) {
     assertAdminPermission(actor, "product.manage");
@@ -3108,13 +3661,62 @@ class BackendServices {
   updateCouponTemplateStatus(actor: AdminActor, couponId: string, input: { status: string }) {
     assertAdminPermission(actor, "product.manage");
     const coupon = requireEntity(this.store.couponTemplates.get(couponId), "RESOURCE_NOT_FOUND", "coupon template not found");
-    coupon.status = input.status;
+    coupon.status = input.status === "disabled" ? "inactive" : input.status;
     this.audit(actor.role, "coupon_template.status", "coupon_template", couponId, input);
     return coupon;
   }
 
+  grantCouponTemplate(actor: AdminActor, couponId: string, input: { target: "all_users" | "single_user"; userId?: string; phone?: string }) {
+    assertAdminPermission(actor, "product.manage");
+    const template = requireEntity(this.store.couponTemplates.get(couponId), "RESOURCE_NOT_FOUND", "coupon template not found");
+    if (template.status !== "active") throw new ApiError(400, "COUPON_INACTIVE", "coupon template must be active before grant");
+    const userIds = input.target === "all_users"
+      ? this.knownUserIds()
+      : [this.resolveCouponGrantUserId(input)];
+    const uniqueUserIds = Array.from(new Set(userIds.filter(Boolean)));
+    const grantedCoupons: UserCoupon[] = [];
+    let skipped = 0;
+    for (const userId of uniqueUserIds) {
+      const duplicated = [...this.store.userCoupons.values()].some((coupon) =>
+        coupon.userId === userId
+        && coupon.templateId === template.id
+        && coupon.status === "available"
+      );
+      if (duplicated) {
+        skipped += 1;
+        continue;
+      }
+      const coupon: UserCoupon = {
+        id: nextId(this.store, "coupon-user"),
+        templateId: template.id,
+        userId,
+        status: "available",
+        grantReason: input.target === "all_users" ? "admin_all" : "admin_user",
+        grantedAt: new Date(),
+        usedAt: null,
+        orderNo: null
+      };
+      this.store.userCoupons.set(coupon.id, coupon);
+      grantedCoupons.push(coupon);
+    }
+    this.audit(actor.role, "coupon.grant.admin", "coupon_template", couponId, {
+      target: input.target,
+      requestedUserId: input.userId,
+      requestedPhone: input.phone,
+      grantedCount: grantedCoupons.length,
+      skippedCount: skipped,
+      couponIds: grantedCoupons.map((coupon) => coupon.id)
+    });
+    return {
+      couponTemplate: template,
+      grantedCount: grantedCoupons.length,
+      skippedCount: skipped,
+      coupons: grantedCoupons
+    };
+  }
+
   updateShopCollection(actor: AdminActor, shopId: string, input: { collectionAccountName?: string; collectionQrUrl?: string; collectionNote?: string }) {
-    assertAdminPermission(actor, "agent.review");
+    assertAdminPermission(actor, "merchant.review");
     const shop = this.getShop(shopId);
     shop.collectionAccountName = input.collectionAccountName ?? shop.collectionAccountName;
     shop.collectionQrUrl = input.collectionQrUrl ?? shop.collectionQrUrl;
@@ -3130,7 +3732,7 @@ class BackendServices {
     customerServiceQqQrUrl?: string;
     customerServiceNote?: string;
   }) {
-    assertAdminPermission(actor, "agent.review");
+    assertAdminPermission(actor, "merchant.review");
     const shop = this.getShop(shopId);
     shop.customerServiceWechat = input.customerServiceWechat ?? shop.customerServiceWechat;
     shop.customerServiceQrUrl = input.customerServiceQrUrl ?? shop.customerServiceQrUrl;
@@ -3141,11 +3743,11 @@ class BackendServices {
     return shop;
   }
 
-  private upsertPaymentMethod(ownerType: "platform" | "agent", operatorId: string, input: PaymentMethodUpsertInput) {
+  private upsertPaymentMethod(ownerType: "platform" | "merchant", operatorId: string, input: PaymentMethodUpsertInput) {
     this.assertPaymentMethodInput(ownerType, input);
     const existing = input.id ? this.store.paymentMethods.get(input.id) : undefined;
     if (existing) {
-      if (ownerType === "agent" && (existing.agentId !== input.agentId || existing.shopId !== input.shopId)) {
+      if (ownerType === "merchant" && (existing.merchantId !== input.merchantId || existing.shopId !== input.shopId)) {
         throw new ApiError(403, "PAYMENT_METHOD_SCOPE_FORBIDDEN", "cannot update another merchant payment method");
       }
       existing.provider = input.provider ?? existing.provider;
@@ -3155,6 +3757,7 @@ class BackendServices {
       existing.appId = input.appId ?? existing.appId;
       existing.serviceProviderId = input.serviceProviderId ?? existing.serviceProviderId;
       existing.gatewayUrl = input.gatewayUrl ?? existing.gatewayUrl;
+      existing.apiMode = input.apiMode ?? existing.apiMode;
       existing.accountName = input.accountName ?? existing.accountName;
       existing.qrUrl = input.qrUrl ?? existing.qrUrl;
       existing.paymentUrl = input.paymentUrl ?? existing.paymentUrl;
@@ -3169,19 +3772,21 @@ class BackendServices {
       if (existing.isDefault) this.setPaymentMethodDefault(existing);
       return existing;
     }
+    const provider = required(input.provider, "provider");
     const method: PaymentMethodConfig = {
       id: nextId(this.store, "payment-method"),
       ownerType,
-      agentId: ownerType === "agent" ? required(input.agentId, "agentId") : input.agentId,
-      shopId: ownerType === "agent" ? required(input.shopId, "shopId") : input.shopId,
-      provider: required(input.provider, "provider"),
-      confirmationMode: input.provider === "personal_alipay" ? "manual" : "automatic",
+      merchantId: ownerType === "merchant" ? required(input.merchantId, "merchantId") : input.merchantId,
+      shopId: ownerType === "merchant" ? required(input.shopId, "shopId") : input.shopId,
+      provider,
+      confirmationMode: isManualPaymentProvider(provider) ? "manual" : "automatic",
       displayName: required(input.displayName, "displayName"),
       productType: input.productType,
       merchantNo: input.merchantNo,
       appId: input.appId,
       serviceProviderId: input.serviceProviderId,
       gatewayUrl: input.gatewayUrl,
+      apiMode: input.apiMode,
       accountName: input.accountName,
       qrUrl: input.qrUrl,
       paymentUrl: input.paymentUrl,
@@ -3201,26 +3806,127 @@ class BackendServices {
     return method;
   }
 
-  private assertPaymentMethodInput(ownerType: "platform" | "agent", input: PaymentMethodUpsertInput) {
-    if (ownerType === "agent" && (!input.agentId || !input.shopId)) throw new ApiError(400, "PAYMENT_METHOD_SCOPE_REQUIRED", "merchant payment method requires agent and shop scope");
+  private ensureUserWallet(userId: string): UserWalletState {
+    const existing = this.store.userWallets.get(userId);
+    if (existing) return existing;
+    const wallet: UserWalletState = {
+      id: nextId(this.store, "wallet"),
+      userId,
+      walletNo: `wallet-${userId}`,
+      availableBalanceCents: 0n,
+      frozenBalanceCents: 0n,
+      totalRechargeCents: 0n,
+      totalSpendCents: 0n,
+      status: "active",
+      version: 0,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+    this.store.userWallets.set(userId, wallet);
+    return wallet;
+  }
+
+  private serializeWallet(wallet: UserWalletState) {
+    return {
+      walletNo: wallet.walletNo,
+      userId: wallet.userId,
+      availableBalanceCents: wallet.availableBalanceCents,
+      frozenBalanceCents: wallet.frozenBalanceCents,
+      totalRechargeCents: wallet.totalRechargeCents,
+      totalSpendCents: wallet.totalSpendCents,
+      status: wallet.status,
+      version: wallet.version
+    };
+  }
+
+  private recordWalletTransaction(input: {
+    userId: string;
+    wallet: UserWalletState;
+    type: WalletTransactionState["type"];
+    direction: "credit" | "debit";
+    amountCents: bigint;
+    balanceBeforeCents: bigint;
+    balanceAfterCents: bigint;
+    sourceType: string;
+    sourceId: string;
+    orderNo?: string;
+    paymentNo?: string;
+    rechargeNo?: string;
+    holdNo?: string;
+    note?: string;
+  }) {
+    const transaction: WalletTransactionState = {
+      transactionNo: nextId(this.store, "wallet-tx"),
+      userId: input.userId,
+      walletId: input.wallet.id,
+      type: input.type,
+      direction: input.direction,
+      amountCents: input.amountCents,
+      balanceBeforeCents: input.balanceBeforeCents,
+      balanceAfterCents: input.balanceAfterCents,
+      frozenBeforeCents: input.wallet.frozenBalanceCents,
+      frozenAfterCents: input.wallet.frozenBalanceCents,
+      sourceType: input.sourceType,
+      sourceId: input.sourceId,
+      orderNo: input.orderNo,
+      paymentNo: input.paymentNo,
+      rechargeNo: input.rechargeNo,
+      holdNo: input.holdNo,
+      note: input.note,
+      idempotencyKey: `wallet-tx:${input.sourceType}:${input.sourceId}:${input.type}`,
+      createdAt: new Date()
+    };
+    this.store.walletTransactions.push(transaction);
+    return transaction;
+  }
+
+  private defaultExternalRechargeMethod() {
+    return [...this.store.paymentMethods.values()].find((method) =>
+      method.enabled && method.status === "enabled" && method.provider !== "balance"
+    );
+  }
+
+  private paymentFeeBpsForProvider(provider: PaymentProviderType) {
+    if (provider === "balance") return 0;
+    const channel = paymentChannelForProvider(provider);
+    return this.store.paymentChannelConfigs.find((item) => item.channel === channel)?.feeBps ?? 100;
+  }
+
+  private applyPaymentFeeSnapshot(order: DemoOrder, method: PaymentMethodConfig) {
+    const baseAmountCents = order.buyerPaidAmountCents ?? order.snapshot.amountSnapshot.paidAmountCents;
+    const feeBps = this.paymentFeeBpsForProvider(method.provider);
+    const feeCents = calculateServiceFeeCents(baseAmountCents, BigInt(feeBps));
+    const amount = order.snapshot.amountSnapshot as DemoAmountSnapshot;
+    amount.paymentFeeBps = BigInt(feeBps);
+    amount.paymentFeeCents = feeCents;
+    amount.balancePaidCents = method.provider === "balance" ? baseAmountCents : 0n;
+    amount.externalPaidCents = method.provider === "balance" ? 0n : baseAmountCents + feeCents;
+    order.buyerPaidAmountCents = baseAmountCents + feeCents;
+    return order.buyerPaidAmountCents;
+  }
+
+  private assertPaymentMethodInput(ownerType: "platform" | "merchant", input: PaymentMethodUpsertInput) {
+    if (ownerType === "merchant" && (!input.merchantId || !input.shopId)) throw new ApiError(400, "PAYMENT_METHOD_SCOPE_REQUIRED", "merchant payment method requires merchant and shop scope");
     if (!input.provider && !input.id) throw new ApiError(400, "PAYMENT_METHOD_PROVIDER_REQUIRED", "payment provider is required");
-    if (input.provider === "personal_alipay") {
-      if (!input.accountName || !input.qrUrl) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "personal alipay requires account name and QR code");
+    const updatingExisting = Boolean(input.id);
+    if (input.provider && isManualPaymentProvider(input.provider)) {
+      if (!updatingExisting && (!input.accountName || !input.qrUrl)) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "personal payment requires account name and QR code");
       return;
     }
+    if (input.provider === "balance") return;
     if (input.provider && ["alipay_merchant", "wechat_merchant", "epay"].includes(input.provider)) {
-      if (!input.merchantNo) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "merchant number is required");
-      if (input.provider !== "epay" && !input.appId) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "app id is required");
-      if (input.provider === "epay" && !input.gatewayUrl) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "epay gateway url is required");
-      if (!input.signingSecret && !input.id) throw new ApiError(400, "PAYMENT_METHOD_SECRET_REQUIRED", "signing secret is required");
+      if (!updatingExisting && !input.merchantNo) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "merchant number is required");
+      if (!updatingExisting && input.provider !== "epay" && !input.appId) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "app id is required");
+      if (!updatingExisting && input.provider === "epay" && !input.gatewayUrl) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "epay gateway url is required");
+      if (!input.signingSecret && !updatingExisting) throw new ApiError(400, "PAYMENT_METHOD_SECRET_REQUIRED", "signing secret is required");
     }
   }
 
   private applyPaymentMethodSecrets(method: PaymentMethodConfig, input: PaymentMethodUpsertInput) {
     if (input.signingSecret) {
+      method.signingSecret = input.signingSecret;
       method.signingSecretHash = hashSecret(input.signingSecret);
       method.signingSecretPreview = previewSecret(input.signingSecret);
-      method.signingSecretEncrypted = `sha256:${hashSecret(input.signingSecret)}`;
       method.secretConfigured = true;
     }
     if (input.privateKey) {
@@ -3240,7 +3946,7 @@ class BackendServices {
   private setPaymentMethodDefault(method: PaymentMethodConfig) {
     for (const candidate of this.store.paymentMethods.values()) {
       if (candidate.id === method.id) continue;
-      if (candidate.ownerType === method.ownerType && candidate.agentId === method.agentId && candidate.shopId === method.shopId) candidate.isDefault = false;
+      if (candidate.ownerType === method.ownerType && candidate.merchantId === method.merchantId && candidate.shopId === method.shopId) candidate.isDefault = false;
     }
     method.isDefault = true;
     method.enabled = true;
@@ -3251,8 +3957,8 @@ class BackendServices {
   private serializePaymentMethod(method: PaymentMethodConfig) {
     return {
       id: method.id,
-      ownerType: method.ownerType,
-      agentId: method.agentId,
+      ownerType: method.ownerType === "merchant" ? "merchant" : method.ownerType,
+      merchantId: method.merchantId,
       shopId: method.shopId,
       provider: method.provider,
       confirmationMode: method.confirmationMode,
@@ -3262,9 +3968,10 @@ class BackendServices {
       appIdMasked: maskSecret(method.appId),
       serviceProviderMasked: maskSecret(method.serviceProviderId),
       gatewayUrl: method.gatewayUrl,
-      accountName: method.provider === "personal_alipay" ? method.accountName : maskSecret(method.accountName),
-      qrUrl: method.provider === "personal_alipay" ? method.qrUrl : undefined,
-      paymentUrl: method.provider === "personal_alipay" ? method.paymentUrl : undefined,
+      apiMode: method.apiMode ?? defaultPaymentApiMode(method.provider),
+      accountName: isManualPaymentProvider(method.provider) ? method.accountName : maskSecret(method.accountName),
+      qrUrl: isManualPaymentProvider(method.provider) ? method.qrUrl : undefined,
+      paymentUrl: isManualPaymentProvider(method.provider) ? method.paymentUrl : undefined,
       note: method.note,
       returnUrl: method.returnUrl,
       callbackUrl: this.providerCallbackUrl(method.provider),
@@ -3284,9 +3991,34 @@ class BackendServices {
     };
   }
 
+  private serializePublicPaymentMethodAsChannel(method: PaymentMethodConfig, index: number) {
+    const feeBps = this.paymentFeeBpsForProvider(method.provider);
+    return {
+      id: method.id,
+      paymentMethodId: method.id,
+      shopId: method.shopId,
+      ownerType: method.ownerType,
+      provider: method.provider,
+      confirmationMode: method.confirmationMode,
+      channelType: paymentDisplayTypeForProvider(method.provider),
+      displayName: paymentProviderDisplay(method.provider),
+      accountName: undefined,
+      qrUrl: isManualPaymentProvider(method.provider) ? method.qrUrl : undefined,
+      paymentUrl: isManualPaymentProvider(method.provider) ? method.paymentUrl : undefined,
+      isDefault: method.isDefault,
+      sortOrder: index,
+      paymentFeeBps: feeBps,
+      paymentFeeLabel: feeBps === 0 ? "0%" : `${(feeBps / 100).toFixed(0)}%`,
+      publicLabel: paymentProviderPublicLabel(method.provider, feeBps),
+      note: isManualPaymentProvider(method.provider) ? "个人收款需商户人工确认" : method.provider === "balance" ? "余额支付无手续费" : "官方支付以回调或查单为准"
+    };
+  }
+
   private testPaymentMethod(method: PaymentMethodConfig) {
-    const ok = method.provider === "personal_alipay"
+    const ok = isManualPaymentProvider(method.provider)
       ? Boolean(method.accountName && method.qrUrl)
+      : method.provider === "balance"
+        ? true
       : Boolean(method.merchantNo && method.secretConfigured && (method.provider === "epay" || method.appId));
     method.lastTestAt = new Date();
     method.lastTestResult = ok ? "passed" : "failed";
@@ -3300,17 +4032,61 @@ class BackendServices {
   }
 
   private resolvePaymentMethodForOrder(order: DemoOrder, paymentMethodId?: string) {
+    if (paymentMethodId === "balance") return this.balancePaymentMethod();
+    const shop = this.getShop(order.shopId);
+    const shopOwnsPaymentMethods = (shop.ownerType ?? "merchant") === "platform";
     const methods = [...this.store.paymentMethods.values()]
       .filter((method) => method.enabled && method.status === "enabled")
-      .filter((method) =>
-        method.ownerType === "platform"
-        || (method.ownerType === "agent" && method.agentId === order.agentId && method.shopId === order.shopId)
-      );
+      .filter((method) => this.paymentMethodIsPublicComplete(method))
+      .filter((method) => this.paymentMethodMatchesOrderScope(method, order, shopOwnsPaymentMethods));
     const method = paymentMethodId
       ? methods.find((candidate) => candidate.id === paymentMethodId)
-      : methods.find((candidate) => candidate.ownerType === "agent" && candidate.agentId === order.agentId && candidate.shopId === order.shopId && candidate.isDefault)
-        ?? methods.find((candidate) => candidate.ownerType === "platform" && candidate.isDefault);
+      : methods.find((candidate) => candidate.isDefault);
     return requireEntity(method, "PAYMENT_METHOD_UNAVAILABLE", "no enabled payment method is available for this order");
+  }
+
+  private paymentMethodMatchesOrderScope(method: PaymentMethodConfig, order: DemoOrder, shopOwnsPaymentMethods: boolean) {
+    if (shopOwnsPaymentMethods) return method.ownerType === "platform";
+    return method.ownerType === "merchant" && method.merchantId === order.merchantId && method.shopId === order.shopId;
+  }
+
+  private paymentMethodMatchesShopScope(method: PaymentMethodConfig, shop: DemoShop, shopOwnsPaymentMethods: boolean) {
+    if (shopOwnsPaymentMethods) return method.ownerType === "platform";
+    return method.ownerType === "merchant" && method.merchantId === shop.merchantId && method.shopId === shop.id;
+  }
+
+  private resolvePaymentMethodForRecharge(paymentMethodId?: string) {
+    if (paymentMethodId === "balance") throw new ApiError(400, "WALLET_RECHARGE_METHOD_INVALID", "balance cannot be used to recharge balance");
+    const methods = [...this.store.paymentMethods.values()]
+      .filter((method) => method.enabled && method.status === "enabled" && method.provider !== "balance")
+      .filter((method) => this.paymentMethodIsPublicComplete(method));
+    const method = paymentMethodId
+      ? methods.find((candidate) => candidate.id === paymentMethodId)
+      : methods.find((candidate) => candidate.isDefault);
+    return requireEntity(method, "PAYMENT_METHOD_UNAVAILABLE", "no enabled payment method is available for recharge");
+  }
+
+  private balancePaymentMethod(): PaymentMethodConfig {
+    return {
+      id: "balance",
+      ownerType: "platform",
+      provider: "balance",
+      confirmationMode: "automatic",
+      displayName: "余额支付",
+      enabled: true,
+      status: "enabled",
+      isDefault: false,
+      secretConfigured: true,
+      createdAt: new Date(0),
+      updatedAt: new Date(0)
+    };
+  }
+
+  private paymentMethodIsPublicComplete(method: PaymentMethodConfig) {
+    if (method.provider === "balance") return true;
+    if (isManualPaymentProvider(method.provider)) return Boolean(method.qrUrl);
+    if (method.provider === "epay") return Boolean(method.gatewayUrl && method.merchantNo && method.secretConfigured);
+    return Boolean(method.merchantNo && method.appId && method.secretConfigured);
   }
 
   private resolvePaymentMethodFromOrder(order: DemoOrder) {
@@ -3336,13 +4112,62 @@ class BackendServices {
   }
 
   private signPaymentPayload(method: PaymentMethodConfig, orderNo: string, amountCents: bigint, providerTradeNo: string) {
-    const secret = method.signingSecretEncrypted ?? method.signingSecretHash ?? "";
+    const secret = method.signingSecretHash ? `sha256:${method.signingSecretHash}` : method.signingSecret ?? method.signingSecretEncrypted ?? "";
     return createHmac("sha256", secret).update(this.paymentSignaturePayload(method.provider, orderNo, amountCents, providerTradeNo, method.merchantNo)).digest("hex");
   }
 
   private verifyPaymentSignature(method: PaymentMethodConfig, orderNo: string, amountCents: bigint, providerTradeNo: string, signature: string) {
     if (!signature || !method.secretConfigured) return false;
     return this.signPaymentPayload(method, orderNo, amountCents, providerTradeNo) === signature;
+  }
+
+  private async buildEpayPaymentParams(method: PaymentMethodConfig, order: DemoOrder, amountCents: bigint) {
+    const gatewayUrl = required(method.gatewayUrl, "epay gatewayUrl");
+    const merchantNo = required(method.merchantNo, "epay merchantNo");
+    const signingSecret = required(method.signingSecret, "epay signingSecret");
+    const notifyUrl = absoluteCallbackUrl(this.providerCallbackUrl("epay"));
+    const returnUrl = method.returnUrl ?? publicSiteUrl();
+    const endpoints = epayGatewayEndpoints(gatewayUrl);
+    const submitParams: Record<string, string> = {
+      pid: merchantNo,
+      type: method.productType || "alipay",
+      out_trade_no: order.orderNo,
+      notify_url: notifyUrl,
+      return_url: returnUrl,
+      name: orderProductNameForPayment(order),
+      money: centsString(amountCents),
+      sign_type: "MD5"
+    };
+    submitParams.sign = signEpayParams(submitParams, signingSecret);
+    const submitPaymentUrl = appendQuery(endpoints.submitUrl, submitParams);
+    const mapi = method.apiMode === "submit" ? undefined : await requestEpayMapi(endpoints.mapiUrl, submitParams);
+    const directAppUrl = mapi?.directAppUrl;
+    const cashierUrl = mapi?.cashierUrl;
+    const qrCodeUrl = mapi?.qrCodeUrl;
+    const paymentUrl = directAppUrl ?? cashierUrl ?? submitPaymentUrl;
+    return {
+      method: directAppUrl ? "APP" : mapi?.ok ? "MAPI" : "GET",
+      gatewayUrl: endpoints.submitUrl,
+      mapiUrl: endpoints.mapiUrl,
+      paymentUrl,
+      submitPaymentUrl,
+      directAppUrl,
+      cashierUrl,
+      qrCodeUrl: qrCodeUrl ?? paymentUrl,
+      submitParams,
+      apiMode: method.apiMode ?? "mapi_first",
+      mapiStatus: mapi?.ok ? "resolved" : mapi ? "fallback" : "skipped",
+      mapiMessage: mapi?.message,
+      notifyUrl,
+      returnUrl
+    };
+  }
+
+  private verifyEpaySignature(method: PaymentMethodConfig, rawPayload: Record<string, unknown>) {
+    const signingSecret = method.signingSecret;
+    const signature = stringValue(rawPayload.sign);
+    if (!signingSecret || !signature) return false;
+    return safeEqualHex(signEpayParams(rawPayload, signingSecret), signature);
   }
 
   private paymentMethodMaskedIdentity(method: PaymentMethodConfig) {
@@ -3431,10 +4256,10 @@ class BackendServices {
     order.fulfillmentStatus = "processing";
     order.paidAt = order.paidAt ?? new Date();
     if (order.salesChannelType !== "platform_self_operated") {
-      this.store.pendingIncomeByAgent.set(order.agentId, (this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n) + order.snapshot.amountSnapshot.agentExpectedIncomeCents);
+      this.store.pendingIncomeByMerchant.set(order.merchantId, (this.store.pendingIncomeByMerchant.get(order.merchantId) ?? 0n) + order.snapshot.amountSnapshot.merchantExpectedIncomeCents);
       this.addChannelPendingIncome(order);
     }
-    this.ledger(source === "manual" ? "MANUAL_PAYMENT_CONFIRMED" : "PAYMENT_SUCCEEDED", { orderNo: order.orderNo, agentId: order.agentId }, amountCents, metadata);
+    this.ledger(source === "manual" ? "MANUAL_PAYMENT_CONFIRMED" : "PAYMENT_SUCCEEDED", { orderNo: order.orderNo, merchantId: order.merchantId }, amountCents, metadata);
     this.tryAutoFulfillWithRightsCode(order);
   }
 
@@ -3464,66 +4289,84 @@ class BackendServices {
     return output;
   }
 
-  private buildSnapshot(input: { orderNo: string; userId: string; shopId: string; agentProductId: string; quantity?: number; entrySource?: string }): DemoOrderSnapshot {
+  private buildSnapshot(input: { orderNo: string; userId: string; shopId: string; merchantProductListingId: string; quantity?: number; entrySource?: string; serviceFeeBps?: bigint }): DemoOrderSnapshot {
     const shop = requireEntity(this.store.shops.get(input.shopId), "RESOURCE_NOT_FOUND", "shop not found");
-    if ((shop.ownerType ?? "agent") === "platform") {
+    if ((shop.ownerType ?? "merchant") === "platform") {
       return this.buildPlatformSelfOperatedSnapshot(input, shop);
     }
-    const agent = requireEntity(this.store.agents.get(required(shop.agentId, "agentId")), "RESOURCE_NOT_FOUND", "agent not found");
-    const account = requireEntity(this.store.depositAccounts.get(agent.id), "RESOURCE_NOT_FOUND", "deposit account not found");
-    if (shouldRestrictForDeposit(account)) throw new ApiError(400, "DEPOSIT_INSUFFICIENT", "agent deposit is insufficient");
-    const agentProduct = requireEntity(this.store.agentProducts.get(input.agentProductId), "RESOURCE_NOT_FOUND", "agent product not found");
-    if (agentProduct.shopId !== shop.id) throw new ApiError(400, "RESOURCE_SCOPE_MISMATCH", "agent product does not belong to shop");
-    const platformProduct = agentProduct.platformProductId ? this.store.platformProducts.get(agentProduct.platformProductId) : undefined;
-    const ownProduct = agentProduct.ownProductReviewId ? this.store.ownProducts.get(agentProduct.ownProductReviewId) : undefined;
-    const relation = this.findActiveChannelRelationForSellingAgent(agent.id);
-    if (relation && agentProduct.productType === "platform" && platformProduct) {
-      return this.buildChannelSnapshot(input, shop, agent, agentProduct, platformProduct, relation);
+    const merchant = requireEntity(this.store.merchants.get(required(shop.merchantId, "merchantId")), "RESOURCE_NOT_FOUND", "merchant not found");
+    const account = requireEntity(this.store.depositAccounts.get(merchant.id), "RESOURCE_NOT_FOUND", "deposit account not found");
+    if (shouldRestrictForDeposit(account)) throw new ApiError(400, "DEPOSIT_INSUFFICIENT", "merchant deposit is insufficient");
+    const merchantProductListing = requireEntity(this.store.merchantProductListings.get(input.merchantProductListingId), "RESOURCE_NOT_FOUND", "merchant product not found");
+    if (merchantProductListing.shopId !== shop.id) throw new ApiError(400, "RESOURCE_SCOPE_MISMATCH", "merchant product does not belong to shop");
+    const platformProduct = merchantProductListing.platformProductId ? this.store.platformProducts.get(merchantProductListing.platformProductId) : undefined;
+    const displayPlatformProduct = merchantProductListing.platformProductId
+      ? this.productWithMerchantDisplayOverrides(merchantProductListing, platformProduct) as DemoPlatformProduct | undefined
+      : undefined;
+    const ownProduct = merchantProductListing.ownProductReviewId ? this.store.ownProducts.get(merchantProductListing.ownProductReviewId) : undefined;
+    const relation = this.findActiveChannelRelationForSellingMerchant(merchant.id);
+    if (relation && merchantProductListing.productType === "platform" && platformProduct) {
+      return this.buildChannelSnapshot(input, shop, merchant, merchantProductListing, platformProduct, relation, displayPlatformProduct);
     }
-    return buildOrderSnapshot({
+    return this.withServiceFeeSnapshot(buildOrderSnapshot({
       orderNo: input.orderNo,
       userId: input.userId,
-      agent,
+      merchant,
       shop,
-      agentProduct,
-      platformProduct,
+      merchantProductListing,
+      platformProduct: displayPlatformProduct,
       ownProduct,
       quantity: input.quantity,
-      entrySource: input.entrySource
-    });
+      entrySource: input.entrySource,
+      serviceFeeBps: input.serviceFeeBps
+    }));
   }
 
-  private resolvePublicCollectionChannel(shopId: string, channelId?: string) {
-    const channels = [...this.store.collectionChannels.values()]
-      .filter((channel) => channel.shopId === shopId && channel.status === "active" && channel.reviewStatus === "approved")
-      .sort((left, right) => Number(right.isDefault) - Number(left.isDefault) || left.sortOrder - right.sortOrder);
-    if (channelId) {
-      return requireEntity(channels.find((channel) => channel.id === channelId), "COLLECTION_CHANNEL_UNAVAILABLE", "collection channel is not available");
-    }
-    return requireEntity(channels[0], "COLLECTION_CHANNEL_UNAVAILABLE", "no active collection channel for this shop");
+  private withServiceFeeSnapshot<T extends DemoOrderSnapshot>(snapshot: T): T {
+    const config = this.activeServiceFeeConfig();
+    const amount = snapshot.amountSnapshot as DemoAmountSnapshot;
+    const finalSalePriceCents = "finalSalePriceCents" in amount && typeof amount.finalSalePriceCents === "bigint"
+      ? amount.finalSalePriceCents
+      : amount.paidAmountCents;
+    const basisAmountCents = config.basisType === "paid_amount"
+      ? amount.paidAmountCents
+      : finalSalePriceCents;
+    amount.serviceFeeEnabled = config.enabled;
+    amount.serviceFeeBasisAmountCents = basisAmountCents;
+    amount.serviceFeeConfigSnapshot = {
+      id: config.id,
+      enabled: config.enabled,
+      feeBps: config.feeBps,
+      basisType: config.basisType,
+      status: config.status,
+      updatedAt: config.updatedAt,
+      updatedBy: config.updatedBy
+    };
+    return snapshot;
   }
 
   private buildChannelSnapshot(
-    input: { orderNo: string; userId: string; shopId: string; agentProductId: string; quantity?: number; entrySource?: string },
+    input: { orderNo: string; userId: string; shopId: string; merchantProductListingId: string; quantity?: number; entrySource?: string; serviceFeeBps?: bigint },
     shop: DemoShop,
-    sellingAgent: DemoAgent,
-    agentProduct: DemoAgentProduct,
+    sellingMerchant: DemoMerchant,
+    merchantProductListing: DemoMerchantProductListing,
     platformProduct: DemoPlatformProduct,
-    relation: ChannelRelation
+    relation: ChannelRelation,
+    displayProduct: DemoPlatformProduct | undefined
   ): DemoOrderSnapshot {
-    const firstTier = requireEntity(this.store.agents.get(relation.firstTierAgentId), "RESOURCE_NOT_FOUND", "first tier agent not found");
-    const secondTier = requireEntity(this.store.agents.get(relation.secondTierAgentId), "RESOURCE_NOT_FOUND", "second tier agent not found");
-    const thirdTier = relation.thirdTierAgentId ? requireEntity(this.store.agents.get(relation.thirdTierAgentId), "RESOURCE_NOT_FOUND", "third tier agent not found") : undefined;
-    const firstTierShop = requireEntity(this.findShopByAgentId(firstTier.id), "RESOURCE_NOT_FOUND", "first tier shop not found");
-    const secondTierShop = requireEntity(this.findShopByAgentId(secondTier.id), "RESOURCE_NOT_FOUND", "second tier shop not found");
+    const firstTier = requireEntity(this.store.merchants.get(relation.firstTierMerchantId), "RESOURCE_NOT_FOUND", "first tier merchant not found");
+    const secondTier = requireEntity(this.store.merchants.get(relation.secondTierMerchantId), "RESOURCE_NOT_FOUND", "second tier merchant not found");
+    const thirdTier = relation.thirdTierMerchantId ? requireEntity(this.store.merchants.get(relation.thirdTierMerchantId), "RESOURCE_NOT_FOUND", "third tier merchant not found") : undefined;
+    const firstTierShop = requireEntity(this.findShopByMerchantId(firstTier.id), "RESOURCE_NOT_FOUND", "first tier shop not found");
+    const secondTierShop = requireEntity(this.findShopByMerchantId(secondTier.id), "RESOURCE_NOT_FOUND", "second tier shop not found");
     const firstTierAccount = requireEntity(this.store.depositAccounts.get(firstTier.id), "RESOURCE_NOT_FOUND", "first tier deposit account not found");
     const secondTierAccount = requireEntity(this.store.depositAccounts.get(secondTier.id), "RESOURCE_NOT_FOUND", "second tier deposit account not found");
-    if (sellingAgent.id !== (thirdTier?.id ?? secondTier.id)) throw new ApiError(400, "CHANNEL_RULE_FAILED", "selling agent does not match channel relation");
-    if (sellingAgent.status !== "active" || secondTier.status !== "active" || firstTier.status !== "active" || (thirdTier && thirdTier.status !== "active")) throw new ApiError(400, "AGENT_NOT_ACTIVE", "channel agents must be active");
-    if (shop.status !== "open" || firstTierShop.status !== "open" || secondTierShop.status !== "open") throw new ApiError(400, "SHOP_NOT_OPEN", "channel shops must be open");
-    if (agentProduct.status !== "listed") throw new ApiError(400, "PRODUCT_NOT_LISTED", "agent product is not listed");
+    if (sellingMerchant.id !== (thirdTier?.id ?? secondTier.id)) throw new ApiError(400, "MERCHANT_SUPPLY_RULE_FAILED", "selling merchant does not match merchant supply relation");
+    if (sellingMerchant.status !== "active" || secondTier.status !== "active" || firstTier.status !== "active" || (thirdTier && thirdTier.status !== "active")) throw new ApiError(400, "MERCHANT_NOT_ACTIVE", "merchant supply participants must be active");
+    if (shop.status !== "open" || firstTierShop.status !== "open" || secondTierShop.status !== "open") throw new ApiError(400, "SHOP_NOT_OPEN", "merchant supply shops must be open");
+    if (merchantProductListing.status !== "listed") throw new ApiError(400, "PRODUCT_NOT_LISTED", "merchant product is not listed");
     if (platformProduct.status !== "active") throw new ApiError(400, "PRODUCT_NOT_ACTIVE", "platform product is not active");
-    if (sellingAgent.riskStatus !== "normal" || secondTier.riskStatus !== "normal" || firstTier.riskStatus !== "normal" || shop.riskStatus !== "normal") {
+    if (sellingMerchant.riskStatus !== "normal" || secondTier.riskStatus !== "normal" || firstTier.riskStatus !== "normal" || shop.riskStatus !== "normal") {
       throw new ApiError(400, "RISK_BLOCKED", "risk freeze blocks order creation");
     }
     if (shouldRestrictForDeposit(firstTierAccount)) throw new ApiError(400, "DEPOSIT_INSUFFICIENT", "first tier deposit is insufficient");
@@ -3536,7 +4379,7 @@ class BackendServices {
     if (firstTierOffer.resellSupplyPriceCents < platformProduct.supplyPriceCents) {
       throw new ApiError(400, "PRICE_RULE_FAILED", "first tier supply price cannot be below platform supply price");
     }
-    const secondTierOffer = relation.thirdTierAgentId
+    const secondTierOffer = relation.thirdTierMerchantId
       ? requireEntity(
         this.store.channelProductOffers.find((item) => item.channelRelationId === relation.id && item.platformProductId === platformProduct.id && item.status === "listed"),
         "RESOURCE_NOT_FOUND",
@@ -3549,27 +4392,28 @@ class BackendServices {
     const quantity = input.quantity ?? 1;
     const sellerSupplyUnitPriceCents = secondTierOffer?.resellSupplyPriceCents ?? firstTierOffer.resellSupplyPriceCents;
     const quote = quotePlatformProduct({
-      salePriceCents: agentProduct.salePriceCents,
+      salePriceCents: merchantProductListing.salePriceCents,
       supplyPriceCents: sellerSupplyUnitPriceCents,
       minSalePriceCents: platformProduct.minSalePriceCents,
-      quantity
+      quantity,
+      serviceFeeBps: input.serviceFeeBps
     });
     const platformSupplyPriceCents = platformProduct.supplyPriceCents * BigInt(quantity);
     const firstTierSupplyPriceCents = firstTierOffer.resellSupplyPriceCents * BigInt(quantity);
     const secondTierSupplyPriceCents = secondTierOffer ? secondTierOffer.resellSupplyPriceCents * BigInt(quantity) : null;
     const firstTierIncomeCents = firstTierSupplyPriceCents - platformSupplyPriceCents;
-    const secondTierIncomeCents = secondTierSupplyPriceCents ? secondTierSupplyPriceCents - firstTierSupplyPriceCents : quote.agentExpectedIncomeCents;
-    const thirdTierIncomeCents = secondTierSupplyPriceCents ? quote.agentExpectedIncomeCents : 0n;
+    const secondTierIncomeCents = secondTierSupplyPriceCents ? secondTierSupplyPriceCents - firstTierSupplyPriceCents : quote.merchantExpectedIncomeCents;
+    const thirdTierIncomeCents = secondTierSupplyPriceCents ? quote.merchantExpectedIncomeCents : 0n;
 
-    return {
+    return this.withServiceFeeSnapshot({
       orderNo: input.orderNo,
       userId: input.userId,
-      agentId: sellingAgent.id,
+      merchantId: sellingMerchant.id,
       shopId: shop.id,
-      agentProductId: agentProduct.id,
+      merchantProductListingId: merchantProductListing.id,
       salesChannelType: secondTierOffer ? "three_tier" : "two_tier",
       productType: "platform",
-      productNameSnapshot: platformProduct.name,
+      productNameSnapshot: displayProduct?.name ?? platformProduct.name,
       quantity,
       quote,
       amountSnapshot: {
@@ -3577,7 +4421,7 @@ class BackendServices {
         paidAmountCents: quote.paidAmountCents,
         supplyAmountCents: quote.supplyAmountCents,
         serviceFeeCents: quote.serviceFeeCents,
-        agentExpectedIncomeCents: quote.agentExpectedIncomeCents,
+        merchantExpectedIncomeCents: quote.merchantExpectedIncomeCents,
         platformSupplyPriceCents,
         resellSupplyPriceCents: firstTierSupplyPriceCents,
         firstTierSupplyPriceCents,
@@ -3587,7 +4431,14 @@ class BackendServices {
         secondTierIncomeCents,
         thirdTierIncomeCents
       },
-      productSnapshot: { id: platformProduct.id, type: "platform", name: platformProduct.name },
+      productSnapshot: {
+        id: platformProduct.id,
+        type: "platform",
+        name: displayProduct?.name ?? platformProduct.name,
+        sourceName: platformProduct.name,
+        imageUrl: displayProduct?.imageUrl,
+        description: displayProduct?.description
+      },
       shopSnapshot: {
         id: shop.id,
         name: shop.name,
@@ -3596,22 +4447,22 @@ class BackendServices {
         customerServiceQq: shop.customerServiceQq,
         customerServiceQqQrUrl: shop.customerServiceQqQrUrl,
         customerServiceNote: shop.customerServiceNote,
-        agentStatus: sellingAgent.status,
+        merchantStatus: sellingMerchant.status,
         shopStatus: shop.status,
         entrySource: input.entrySource
       },
       pricingSnapshot: {
-        salePriceCents: agentProduct.salePriceCents,
+        salePriceCents: merchantProductListing.salePriceCents,
         minSalePriceCents: platformProduct.minSalePriceCents,
         suggestedSalePriceCents: platformProduct.suggestedSalePriceCents
       },
       channelSnapshot: {
         relationId: relation.id,
-        firstTierAgentId: firstTier.id,
+        firstTierMerchantId: firstTier.id,
         firstTierShopId: firstTierShop.id,
-        secondTierAgentId: secondTier.id,
+        secondTierMerchantId: secondTier.id,
         secondTierShopId: secondTierShop.id,
-        thirdTierAgentId: thirdTier?.id,
+        thirdTierMerchantId: thirdTier?.id,
         thirdTierShopId: thirdTier ? shop.id : undefined,
         platformSupplyPriceCents,
         resellSupplyPriceCents: firstTierSupplyPriceCents,
@@ -3624,16 +4475,16 @@ class BackendServices {
       },
       fulfillmentRuleSnapshot: platformProduct.fulfillmentRule,
       afterSaleRuleSnapshot: platformProduct.afterSaleRule
-    } as DemoOrderSnapshot;
+    } as DemoOrderSnapshot);
   }
 
   private buildPlatformSelfOperatedSnapshot(
-    input: { orderNo: string; userId: string; shopId: string; agentProductId: string; quantity?: number; entrySource?: string },
+    input: { orderNo: string; userId: string; shopId: string; merchantProductListingId: string; quantity?: number; entrySource?: string; serviceFeeBps?: bigint },
     shop: DemoShop
   ): PlatformSelfOperatedSnapshot {
     if (shop.status !== "open") throw new ApiError(400, "SHOP_NOT_OPEN", "platform shop is not open");
     if (shop.riskStatus !== "normal") throw new ApiError(400, "RISK_BLOCKED", "risk freeze blocks order creation");
-    const shopProduct = requireEntity(this.store.platformShopProducts.get(input.agentProductId), "RESOURCE_NOT_FOUND", "platform shop product not found");
+    const shopProduct = requireEntity(this.store.platformShopProducts.get(input.merchantProductListingId), "RESOURCE_NOT_FOUND", "platform shop product not found");
     if (shopProduct.shopId !== shop.id) throw new ApiError(400, "RESOURCE_SCOPE_MISMATCH", "product does not belong to platform shop");
     if (shopProduct.status !== "listed") throw new ApiError(400, "PRODUCT_NOT_LISTED", "platform shop product is not listed");
     const product = requireEntity(this.store.platformProducts.get(shopProduct.platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
@@ -3644,17 +4495,17 @@ class BackendServices {
     const quantity = input.quantity ?? 1;
     const paidAmountCents = shopProduct.salePriceCents * BigInt(quantity);
     const fulfillmentCostCents = shopProduct.fulfillmentCostCents * BigInt(quantity);
-    const serviceFeeBps = 50n;
+    const serviceFeeBps = input.serviceFeeBps ?? 50n;
     const paymentChannelFeeCents = calculateServiceFeeCents(paidAmountCents, serviceFeeBps);
     const grossMarginCents = paidAmountCents - fulfillmentCostCents - paymentChannelFeeCents;
     if (grossMarginCents < 0n) throw new ApiError(400, "PRICE_RULE_FAILED", "platform self-operated margin cannot be negative");
 
-    return {
+    return this.withServiceFeeSnapshot({
       orderNo: input.orderNo,
       userId: input.userId,
-      agentId: PLATFORM_AGENT_ID,
+      merchantId: PLATFORM_MERCHANT_ID,
       shopId: shop.id,
-      agentProductId: shopProduct.id,
+      merchantProductListingId: shopProduct.id,
       salesChannelType: "platform_self_operated",
       productType: "platform",
       productNameSnapshot: product.name,
@@ -3664,14 +4515,14 @@ class BackendServices {
         paidAmountCents,
         supplyAmountCents: fulfillmentCostCents,
         serviceFeeCents: paymentChannelFeeCents,
-        agentExpectedIncomeCents: 0n
+        merchantExpectedIncomeCents: 0n
       },
       amountSnapshot: {
         serviceFeeBps,
         paidAmountCents,
         supplyAmountCents: fulfillmentCostCents,
         serviceFeeCents: paymentChannelFeeCents,
-        agentExpectedIncomeCents: 0n,
+        merchantExpectedIncomeCents: 0n,
         platformSelfOperatedGrossMarginCents: grossMarginCents
       },
       productSnapshot: {
@@ -3705,14 +4556,47 @@ class BackendServices {
       },
       fulfillmentRuleSnapshot: product.fulfillmentRule,
       afterSaleRuleSnapshot: product.afterSaleRule
+    });
+  }
+
+  private applyMerchantProductListingDisplayOverrides(merchantProductListing: DemoMerchantProductListing, input: MerchantProductListingDisplayOverrideInput) {
+    if ("displayName" in input) merchantProductListing.displayName = optionalTrimmedText(input.displayName);
+    if ("displaySubtitle" in input) merchantProductListing.displaySubtitle = optionalTrimmedText(input.displaySubtitle);
+    if ("displayDescription" in input) merchantProductListing.displayDescription = optionalTrimmedText(input.displayDescription);
+    if ("displayUsageGuide" in input) merchantProductListing.displayUsageGuide = optionalTrimmedText(input.displayUsageGuide);
+    if ("displayImageUrl" in input) merchantProductListing.displayImageUrl = optionalTrimmedText(input.displayImageUrl);
+    if ("displayCategory" in input) merchantProductListing.displayCategory = optionalTrimmedText(input.displayCategory);
+    if ("displayTags" in input) merchantProductListing.displayTags = normalizeOptionalStringArray(input.displayTags);
+    if ("displaySpecs" in input) merchantProductListing.displaySpecs = normalizeOptionalStringArray(input.displaySpecs);
+    if ("displayDetailSections" in input) merchantProductListing.displayDetailSections = normalizeOptionalDetailSections(input.displayDetailSections);
+  }
+
+  private productWithMerchantDisplayOverrides(merchantProductListing: DemoMerchantProductListing, product?: DemoPlatformProduct | DemoOwnProduct) {
+    if (!product || merchantProductListing.productType !== "platform") return product;
+    return {
+      ...product,
+      sourceName: product.name,
+      sourceCategory: product.category,
+      sourceImageUrl: product.imageUrl,
+      sourceDescription: product.description,
+      name: merchantProductListing.displayName ?? product.name,
+      category: merchantProductListing.displayCategory ?? product.category,
+      tags: merchantProductListing.displayTags ?? product.tags,
+      subtitle: merchantProductListing.displaySubtitle ?? product.subtitle,
+      description: merchantProductListing.displayDescription ?? product.description,
+      usageGuide: merchantProductListing.displayUsageGuide ?? product.usageGuide,
+      imageUrl: merchantProductListing.displayImageUrl ?? product.imageUrl,
+      specs: merchantProductListing.displaySpecs ?? product.specs,
+      detailSections: merchantProductListing.displayDetailSections ?? product.detailSections
     };
   }
 
-  private serializeAgentProduct(agentProduct: DemoAgentProduct) {
-    const product = agentProduct.platformProductId
-      ? this.store.platformProducts.get(agentProduct.platformProductId)
-      : this.store.ownProducts.get(required(agentProduct.ownProductReviewId, "ownProductReviewId"));
-    return { ...agentProduct, product };
+  private serializeMerchantProduct(merchantProductListing: DemoMerchantProductListing) {
+    const sourceProduct = merchantProductListing.platformProductId
+      ? this.store.platformProducts.get(merchantProductListing.platformProductId)
+      : this.store.ownProducts.get(required(merchantProductListing.ownProductReviewId, "ownProductReviewId"));
+    const product = this.productWithMerchantDisplayOverrides(merchantProductListing, sourceProduct);
+    return { ...merchantProductListing, product, sourceProductName: sourceProduct?.name };
   }
 
   private serializePlatformProductDetail(product: DemoPlatformProduct, audience: "admin" | "merchant", actor?: AdminActor) {
@@ -3750,7 +4634,7 @@ class BackendServices {
     const shop = this.store.shops.get(shopProduct.shopId);
     return {
       ...shopProduct,
-      shop: shop ? { id: shop.id, name: shop.name, status: shop.status, ownerType: shop.ownerType ?? "agent" } : undefined,
+      shop: shop ? { id: shop.id, name: shop.name, status: shop.status, ownerType: shop.ownerType ?? "merchant" } : undefined,
       product: this.serializePlatformProductDetail(product, "admin", actor),
       fieldPermissions: {
         editable: ["salePriceCents", "fulfillmentCostCents", "status"],
@@ -3759,10 +4643,10 @@ class BackendServices {
     };
   }
 
-  private serializeAgentProductForActor(actor: AgentActor, agentProduct: DemoAgentProduct) {
-    const base = this.serializeAgentProduct(agentProduct) as Record<string, unknown> & { product?: Record<string, unknown> };
-    if (!base.product || agentProduct.productType !== "platform") return base;
-    const visibility = this.priceVisibilityForAgent(actor.agentId, agentProduct.platformProductId);
+  private serializeMerchantProductForActor(actor: MerchantActor, merchantProductListing: DemoMerchantProductListing) {
+    const base = this.serializeMerchantProduct(merchantProductListing) as Record<string, unknown> & { product?: Record<string, unknown> };
+    if (!base.product || merchantProductListing.productType !== "platform") return base;
+    const visibility = this.priceVisibilityForMerchant(actor.merchantId, merchantProductListing.platformProductId);
     const product = { ...base.product };
     delete product.supplyPriceCents;
     if (visibility.canSeePlatformSupplyPrice) product.platformSupplyPriceCents = visibility.platformSupplyPriceCents;
@@ -3771,14 +4655,14 @@ class BackendServices {
     return { ...base, product };
   }
 
-  private serializeAgentProductDetailForActor(actor: AgentActor, agentProduct: DemoAgentProduct) {
-    const base = this.serializeAgentProductForActor(actor, agentProduct) as Record<string, unknown> & { product?: Record<string, unknown> };
-    const inventoryProductId = agentProduct.productType === "agent_owned" ? agentProduct.id : agentProduct.platformProductId;
+  private serializeMerchantProductDetailForActor(actor: MerchantActor, merchantProductListing: DemoMerchantProductListing) {
+    const base = this.serializeMerchantProductForActor(actor, merchantProductListing) as Record<string, unknown> & { product?: Record<string, unknown> };
+    const inventoryProductId = merchantProductListing.productType === "merchant_owned" ? merchantProductListing.id : merchantProductListing.platformProductId;
     return {
       ...base,
       rightsCodePool: inventoryProductId ? this.rightsCodePoolSummary(inventoryProductId, {
-        canImport: agentProduct.productType === "agent_owned",
-        canExportMasked: agentProduct.productType === "agent_owned",
+        canImport: merchantProductListing.productType === "merchant_owned",
+        canExportMasked: merchantProductListing.productType === "merchant_owned",
         canViewPlaintext: false,
         canExportPlaintext: false
       }) : undefined,
@@ -3786,15 +4670,15 @@ class BackendServices {
         editable: ["salePriceCents", "status"],
         readonly: ["product", "fulfillmentMode", "afterSaleRule", "rightsCodePool"]
       },
-      canViewPlainRightsCodes: agentProduct.productType === "agent_owned",
-      priceVisibility: agentProduct.productType === "platform" ? this.priceVisibilityForAgent(actor.agentId, agentProduct.platformProductId) : undefined
+      canViewPlainRightsCodes: merchantProductListing.productType === "merchant_owned",
+      priceVisibility: merchantProductListing.productType === "platform" ? this.priceVisibilityForMerchant(actor.merchantId, merchantProductListing.platformProductId) : undefined
     };
   }
 
   private serializeOwnProductDetail(product: DemoOwnProduct, audience: "admin" | "merchant") {
-    const agent = this.store.agents.get(product.agentId);
+    const merchant = this.store.merchants.get(product.merchantId);
     const shop = this.store.shops.get(product.shopId);
-    const agentProduct = [...this.store.agentProducts.values()].find((item) => item.ownProductReviewId === product.id);
+    const merchantProductListing = [...this.store.merchantProductListings.values()].find((item) => item.ownProductReviewId === product.id);
     const editable = audience === "admin"
       ? ["reviewStatus", "status"]
       : product.reviewStatus === "pending_review"
@@ -3802,13 +4686,15 @@ class BackendServices {
         : ["salePriceCents", "status"];
     return {
       ...product,
+      minSalePriceCents: product.minSalePriceCents ?? product.salePriceCents,
       ownProductId: product.id,
-      agentProductId: agentProduct?.id,
-      agent: agent ? { id: agent.id, name: agent.name, tier: agent.tier, status: agent.status } : undefined,
+      merchantId: product.merchantId,
+      merchantProductListingId: merchantProductListing?.id,
+      merchant: merchant ? { id: merchant.id, name: merchant.name, tier: merchant.tier, status: merchant.status } : undefined,
       shop: shop ? { id: shop.id, name: shop.name, status: shop.status } : undefined,
       fulfillmentMode: fulfillmentRuleMode(product.fulfillmentRule),
       manualFulfillmentInstruction: manualFulfillmentInstruction(product.fulfillmentRule),
-      rightsCodePool: agentProduct ? this.rightsCodePoolSummary(agentProduct.id, {
+      rightsCodePool: merchantProductListing ? this.rightsCodePoolSummary(merchantProductListing.id, {
         canImport: audience === "merchant" && fulfillmentRuleMode(product.fulfillmentRule) === "code_pool",
         canExportMasked: audience === "merchant",
         canViewPlaintext: false,
@@ -3819,7 +4705,7 @@ class BackendServices {
         canViewPlaintext: false,
         canExportPlaintext: false
       }),
-      fieldPermissions: { editable, readonly: audience === "admin" ? ["agent", "shop", "rightsCodePool"] : ["reviewStatus", "agent", "shop"] },
+      fieldPermissions: { editable, readonly: audience === "admin" ? ["merchant", "shop", "rightsCodePool"] : ["reviewStatus", "merchant", "shop"] },
       saveConfirmation: {
         requiresConfirmation: true,
         message: "保存后只影响后续展示和新订单，已产生订单保持原快照。"
@@ -3833,7 +4719,7 @@ class BackendServices {
     canViewPlaintext?: boolean;
     canExportPlaintext?: boolean;
   } = {}) {
-    const codes = this.store.rightsCodes.filter((code) => code.productId === productId || code.agentProductId === productId);
+    const codes = this.store.rightsCodes.filter((code) => code.productId === productId || code.merchantProductListingId === productId);
     const available = codes.filter((code) => code.status === "available").length;
     const issued = codes.filter((code) => code.status === "issued").length;
     const voided = codes.filter((code) => code.status === "voided").length;
@@ -3868,11 +4754,11 @@ class BackendServices {
   }
 
   private assertSafeOwnFulfillmentModeChange(ownProductId: string, nextMode: "manual" | "code_pool") {
-    const agentProduct = [...this.store.agentProducts.values()].find((product) => product.ownProductReviewId === ownProductId);
-    if (!agentProduct || nextMode === "code_pool") return;
-    const hasCodes = this.store.rightsCodes.some((code) => (code.agentProductId ?? code.productId) === agentProduct.id);
+    const merchantProductListing = [...this.store.merchantProductListings.values()].find((product) => product.ownProductReviewId === ownProductId);
+    if (!merchantProductListing || nextMode === "code_pool") return;
+    const hasCodes = this.store.rightsCodes.some((code) => (code.merchantProductListingId ?? code.productId) === merchantProductListing.id);
     const hasActiveOrders = [...this.store.orders.values()].some((order) =>
-      order.agentProductId === agentProduct.id
+      order.merchantProductListingId === merchantProductListing.id
       && !["refunded", "closed"].includes(order.status)
       && order.fulfillmentStatus !== "not_started"
     );
@@ -3881,7 +4767,7 @@ class BackendServices {
     }
   }
 
-  private serializeAgentOrderForActor(actor: AgentActor, order: DemoOrder) {
+  private serializeMerchantOrderForActor(actor: MerchantActor, order: DemoOrder) {
     const channel = getChannelSnapshot(order.snapshot);
     const settlementBasisAmountCents = order.snapshot.amountSnapshot.paidAmountCents;
     const buyerPaidAmountCents = payableAmount(order);
@@ -3899,43 +4785,44 @@ class BackendServices {
       couponDiscountCents: order.couponDiscountCents ?? 0n,
       productName: order.snapshot.productNameSnapshot,
       quantity: order.snapshot.quantity,
-      collectionChannel: order.collectionChannelSnapshot ? {
-        id: order.collectionChannelSnapshot.id,
-        channelType: order.collectionChannelSnapshot.channelType,
-        displayName: order.collectionChannelSnapshot.displayName
+      collectionPaymentMethod: order.collectionPaymentSnapshot ? {
+        id: order.collectionPaymentSnapshot.id,
+        paymentType: order.collectionPaymentSnapshot.channelType,
+        displayName: order.collectionPaymentSnapshot.displayName
       } : undefined
     };
     if (!channel) {
       result.visibleSupplyPriceCents = order.snapshot.amountSnapshot.supplyAmountCents;
-      result.visibleIncomeCents = order.snapshot.amountSnapshot.agentExpectedIncomeCents;
+      result.visibleIncomeCents = order.snapshot.amountSnapshot.merchantExpectedIncomeCents;
       return result;
     }
-    if (actor.agentId === channel.firstTierAgentId) {
+    if (actor.merchantId === channel.firstTierMerchantId) {
       result.platformSupplyPriceCents = channel.platformSupplyPriceCents;
       result.firstTierSupplyPriceCents = channel.firstTierSupplyPriceCents;
       result.visibleIncomeCents = channel.firstTierIncomeCents;
-    } else if (actor.agentId === channel.secondTierAgentId) {
+    } else if (actor.merchantId === channel.secondTierMerchantId) {
       result.firstTierSupplyPriceCents = channel.firstTierSupplyPriceCents;
       result.secondTierSupplyPriceCents = channel.secondTierSupplyPriceCents;
       result.visibleIncomeCents = channel.secondTierIncomeCents;
-    } else if (actor.agentId === channel.thirdTierAgentId) {
+    } else if (actor.merchantId === channel.thirdTierMerchantId) {
       result.secondTierSupplyPriceCents = channel.secondTierSupplyPriceCents;
       result.visibleIncomeCents = channel.thirdTierIncomeCents;
     }
     return result;
   }
 
-  private serializePublicAgentProduct(agentProduct: DemoAgentProduct) {
-    const product = agentProduct.platformProductId
-      ? this.store.platformProducts.get(agentProduct.platformProductId)
-      : this.store.ownProducts.get(required(agentProduct.ownProductReviewId, "ownProductReviewId"));
+  private serializePublicMerchantProduct(merchantProductListing: DemoMerchantProductListing) {
+    const sourceProduct = merchantProductListing.platformProductId
+      ? this.store.platformProducts.get(merchantProductListing.platformProductId)
+      : this.store.ownProducts.get(required(merchantProductListing.ownProductReviewId, "ownProductReviewId"));
+    const product = this.productWithMerchantDisplayOverrides(merchantProductListing, sourceProduct);
     return {
-      id: agentProduct.id,
-      shopId: agentProduct.shopId,
-      productType: agentProduct.productType,
-      salePriceCents: agentProduct.salePriceCents,
-      status: agentProduct.status,
-      groupName: agentProduct.groupName,
+      id: merchantProductListing.id,
+      shopId: merchantProductListing.shopId,
+      productType: merchantProductListing.productType,
+      salePriceCents: merchantProductListing.salePriceCents,
+      status: merchantProductListing.status,
+      groupName: merchantProductListing.groupName,
       product: product ? {
         id: product.id,
         name: product.name,
@@ -3949,10 +4836,11 @@ class BackendServices {
         detailSections: product.detailSections,
         stockCount: product.stockCount,
         soldCount: product.soldCount,
-        ...(agentProduct.platformProductId ? {
-          displayBadge: (product as DemoPlatformProduct).displayBadge,
-          isRecommended: (product as DemoPlatformProduct).isRecommended,
-          displaySort: (product as DemoPlatformProduct).displaySort
+        ...(merchantProductListing.platformProductId ? {
+          platformProductId: merchantProductListing.platformProductId,
+          displayBadge: (sourceProduct as DemoPlatformProduct).displayBadge,
+          isRecommended: (sourceProduct as DemoPlatformProduct).isRecommended,
+          displaySort: (sourceProduct as DemoPlatformProduct).displaySort
         } : {}),
         fulfillmentRule: product.fulfillmentRule,
         afterSaleRule: product.afterSaleRule,
@@ -4015,13 +4903,14 @@ class BackendServices {
       orderNo: order.orderNo,
       userId: order.userId,
       shopId: order.shopId,
-      agentProductId: order.agentProductId,
+      merchantProductListingId: order.merchantProductListingId,
       salesChannelType: order.salesChannelType,
       status: order.status,
       paymentStatus: order.paymentStatus,
       fulfillmentStatus: order.fulfillmentStatus,
       refundStatus: order.refundStatus,
       buyerEmail: options.includeBuyerContact ? order.buyerEmail : undefined,
+      buyerPhone: options.includeBuyerContact ? order.buyerPhone : undefined,
       purchasePasswordSet: order.extractionCodeSet,
       paidAt: order.paidAt,
       fulfilledAt: order.fulfilledAt,
@@ -4042,7 +4931,7 @@ class BackendServices {
       customerServiceNote: (order.snapshot.shopSnapshot as { customerServiceNote?: string }).customerServiceNote,
       fulfillmentMode: fulfillmentMode(order.snapshot),
       delivery: this.serializeDelivery(order, options),
-      collectionChannel: order.collectionChannelSnapshot,
+      collectionPaymentMethod: order.collectionPaymentSnapshot,
       paymentSnapshot: order.paymentSnapshot,
       snapshot: {
         productType: order.snapshot.productType
@@ -4052,6 +4941,7 @@ class BackendServices {
 
   private serializeDelivery(order: DemoOrder, options: { includeDeliveryCodes?: boolean; includeBuyerContact?: boolean }) {
     const mode = fulfillmentMode(order.snapshot);
+    const emailDelivery = this.latestEmailDeliveryForOrder(order.orderNo);
     if (mode !== "code_pool") {
       const instruction = manualFulfillmentInstruction(order.snapshot.fulfillmentRuleSnapshot);
       return {
@@ -4077,48 +4967,69 @@ class BackendServices {
       mode: "automatic",
       status: order.fulfillmentStatus,
       buyerEmail: options.includeBuyerContact ? order.buyerEmail : undefined,
+      buyerPhone: options.includeBuyerContact ? order.buyerPhone : undefined,
       purchasePasswordSet: order.extractionCodeSet,
       extractable: Boolean(order.extractionCodeSet) && order.paymentStatus === "paid" && order.fulfillmentStatus === "success" && order.refundStatus === "none",
       extractionToken: Boolean(order.extractionCodeSet) ? this.extractionTokenForOrder(order) : undefined,
+      emailDelivery: options.includeBuyerContact && order.buyerEmail ? emailDelivery ? {
+        id: emailDelivery.id,
+        status: emailDelivery.status,
+        reason: emailDelivery.reason,
+        codeCount: emailDelivery.codeCount,
+        source: emailDelivery.source,
+        createdAt: emailDelivery.createdAt
+      } : {
+        status: "pending",
+        reason: order.paymentStatus === "paid" ? "EMAIL_DELIVERY_PENDING" : "WAITING_PAYMENT_CONFIRMATION",
+        codeCount: 0
+      } : undefined,
       codes: !order.extractionCodeSet && options.includeBuyerContact && order.paymentStatus === "paid" && order.fulfillmentStatus === "success" && order.refundStatus === "none" ? codes : [],
       message: codes.length > 0 ? "卡密已自动发放，请使用购买时设置的购买密码查看。" : "付款后系统会自动发放卡密。"
     };
   }
 
-  private serializeUserCoupon(coupon: UserCoupon, input: { shopId?: string; agentProductId?: string }) {
+  private latestEmailDeliveryForOrder(orderNo: string) {
+    return this.store.emailDeliveries
+      .filter((delivery) => delivery.orderNo === orderNo)
+      .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())[0];
+  }
+
+  private serializeUserCoupon(coupon: UserCoupon, input: { shopId?: string; merchantProductListingId?: string }) {
     const template = this.store.couponTemplates.get(coupon.templateId);
     const visible = Boolean(template) && coupon.status !== "voided";
     return {
       ...coupon,
       template,
       visible,
-      applicable: template && input.agentProductId
-        ? this.couponAppliesToProduct(template, input.agentProductId)
+      applicable: template && input.merchantProductListingId
+        ? this.couponAppliesToProduct(template, input.merchantProductListingId)
         : true
     };
   }
 
-  private serializePublicCollectionChannel(channel: CollectionChannel) {
-    return {
-      id: channel.id,
-      shopId: channel.shopId,
-      ownerType: channel.ownerType,
-      channelType: channel.channelType,
-      displayName: channel.displayName,
-      accountName: channel.accountName,
-      qrUrl: channel.qrUrl,
-      paymentUrl: channel.paymentUrl,
-      isDefault: channel.isDefault,
-      sortOrder: channel.sortOrder,
-      singleOrderLimitCents: channel.singleOrderLimitCents
-    };
+  private knownUserIds() {
+    const userIds = new Set<string>();
+    for (const merchant of this.store.merchants.values()) userIds.add(merchant.userId);
+    for (const application of this.store.merchantApplications.values()) userIds.add(application.userId);
+    for (const order of this.store.orders.values()) userIds.add(order.userId);
+    for (const coupon of this.store.userCoupons.values()) userIds.add(coupon.userId);
+    for (const wallet of this.store.userWallets.values()) userIds.add(wallet.userId);
+    return Array.from(userIds);
   }
 
-  private listVisibleUpstreamProducts(actor: AgentActor) {
+  private resolveCouponGrantUserId(input: { userId?: string; phone?: string }) {
+    const userId = input.userId?.trim();
+    if (userId) return userId;
+    const phone = input.phone?.replace(/[^\d+]/g, "");
+    if (phone) return `h5-phone-${phone}`;
+    throw new ApiError(400, "COUPON_GRANT_TARGET_REQUIRED", "userId or phone is required");
+  }
+
+  private listVisibleUpstreamProducts(actor: MerchantActor) {
     const visibleProductIds = new Set<string>();
     for (const relation of this.store.channelRelations) {
       if (relation.status !== "active") continue;
-      if (relation.secondTierAgentId === actor.agentId || relation.thirdTierAgentId === actor.agentId) {
+      if (relation.secondTierMerchantId === actor.merchantId || relation.thirdTierMerchantId === actor.merchantId) {
         for (const offer of this.store.channelProductOffers.filter((item) => item.channelRelationId === relation.id && item.status === "listed")) {
           visibleProductIds.add(offer.platformProductId);
         }
@@ -4128,22 +5039,44 @@ class BackendServices {
       .map((productId) => this.store.platformProducts.get(productId))
       .filter((product): product is DemoPlatformProduct => Boolean(product))
       .map((product) => {
-        const visibility = this.priceVisibilityForAgent(actor.agentId, product.id);
+        const visibility = this.priceVisibilityForMerchant(actor.merchantId, product.id);
+        const upstreamMerchantProduct = this.upstreamMerchantProductForActor(actor.merchantId, product.id);
+        const displayProduct = this.productWithMerchantDisplayOverrides(upstreamMerchantProduct ?? {
+          id: "",
+          merchantId: "",
+          shopId: "",
+          productType: "platform",
+          platformProductId: product.id,
+          ownProductReviewId: null,
+          salePriceCents: product.suggestedSalePriceCents,
+          status: "listed"
+        }, product) as DemoPlatformProduct;
+        const suggestedSalePriceCents = maxBigInt([
+          product.suggestedSalePriceCents,
+          upstreamMerchantProduct?.salePriceCents,
+          visibility.visibleUpstreamSupplyPriceCents
+        ]);
+        const minSalePriceCents = maxBigInt([
+          product.minSalePriceCents,
+          visibility.visibleUpstreamSupplyPriceCents
+        ]);
         return {
           id: product.id,
-          name: product.name,
-          category: product.category,
-          tags: product.tags,
-          subtitle: product.subtitle,
-          description: product.description,
-          usageGuide: product.usageGuide,
-          imageUrl: product.imageUrl,
-          specs: product.specs,
-          detailSections: product.detailSections,
+          name: displayProduct.name,
+          category: displayProduct.category,
+          tags: displayProduct.tags,
+          subtitle: displayProduct.subtitle,
+          description: displayProduct.description,
+          usageGuide: displayProduct.usageGuide,
+          imageUrl: displayProduct.imageUrl,
+          specs: displayProduct.specs,
+          detailSections: displayProduct.detailSections,
+          sourceName: product.name,
+          upstreamMerchantProductId: upstreamMerchantProduct?.id,
           stockCount: product.stockCount,
           soldCount: product.soldCount,
-          minSalePriceCents: product.minSalePriceCents,
-          suggestedSalePriceCents: product.suggestedSalePriceCents,
+          minSalePriceCents,
+          suggestedSalePriceCents,
           fulfillmentRule: product.fulfillmentRule,
           afterSaleRule: product.afterSaleRule,
           status: product.status,
@@ -4153,9 +5086,9 @@ class BackendServices {
       });
   }
 
-  private platformSelectionPricingForActor(actor: AgentActor, platformProductId: string) {
+  private platformSelectionPricingForActor(actor: MerchantActor, platformProductId: string) {
     const product = requireEntity(this.store.platformProducts.get(platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
-    const tier = this.agentTier(actor.agentId);
+    const tier = this.merchantTier(actor.merchantId);
     if (tier === "first_tier") {
       return {
         product,
@@ -4163,7 +5096,7 @@ class BackendServices {
         minSalePriceCents: product.minSalePriceCents
       };
     }
-    const visibility = this.priceVisibilityForAgent(actor.agentId, platformProductId);
+    const visibility = this.priceVisibilityForMerchant(actor.merchantId, platformProductId);
     if (visibility.visibleUpstreamSupplyPriceCents === undefined) {
       throw new ApiError(404, "RESOURCE_NOT_FOUND", "platform product is not available to current merchant");
     }
@@ -4176,10 +5109,10 @@ class BackendServices {
     };
   }
 
-  private priceVisibilityForAgent(agentId: string, platformProductId?: string | null) {
+  private priceVisibilityForMerchant(merchantId: string, platformProductId?: string | null) {
     if (!platformProductId) return {};
     const product = this.store.platformProducts.get(platformProductId);
-    const firstTierRelation = this.store.channelRelations.find((relation) => relation.status === "active" && relation.firstTierAgentId === agentId && !relation.thirdTierAgentId);
+    const firstTierRelation = this.store.channelRelations.find((relation) => relation.status === "active" && relation.firstTierMerchantId === merchantId && !relation.thirdTierMerchantId);
     if (firstTierRelation && product) {
       const firstOffer = this.store.channelProductOffers.find((offer) => offer.channelRelationId === firstTierRelation.id && offer.platformProductId === platformProductId && offer.status === "listed");
       return {
@@ -4188,13 +5121,13 @@ class BackendServices {
         ownTransferSupplyPriceCents: firstOffer?.resellSupplyPriceCents
       };
     }
-    const secondTierRelation = this.store.channelRelations.find((relation) => relation.status === "active" && relation.secondTierAgentId === agentId && !relation.thirdTierAgentId);
-    const thirdTierRelation = this.store.channelRelations.find((relation) => relation.status === "active" && relation.thirdTierAgentId === agentId);
+    const secondTierRelation = this.store.channelRelations.find((relation) => relation.status === "active" && relation.secondTierMerchantId === merchantId && !relation.thirdTierMerchantId);
+    const thirdTierRelation = this.store.channelRelations.find((relation) => relation.status === "active" && relation.thirdTierMerchantId === merchantId);
     if (secondTierRelation) {
       const firstOffer = this.store.channelProductOffers.find((offer) => offer.channelRelationId === secondTierRelation.id && offer.platformProductId === platformProductId && offer.status === "listed");
       const secondOffer = this.store.channelProductOffers.find((offer) => {
         const relation = this.store.channelRelations.find((candidate) => candidate.id === offer.channelRelationId);
-        return relation?.secondTierAgentId === agentId && relation.thirdTierAgentId && offer.platformProductId === platformProductId && offer.status === "listed";
+        return relation?.secondTierMerchantId === merchantId && relation.thirdTierMerchantId && offer.platformProductId === platformProductId && offer.status === "listed";
       });
       return {
         canSeePlatformSupplyPrice: false,
@@ -4212,12 +5145,23 @@ class BackendServices {
     return product ? { canSeePlatformSupplyPrice: true, platformSupplyPriceCents: product.supplyPriceCents } : {};
   }
 
-  private findDirectDownstreamRelation(upstreamAgentId: string, downstreamAgentId: string) {
+  private upstreamMerchantProductForActor(merchantId: string, platformProductId: string) {
+    const relation = this.findActiveChannelRelationForSellingMerchant(merchantId);
+    if (!relation) return undefined;
+    const upstreamMerchantId = relation.thirdTierMerchantId === merchantId ? relation.secondTierMerchantId : relation.firstTierMerchantId;
+    return [...this.store.merchantProductListings.values()].find((product) =>
+      product.merchantId === upstreamMerchantId
+      && product.platformProductId === platformProductId
+      && product.status === "listed"
+    );
+  }
+
+  private findDirectDownstreamRelation(upstreamMerchantId: string, downstreamMerchantId: string) {
     return this.store.channelRelations.find((relation) =>
       relation.status === "active"
       && (
-        (!relation.thirdTierAgentId && relation.firstTierAgentId === upstreamAgentId && relation.secondTierAgentId === downstreamAgentId)
-        || (relation.thirdTierAgentId === downstreamAgentId && relation.secondTierAgentId === upstreamAgentId)
+        (!relation.thirdTierMerchantId && relation.firstTierMerchantId === upstreamMerchantId && relation.secondTierMerchantId === downstreamMerchantId)
+        || (relation.thirdTierMerchantId === downstreamMerchantId && relation.secondTierMerchantId === upstreamMerchantId)
       )
     );
   }
@@ -4249,34 +5193,34 @@ class BackendServices {
     return Boolean(productId && template.productIds.includes(productId));
   }
 
-  private couponAppliesToProduct(template: CouponTemplate, agentProductId: string) {
+  private couponAppliesToProduct(template: CouponTemplate, merchantProductListingId: string) {
     if (template.productIds.length === 0) return true;
-    const agentProduct = this.store.agentProducts.get(agentProductId);
-    const shopProduct = this.store.platformShopProducts.get(agentProductId);
-    const productId = agentProduct?.platformProductId ?? shopProduct?.platformProductId;
+    const merchantProductListing = this.store.merchantProductListings.get(merchantProductListingId);
+    const shopProduct = this.store.platformShopProducts.get(merchantProductListingId);
+    const productId = merchantProductListing?.platformProductId ?? shopProduct?.platformProductId;
     return Boolean(productId && template.productIds.includes(productId));
   }
 
   private createClawback(order: DemoOrder, amountCents: bigint, sourceType: string, sourceId: string) {
     const balances = {
-      pendingIncomeCents: this.store.pendingIncomeByAgent.get(order.agentId) ?? 0n,
-      payableIncomeCents: this.store.payableIncomeByAgent.get(order.agentId) ?? 0n,
-      depositAvailableCents: this.store.depositAccounts.get(order.agentId)?.availableAmountCents ?? 0n
+      pendingIncomeCents: this.store.pendingIncomeByMerchant.get(order.merchantId) ?? 0n,
+      payableIncomeCents: this.store.payableIncomeByMerchant.get(order.merchantId) ?? 0n,
+      depositAvailableCents: this.store.depositAccounts.get(order.merchantId)?.availableAmountCents ?? 0n
     };
     const result = applyClawback(amountCents, balances);
-    this.store.pendingIncomeByAgent.set(order.agentId, result.balances.pendingIncomeCents);
-    this.store.payableIncomeByAgent.set(order.agentId, result.balances.payableIncomeCents);
+    this.store.pendingIncomeByMerchant.set(order.merchantId, result.balances.pendingIncomeCents);
+    this.store.payableIncomeByMerchant.set(order.merchantId, result.balances.payableIncomeCents);
     this.applyPayableClawbackToOpenSettlement(order, result.deductions);
-    const deposit = this.store.depositAccounts.get(order.agentId);
+    const deposit = this.store.depositAccounts.get(order.merchantId);
     if (deposit) {
       deposit.availableAmountCents = result.balances.depositAvailableCents;
       deposit.status = shouldRestrictForDeposit(deposit) ? "insufficient" : deposit.status;
-      const agent = this.store.agents.get(order.agentId);
-      if (agent && shouldRestrictForDeposit(deposit)) agent.depositStatus = "insufficient";
+      const merchant = this.store.merchants.get(order.merchantId);
+      if (merchant && shouldRestrictForDeposit(deposit)) merchant.depositStatus = "insufficient";
     }
     const clawback = {
       clawbackNo: nextId(this.store, "clawback"),
-      agentId: order.agentId,
+      merchantId: order.merchantId,
       orderNo: order.orderNo,
       sourceType,
       sourceId,
@@ -4288,13 +5232,14 @@ class BackendServices {
   }
 
   private tryAutoFulfillWithRightsCode(order: DemoOrder) {
-    const agentProduct = this.store.agentProducts.get(order.agentProductId);
-    const shopProduct = this.store.platformShopProducts.get(order.agentProductId);
-    const productId = agentProduct?.platformProductId ?? shopProduct?.platformProductId;
+    this.releaseExpiredRightsCodeLocks();
+    const merchantProductListing = this.store.merchantProductListings.get(order.merchantProductListingId);
+    const shopProduct = this.store.platformShopProducts.get(order.merchantProductListingId);
+    const productId = merchantProductListing?.platformProductId ?? shopProduct?.platformProductId;
     const product = productId ? this.store.platformProducts.get(productId) : undefined;
-    const ownProduct = agentProduct?.ownProductReviewId ? this.store.ownProducts.get(agentProduct.ownProductReviewId) : undefined;
+    const ownProduct = merchantProductListing?.ownProductReviewId ? this.store.ownProducts.get(merchantProductListing.ownProductReviewId) : undefined;
     const fulfillmentOwner = product ?? ownProduct;
-    const inventoryProductId = product?.id ?? (ownProduct && agentProduct ? agentProduct.id : undefined);
+    const inventoryProductId = product?.id ?? (ownProduct && merchantProductListing ? merchantProductListing.id : undefined);
     const rule = fulfillmentOwner?.fulfillmentRule;
     if (!isRecord(rule) || rule.mode !== "code_pool" || !fulfillmentOwner || !inventoryProductId) return;
     const quantity = order.snapshot.quantity;
@@ -4307,15 +5252,20 @@ class BackendServices {
       return;
     }
     const remainingQuantity = quantity - issuedForOrder.length;
-    const codes = this.store.rightsCodes
+    const lockedForOrder = this.store.rightsCodes
+      .filter((item) => item.productId === inventoryProductId && item.status === "locked" && item.orderNo === order.orderNo);
+    const additionalNeeded = Math.max(0, remainingQuantity - lockedForOrder.length);
+    const additionalCodes = this.store.rightsCodes
       .filter((item) => item.productId === inventoryProductId && item.status === "available")
+      .slice(0, additionalNeeded);
+    const codes = [...lockedForOrder, ...additionalCodes]
       .slice(0, remainingQuantity);
     if (codes.length < remainingQuantity) {
       order.fulfillmentStatus = "failed";
       order.status = "fulfillment_failed";
       order.settlementStatus = "frozen";
       if (order.salesChannelType !== "platform_self_operated") {
-        this.notify(order.agentId, "stock.empty", "权益码库存不足", `${fulfillmentOwner.name} 库存不足，订单 ${order.orderNo} 已冻结结算。`);
+        this.notify(order.merchantId, "stock.empty", "权益码库存不足", `${fulfillmentOwner.name} 库存不足，订单 ${order.orderNo} 已冻结结算。`);
       }
       return;
     }
@@ -4335,14 +5285,66 @@ class BackendServices {
       attemptCount: 1
     });
     if (order.salesChannelType !== "platform_self_operated") {
-      this.notify(order.agentId, "order.auto_fulfilled", "订单已自动履约", `${order.orderNo} 已从权益码池自动发放。`);
+      this.notify(order.merchantId, "order.auto_fulfilled", "订单已自动履约", `${order.orderNo} 已从权益码池自动发放。`);
     }
     this.recordEmailDelivery(order, codes);
     this.audit("system", "fulfillment.auto_code_pool", "order", order.orderNo, { codeIds: codes.map((code) => code.codeId) });
   }
 
+  private reserveRightsCodesForOrder(order: DemoOrder) {
+    const inventory = this.resolveRightsCodeInventoryForOrder(order);
+    if (!inventory) return;
+    const { inventoryProductId, fulfillmentOwner } = inventory;
+    const alreadyLocked = this.store.rightsCodes.filter((code) =>
+      code.productId === inventoryProductId && code.status === "locked" && code.orderNo === order.orderNo
+    );
+    const needed = order.snapshot.quantity - alreadyLocked.length;
+    if (needed <= 0) return;
+    const codes = this.store.rightsCodes
+      .filter((code) => code.productId === inventoryProductId && code.status === "available")
+      .slice(0, needed);
+    if (codes.length < needed) {
+      throw new ApiError(400, "RIGHTS_CODE_STOCK_INSUFFICIENT", `${fulfillmentOwner.name} 库存不足，暂时无法下单`);
+    }
+    const now = new Date();
+    for (const [index, code] of codes.entries()) {
+      code.status = "locked";
+      code.orderNo = order.orderNo;
+      code.issueKey = `lock:${order.orderNo}:${alreadyLocked.length + index + 1}`;
+      code.issuedAt = now;
+    }
+  }
+
+  private releaseExpiredRightsCodeLocks(now = new Date()) {
+    const lockTtlMs = 15 * 60 * 1000;
+    for (const code of this.store.rightsCodes) {
+      if (code.status !== "locked" || !code.orderNo) continue;
+      const order = this.store.orders.get(code.orderNo);
+      const lockedAt = code.issuedAt ?? code.createdAt;
+      const expired = now.getTime() - lockedAt.getTime() > lockTtlMs;
+      if (order?.paymentStatus === "paid" || !expired) continue;
+      code.status = "available";
+      code.orderNo = undefined;
+      code.issueKey = undefined;
+      code.issuedAt = undefined;
+    }
+  }
+
+  private resolveRightsCodeInventoryForOrder(order: DemoOrder) {
+    const merchantProductListing = this.store.merchantProductListings.get(order.merchantProductListingId);
+    const shopProduct = this.store.platformShopProducts.get(order.merchantProductListingId);
+    const productId = merchantProductListing?.platformProductId ?? shopProduct?.platformProductId;
+    const product = productId ? this.store.platformProducts.get(productId) : undefined;
+    const ownProduct = merchantProductListing?.ownProductReviewId ? this.store.ownProducts.get(merchantProductListing.ownProductReviewId) : undefined;
+    const fulfillmentOwner = product ?? ownProduct;
+    const inventoryProductId = product?.id ?? (ownProduct && merchantProductListing ? merchantProductListing.id : undefined);
+    const rule = fulfillmentOwner?.fulfillmentRule;
+    if (!isRecord(rule) || rule.mode !== "code_pool" || !fulfillmentOwner || !inventoryProductId) return undefined;
+    return { fulfillmentOwner, inventoryProductId };
+  }
+
   private confirmCollectedPayment(input: {
-    actor: "agent" | "admin";
+    actor: "merchant" | "admin";
     operatorId: string;
     auditRole: string;
     order: DemoOrder;
@@ -4351,8 +5353,8 @@ class BackendServices {
     note?: string;
   }) {
     const expectedAmount = payableAmount(input.order);
-    if (input.order.paymentSnapshot?.provider && input.order.paymentSnapshot.provider !== "personal_alipay") {
-      throw new ApiError(400, "MANUAL_CONFIRM_NOT_ALLOWED", "only personal alipay orders can be manually confirmed");
+    if (input.order.paymentSnapshot?.provider && !isManualPaymentProvider(input.order.paymentSnapshot.provider)) {
+      throw new ApiError(400, "MANUAL_CONFIRM_NOT_ALLOWED", "only personal payment orders can be manually confirmed");
     }
     if (input.amountCents !== expectedAmount) {
       throw new ApiError(400, "AMOUNT_MISMATCH", "offline payment amount does not match order amount");
@@ -4403,7 +5405,7 @@ class BackendServices {
       const deducted = item.settleAmountCents > payableDeductionCents ? payableDeductionCents : item.settleAmountCents;
       item.deductedCents += deducted;
       item.settleAmountCents -= deducted;
-      sheet.totalAgentIncomeCents -= deducted;
+      sheet.totalMerchantIncomeCents -= deducted;
       payableDeductionCents -= deducted;
       if (payableDeductionCents === 0n) return;
     }
@@ -4412,23 +5414,23 @@ class BackendServices {
   private addChannelPendingIncome(order: DemoOrder) {
     const channel = getChannelSnapshot(order.snapshot);
     if (!channel) return;
-    this.store.pendingIncomeByAgent.set(
-      channel.firstTierAgentId,
-      (this.store.pendingIncomeByAgent.get(channel.firstTierAgentId) ?? 0n) + channel.firstTierIncomeCents
+    this.store.pendingIncomeByMerchant.set(
+      channel.firstTierMerchantId,
+      (this.store.pendingIncomeByMerchant.get(channel.firstTierMerchantId) ?? 0n) + channel.firstTierIncomeCents
     );
-    if (channel.thirdTierAgentId && channel.secondTierIncomeCents > 0n) {
-      this.store.pendingIncomeByAgent.set(
-        channel.secondTierAgentId,
-        (this.store.pendingIncomeByAgent.get(channel.secondTierAgentId) ?? 0n) + channel.secondTierIncomeCents
+    if (channel.thirdTierMerchantId && channel.secondTierIncomeCents > 0n) {
+      this.store.pendingIncomeByMerchant.set(
+        channel.secondTierMerchantId,
+        (this.store.pendingIncomeByMerchant.get(channel.secondTierMerchantId) ?? 0n) + channel.secondTierIncomeCents
       );
     }
   }
 
   private createInviteCode(input: {
     code?: string;
-    issuerType: "platform" | "agent";
-    issuerAgentId?: string;
-    targetTier: AgentTier;
+    issuerType: "platform" | "merchant";
+    issuerMerchantId?: string;
+    targetTier: MerchantTier;
     maxUses?: number;
     expiresAt?: Date | null;
     createdBy: string;
@@ -4445,9 +5447,9 @@ class BackendServices {
     if (input.issuerType === "platform" && (input.depositRequiredAmountCents === undefined || input.depositRequiredAmountCents <= 0n)) {
       throw new ApiError(400, "DEPOSIT_REQUIREMENT_MISSING", "platform invite requires deposit amount");
     }
-    if (input.issuerType === "agent") {
-      const issuer = requireEntity(input.issuerAgentId ? this.store.agents.get(input.issuerAgentId) : undefined, "RESOURCE_NOT_FOUND", "issuer agent not found");
-      const issuerTier = this.agentTier(issuer.id);
+    if (input.issuerType === "merchant") {
+      const issuer = requireEntity(input.issuerMerchantId ? this.store.merchants.get(input.issuerMerchantId) : undefined, "RESOURCE_NOT_FOUND", "issuer merchant not found");
+      const issuerTier = this.merchantTier(issuer.id);
       if (issuerTier === "first_tier" && input.targetTier !== "second_tier") throw new ApiError(400, "INVITE_RULE_FAILED", "first-tier invite must target second tier");
       if (issuerTier === "second_tier" && input.targetTier !== "third_tier") throw new ApiError(400, "INVITE_RULE_FAILED", "second-tier invite must target third tier");
       if (issuerTier === "third_tier") throw new ApiError(400, "FOURTH_TIER_FORBIDDEN", "third-tier merchants cannot create fourth-tier invite codes");
@@ -4457,7 +5459,7 @@ class BackendServices {
       code,
       codeHash,
       issuerType: input.issuerType,
-      issuerAgentId: input.issuerAgentId,
+      issuerMerchantId: input.issuerMerchantId,
       targetTier: input.targetTier,
       status: "active",
       maxUses: input.maxUses ?? null,
@@ -4482,8 +5484,8 @@ class BackendServices {
       throw new ApiError(400, "INVITE_CODE_INVALID", "invite code has been used up");
     }
     if (invite.targetTier === "third_tier") {
-      const issuer = requireEntity(invite.issuerAgentId ? this.store.agents.get(invite.issuerAgentId) : undefined, "INVITE_CODE_INVALID", "issuer not found");
-      if (this.agentTier(issuer.id) !== "second_tier") throw new ApiError(400, "FOURTH_TIER_FORBIDDEN", "invalid third-tier invite issuer");
+      const issuer = requireEntity(invite.issuerMerchantId ? this.store.merchants.get(invite.issuerMerchantId) : undefined, "INVITE_CODE_INVALID", "issuer not found");
+      if (this.merchantTier(issuer.id) !== "second_tier") throw new ApiError(400, "FOURTH_TIER_FORBIDDEN", "invalid third-tier invite issuer");
     }
   }
 
@@ -4494,68 +5496,68 @@ class BackendServices {
     ));
   }
 
-  private depositRequirementForAgentInvite(agentId: string) {
-    const account = requireEntity(this.store.depositAccounts.get(agentId), "RESOURCE_NOT_FOUND", "deposit account not found");
+  private depositRequirementForMerchantInvite(merchantId: string) {
+    const account = requireEntity(this.store.depositAccounts.get(merchantId), "RESOURCE_NOT_FOUND", "deposit account not found");
     if (account.requiredAmountCents <= 0n) {
       throw new ApiError(400, "DEPOSIT_REQUIREMENT_MISSING", "issuer deposit requirement is missing");
     }
     return account.requiredAmountCents;
   }
 
-  private createPendingRelationForInvite(invite: InviteCode, childAgentId: string) {
+  private createPendingRelationForInvite(invite: InviteCode, childMerchantId: string) {
     if (invite.targetTier === "first_tier") return;
-    const parentAgentId = required(invite.issuerAgentId, "issuerAgentId");
+    const parentMerchantId = required(invite.issuerMerchantId, "issuerMerchantId");
     if (invite.targetTier === "second_tier") {
       this.store.channelRelations.push({
         id: nextId(this.store, "channel-rel"),
-        firstTierAgentId: parentAgentId,
-        secondTierAgentId: childAgentId,
+        firstTierMerchantId: parentMerchantId,
+        secondTierMerchantId: childMerchantId,
         status: "pending_review",
         reason: "invite_registration",
         reviewedAt: null,
-        activeUniqueKey: `second-tier:${childAgentId}`
+        activeUniqueKey: `second-tier:${childMerchantId}`
       });
       return;
     }
     const upstream = requireEntity(
-      this.store.channelRelations.find((relation) => relation.status === "active" && !relation.thirdTierAgentId && relation.secondTierAgentId === parentAgentId),
+      this.store.channelRelations.find((relation) => relation.status === "active" && !relation.thirdTierMerchantId && relation.secondTierMerchantId === parentMerchantId),
       "CHANNEL_RULE_FAILED",
       "second-tier issuer must have an active first-tier relation before inviting third tier"
     );
     this.store.channelRelations.push({
       id: nextId(this.store, "channel-rel"),
-      firstTierAgentId: upstream.firstTierAgentId,
-      secondTierAgentId: parentAgentId,
-      thirdTierAgentId: childAgentId,
+      firstTierMerchantId: upstream.firstTierMerchantId,
+      secondTierMerchantId: parentMerchantId,
+      thirdTierMerchantId: childMerchantId,
       status: "pending_review",
       reason: "invite_registration",
       reviewedAt: null,
-      activeUniqueKey: `third-tier:${childAgentId}`
+      activeUniqueKey: `third-tier:${childMerchantId}`
     });
   }
 
-  private activateEligibleInviteRelations(agentId: string) {
+  private activateEligibleInviteRelations(merchantId: string) {
     for (const relation of this.store.channelRelations) {
       if (relation.status !== "pending_deposit") continue;
-      if (relation.secondTierAgentId !== agentId && relation.thirdTierAgentId !== agentId) continue;
-      const second = this.store.agents.get(relation.secondTierAgentId);
-      const third = relation.thirdTierAgentId ? this.store.agents.get(relation.thirdTierAgentId) : undefined;
-      if (second?.status === "active" && (!relation.thirdTierAgentId || third?.status === "active")) {
+      if (relation.secondTierMerchantId !== merchantId && relation.thirdTierMerchantId !== merchantId) continue;
+      const second = this.store.merchants.get(relation.secondTierMerchantId);
+      const third = relation.thirdTierMerchantId ? this.store.merchants.get(relation.thirdTierMerchantId) : undefined;
+      if (second?.status === "active" && (!relation.thirdTierMerchantId || third?.status === "active")) {
         relation.status = "active";
         relation.reviewedAt = new Date();
       }
     }
   }
 
-  private agentTier(agentId: string): AgentTier {
-    const agent = requireEntity(this.store.agents.get(agentId), "RESOURCE_NOT_FOUND", "agent not found");
-    if (agent.tier) return agent.tier;
-    if (this.store.channelRelations.some((relation) => relation.status === "active" && relation.thirdTierAgentId === agentId)) return "third_tier";
-    if (this.store.channelRelations.some((relation) => relation.status === "active" && relation.secondTierAgentId === agentId)) return "second_tier";
+  private merchantTier(merchantId: string): MerchantTier {
+    const merchant = requireEntity(this.store.merchants.get(merchantId), "RESOURCE_NOT_FOUND", "merchant not found");
+    if (merchant.tier) return merchant.tier;
+    if (this.store.channelRelations.some((relation) => relation.status === "active" && relation.thirdTierMerchantId === merchantId)) return "third_tier";
+    if (this.store.channelRelations.some((relation) => relation.status === "active" && relation.secondTierMerchantId === merchantId)) return "second_tier";
     return "first_tier";
   }
 
-  private serializeInviteCode(invite: InviteCode, actor?: AgentActor) {
+  private serializeInviteCode(invite: InviteCode, actor?: MerchantActor) {
     return {
       id: invite.id,
       code: invite.code || undefined,
@@ -4567,24 +5569,24 @@ class BackendServices {
       depositRequiredAmountCents: invite.depositRequiredAmountCents,
       issuer: {
         type: invite.issuerType,
-        agentId: invite.issuerAgentId
+        merchantId: invite.issuerMerchantId
       },
       currentMerchantScope: actor ? {
-        agentId: actor.agentId,
+        merchantId: actor.merchantId,
         shopId: actor.shopId,
-        ownsInvite: invite.issuerAgentId === actor.agentId
+        ownsInvite: invite.issuerMerchantId === actor.merchantId
       } : undefined,
       createdAt: invite.createdAt
     };
   }
 
-  private findActiveChannelRelationForSellingAgent(agentId: string) {
-    return this.store.channelRelations.find((relation) => (relation.thirdTierAgentId === agentId || (!relation.thirdTierAgentId && relation.secondTierAgentId === agentId)) && relation.status === "active");
+  private findActiveChannelRelationForSellingMerchant(merchantId: string) {
+    return this.store.channelRelations.find((relation) => (relation.thirdTierMerchantId === merchantId || (!relation.thirdTierMerchantId && relation.secondTierMerchantId === merchantId)) && relation.status === "active");
   }
 
   private findFirstSecondRelationFor(relation: ChannelRelation) {
-    if (!relation.thirdTierAgentId) return relation;
-    return this.store.channelRelations.find((candidate) => candidate.status === "active" && !candidate.thirdTierAgentId && candidate.firstTierAgentId === relation.firstTierAgentId && candidate.secondTierAgentId === relation.secondTierAgentId);
+    if (!relation.thirdTierMerchantId) return relation;
+    return this.store.channelRelations.find((candidate) => candidate.status === "active" && !candidate.thirdTierMerchantId && candidate.firstTierMerchantId === relation.firstTierMerchantId && candidate.secondTierMerchantId === relation.secondTierMerchantId);
   }
 
   private firstSecondRelationFor(relation: ChannelRelation) {
@@ -4592,7 +5594,7 @@ class BackendServices {
   }
 
   private upstreamSupplyPriceForRelation(relation: ChannelRelation, platformProductId: string) {
-    if (!relation.thirdTierAgentId) {
+    if (!relation.thirdTierMerchantId) {
       const product = requireEntity(this.store.platformProducts.get(platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
       return product.supplyPriceCents;
     }
@@ -4604,14 +5606,14 @@ class BackendServices {
     ).resellSupplyPriceCents;
   }
 
-  private findShopByAgentId(agentId: string) {
-    return [...this.store.shops.values()].find((candidate) => candidate.agentId === agentId);
+  private findShopByMerchantId(merchantId: string) {
+    return [...this.store.shops.values()].find((candidate) => candidate.merchantId === merchantId);
   }
 
-  private addDepositTransaction(agentId: string, input: Omit<DepositTransaction, "transactionNo" | "agentId">) {
+  private addDepositTransaction(merchantId: string, input: Omit<DepositTransaction, "transactionNo" | "merchantId">) {
     const transaction: DepositTransaction = {
       transactionNo: nextId(this.store, "deposit-tx"),
-      agentId,
+      merchantId,
       ...input
     };
     this.store.depositTransactions.push(transaction);
@@ -4630,22 +5632,22 @@ class BackendServices {
     });
   }
 
-  private ledger(entryType: string, target: { orderNo?: string; agentId?: string }, amountCents: bigint, metadata: unknown) {
+  private ledger(entryType: string, target: { orderNo?: string; merchantId?: string }, amountCents: bigint, metadata: unknown) {
     this.store.ledgerEntries.push({
       ledgerNo: nextId(this.store, "ledger"),
       entryType,
       orderNo: target.orderNo,
-      agentId: target.agentId,
+      merchantId: target.merchantId,
       amountCents,
       metadata,
       createdAt: new Date()
     });
   }
 
-  private notify(agentId: string, type: string, title: string, content: string) {
+  private notify(merchantId: string, type: string, title: string, content: string) {
     const notification: NotificationItem = {
       id: nextId(this.store, "notice"),
-      agentId,
+      merchantId,
       type,
       title,
       content,
@@ -4721,14 +5723,47 @@ class BackendServices {
     return this.store.extractLogs;
   }
 
-  private isSecondTierSupplier(agentId: string) {
-    return this.store.channelRelations.some((relation) => relation.status === "active" && relation.secondTierAgentId === agentId && relation.thirdTierAgentId);
+  private isSecondTierSupplier(merchantId: string) {
+    return this.store.channelRelations.some((relation) => relation.status === "active" && relation.secondTierMerchantId === merchantId && relation.thirdTierMerchantId);
   }
 
-  private assertAgentDepositConfirmed(agentId: string, action: string) {
-    const account = requireEntity(this.store.depositAccounts.get(agentId), "RESOURCE_NOT_FOUND", "deposit account not found");
+  private resolveShop(shopIdentifier: string): DemoShop | undefined {
+    const normalized = normalizeShopIdentifier(shopIdentifier);
+    if (!normalized || ["default", "platform", "home"].includes(normalized)) return this.defaultPublicShop();
+
+    const direct = this.store.shops.get(normalized);
+    if (direct) return direct;
+
+    for (const shop of this.store.shops.values()) {
+      const aliases = new Set([
+        shop.id,
+        shop.shopNo,
+        shop.sharePath,
+        publicShopPath(shop),
+        stripShopPath(shop.sharePath),
+        stripShopPath(publicShopPath(shop))
+      ].filter(Boolean) as string[]);
+      if (aliases.has(normalized)) return shop;
+    }
+    return undefined;
+  }
+
+  private defaultPublicShop(): DemoShop | undefined {
+    const configured = process.env.DEFAULT_PLATFORM_SHOP_ID || process.env.VITE_PLATFORM_SHOP_ID;
+    if (configured) {
+      const shop = this.resolveShop(configured);
+      if (shop) return shop;
+    }
+    return [...this.store.shops.values()].find((shop) => (shop.ownerType ?? "merchant") === "platform" && shop.status === "open")
+      ?? (process.env.VITE_DEFAULT_SHOP_ID ? this.resolveShop(process.env.VITE_DEFAULT_SHOP_ID) : undefined)
+      ?? [...this.store.shops.values()].find((shop) => shop.status === "open")
+      ?? [...this.store.shops.values()][0];
+  }
+
+  private assertMerchantDepositConfirmed(merchantId: string, action: string) {
+    const account = requireEntity(this.store.depositAccounts.get(merchantId), "RESOURCE_NOT_FOUND", "deposit account not found");
     if (shouldRestrictForDeposit(account)) {
-      throw new ApiError(403, "DEPOSIT_INSUFFICIENT", `agent deposit is required before ${action}`);
+      throw new ApiError(403, "DEPOSIT_INSUFFICIENT", `merchant deposit is required before ${action}`);
     }
   }
 }
@@ -4742,6 +5777,7 @@ class PrismaStateRepository {
   ) {}
 
   async verifyAdmin(input: { username: string; password: string }): Promise<AdminLoginResult> {
+    let connectionError: unknown;
     try {
       const rows = await this.prisma.$queryRaw<Array<{
         id: string;
@@ -4769,6 +5805,7 @@ class PrismaStateRepository {
       }
     } catch (error) {
       if (!isPrismaConnectionError(error)) throw error;
+      connectionError = error;
     }
 
     const bootstrapUsername = process.env.ADMIN_USERNAME;
@@ -4782,43 +5819,32 @@ class PrismaStateRepository {
       };
     }
 
+    if (connectionError) throw connectionError;
     throw new ApiError(401, "AUTH_INVALID", "invalid admin credentials");
   }
 
-  async verifyAgent(input: { account: string; password: string }): Promise<AgentLoginResult> {
+  async verifyMerchant(input: { account: string; password: string }): Promise<MerchantLoginResult> {
     const rows = await this.prisma.$queryRaw<Array<{
       username: string;
       password_hash: string | null;
       status: string;
       must_change_password: boolean;
-      agent_id: string | null;
+      merchant_id: string | null;
       shop_id: string | null;
       display_name: string | null;
-      tier: AgentTier | null;
-      agent_status: string | null;
+      tier: MerchantTier | null;
+      merchant_status: string | null;
       deposit_status: string | null;
       shop_name: string | null;
       shop_status: string | null;
     }>>`
 	      SELECT ma.username, ma.password_hash, ma.status, ma.must_change_password,
-	             a.id AS agent_id, s.id AS shop_id, a.name AS display_name,
-	             CASE
-	               WHEN EXISTS (
-	                 SELECT 1 FROM channel_relations cr
-	                  WHERE cr.third_tier_agent_id = a.id
-	                    AND cr.status IN ('active', 'pending_review')
-	               ) THEN 'third_tier'
-	               WHEN EXISTS (
-	                 SELECT 1 FROM channel_relations cr
-	                  WHERE cr.second_tier_agent_id = a.id
-	                    AND cr.status IN ('active', 'pending_review')
-	               ) THEN 'second_tier'
-	               ELSE 'first_tier'
-	             END AS tier,
-	             a.status AS agent_status, a.deposit_status, s.name AS shop_name, s.status AS shop_status
-	        FROM merchant_accounts ma
-	        JOIN agents a ON a.user_id = ma.user_id
-        JOIN shops s ON s.agent_id = a.id
+		             m.id AS merchant_id, s.id AS shop_id, m.name AS display_name,
+                 m.tier AS tier,
+		             m.status AS merchant_status, m.deposit_status, s.name AS shop_name, s.status AS shop_status
+		        FROM merchant_accounts ma
+		        JOIN merchants m ON m.id = ma.merchant_id
+	        JOIN shops s ON s.merchant_id = m.id
        WHERE ma.username = ${input.account}
           OR ma.phone = ${input.account}
           OR ma.email = ${input.account}
@@ -4829,19 +5855,19 @@ class PrismaStateRepository {
     if (!account || account.status !== "active" || !account.password_hash || !verifyPassword(input.password, account.password_hash)) {
       throw new ApiError(401, "AUTH_INVALID", "invalid merchant credentials");
     }
-    if (!account.agent_id || !account.shop_id) {
+    if (!account.merchant_id || !account.shop_id) {
       throw new ApiError(401, "AUTH_INVALID", "merchant account is not linked to an active shop");
     }
-    if (account.agent_status !== "active" && account.agent_status !== "pending_deposit") {
+    if (account.merchant_status !== "active" && account.merchant_status !== "pending_deposit") {
       throw new ApiError(403, "AUTH_DISABLED", "merchant account is not active");
     }
     return {
-      agentId: account.agent_id,
+      merchantId: account.merchant_id,
       shopId: account.shop_id,
       username: account.username,
       displayName: account.display_name ?? account.username,
       tier: account.tier ?? undefined,
-      status: account.agent_status ?? "pending_review",
+      status: account.merchant_status ?? "pending_review",
       depositStatus: account.deposit_status ?? "pending_payment",
       shopName: account.shop_name ?? account.username,
       shopStatus: account.shop_status ?? "not_opened",
@@ -4849,35 +5875,3238 @@ class PrismaStateRepository {
     };
   }
 
+  async getPublicShop(shopIdentifier: string) {
+    const shop = await this.findPublicShop(shopIdentifier);
+    if (!shop) throw new ApiError(404, "RESOURCE_NOT_FOUND", "shop not found");
+    return this.serializePublicShopRow(shop);
+  }
+
+  async getMerchantShop(actor: MerchantActor) {
+    const shop = await this.findPublicShop(actor.shopId);
+    if (!shop) throw new ApiError(404, "RESOURCE_NOT_FOUND", "shop not found");
+    assertMerchantScope(actor, { merchantId: required(shop.merchantId, "merchantId"), shopId: shop.id });
+    return shop;
+  }
+
+  async createMerchantByAdmin(actor: AdminActor, input: Parameters<BackendServices["createMerchantByAdmin"]>[1]) {
+    assertAdminPermission(actor, "merchant.review");
+    if (input.targetTier && input.targetTier !== "first_tier") {
+      throw new ApiError(400, "ADMIN_CREATE_FIRST_TIER_ONLY", "admin manual creation can only create first-tier merchants");
+    }
+    const requiredAmount = input.depositRequiredAmountCents ?? input.depositAmountCents;
+    if (requiredAmount === undefined || requiredAmount <= 0n) {
+      throw new ApiError(400, "DEPOSIT_REQUIREMENT_MISSING", "deposit required amount is required");
+    }
+    const paidAmount = input.depositPaid ? (input.depositAmountCents ?? requiredAmount) : 0n;
+    const paid = paidAmount >= requiredAmount;
+    const now = new Date();
+    const seed = `${now.getTime()}-${randomUUID().slice(0, 8)}`;
+    const merchantId = `merchant-${seed}`;
+    const shopId = `shop-${seed}`;
+    const userId = `merchant-user-${seed}`;
+    const initialPassword = input.initialPassword ?? `TS${Date.now().toString().slice(-6)}`;
+    const merchant: DemoMerchant = {
+      id: merchantId,
+      userId,
+      name: input.name,
+      contactPhone: input.contactPhone,
+      tier: "first_tier",
+      status: paid ? "active" : "pending_deposit",
+      riskStatus: "normal",
+      depositStatus: paid ? "paid" : "pending_payment",
+      createdByAdminId: actor.adminId,
+      initialPasswordSet: true,
+      merchantUsername: merchantId,
+      passwordHash: `sha256:${hashSecret(initialPassword)}`
+    };
+    const shop: DemoShop = {
+      id: shopId,
+      merchantId,
+      ownerType: "merchant",
+      name: input.shopName ?? `${input.name} 小店`,
+      status: paid ? "open" : "not_opened",
+      riskStatus: "normal",
+      announcement: "精选虚拟权益，付款后按商品规则发放。",
+      customerServiceWechat: input.customerServiceWechat,
+      themeColor: "#ff9900",
+      shareTitle: `${input.name} 官方小店`,
+      createdByAdminId: actor.adminId
+    };
+    const depositAccount = {
+      merchantId,
+      requiredAmountCents: requiredAmount,
+      availableAmountCents: paidAmount,
+      frozenAmountCents: 0n,
+      deductedAmountCents: 0n,
+      status: paid ? "paid" : "pending_payment"
+    };
+    const auditKey = `audit:merchant.admin_create_first_tier:${merchantId}`;
+    await this.persistInShortTransaction(async (tx) => {
+      await this.persistUserId(tx, userId);
+      await this.persistAdminPlaceholder(tx, actor.adminId);
+      await this.persistMerchant(tx, merchant);
+      await this.persistMerchantAccountForMerchant(tx, merchant);
+      await this.persistShop(tx, shop);
+      await this.persistDepositAccount(tx, merchantId, depositAccount);
+      if (paidAmount > 0n) {
+        await this.persistDepositTransaction(tx, {
+          transactionNo: `deposit-tx-${seed}`,
+          merchantId,
+          type: "pay",
+          amountCents: paidAmount,
+          balanceBeforeCents: 0n,
+          balanceAfterCents: paidAmount,
+          reasonCode: "admin_manual_create",
+          relatedType: "merchant",
+          relatedId: merchantId,
+          idempotencyKey: `admin-create-merchant:${merchantId}:deposit`,
+          proofUrl: "admin://manual-first-tier",
+          operatorId: actor.adminId,
+          remark: "后台手工开一级商户并确认保证金"
+        });
+      }
+      await tx.$executeRaw`
+        INSERT INTO audit_logs (
+          id, actor_type, actor_id, action, target_type, target_id,
+          after_json, idempotency_key, request_id, ip, created_at
+        )
+        VALUES (
+          ${stableDbId("audit", auditKey)}, CAST('admin' AS "ActorType"), ${actor.adminId},
+          'merchant.admin_create_first_tier', 'merchant', ${merchantId},
+          ${jsonForDb({ merchantId, shopId, depositPaid: paid, operatorId: actor.adminId })}::jsonb,
+          ${auditKey}, ${auditKey}, '127.0.0.1', ${now}
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+    });
+    return {
+      merchant: {
+        id: merchant.id,
+        userId: merchant.userId,
+        name: merchant.name,
+        contactPhone: merchant.contactPhone,
+        tier: merchant.tier,
+        status: merchant.status,
+        riskStatus: merchant.riskStatus,
+        depositStatus: merchant.depositStatus,
+        createdByAdminId: merchant.createdByAdminId
+      },
+      shop,
+      credential: {
+        account: merchantId,
+        initialPassword,
+        mustResetPassword: true
+      }
+    };
+  }
+
+  async listPlatformProducts(actor?: MerchantActor) {
+    if (!actor) {
+      return this.listDirectFirstTierPlatformProducts();
+    }
+    const shop = await this.getMerchantShop(actor);
+    await this.assertDirectMerchantCanManageProducts(actor.merchantId, shop.id);
+    const tierRows = await this.prisma.$queryRaw<Array<{ tier: MerchantTier }>>`
+      SELECT tier FROM merchants WHERE id = ${actor.merchantId} LIMIT 1
+    `;
+    const tier = tierRows[0]?.tier ?? "first_tier";
+    return tier === "first_tier"
+      ? this.listDirectFirstTierPlatformProducts()
+      : this.listDirectUpstreamPlatformProducts(actor.merchantId);
+  }
+
+  async listMerchantProducts(actor: MerchantActor) {
+    await this.getMerchantShop(actor);
+    const rows = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      SELECT id
+        FROM merchant_product_listings
+       WHERE merchant_id = ${actor.merchantId}
+         AND shop_id = ${actor.shopId}
+       ORDER BY updated_at DESC, created_at DESC
+    `;
+    return Promise.all(rows.map((row) => this.getDirectMerchantProductListing(actor, row.id)));
+  }
+
+  async getMerchantProductDetail(actor: MerchantActor, merchantProductListingId: string) {
+    return this.getDirectMerchantProductListing(actor, merchantProductListingId);
+  }
+
+  async updateMerchantProductDetail(actor: MerchantActor, merchantProductListingId: string, input: MerchantProductListingDetailUpdateInput) {
+    await this.getMerchantShop(actor);
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      merchant_id: string;
+      shop_id: string;
+      platform_product_id: string;
+      upstream_listing_id: string | null;
+      sale_price_cents: bigint;
+      display_name: string | null;
+      display_subtitle: string | null;
+      display_description: string | null;
+      display_usage_guide: string | null;
+      display_image_url: string | null;
+      display_category: string | null;
+      display_tags_json: unknown;
+      display_specs_json: unknown;
+      display_detail_sections_json: unknown;
+      status: string;
+      supply_price_cents: bigint;
+      min_sale_price_cents: bigint;
+      upstream_sale_price_cents: bigint | null;
+    }>>`
+      SELECT mpl.id, mpl.merchant_id, mpl.shop_id, mpl.platform_product_id, mpl.upstream_listing_id,
+             mpl.sale_price_cents, mpl.display_name, mpl.display_subtitle, mpl.display_description,
+             mpl.display_usage_guide, mpl.display_image_url, mpl.display_category,
+             mpl.display_tags_json, mpl.display_specs_json, mpl.display_detail_sections_json, mpl.status,
+             pp.supply_price_cents, pp.min_sale_price_cents, upstream.sale_price_cents AS upstream_sale_price_cents
+        FROM merchant_product_listings mpl
+        JOIN platform_products pp ON pp.id = mpl.platform_product_id
+        LEFT JOIN merchant_product_listings upstream ON upstream.id = mpl.upstream_listing_id
+       WHERE mpl.id = ${merchantProductListingId}
+       LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) throw new ApiError(404, "RESOURCE_NOT_FOUND", "merchant product not found");
+    assertMerchantScope(actor, { merchantId: row.merchant_id, shopId: row.shop_id });
+    const salePriceCents = input.salePriceCents ?? row.sale_price_cents;
+    const supplyPriceCents = row.upstream_sale_price_cents ?? row.supply_price_cents;
+    const minSalePriceCents = maxBigInt([row.min_sale_price_cents, supplyPriceCents]);
+    try {
+      quotePlatformProduct({ salePriceCents, supplyPriceCents, minSalePriceCents });
+    } catch (error) {
+      throw new ApiError(400, "PRICE_RULE_FAILED", getErrorMessage(error));
+    }
+
+    const displayTags = "displayTags" in input ? normalizeOptionalStringArray(input.displayTags) : (Array.isArray(row.display_tags_json) ? row.display_tags_json as string[] : undefined);
+    const displaySpecs = "displaySpecs" in input ? normalizeOptionalStringArray(input.displaySpecs) : (Array.isArray(row.display_specs_json) ? row.display_specs_json as string[] : undefined);
+    const displayDetailSections = "displayDetailSections" in input ? normalizeOptionalDetailSections(input.displayDetailSections) : (Array.isArray(row.display_detail_sections_json) ? row.display_detail_sections_json as ProductDetailSection[] : undefined);
+    const status = input.status ? mapProductListingStatus(input.status) : mapProductListingStatus(row.status);
+    const now = new Date();
+    const auditKey = `audit:merchant_product_listing.detail_update:${row.id}:${now.getTime()}`;
+    await this.persistInShortTransaction(async (tx) => {
+      await tx.$executeRaw`
+        UPDATE merchant_product_listings
+           SET sale_price_cents = ${salePriceCents},
+               display_name = ${"displayName" in input ? optionalTrimmedText(input.displayName) ?? null : row.display_name},
+               display_subtitle = ${"displaySubtitle" in input ? optionalTrimmedText(input.displaySubtitle) ?? null : row.display_subtitle},
+               display_description = ${"displayDescription" in input ? optionalTrimmedText(input.displayDescription) ?? null : row.display_description},
+               display_usage_guide = ${"displayUsageGuide" in input ? optionalTrimmedText(input.displayUsageGuide) ?? null : row.display_usage_guide},
+               display_image_url = ${"displayImageUrl" in input ? optionalTrimmedText(input.displayImageUrl) ?? null : row.display_image_url},
+               display_category = ${"displayCategory" in input ? optionalTrimmedText(input.displayCategory) ?? null : row.display_category},
+               display_tags_json = ${displayTags ? jsonForDb(displayTags) : null}::jsonb,
+               display_specs_json = ${displaySpecs ? jsonForDb(displaySpecs) : null}::jsonb,
+               display_detail_sections_json = ${displayDetailSections ? jsonForDb(displayDetailSections) : null}::jsonb,
+               status = CAST(${status} AS "ProductListingStatus"),
+               listed_at = CASE WHEN ${status} = 'listed' THEN COALESCE(listed_at, ${now}) ELSE listed_at END,
+               delisted_at = CASE WHEN ${status} = 'delisted' THEN ${now} ELSE delisted_at END,
+               updated_at = ${now}
+         WHERE id = ${row.id}
+      `;
+      await tx.$executeRaw`
+        INSERT INTO audit_logs (
+          id, actor_type, actor_id, action, target_type, target_id,
+          after_json, idempotency_key, request_id, ip, created_at
+        )
+        VALUES (
+          ${stableDbId("audit", auditKey)}, CAST('merchant' AS "ActorType"), ${actor.merchantId},
+          'merchant_product_listing.detail_update', 'merchant_product_listing', ${row.id},
+          ${jsonForDb({ id: row.id, salePriceCents, status, input })}::jsonb,
+          ${auditKey}, ${auditKey}, '127.0.0.1', ${now}
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+    });
+    return this.getDirectMerchantProductListing(actor, row.id);
+  }
+
+  async selectPlatformProduct(actor: MerchantActor, input: MerchantProductListingSelectionInput) {
+    await this.getMerchantShop(actor);
+    const rows = await this.prisma.$queryRaw<Array<{
+      merchant_status: string;
+      merchant_tier: MerchantTier;
+      merchant_risk_status: string | null;
+      deposit_status: string | null;
+      shop_status: string;
+      shop_risk_status: string | null;
+      product_id: string | null;
+      product_name: string | null;
+      product_status: string | null;
+      supply_price_cents: bigint | null;
+      min_sale_price_cents: bigint | null;
+    }>>`
+      SELECT m.status AS merchant_status, m.tier AS merchant_tier, m.risk_status AS merchant_risk_status,
+             da.status AS deposit_status, s.status AS shop_status, s.risk_status AS shop_risk_status,
+             pp.id AS product_id, pp.name AS product_name, pp.status AS product_status,
+             pp.supply_price_cents, pp.min_sale_price_cents
+        FROM merchants m
+        JOIN shops s ON s.merchant_id = m.id
+        LEFT JOIN deposit_accounts da ON da.merchant_id = m.id
+        LEFT JOIN platform_products pp ON pp.id = ${input.platformProductId}
+       WHERE m.id = ${actor.merchantId}
+         AND s.id = ${actor.shopId}
+       LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) throw new ApiError(404, "RESOURCE_NOT_FOUND", "merchant shop not found");
+    if (!row.product_id) throw new ApiError(404, "RESOURCE_NOT_FOUND", "platform product not found");
+    if (row.merchant_status !== "active" || row.deposit_status !== "paid") {
+      throw new ApiError(400, "DEPOSIT_INSUFFICIENT", "merchant deposit is required before select platform product");
+    }
+    if (row.shop_status !== "open") throw new ApiError(400, "SHOP_NOT_OPEN", "merchant shop is not open");
+    if (row.merchant_risk_status !== "normal" || row.shop_risk_status !== "normal") {
+      throw new ApiError(400, "RISK_BLOCKED", "risk freeze blocks product listing");
+    }
+    if (row.product_status !== "active") throw new ApiError(400, "PRODUCT_NOT_LISTED", "platform product is not active");
+
+    const upstream = row.merchant_tier === "first_tier"
+      ? undefined
+      : await this.findDirectUpstreamProductListing(actor.merchantId, input.platformProductId);
+    if (row.merchant_tier !== "first_tier" && !upstream) {
+      throw new ApiError(404, "RESOURCE_NOT_FOUND", "platform product is not available to current merchant");
+    }
+    const supplyPriceCents = upstream?.salePriceCents ?? required(row.supply_price_cents, "supplyPriceCents");
+    const minSalePriceCents = maxBigInt([required(row.min_sale_price_cents, "minSalePriceCents"), supplyPriceCents]);
+    try {
+      quotePlatformProduct({
+        salePriceCents: input.salePriceCents,
+        supplyPriceCents,
+        minSalePriceCents
+      });
+    } catch (error) {
+      throw new ApiError(400, "PRICE_RULE_FAILED", getErrorMessage(error));
+    }
+
+    const existingRows = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      SELECT id
+        FROM merchant_product_listings
+       WHERE shop_id = ${actor.shopId}
+         AND platform_product_id = ${input.platformProductId}
+       LIMIT 1
+    `;
+    const listingId = existingRows[0]?.id ?? `merchant-listing-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    const now = new Date();
+    const auditKey = `audit:merchant_product_listing.select_platform:${listingId}:${now.getTime()}`;
+    await this.persistInShortTransaction(async (tx) => {
+      await tx.$executeRaw`
+        INSERT INTO merchant_product_listings (
+          id, merchant_id, shop_id, source_type, platform_product_id, upstream_listing_id,
+          sale_price_cents, display_name, display_subtitle, display_description,
+          display_usage_guide, display_image_url, display_category, display_tags_json,
+          display_specs_json, display_detail_sections_json, status, listed_at, created_at, updated_at
+        )
+        VALUES (
+          ${listingId}, ${actor.merchantId}, ${actor.shopId},
+          CAST(${upstream ? "upstream_listing" : "platform_product"} AS "MerchantProductListingSourceType"),
+          ${input.platformProductId}, ${upstream?.id ?? null},
+          ${input.salePriceCents},
+          ${optionalTrimmedText(input.displayName) ?? null},
+          ${optionalTrimmedText(input.displaySubtitle) ?? null},
+          ${optionalTrimmedText(input.displayDescription) ?? null},
+          ${optionalTrimmedText(input.displayUsageGuide) ?? null},
+          ${optionalTrimmedText(input.displayImageUrl) ?? null},
+          ${optionalTrimmedText(input.displayCategory) ?? null},
+          ${normalizeOptionalStringArray(input.displayTags) ? jsonForDb(normalizeOptionalStringArray(input.displayTags)) : null}::jsonb,
+          ${normalizeOptionalStringArray(input.displaySpecs) ? jsonForDb(normalizeOptionalStringArray(input.displaySpecs)) : null}::jsonb,
+          ${normalizeOptionalDetailSections(input.displayDetailSections) ? jsonForDb(normalizeOptionalDetailSections(input.displayDetailSections)) : null}::jsonb,
+          CAST('listed' AS "ProductListingStatus"), ${now}, ${now}, ${now}
+        )
+        ON CONFLICT (shop_id, platform_product_id) DO UPDATE SET
+          source_type = EXCLUDED.source_type,
+          upstream_listing_id = EXCLUDED.upstream_listing_id,
+          sale_price_cents = EXCLUDED.sale_price_cents,
+          display_name = EXCLUDED.display_name,
+          display_subtitle = EXCLUDED.display_subtitle,
+          display_description = EXCLUDED.display_description,
+          display_usage_guide = EXCLUDED.display_usage_guide,
+          display_image_url = EXCLUDED.display_image_url,
+          display_category = EXCLUDED.display_category,
+          display_tags_json = EXCLUDED.display_tags_json,
+          display_specs_json = EXCLUDED.display_specs_json,
+          display_detail_sections_json = EXCLUDED.display_detail_sections_json,
+          status = EXCLUDED.status,
+          listed_at = EXCLUDED.listed_at,
+          updated_at = EXCLUDED.updated_at
+      `;
+      await tx.$executeRaw`
+        INSERT INTO audit_logs (
+          id, actor_type, actor_id, action, target_type, target_id,
+          after_json, idempotency_key, request_id, ip, created_at
+        )
+        VALUES (
+          ${stableDbId("audit", auditKey)}, CAST('merchant' AS "ActorType"), ${actor.merchantId},
+          'merchant_product_listing.select_platform', 'merchant_product_listing', ${listingId},
+          ${jsonForDb({ id: listingId, merchantId: actor.merchantId, shopId: actor.shopId, platformProductId: input.platformProductId, upstreamListingId: upstream?.id, salePriceCents: input.salePriceCents, status: "listed" })}::jsonb,
+          ${auditKey}, ${auditKey}, '127.0.0.1', ${now}
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+    });
+    return this.getDirectMerchantProductListing(actor, listingId);
+  }
+
+  private async findDirectUpstreamProductListing(merchantId: string, platformProductId: string): Promise<{ id: string; salePriceCents: bigint } | undefined> {
+    const rows = await this.prisma.$queryRaw<Array<{ id: string; sale_price_cents: bigint }>>`
+      SELECT mpl.id, mpl.sale_price_cents
+        FROM merchant_applications ma
+        JOIN merchant_invite_codes mic ON mic.id = ma.invite_code_id
+        JOIN merchant_product_listings mpl ON mpl.merchant_id = mic.issuer_merchant_id
+       WHERE ma.merchant_id = ${merchantId}
+         AND ma.status = 'approved'
+         AND mic.issuer_merchant_id IS NOT NULL
+         AND mpl.platform_product_id = ${platformProductId}
+         AND mpl.status = 'listed'
+       ORDER BY ma.reviewed_at DESC NULLS LAST, ma.created_at DESC, mpl.updated_at DESC
+       LIMIT 1
+    `;
+    const row = rows[0];
+    return row ? { id: row.id, salePriceCents: row.sale_price_cents } : undefined;
+  }
+
+  private async assertDirectMerchantCanManageProducts(merchantId: string, shopId: string) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      merchant_status: string;
+      deposit_status: string | null;
+      shop_status: string;
+      merchant_risk_status: string | null;
+      shop_risk_status: string | null;
+    }>>`
+      SELECT m.status AS merchant_status, da.status AS deposit_status,
+             s.status AS shop_status, m.risk_status AS merchant_risk_status,
+             s.risk_status AS shop_risk_status
+        FROM merchants m
+        JOIN shops s ON s.merchant_id = m.id
+        LEFT JOIN deposit_accounts da ON da.merchant_id = m.id
+       WHERE m.id = ${merchantId}
+         AND s.id = ${shopId}
+       LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) throw new ApiError(404, "RESOURCE_NOT_FOUND", "merchant shop not found");
+    if (row.merchant_status !== "active" || row.deposit_status !== "paid") {
+      throw new ApiError(400, "DEPOSIT_INSUFFICIENT", "merchant deposit is required before managing products");
+    }
+    if (row.shop_status !== "open") throw new ApiError(400, "SHOP_NOT_OPEN", "merchant shop is not open");
+    if (row.merchant_risk_status !== "normal" || row.shop_risk_status !== "normal") {
+      throw new ApiError(400, "RISK_BLOCKED", "risk freeze blocks product management");
+    }
+  }
+
+  private async listDirectFirstTierPlatformProducts() {
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      name: string;
+      category_name: string | null;
+      tags_json: unknown;
+      image_url: string | null;
+      specs_json: unknown;
+      detail_sections_json: unknown;
+      stock_count: number | null;
+      public_stock_count: number | null;
+      sold_count: number | null;
+      display_badge: string | null;
+      is_recommended: boolean | null;
+      display_sort: number | null;
+      detail: string | null;
+      rights_desc: string | null;
+      supply_price_cents: bigint;
+      min_sale_price_cents: bigint;
+      suggested_sale_price_cents: bigint;
+      fulfillment_rule_json: unknown;
+      after_sale_rule_json: unknown;
+      status: string;
+    }>>`
+      SELECT id, name, category_name, tags_json, image_url, specs_json, detail_sections_json,
+             stock_count, sold_count, display_badge, is_recommended, display_sort, detail, rights_desc,
+             supply_price_cents, min_sale_price_cents, suggested_sale_price_cents,
+             fulfillment_rule_json, after_sale_rule_json, status
+        FROM platform_products
+       WHERE status = 'active'
+       ORDER BY COALESCE(display_sort, 0) DESC, created_at ASC
+    `;
+    return rows.map((row) => this.serializeDirectPlatformProductRow(row, {
+      canSeePlatformSupplyPrice: true,
+      platformSupplyPriceCents: row.supply_price_cents
+    }));
+  }
+
+  private async listDirectUpstreamPlatformProducts(merchantId: string) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      name: string;
+      category_name: string | null;
+      tags_json: unknown;
+      image_url: string | null;
+      specs_json: unknown;
+      detail_sections_json: unknown;
+      stock_count: number | null;
+      public_stock_count: number | null;
+      sold_count: number | null;
+      display_badge: string | null;
+      is_recommended: boolean | null;
+      display_sort: number | null;
+      detail: string | null;
+      rights_desc: string | null;
+      supply_price_cents: bigint;
+      min_sale_price_cents: bigint;
+      suggested_sale_price_cents: bigint;
+      fulfillment_rule_json: unknown;
+      after_sale_rule_json: unknown;
+      status: string;
+      upstream_listing_id: string;
+      upstream_sale_price_cents: bigint;
+      upstream_display_name: string | null;
+      upstream_display_subtitle: string | null;
+      upstream_display_description: string | null;
+      upstream_display_usage_guide: string | null;
+      upstream_display_image_url: string | null;
+      upstream_display_category: string | null;
+      upstream_display_tags_json: unknown;
+      upstream_display_specs_json: unknown;
+      upstream_display_detail_sections_json: unknown;
+    }>>`
+      SELECT pp.id, pp.name, pp.category_name, pp.tags_json, pp.image_url, pp.specs_json,
+             pp.detail_sections_json, pp.stock_count, pp.sold_count, pp.display_badge,
+             pp.is_recommended, pp.display_sort, pp.detail, pp.rights_desc, pp.supply_price_cents,
+             pp.min_sale_price_cents, pp.suggested_sale_price_cents, pp.fulfillment_rule_json,
+             pp.after_sale_rule_json, pp.status,
+             upstream.id AS upstream_listing_id, upstream.sale_price_cents AS upstream_sale_price_cents,
+             upstream.display_name AS upstream_display_name,
+             upstream.display_subtitle AS upstream_display_subtitle,
+             upstream.display_description AS upstream_display_description,
+             upstream.display_usage_guide AS upstream_display_usage_guide,
+             upstream.display_image_url AS upstream_display_image_url,
+             upstream.display_category AS upstream_display_category,
+             upstream.display_tags_json AS upstream_display_tags_json,
+             upstream.display_specs_json AS upstream_display_specs_json,
+             upstream.display_detail_sections_json AS upstream_display_detail_sections_json
+        FROM merchant_applications ma
+        JOIN merchant_invite_codes mic ON mic.id = ma.invite_code_id
+        JOIN merchant_product_listings upstream ON upstream.merchant_id = mic.issuer_merchant_id
+        JOIN platform_products pp ON pp.id = upstream.platform_product_id
+       WHERE ma.merchant_id = ${merchantId}
+         AND ma.status = 'approved'
+         AND mic.issuer_merchant_id IS NOT NULL
+         AND upstream.status = 'listed'
+         AND pp.status = 'active'
+       ORDER BY COALESCE(pp.display_sort, 0) DESC, upstream.updated_at DESC
+    `;
+    return rows.map((row) => this.serializeDirectPlatformProductRow({
+      ...row,
+      name: row.upstream_display_name ?? row.name,
+      category_name: row.upstream_display_category ?? row.category_name,
+      tags_json: Array.isArray(row.upstream_display_tags_json) ? row.upstream_display_tags_json : row.tags_json,
+      image_url: row.upstream_display_image_url ?? row.image_url,
+      specs_json: Array.isArray(row.upstream_display_specs_json) ? row.upstream_display_specs_json : row.specs_json,
+      detail_sections_json: Array.isArray(row.upstream_display_detail_sections_json) ? row.upstream_display_detail_sections_json : row.detail_sections_json,
+      detail: row.upstream_display_description ?? row.detail,
+      rights_desc: row.upstream_display_subtitle ?? row.rights_desc
+    }, {
+      canSeePlatformSupplyPrice: false,
+      sourceName: row.name,
+      upstreamMerchantProductId: row.upstream_listing_id,
+      visibleUpstreamSupplyPriceCents: row.upstream_sale_price_cents,
+      minSalePriceCents: maxBigInt([row.min_sale_price_cents, row.upstream_sale_price_cents]),
+      suggestedSalePriceCents: maxBigInt([row.suggested_sale_price_cents, row.upstream_sale_price_cents])
+    }));
+  }
+
+  private serializeDirectPlatformProductRow(row: {
+    id: string;
+    name: string;
+    category_name: string | null;
+    tags_json: unknown;
+    image_url: string | null;
+    specs_json: unknown;
+    detail_sections_json: unknown;
+    stock_count: number | null;
+    sold_count: number | null;
+    display_badge: string | null;
+    is_recommended: boolean | null;
+    display_sort: number | null;
+    detail: string | null;
+    rights_desc: string | null;
+    supply_price_cents: bigint;
+    min_sale_price_cents: bigint;
+    suggested_sale_price_cents: bigint;
+    fulfillment_rule_json: unknown;
+    after_sale_rule_json: unknown;
+    status: string;
+  }, visibility: {
+    canSeePlatformSupplyPrice: boolean;
+    platformSupplyPriceCents?: bigint;
+    sourceName?: string;
+    upstreamMerchantProductId?: string;
+    visibleUpstreamSupplyPriceCents?: bigint;
+    minSalePriceCents?: bigint;
+    suggestedSalePriceCents?: bigint;
+  }) {
+    return {
+      id: row.id,
+      name: row.name,
+      category: row.category_name ?? undefined,
+      tags: Array.isArray(row.tags_json) ? row.tags_json : undefined,
+      subtitle: row.rights_desc ?? undefined,
+      description: row.detail ?? undefined,
+      imageUrl: row.image_url ?? undefined,
+      specs: Array.isArray(row.specs_json) ? row.specs_json : undefined,
+      detailSections: Array.isArray(row.detail_sections_json) ? row.detail_sections_json : undefined,
+      stockCount: row.stock_count ?? undefined,
+      soldCount: row.sold_count ?? undefined,
+      displayBadge: row.display_badge ?? undefined,
+      isRecommended: row.is_recommended ?? undefined,
+      displaySort: row.display_sort ?? undefined,
+      supplyPriceCents: visibility.canSeePlatformSupplyPrice ? row.supply_price_cents : undefined,
+      platformSupplyPriceCents: visibility.platformSupplyPriceCents,
+      minSalePriceCents: visibility.minSalePriceCents ?? row.min_sale_price_cents,
+      suggestedSalePriceCents: visibility.suggestedSalePriceCents ?? row.suggested_sale_price_cents,
+      fulfillmentRule: row.fulfillment_rule_json,
+      afterSaleRule: row.after_sale_rule_json,
+      status: row.status,
+      sourceName: visibility.sourceName,
+      upstreamMerchantProductId: visibility.upstreamMerchantProductId,
+      visibleUpstreamSupplyPriceCents: visibility.visibleUpstreamSupplyPriceCents
+    };
+  }
+
+  private async getDirectMerchantProductListing(actor: MerchantActor, listingId: string) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      merchant_id: string;
+      shop_id: string;
+      source_type: string;
+      platform_product_id: string;
+      upstream_listing_id: string | null;
+      sale_price_cents: bigint;
+      display_name: string | null;
+      display_subtitle: string | null;
+      display_description: string | null;
+      display_usage_guide: string | null;
+      display_image_url: string | null;
+      display_category: string | null;
+      display_tags_json: unknown;
+      display_specs_json: unknown;
+      display_detail_sections_json: unknown;
+      status: string;
+      pp_name: string;
+      category_name: string | null;
+      tags_json: unknown;
+      image_url: string | null;
+      specs_json: unknown;
+      detail_sections_json: unknown;
+      stock_count: number | null;
+      public_stock_count: number | null;
+      sold_count: number | null;
+      display_badge: string | null;
+      is_recommended: boolean | null;
+      display_sort: number | null;
+      detail: string | null;
+      rights_desc: string | null;
+      fulfillment_rule_json: unknown;
+      after_sale_rule_json: unknown;
+      product_status: string;
+      supply_price_cents: bigint;
+      min_sale_price_cents: bigint;
+      suggested_sale_price_cents: bigint;
+      upstream_sale_price_cents: bigint | null;
+    }>>`
+      SELECT mpl.id, mpl.merchant_id, mpl.shop_id, mpl.source_type, mpl.platform_product_id,
+             mpl.upstream_listing_id, mpl.sale_price_cents, mpl.display_name, mpl.display_subtitle,
+             mpl.display_description, mpl.display_usage_guide, mpl.display_image_url, mpl.display_category,
+             mpl.display_tags_json, mpl.display_specs_json, mpl.display_detail_sections_json, mpl.status,
+             pp.name AS pp_name, pp.category_name, pp.tags_json, pp.image_url, pp.specs_json,
+             pp.detail_sections_json, pp.stock_count, pp.sold_count, pp.display_badge, pp.is_recommended,
+             pp.display_sort, pp.detail, pp.rights_desc, pp.fulfillment_rule_json,
+             pp.after_sale_rule_json, pp.status AS product_status, pp.supply_price_cents,
+             pp.min_sale_price_cents, pp.suggested_sale_price_cents,
+             upstream.sale_price_cents AS upstream_sale_price_cents
+        FROM merchant_product_listings mpl
+        JOIN platform_products pp ON pp.id = mpl.platform_product_id
+        LEFT JOIN merchant_product_listings upstream ON upstream.id = mpl.upstream_listing_id
+       WHERE mpl.id = ${listingId}
+       LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) throw new ApiError(404, "RESOURCE_NOT_FOUND", "merchant product not found");
+    assertMerchantScope(actor, { merchantId: row.merchant_id, shopId: row.shop_id });
+    const directPlatformSource = !row.upstream_listing_id;
+    const visibleUpstreamSupplyPriceCents = row.upstream_sale_price_cents ?? undefined;
+    const minSalePriceCents = maxBigInt([
+      row.min_sale_price_cents,
+      visibleUpstreamSupplyPriceCents ?? row.supply_price_cents
+    ]);
+    const suggestedSalePriceCents = maxBigInt([
+      row.suggested_sale_price_cents,
+      visibleUpstreamSupplyPriceCents ?? row.supply_price_cents
+    ]);
+    return {
+      id: row.id,
+      merchantId: row.merchant_id,
+      shopId: row.shop_id,
+      productType: "platform",
+      sourceType: row.source_type,
+      platformProductId: row.platform_product_id,
+      upstreamListingId: row.upstream_listing_id ?? undefined,
+      salePriceCents: row.sale_price_cents,
+      displayName: row.display_name ?? undefined,
+      displaySubtitle: row.display_subtitle ?? undefined,
+      displayDescription: row.display_description ?? undefined,
+      displayUsageGuide: row.display_usage_guide ?? undefined,
+      displayImageUrl: row.display_image_url ?? undefined,
+      displayCategory: row.display_category ?? undefined,
+      displayTags: Array.isArray(row.display_tags_json) ? row.display_tags_json : undefined,
+      displaySpecs: Array.isArray(row.display_specs_json) ? row.display_specs_json : undefined,
+      displayDetailSections: Array.isArray(row.display_detail_sections_json) ? row.display_detail_sections_json : undefined,
+      status: row.status,
+      sourceProductName: row.pp_name,
+      product: {
+        id: row.platform_product_id,
+        name: row.display_name ?? row.pp_name,
+        category: row.display_category ?? row.category_name ?? undefined,
+        tags: Array.isArray(row.display_tags_json) ? row.display_tags_json : Array.isArray(row.tags_json) ? row.tags_json : undefined,
+        subtitle: row.display_subtitle ?? row.rights_desc ?? undefined,
+        description: row.display_description ?? row.detail ?? undefined,
+        usageGuide: row.display_usage_guide ?? undefined,
+        imageUrl: row.display_image_url ?? row.image_url ?? undefined,
+        specs: Array.isArray(row.display_specs_json) ? row.display_specs_json : Array.isArray(row.specs_json) ? row.specs_json : undefined,
+        detailSections: Array.isArray(row.display_detail_sections_json) ? row.display_detail_sections_json : Array.isArray(row.detail_sections_json) ? row.detail_sections_json : undefined,
+        stockCount: row.stock_count ?? undefined,
+        soldCount: row.sold_count ?? undefined,
+        platformProductId: row.platform_product_id,
+        displayBadge: row.display_badge ?? undefined,
+        isRecommended: row.is_recommended ?? undefined,
+        displaySort: row.display_sort ?? undefined,
+        supplyPriceCents: directPlatformSource ? row.supply_price_cents : undefined,
+        platformSupplyPriceCents: directPlatformSource ? row.supply_price_cents : undefined,
+        visibleUpstreamSupplyPriceCents,
+        minSalePriceCents,
+        suggestedSalePriceCents,
+        fulfillmentRule: row.fulfillment_rule_json,
+        afterSaleRule: row.after_sale_rule_json,
+        status: row.product_status
+      }
+    };
+  }
+
+  async upsertMerchantPaymentMethod(actor: MerchantActor, input: PaymentMethodUpsertInput) {
+    await this.getMerchantShop(actor);
+    const existing = input.id ? await this.findDirectPaymentMethodConfig(input.id) : undefined;
+    if (input.id && !existing) throw new ApiError(404, "RESOURCE_NOT_FOUND", "payment method not found");
+    if (existing && (existing.ownerType !== "merchant" || existing.merchantId !== actor.merchantId || existing.shopId !== actor.shopId)) {
+      throw new ApiError(403, "PAYMENT_METHOD_SCOPE_FORBIDDEN", "cannot update another merchant payment method");
+    }
+    const updatingExisting = Boolean(existing);
+    const provider = input.provider ?? existing?.provider;
+    if (!provider) throw new ApiError(400, "PAYMENT_METHOD_PROVIDER_REQUIRED", "payment provider is required");
+    this.assertDirectPaymentMethodInput("merchant", { ...input, provider, merchantId: actor.merchantId, shopId: actor.shopId }, updatingExisting);
+    const now = new Date();
+    const method: PaymentMethodConfig = existing
+      ? { ...existing }
+      : {
+        id: `payment-method-${Date.now()}-${randomUUID().slice(0, 8)}`,
+        ownerType: "merchant",
+        merchantId: actor.merchantId,
+        shopId: actor.shopId,
+        provider,
+        confirmationMode: isManualPaymentProvider(provider) ? "manual" : "automatic",
+        displayName: required(input.displayName, "displayName"),
+        enabled: input.enabled ?? false,
+        status: input.status ?? (input.enabled ? "enabled" : "pending_test"),
+        isDefault: input.isDefault ?? false,
+        secretConfigured: false,
+        createdAt: now,
+        updatedAt: now,
+        updatedBy: actor.merchantId
+      };
+    method.provider = provider;
+    method.confirmationMode = isManualPaymentProvider(provider) ? "manual" : method.provider === "balance" ? "automatic" : method.confirmationMode;
+    method.displayName = input.displayName ?? method.displayName;
+    method.productType = input.productType ?? method.productType;
+    method.merchantNo = input.merchantNo ?? method.merchantNo;
+    method.appId = input.appId ?? method.appId;
+    method.serviceProviderId = input.serviceProviderId ?? method.serviceProviderId;
+    method.gatewayUrl = input.gatewayUrl ?? method.gatewayUrl;
+    method.apiMode = input.apiMode ?? method.apiMode;
+    method.accountName = input.accountName ?? method.accountName;
+    method.qrUrl = input.qrUrl ?? method.qrUrl;
+    method.paymentUrl = input.paymentUrl ?? method.paymentUrl;
+    method.note = input.note ?? method.note;
+    method.returnUrl = input.returnUrl ?? method.returnUrl;
+    method.enabled = input.enabled ?? method.enabled;
+    method.status = input.status ?? (method.enabled ? "enabled" : method.status);
+    method.isDefault = input.isDefault ?? method.isDefault;
+    method.updatedAt = now;
+    method.updatedBy = actor.merchantId;
+    this.applyDirectPaymentMethodSecrets(method, input);
+    await this.persistInShortTransaction(async (tx) => {
+      if (method.isDefault) {
+        await tx.$executeRaw`
+          UPDATE collection_payment_configs
+             SET is_default = false, updated_at = now()
+           WHERE owner_type = CAST('merchant' AS "CollectionConfigOwnerType")
+             AND owner_merchant_id = ${actor.merchantId}
+             AND shop_id = ${actor.shopId}
+             AND id <> ${method.id}
+        `;
+      }
+      await this.persistPaymentMethodConfig(tx, method);
+      await tx.$executeRaw`
+        INSERT INTO audit_logs (
+          id, actor_type, actor_id, action, target_type, target_id,
+          after_json, idempotency_key, request_id, ip, created_at
+        )
+        VALUES (
+          ${stableDbId("audit", `payment_method.upsert:${method.id}:${method.updatedAt.getTime()}`)},
+          CAST('merchant' AS "ActorType"), ${actor.merchantId}, 'payment_method.upsert',
+          'payment_method', ${method.id},
+          ${jsonForDb({ id: method.id, ownerType: method.ownerType, merchantId: method.merchantId, shopId: method.shopId, provider: method.provider, enabled: method.enabled, status: method.status, isDefault: method.isDefault })}::jsonb,
+          ${`audit:payment_method.upsert:${method.id}:${method.updatedAt.getTime()}`},
+          ${`payment_method.upsert:${method.id}:${method.updatedAt.getTime()}`},
+          '127.0.0.1', now()
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+    });
+    return this.serializeDirectPaymentMethod(method);
+  }
+
+  async listMerchantOrders(actor: MerchantActor) {
+    const rows = await this.findDirectMerchantOrderRows(actor);
+    return rows.map((row) => this.serializeDirectMerchantOrderRow(actor, row));
+  }
+
+  async getMerchantOrder(actor: MerchantActor, orderNo: string) {
+    const rows = await this.findDirectMerchantOrderRows(actor, orderNo);
+    const row = rows[0];
+    if (!row) throw new ApiError(404, "RESOURCE_NOT_FOUND", "order not found");
+    return this.serializeDirectMerchantOrderRow(actor, row);
+  }
+
+  async fulfillMerchantOrder(actor: MerchantActor, orderNo: string, input: { status: "success" | "failed"; attemptNo: number; evidence?: string; failReason?: string }) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      order_no: string;
+      merchant_id: string | null;
+      shop_id: string;
+      payment_status: string;
+      order_item_id: string | null;
+    }>>`
+      SELECT o.id, o.order_no, o.merchant_id, o.shop_id, o.payment_status, oi.id AS order_item_id
+        FROM orders o
+        LEFT JOIN order_items oi ON oi.order_id = o.id
+       WHERE o.order_no = ${orderNo}
+       LIMIT 1
+    `;
+    const order = rows[0];
+    if (!order) throw new ApiError(404, "RESOURCE_NOT_FOUND", "order not found");
+    assertMerchantScope(actor, { merchantId: required(order.merchant_id ?? undefined, "merchantId"), shopId: order.shop_id });
+    if (order.payment_status !== "paid") throw new ApiError(400, "STATE_NOT_ALLOWED", "only paid orders can be fulfilled");
+    const orderItemId = required(order.order_item_id ?? undefined, "orderItemId");
+    const now = new Date();
+    const fulfillmentStatus = input.status === "success" ? "success" : "failed";
+    const orderStatus = input.status === "success" ? "fulfilled" : "fulfillment_failed";
+    const fulfillmentId = stableDbId("fulfillment", orderNo);
+    await this.persistInShortTransaction(async (tx) => {
+      await tx.$executeRaw`
+        INSERT INTO fulfillment_records (
+          id, order_id, order_item_id, merchant_id, shop_id, idempotency_key,
+          fulfillment_type, status, success_at, fail_reason, created_at, updated_at
+        )
+        VALUES (
+          ${fulfillmentId}, ${order.id}, ${orderItemId}, ${actor.merchantId}, ${actor.shopId},
+          ${`fulfillment:${orderNo}`}, CAST('manual' AS "FulfillmentType"),
+          CAST(${fulfillmentStatus} AS "FulfillmentStatus"),
+          ${input.status === "success" ? now : null}, ${input.failReason ?? null}, now(), now()
+        )
+        ON CONFLICT (idempotency_key) DO UPDATE SET
+          status = EXCLUDED.status,
+          success_at = EXCLUDED.success_at,
+          fail_reason = EXCLUDED.fail_reason,
+          updated_at = now()
+      `;
+      await tx.$executeRaw`
+        INSERT INTO fulfillment_attempts (
+          id, fulfillment_id, attempt_no, idempotency_key, operator_id,
+          request_json, result_json, status, created_at
+        )
+        VALUES (
+          ${stableDbId("fulfillment_attempt", `${orderNo}:${input.attemptNo}`)},
+          ${fulfillmentId}, ${input.attemptNo}, ${`fulfillment-attempt:${orderNo}:${input.attemptNo}`},
+          ${actor.merchantId},
+          ${jsonForDb({ evidence: input.evidence, failReason: input.failReason })}::jsonb,
+          ${jsonForDb(input)}::jsonb,
+          CAST(${fulfillmentStatus} AS "FulfillmentStatus"), now()
+        )
+        ON CONFLICT (fulfillment_id, attempt_no) DO UPDATE SET
+          result_json = EXCLUDED.result_json,
+          status = EXCLUDED.status
+      `;
+      await tx.$executeRaw`
+        UPDATE orders
+           SET fulfillment_status = CAST(${fulfillmentStatus} AS "FulfillmentStatus"),
+               status = CAST(${orderStatus} AS "OrderStatus"),
+               fulfilled_at = CASE WHEN ${input.status === "success"} THEN ${now} ELSE fulfilled_at END,
+               updated_at = now()
+         WHERE id = ${order.id}
+      `;
+      await tx.$executeRaw`
+        INSERT INTO audit_logs (
+          id, actor_type, actor_id, action, target_type, target_id,
+          after_json, idempotency_key, request_id, ip, created_at
+        )
+        VALUES (
+          ${stableDbId("audit", `fulfillment.update:${orderNo}:${input.attemptNo}`)},
+          CAST('merchant' AS "ActorType"), ${actor.merchantId}, 'fulfillment.update',
+          'order', ${orderNo}, ${jsonForDb(input)}::jsonb,
+          ${`audit:fulfillment.update:${orderNo}:${input.attemptNo}`},
+          ${`fulfillment.update:${orderNo}:${input.attemptNo}`}, '127.0.0.1', now()
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+    });
+    const refreshed = await this.getMerchantOrder(actor, orderNo);
+    return {
+      fulfillmentStatus,
+      orderStatus,
+      order: refreshed
+    };
+  }
+
+  private async findDirectMerchantOrderRows(actor: MerchantActor, orderNo?: string) {
+    return this.prisma.$queryRaw<Array<{
+      order_no: string;
+      shop_id: string;
+      merchant_id: string | null;
+      sales_channel_type: string;
+      first_tier_merchant_id: string | null;
+      second_tier_merchant_id: string | null;
+      third_tier_merchant_id: string | null;
+      status: string;
+      payment_status: string;
+      fulfillment_status: string;
+      refund_status: string;
+      paid_amount_cents: bigint;
+      coupon_discount_cents: bigint;
+      collection_snapshot_json: unknown;
+      product_name_snapshot: string | null;
+      quantity: number | null;
+      snapshot_paid_amount_cents: bigint | null;
+      supply_amount_cents: bigint | null;
+      service_fee_cents: bigint | null;
+      merchant_expected_income_cents: bigint | null;
+      platform_supply_price_cents: bigint | null;
+      first_tier_supply_price_cents: bigint | null;
+      second_tier_supply_price_cents: bigint | null;
+      first_tier_income_cents: bigint | null;
+      second_tier_income_cents: bigint | null;
+      third_tier_income_cents: bigint | null;
+      payment_payable_amount_cents: bigint | null;
+      created_at: Date;
+    }>>`
+      SELECT o.order_no, o.shop_id, o.merchant_id, o.sales_channel_type,
+             o.first_tier_merchant_id, o.second_tier_merchant_id, o.third_tier_merchant_id,
+             o.status, o.payment_status, o.fulfillment_status, o.refund_status,
+             o.paid_amount_cents, o.coupon_discount_cents, o.collection_snapshot_json,
+             oi.product_name_snapshot, oi.quantity,
+             oas.paid_amount_cents AS snapshot_paid_amount_cents,
+             oas.supply_amount_cents, oas.service_fee_cents, oas.merchant_expected_income_cents,
+             oas.platform_supply_price_cents, oas.first_tier_supply_price_cents,
+             oas.second_tier_supply_price_cents, oas.first_tier_income_cents,
+             oas.second_tier_income_cents, oas.third_tier_income_cents,
+             ps.payable_amount_cents AS payment_payable_amount_cents,
+             o.created_at
+        FROM orders o
+        LEFT JOIN order_items oi ON oi.order_id = o.id
+        LEFT JOIN order_amount_snapshots oas ON oas.order_id = o.id
+        LEFT JOIN LATERAL (
+          SELECT payable_amount_cents
+            FROM payment_snapshots
+           WHERE order_id = o.id
+           ORDER BY created_at DESC
+           LIMIT 1
+        ) ps ON TRUE
+       WHERE (${orderNo ?? null}::text IS NULL OR o.order_no = ${orderNo ?? null})
+         AND (
+           (o.merchant_id = ${actor.merchantId} AND o.shop_id = ${actor.shopId})
+           OR o.first_tier_merchant_id = ${actor.merchantId}
+           OR o.second_tier_merchant_id = ${actor.merchantId}
+         )
+       ORDER BY o.created_at DESC
+       LIMIT ${orderNo ? 1 : 100}
+    `;
+  }
+
+  private serializeDirectMerchantOrderRow(actor: MerchantActor, row: Awaited<ReturnType<PrismaStateRepository["findDirectMerchantOrderRows"]>>[number]) {
+    const buyerPaidAmountCents = row.payment_payable_amount_cents ?? row.paid_amount_cents ?? row.snapshot_paid_amount_cents ?? 0n;
+    const settlementBasisAmountCents = row.snapshot_paid_amount_cents ?? row.paid_amount_cents ?? buyerPaidAmountCents;
+    const collectionSnapshot = row.collection_snapshot_json as PaymentMethodPublicSnapshot | null;
+    const result: Record<string, unknown> = {
+      orderNo: row.order_no,
+      shopId: row.shop_id,
+      salesChannelType: row.sales_channel_type,
+      status: row.status,
+      paymentStatus: row.payment_status,
+      fulfillmentStatus: row.fulfillment_status,
+      refundStatus: row.refund_status,
+      paidAmountCents: buyerPaidAmountCents,
+      buyerPaidAmountCents,
+      settlementBasisAmountCents,
+      couponDiscountCents: row.coupon_discount_cents ?? 0n,
+      productName: row.product_name_snapshot ?? "商品",
+      quantity: row.quantity ?? 1,
+      collectionPaymentMethod: collectionSnapshot ? {
+        id: collectionSnapshot.id,
+        paymentType: collectionSnapshot.channelType,
+        displayName: collectionSnapshot.displayName
+      } : undefined
+    };
+    const hasChannel = row.first_tier_merchant_id || row.second_tier_merchant_id || row.third_tier_merchant_id;
+    if (!hasChannel) {
+      result.visibleSupplyPriceCents = row.supply_amount_cents ?? 0n;
+      result.visibleIncomeCents = row.merchant_expected_income_cents ?? 0n;
+      return result;
+    }
+    if (actor.merchantId === row.first_tier_merchant_id) {
+      result.platformSupplyPriceCents = row.platform_supply_price_cents ?? 0n;
+      result.firstTierSupplyPriceCents = row.first_tier_supply_price_cents ?? 0n;
+      result.visibleIncomeCents = row.first_tier_income_cents ?? 0n;
+    } else if (actor.merchantId === row.second_tier_merchant_id) {
+      result.firstTierSupplyPriceCents = row.first_tier_supply_price_cents ?? 0n;
+      result.secondTierSupplyPriceCents = row.second_tier_supply_price_cents ?? 0n;
+      result.visibleIncomeCents = row.second_tier_income_cents ?? 0n;
+    } else if (actor.merchantId === row.third_tier_merchant_id) {
+      result.secondTierSupplyPriceCents = row.second_tier_supply_price_cents ?? 0n;
+      result.visibleIncomeCents = row.third_tier_income_cents ?? 0n;
+    }
+    return result;
+  }
+
+  private async findDirectPaymentMethodConfig(methodId: string): Promise<PaymentMethodConfig | undefined> {
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      owner_type: string;
+      owner_merchant_id: string | null;
+      shop_id: string | null;
+      provider: string;
+      confirm_mode: string;
+      status: string;
+      is_default: boolean;
+      display_name: string;
+      merchant_no_masked: string | null;
+      app_id_masked: string | null;
+      service_provider_masked: string | null;
+      gateway_url: string | null;
+      api_mode: string | null;
+      credential_ciphertext: string | null;
+      return_url: string | null;
+      test_status: string | null;
+      last_test_at: Date | null;
+      last_callback_at: Date | null;
+      qr_url: string | null;
+      account_masked: string | null;
+      instruction: string | null;
+      updated_by_id: string | null;
+      created_at: Date;
+      updated_at: Date;
+    }>>`
+      SELECT id, owner_type, owner_merchant_id, shop_id, provider, confirm_mode, status,
+             is_default, display_name, merchant_no_masked, app_id_masked, service_provider_masked,
+             gateway_url, api_mode, credential_ciphertext, return_url, test_status, last_test_at,
+             last_callback_at, qr_url, account_masked, instruction, updated_by_id, created_at, updated_at
+        FROM collection_payment_configs
+       WHERE id = ${methodId}
+       LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) return undefined;
+    const credentialBundle = decryptPaymentCredentialBundle(row.credential_ciphertext);
+    return {
+      id: row.id,
+      ownerType: row.owner_type === "merchant" ? "merchant" : "platform",
+      merchantId: row.owner_merchant_id ?? undefined,
+      shopId: row.shop_id ?? undefined,
+      provider: mapPaymentProviderFromDb(row.provider),
+      confirmationMode: mapPaymentConfirmModeFromDb(row.confirm_mode),
+      displayName: row.display_name,
+      merchantNo: credentialBundle.merchantNo ?? row.merchant_no_masked ?? undefined,
+      appId: credentialBundle.appId ?? row.app_id_masked ?? undefined,
+      serviceProviderId: credentialBundle.serviceProviderId ?? row.service_provider_masked ?? undefined,
+      gatewayUrl: row.gateway_url ?? undefined,
+      apiMode: parsePaymentApiMode(row.api_mode),
+      accountName: row.account_masked ?? undefined,
+      qrUrl: row.qr_url ?? undefined,
+      paymentUrl: row.qr_url ?? undefined,
+      note: row.instruction ?? undefined,
+      returnUrl: row.return_url ?? undefined,
+      enabled: row.status === "active",
+      status: mapCollectionPaymentConfigStatusFromDb(row.status),
+      isDefault: row.is_default,
+      signingSecret: credentialBundle.signingSecret,
+      secretConfigured: Boolean(credentialBundle.signingSecret || row.credential_ciphertext || isManualPaymentProvider(mapPaymentProviderFromDb(row.provider))),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      updatedBy: row.updated_by_id ?? undefined,
+      lastTestAt: row.last_test_at ?? undefined,
+      lastTestResult: row.test_status === "passed" || row.test_status === "failed" ? row.test_status : undefined,
+      lastCallbackAt: row.last_callback_at ?? undefined
+    };
+  }
+
+  private assertDirectPaymentMethodInput(ownerType: "platform" | "merchant", input: PaymentMethodUpsertInput, updatingExisting: boolean) {
+    if (ownerType === "merchant" && (!input.merchantId || !input.shopId)) throw new ApiError(400, "PAYMENT_METHOD_SCOPE_REQUIRED", "merchant payment method requires merchant and shop scope");
+    if (input.provider && isManualPaymentProvider(input.provider)) {
+      if (!updatingExisting && (!input.accountName || !input.qrUrl)) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "personal payment requires account name and QR code");
+      return;
+    }
+    if (input.provider === "balance") return;
+    if (input.provider && ["alipay_merchant", "wechat_merchant", "epay"].includes(input.provider)) {
+      if (!updatingExisting && !input.merchantNo) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "merchant number is required");
+      if (!updatingExisting && input.provider !== "epay" && !input.appId) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "app id is required");
+      if (!updatingExisting && input.provider === "epay" && !input.gatewayUrl) throw new ApiError(400, "PAYMENT_METHOD_FIELD_REQUIRED", "epay gateway url is required");
+      if (!input.signingSecret && !updatingExisting) throw new ApiError(400, "PAYMENT_METHOD_SECRET_REQUIRED", "signing secret is required");
+    }
+  }
+
+  private applyDirectPaymentMethodSecrets(method: PaymentMethodConfig, input: PaymentMethodUpsertInput) {
+    if (input.signingSecret) {
+      method.signingSecret = input.signingSecret;
+      method.signingSecretHash = hashSecret(input.signingSecret);
+      method.signingSecretPreview = previewSecret(input.signingSecret);
+      method.secretConfigured = true;
+    }
+    if (input.privateKey) {
+      method.privateKeyConfigured = true;
+      method.privateKeyPreview = previewSecret(input.privateKey);
+    }
+    if (input.publicKey) {
+      method.publicKeyConfigured = true;
+      method.publicKeyPreview = previewSecret(input.publicKey);
+    }
+    if (input.certificate) {
+      method.certificateConfigured = true;
+      method.certificatePreview = previewSecret(input.certificate);
+    }
+  }
+
+  private serializeDirectPaymentMethod(method: PaymentMethodConfig) {
+    return {
+      id: method.id,
+      ownerType: method.ownerType,
+      merchantId: method.merchantId,
+      shopId: method.shopId,
+      provider: method.provider,
+      confirmationMode: method.confirmationMode,
+      displayName: method.displayName,
+      productType: method.productType,
+      merchantNoMasked: maskSecret(method.merchantNo),
+      appIdMasked: maskSecret(method.appId),
+      serviceProviderMasked: maskSecret(method.serviceProviderId),
+      gatewayUrl: method.gatewayUrl,
+      apiMode: method.apiMode ?? defaultPaymentApiMode(method.provider),
+      accountName: isManualPaymentProvider(method.provider) ? method.accountName : maskSecret(method.accountName),
+      qrUrl: isManualPaymentProvider(method.provider) ? method.qrUrl : undefined,
+      paymentUrl: isManualPaymentProvider(method.provider) ? method.paymentUrl : undefined,
+      note: method.note,
+      returnUrl: method.returnUrl,
+      callbackUrl: providerCallbackUrlForPersistence(method.provider),
+      enabled: method.enabled,
+      status: method.status,
+      isDefault: method.isDefault,
+      keyStatus: {
+        signingSecret: method.secretConfigured ? "configured" : "missing",
+        privateKey: method.privateKeyConfigured ? "configured" : "missing",
+        publicKey: method.publicKeyConfigured ? "configured" : "missing",
+        certificate: method.certificateConfigured ? "configured" : "missing"
+      },
+      updatedAt: method.updatedAt,
+      lastTestAt: method.lastTestAt,
+      lastTestResult: method.lastTestResult,
+      lastCallbackAt: method.lastCallbackAt
+    };
+  }
+
+  async getDirectUserWallet(actor: UserActor) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      wallet_no: string;
+      user_id: string;
+      available_balance_cents: bigint;
+      frozen_balance_cents: bigint;
+      total_recharge_cents: bigint;
+      total_spend_cents: bigint;
+      status: string;
+      version: number;
+    }>>`
+      SELECT wallet_no, user_id, available_balance_cents, frozen_balance_cents,
+             total_recharge_cents, total_spend_cents, status, version
+        FROM user_wallets
+       WHERE user_id = ${actor.userId}
+       LIMIT 1
+    `;
+    const wallet = rows[0];
+    if (wallet) {
+      return {
+        walletNo: wallet.wallet_no,
+        userId: wallet.user_id,
+        availableBalanceCents: wallet.available_balance_cents,
+        frozenBalanceCents: wallet.frozen_balance_cents,
+        totalRechargeCents: wallet.total_recharge_cents,
+        totalSpendCents: wallet.total_spend_cents,
+        status: wallet.status,
+        version: wallet.version
+      };
+    }
+    const walletNo = `wallet-${actor.userId}`;
+    await this.prisma.$executeRaw`
+      INSERT INTO user_wallets (
+        id, wallet_no, user_id, available_balance_cents, frozen_balance_cents,
+        total_recharge_cents, total_spend_cents, status, version, created_at, updated_at
+      )
+      VALUES (
+        ${stableDbId("wallet", actor.userId)}, ${walletNo}, ${actor.userId}, 0, 0,
+        0, 0, CAST('active' AS "WalletStatus"), 0, now(), now()
+      )
+      ON CONFLICT (user_id) DO NOTHING
+    `;
+    return {
+      walletNo,
+      userId: actor.userId,
+      availableBalanceCents: 0n,
+      frozenBalanceCents: 0n,
+      totalRechargeCents: 0n,
+      totalSpendCents: 0n,
+      status: "active",
+      version: 0
+    };
+  }
+
+  async listPublicShopProducts(shopIdentifier: string) {
+    const shop = await this.findPublicShop(shopIdentifier);
+    if (!shop) throw new ApiError(404, "RESOURCE_NOT_FOUND", "shop not found");
+    if ((shop.ownerType ?? "merchant") === "platform") return this.listPublicPlatformShopProducts(shop.id);
+    const [platformRows, ownRows] = await Promise.all([
+      this.prisma.$queryRaw<Array<{
+        id: string;
+        shop_id: string;
+	        product_type: "platform" | "merchant_owned";
+        platform_product_id: string | null;
+        sale_price_cents: bigint;
+        status: string;
+        display_name: string | null;
+        display_subtitle: string | null;
+        display_description: string | null;
+        display_usage_guide: string | null;
+        display_image_url: string | null;
+        display_category: string | null;
+        display_tags_json: unknown;
+        display_specs_json: unknown;
+        display_detail_sections_json: unknown;
+        pp_id: string | null;
+        pp_name: string | null;
+        category_name: string | null;
+        tags_json: unknown;
+        image_url: string | null;
+        specs_json: unknown;
+        detail_sections_json: unknown;
+        stock_count: number | null;
+        public_stock_count: number | null;
+        sold_count: number | null;
+        display_badge: string | null;
+        is_recommended: boolean | null;
+        display_sort: number | null;
+        detail: string | null;
+        rights_desc: string | null;
+        fulfillment_rule_json: unknown;
+        after_sale_rule_json: unknown;
+        product_status: string | null;
+      }>>`
+	        SELECT mpl.id, mpl.shop_id, CAST('platform' AS TEXT) AS product_type, mpl.platform_product_id, mpl.sale_price_cents, mpl.status,
+	               mpl.display_name, mpl.display_subtitle, mpl.display_description, mpl.display_usage_guide,
+	               mpl.display_image_url, mpl.display_category, mpl.display_tags_json, mpl.display_specs_json,
+	               mpl.display_detail_sections_json,
+               pp.id AS pp_id, pp.name AS pp_name, pp.category_name, pp.tags_json, pp.image_url,
+               pp.specs_json, pp.detail_sections_json, pp.stock_count,
+               CASE WHEN pp.fulfillment_rule_json->>'mode' = 'code_pool'
+                 THEN (
+                   SELECT COUNT(*)::int
+                     FROM rights_codes rc
+                    WHERE rc.product_id = pp.id
+                      AND rc.status = 'available'
+                 )
+                 ELSE pp.stock_count
+               END AS public_stock_count,
+               pp.sold_count,
+               pp.display_badge, pp.is_recommended, pp.display_sort, pp.detail, pp.rights_desc,
+               pp.fulfillment_rule_json, pp.after_sale_rule_json, pp.status AS product_status
+	          FROM merchant_product_listings mpl
+	          LEFT JOIN platform_products pp ON pp.id = mpl.platform_product_id
+	         WHERE mpl.shop_id = ${shop.id} AND mpl.status = 'listed'
+	         ORDER BY COALESCE(pp.display_sort, 0) DESC, mpl.id ASC
+      `,
+      this.prisma.$queryRaw<Array<{
+        id: string;
+        shop_id: string;
+	        product_type: "platform" | "merchant_owned";
+        own_product_review_id: string | null;
+        sale_price_cents: bigint;
+        status: string;
+        display_name: string | null;
+        display_subtitle: string | null;
+        display_description: string | null;
+        display_usage_guide: string | null;
+        display_image_url: string | null;
+        display_category: string | null;
+        display_tags_json: unknown;
+        display_specs_json: unknown;
+        display_detail_sections_json: unknown;
+        own_name: string | null;
+        detail_json: unknown;
+        public_stock_count: number | null;
+        fulfillment_rule_json: unknown;
+        after_sale_rule_json: unknown;
+        product_status: string | null;
+      }>>`
+	        SELECT mp.id, mp.shop_id, mp.product_type, mp.own_product_review_id, mp.sale_price_cents, mp.status,
+	               NULL::text AS display_name, NULL::text AS display_subtitle, NULL::text AS display_description, NULL::text AS display_usage_guide,
+	               NULL::text AS display_image_url, NULL::text AS display_category, NULL::jsonb AS display_tags_json, NULL::jsonb AS display_specs_json,
+	               NULL::jsonb AS display_detail_sections_json,
+               opr.name AS own_name, opr.detail_json,
+               CASE WHEN opr.fulfillment_rule_json->>'mode' = 'code_pool'
+                 THEN (
+                   SELECT COUNT(*)::int
+                     FROM rights_codes rc
+                    WHERE rc.merchant_product_listing_id = mp.id
+                      AND rc.status = 'available'
+                 )
+                 ELSE COALESCE((opr.detail_json->>'stockCount')::int, 0)
+               END AS public_stock_count,
+               opr.fulfillment_rule_json, opr.after_sale_rule_json,
+               opr.status AS product_status
+	          FROM merchant_products mp
+	          LEFT JOIN merchant_product_reviews opr ON opr.id = mp.own_product_review_id
+	         WHERE mp.shop_id = ${shop.id} AND mp.status = 'listed' AND mp.product_type = 'merchant_owned'
+	         ORDER BY mp.id ASC
+      `
+    ]);
+    return [
+      ...platformRows.map((row) => ({
+        id: row.id,
+        shopId: row.shop_id,
+        productType: row.product_type,
+        salePriceCents: row.sale_price_cents,
+        status: row.status,
+        product: row.pp_id ? {
+          id: row.pp_id,
+          name: row.display_name ?? row.pp_name,
+          category: row.display_category ?? row.category_name ?? undefined,
+          tags: Array.isArray(row.display_tags_json) ? row.display_tags_json : Array.isArray(row.tags_json) ? row.tags_json : undefined,
+          subtitle: row.display_subtitle ?? row.rights_desc ?? undefined,
+          description: row.display_description ?? row.detail ?? undefined,
+          usageGuide: row.display_usage_guide ?? undefined,
+          imageUrl: row.display_image_url ?? row.image_url ?? undefined,
+          specs: Array.isArray(row.display_specs_json) ? row.display_specs_json : Array.isArray(row.specs_json) ? row.specs_json : undefined,
+          detailSections: Array.isArray(row.display_detail_sections_json) ? row.display_detail_sections_json : Array.isArray(row.detail_sections_json) ? row.detail_sections_json : undefined,
+          stockCount: row.public_stock_count ?? row.stock_count ?? undefined,
+          soldCount: row.sold_count ?? undefined,
+          platformProductId: row.platform_product_id ?? undefined,
+          displayBadge: row.display_badge ?? undefined,
+          isRecommended: row.is_recommended ?? undefined,
+          displaySort: row.display_sort ?? undefined,
+          fulfillmentRule: row.fulfillment_rule_json,
+          afterSaleRule: row.after_sale_rule_json,
+          status: row.product_status ?? undefined
+        } : null
+      })),
+      ...ownRows.map((row) => {
+        const detail = decodeStoreValue(row.detail_json);
+        return {
+          id: row.id,
+          shopId: row.shop_id,
+          productType: row.product_type,
+          salePriceCents: row.sale_price_cents,
+          status: row.status,
+          product: {
+            id: row.own_product_review_id,
+            name: row.display_name ?? row.own_name ?? undefined,
+            category: row.display_category ?? (isRecord(detail) ? stringValue(detail.category) : undefined),
+            tags: Array.isArray(row.display_tags_json) ? row.display_tags_json : isRecord(detail) && Array.isArray(detail.tags) ? detail.tags : undefined,
+            subtitle: row.display_subtitle ?? (isRecord(detail) ? stringValue(detail.subtitle) : undefined),
+            description: row.display_description ?? (isRecord(detail) ? stringValue(detail.description) : undefined),
+            usageGuide: row.display_usage_guide ?? (isRecord(detail) ? stringValue(detail.usageGuide) : undefined),
+            imageUrl: row.display_image_url ?? (isRecord(detail) ? stringValue(detail.imageUrl) : undefined),
+            specs: Array.isArray(row.display_specs_json) ? row.display_specs_json : isRecord(detail) && Array.isArray(detail.specs) ? detail.specs : undefined,
+            detailSections: Array.isArray(row.display_detail_sections_json) ? row.display_detail_sections_json : isRecord(detail) && Array.isArray(detail.detailSections) ? detail.detailSections : undefined,
+            stockCount: row.public_stock_count ?? undefined,
+            fulfillmentRule: decodeStoreValue(row.fulfillment_rule_json),
+            afterSaleRule: decodeStoreValue(row.after_sale_rule_json),
+            status: row.product_status ?? undefined
+          }
+        };
+      })
+    ];
+  }
+
+  async listPublicPaymentMethods(shopIdentifier: string) {
+    const shop = await this.findPublicShop(shopIdentifier);
+    if (!shop) throw new ApiError(404, "RESOURCE_NOT_FOUND", "shop not found");
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+	      owner_type: "platform" | "merchant";
+	      provider: "alipay_merchant" | "wechat_merchant" | "epay" | "alipay_personal" | "wechat_personal" | "balance";
+      confirm_mode: string;
+      is_default: boolean;
+      display_name: string;
+      merchant_no_masked: string | null;
+      app_id_masked: string | null;
+      gateway_url: string | null;
+      credential_ciphertext: string | null;
+      qr_url: string | null;
+      return_url: string | null;
+    }>>`
+	      SELECT id, owner_type, provider, confirm_mode, is_default, display_name,
+               merchant_no_masked, app_id_masked, gateway_url, credential_ciphertext,
+               qr_url, return_url
+	        FROM collection_payment_configs
+         WHERE enabled_at IS NOT NULL
+	         AND status = 'active'
+	         AND provider <> 'balance'
+	         AND (
+	           (provider IN ('alipay_personal', 'wechat_personal') AND qr_url IS NOT NULL)
+	           OR (provider = 'epay' AND gateway_url IS NOT NULL AND merchant_no_masked IS NOT NULL AND credential_ciphertext LIKE 'aes256gcm:%')
+	           OR (provider IN ('alipay_merchant', 'wechat_merchant') AND merchant_no_masked IS NOT NULL AND app_id_masked IS NOT NULL AND credential_ciphertext LIKE 'aes256gcm:%')
+	         )
+	         AND (
+	           (owner_type = 'merchant' AND shop_id = ${shop.id})
+	           OR (owner_type = 'platform' AND ${shop.ownerType} = 'platform')
+	         )
+       ORDER BY is_default DESC, updated_at DESC
+    `;
+    return [
+      {
+        id: "balance",
+        paymentMethodId: "balance",
+        shopId: shop.id,
+        ownerType: "platform",
+        provider: "balance",
+        confirmationMode: "automatic",
+        channelType: "balance",
+        displayName: "余额支付",
+        isDefault: false,
+        sortOrder: -1,
+        paymentFeeBps: 0,
+        paymentFeeLabel: "0%",
+        publicLabel: "余额支付",
+        note: "余额支付无手续费"
+      },
+	      ...rows.filter((row) => {
+          const provider = mapPaymentProviderFromDb(row.provider);
+          const credential = decryptPaymentCredentialBundle(row.credential_ciphertext);
+          if (isManualPaymentProvider(provider)) return Boolean(row.qr_url);
+          if (provider === "epay") return Boolean(row.gateway_url && (credential.merchantNo ?? row.merchant_no_masked) && credential.signingSecret);
+          return Boolean((credential.merchantNo ?? row.merchant_no_masked) && (credential.appId ?? row.app_id_masked) && row.credential_ciphertext?.startsWith("aes256gcm:"));
+        }).map((row, index) => {
+	        const provider = mapPaymentProviderFromDb(row.provider);
+	        const feeBps = provider === "balance" ? 0 : 100;
+	        return {
+	          id: row.id,
+	          paymentMethodId: row.id,
+	          shopId: shop.id,
+	          ownerType: row.owner_type,
+	          provider,
+	          confirmationMode: row.confirm_mode,
+	          channelType: paymentDisplayTypeForProvider(provider),
+	          displayName: paymentProviderDisplay(provider),
+	          qrUrl: isManualPaymentProvider(provider) ? row.qr_url ?? undefined : undefined,
+	          paymentUrl: isManualPaymentProvider(provider) ? row.return_url ?? undefined : undefined,
+	          isDefault: row.is_default,
+	          sortOrder: index,
+	          paymentFeeBps: feeBps,
+	          paymentFeeLabel: feeBps === 0 ? "0%" : `${(feeBps / 100).toFixed(0)}%`,
+	          publicLabel: paymentProviderPublicLabel(provider, feeBps),
+	          note: isManualPaymentProvider(provider) ? "个人收款需商户人工确认" : "官方支付以回调或查单为准"
+	        };
+      })
+    ];
+  }
+
+  async quoteOrder(actor: UserActor, input: { shopId: string; merchantProductListingId?: string; quantity?: number; couponId?: string }) {
+    const quantity = input.quantity ?? 1;
+    const listingId = input.merchantProductListingId;
+    if (!listingId) throw new ApiError(400, "PRODUCT_REQUIRED", "product required");
+    const shop = await this.requirePublicShop(input.shopId);
+    await this.assertDirectShopAcceptsOrders(shop);
+    const product = await this.findQuotableProduct(shop.id, listingId);
+    if (product.fulfillmentMode === "code_pool" && await this.countAvailableDirectRightsCodes(product) < quantity) {
+      throw new ApiError(400, "RIGHTS_CODE_STOCK_INSUFFICIENT", "商品库存不足，暂时无法下单");
+    }
+    const paidAmountCents = product.salePriceCents * BigInt(quantity);
+    const couponDiscountCents = input.couponId
+      ? await this.resolveDirectCouponDiscount(actor.userId, input.couponId, paidAmountCents, product.platformProductId, product.merchantProductId, shop.id)
+      : 0n;
+    const buyerPaidAmountCents = paidAmountCents - couponDiscountCents > 0n ? paidAmountCents - couponDiscountCents : 0n;
+    return {
+      paidAmountCents,
+      buyerPaidAmountCents,
+      settlementBasisAmountCents: paidAmountCents,
+      couponDiscountCents,
+      salePriceCents: product.salePriceCents,
+      quantity
+    };
+  }
+
+  private async countAvailableDirectRightsCodes(product: { platformProductId?: string | null; merchantProductId?: string | null }) {
+    if (product.platformProductId) {
+      return this.prisma.rightsCode.count({
+        where: {
+          productId: product.platformProductId,
+          status: "available"
+        }
+      });
+    }
+    if (product.merchantProductId) {
+      return this.prisma.rightsCode.count({
+        where: {
+          merchantProductListingId: product.merchantProductId,
+          status: "available"
+        }
+      });
+    }
+    return 0;
+  }
+
+  async createOrder(actor: UserActor, input: {
+    shopId: string;
+    merchantProductListingId?: string;
+    quantity?: number;
+    buyerEmail?: string;
+    buyerPhone?: string;
+    extractionCode?: string;
+    couponId?: string;
+    paymentMethodId?: string;
+    clientPaidAmountCents?: bigint;
+  }) {
+    const quantity = input.quantity ?? 1;
+    const listingId = input.merchantProductListingId ?? input.merchantProductListingId;
+    if (!listingId) throw new ApiError(400, "PRODUCT_REQUIRED", "product required");
+    const shop = await this.requirePublicShop(input.shopId);
+    await this.assertDirectShopAcceptsOrders(shop);
+    const product = await this.findOrderProduct(shop.id, listingId);
+    const paidAmountCents = product.salePriceCents * BigInt(quantity);
+    let couponDiscountCents = 0n;
+    let couponSnapshot: Record<string, unknown> | null = null;
+    let couponUsage: {
+      userCouponId: string;
+      couponTemplateId: string;
+      discountCents: bigint;
+      subsidyCents: bigint;
+      idempotencyKey: string;
+    } | null = null;
+    let buyerPaidAmountCents = paidAmountCents;
+    if (product.fulfillmentMode === "code_pool" && !input.extractionCode) {
+      throw new ApiError(400, "PURCHASE_PASSWORD_REQUIRED", "this product requires a purchase password");
+    }
+    if (product.fulfillmentMode === "code_pool" && !/^1[3-9]\d{9}$/.test(input.buyerPhone ?? "")) {
+      throw new ApiError(400, "BUYER_PHONE_REQUIRED", "code_pool products require a valid mainland China mobile phone");
+    }
+
+    const serviceFeeConfig = await this.activeDirectServiceFeeConfig();
+    const serviceFeeBps = serviceFeeConfig.enabled ? BigInt(serviceFeeConfig.feeBps) : 0n;
+    const serviceFeeCents = calculateServiceFeeCents(paidAmountCents, serviceFeeBps);
+    const orderNo = `order-${Date.now()}${Math.floor(Math.random() * 1000).toString().padStart(3, "0")}`;
+    const orderId = stableDbId("order", orderNo);
+    const orderItemId = stableDbId("order_item", orderNo);
+    const amountId = stableDbId("amount_snapshot", orderNo);
+    const now = new Date();
+    const merchantExpectedIncomeCents = product.merchantId ? paidAmountCents - product.supplyAmountCents - serviceFeeCents : 0n;
+    const snapshot = {
+      product: { id: product.platformProductId ?? product.productIdSnapshot, name: product.productName },
+      shop: { id: shop.id, shopNo: shop.shopNo, ownerType: product.shopOwnerType },
+      pricing: { salePriceCents: product.salePriceCents },
+      fulfillmentRule: product.fulfillmentRule,
+      afterSaleRule: product.afterSaleRule
+    };
+
+    await this.prisma.$transaction(async (tx) => {
+      if (input.couponId) {
+        const coupon = await this.lockAndApplyDirectCoupon(tx, {
+          userId: actor.userId,
+          couponId: input.couponId,
+          orderId,
+          paidAmountCents,
+          platformProductId: product.platformProductId,
+          merchantProductId: product.merchantProductId,
+          shopId: shop.id,
+          orderNo
+        });
+        couponDiscountCents = coupon.discountCents;
+        couponSnapshot = coupon.snapshot;
+        couponUsage = coupon.usage;
+      }
+      const finalBuyerPaidAmountCents = paidAmountCents - couponDiscountCents > 0n ? paidAmountCents - couponDiscountCents : 0n;
+      if (input.clientPaidAmountCents !== undefined && input.clientPaidAmountCents !== finalBuyerPaidAmountCents) {
+        throw new ApiError(400, "AMOUNT_MISMATCH", "client amount does not match backend quote");
+      }
+      buyerPaidAmountCents = finalBuyerPaidAmountCents;
+      await tx.$executeRaw`
+        INSERT INTO users (id, status, created_at, updated_at)
+        VALUES (${actor.userId}, 'active', now(), now())
+        ON CONFLICT (id) DO NOTHING
+      `;
+      await tx.$executeRaw`
+        INSERT INTO orders (
+          id, order_no, user_id, merchant_id, shop_id, buyer_email, buyer_phone, purchase_password_hash,
+          sales_channel_type, coupon_discount_cents, coupon_snapshot_json, status, payment_status,
+          fulfillment_status, refund_status, settlement_status, risk_status,
+          paid_amount_cents, created_at, updated_at
+        )
+        VALUES (
+          ${orderId}, ${orderNo}, ${actor.userId}, ${product.merchantId}, ${shop.id},
+          ${input.buyerEmail ?? null}, ${input.buyerPhone ?? null}, ${input.extractionCode ? hashSecret(input.extractionCode) : null},
+          CAST(${product.salesChannelType} AS "SalesChannelType"),
+          ${couponDiscountCents}, ${couponSnapshot ? jsonForDb(couponSnapshot) : null}::jsonb,
+          CAST('pending_payment' AS "OrderStatus"), CAST('unpaid' AS "PaymentStatus"),
+          CAST('not_started' AS "FulfillmentStatus"), CAST('none' AS "RefundStatus"),
+          CAST('pending' AS "SettlementStatus"), CAST('normal' AS "RiskStatus"), ${finalBuyerPaidAmountCents}, ${now}, ${now}
+        )
+      `;
+      if (couponUsage) {
+        await tx.$executeRaw`
+          INSERT INTO coupon_usage (
+            id, user_coupon_id, coupon_template_id, order_id, discount_cents,
+            subsidy_cents, idempotency_key, created_at
+          )
+          VALUES (
+            ${stableDbId("coupon_usage", couponUsage.idempotencyKey)}, ${couponUsage.userCouponId},
+            ${couponUsage.couponTemplateId}, ${orderId}, ${couponUsage.discountCents},
+            ${couponUsage.subsidyCents}, ${couponUsage.idempotencyKey}, now()
+          )
+          ON CONFLICT (idempotency_key) DO NOTHING
+        `;
+      }
+      await tx.$executeRaw`
+        INSERT INTO order_items (
+          id, order_id, merchant_product_listing_id, merchant_product_id, platform_shop_product_id,
+          sale_source_type, product_type, product_id_snapshot, product_name_snapshot,
+          sale_price_cents, quantity, supply_price_cents, service_fee_cents,
+          merchant_income_cents, created_at
+        )
+        VALUES (
+          ${orderItemId}, ${orderId}, ${product.merchantProductListingId}, ${product.merchantProductId}, ${product.platformShopProductId},
+          CAST(${product.saleSourceType} AS "SaleSourceType"), CAST(${product.productType} AS "ProductType"), ${product.productIdSnapshot}, ${product.productName},
+          ${paidAmountCents}, ${quantity}, ${product.supplyAmountCents}, ${serviceFeeCents},
+          ${merchantExpectedIncomeCents}, ${now}
+        )
+      `;
+      await tx.$executeRaw`
+        INSERT INTO order_amount_snapshots (
+          id, order_id, service_fee_bps, paid_amount_cents, supply_amount_cents,
+          service_fee_cents, merchant_expected_income_cents, platform_supply_price_cents,
+          final_sale_price_cents, fulfillment_cost_cents, payment_channel_fee_cents,
+          platform_gross_profit_cents, payment_fee_bps, payment_fee_cents,
+          balance_paid_cents, external_paid_cents, service_fee_enabled,
+          service_fee_basis_amount_cents, service_fee_config_snapshot_json,
+          product_snapshot_json, shop_snapshot_json, pricing_snapshot_json,
+          fulfillment_rule_snapshot_json, after_sale_rule_snapshot_json, created_at
+        )
+        VALUES (
+          ${amountId}, ${orderId}, ${Number(serviceFeeBps)}, ${paidAmountCents}, ${product.supplyAmountCents},
+          ${serviceFeeCents}, ${merchantExpectedIncomeCents}, ${product.supplyAmountCents},
+          ${paidAmountCents}, ${product.platformShopProductId ? product.supplyAmountCents : 0n}, 0,
+          ${product.platformShopProductId ? paidAmountCents - product.supplyAmountCents : 0n}, 0, 0,
+          0, ${finalBuyerPaidAmountCents}, ${serviceFeeConfig.enabled},
+          ${paidAmountCents}, ${jsonForDb(serviceFeeConfig)}::jsonb,
+          ${jsonForDb(snapshot.product)}::jsonb, ${jsonForDb(snapshot.shop)}::jsonb,
+          ${jsonForDb(snapshot.pricing)}::jsonb, ${jsonForDb(product.fulfillmentRule)}::jsonb,
+          ${jsonForDb(product.afterSaleRule)}::jsonb, ${now}
+        )
+      `;
+      if (product.fulfillmentMode === "code_pool") {
+        const locked = product.productType === "platform"
+          ? await tx.$queryRaw<Array<{ id: string }>>`
+            UPDATE rights_codes
+               SET status = CAST('locked' AS "RightsCodeStatus"),
+                   order_id = ${orderId},
+                   issue_key = ${`reserve:${orderNo}`},
+                   updated_at = now()
+             WHERE id = (
+               SELECT id
+                 FROM rights_codes
+                WHERE status = CAST('available' AS "RightsCodeStatus")
+                  AND product_id = ${product.platformProductId ?? null}
+                ORDER BY created_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+             )
+             RETURNING id
+          `
+          : await tx.$queryRaw<Array<{ id: string }>>`
+            UPDATE rights_codes
+               SET status = CAST('locked' AS "RightsCodeStatus"),
+                   order_id = ${orderId},
+                   issue_key = ${`reserve:${orderNo}`},
+                   updated_at = now()
+             WHERE id = (
+               SELECT id
+                FROM rights_codes
+               WHERE status = CAST('available' AS "RightsCodeStatus")
+                  AND merchant_product_listing_id = ${product.merchantProductListingId ?? product.merchantProductId}
+                ORDER BY created_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+             )
+             RETURNING id
+          `;
+        if (locked.length === 0) throw new ApiError(400, "RIGHTS_CODE_STOCK_INSUFFICIENT", `${product.productName} 库存不足，暂时无法下单`);
+        await tx.$executeRaw`
+          INSERT INTO order_extract_secrets (
+            id, order_id, order_item_id, claim_code_hash, status, failed_attempts,
+            idempotency_key, created_at, updated_at
+          )
+          VALUES (
+            ${stableDbId("extract_secret", orderNo)}, ${orderId}, ${orderItemId},
+            ${hashSecret(input.extractionCode ?? "")}, CAST('active' AS "ExtractSecretStatus"), 0, ${`extract:${orderNo}`}, ${now}, ${now}
+          )
+        `;
+      }
+      await tx.$executeRaw`
+        INSERT INTO audit_logs (
+          id, actor_type, actor_id, action, target_type, target_id,
+          after_json, idempotency_key, request_id, ip, created_at
+        )
+        VALUES (
+          ${stableDbId("audit", `order.create:${orderNo}`)}, CAST('user' AS "ActorType"), ${actor.userId},
+          'order.create', 'order', ${orderNo}, ${jsonForDb({ orderNo, shopId: shop.id, shopNo: shop.shopNo })}::jsonb,
+          ${`audit:order.create:${orderNo}`}, ${`order.create:${orderNo}`}, '127.0.0.1', ${now}
+        )
+      `;
+    }, { maxWait: 10_000, timeout: 30_000 });
+
+    const balancePaymentResult = input.paymentMethodId === "balance"
+      ? await this.createPaymentOrder(actor, orderNo, { paymentMethodId: "balance" })
+      : undefined;
+
+    return {
+      orderNo,
+      userId: actor.userId,
+      shopId: shop.id,
+      shopNo: shop.shopNo,
+      merchantProductListingId: listingId,
+      productName: product.productName,
+      paymentStatus: balancePaymentResult?.order?.paymentStatus ?? "unpaid",
+      fulfillmentStatus: balancePaymentResult?.order?.fulfillmentStatus ?? "not_started",
+      refundStatus: "none",
+      paidAmountCents,
+      buyerPaidAmountCents,
+      couponDiscountCents,
+      purchasePasswordSet: Boolean(input.extractionCode),
+      snapshot: {
+        quote: { paidAmountCents, buyerPaidAmountCents, salePriceCents: product.salePriceCents, quantity },
+        amountSnapshot: { paidAmountCents, buyerPaidAmountCents, serviceFeeBps, serviceFeeCents },
+        productSnapshot: snapshot.product,
+        fulfillmentRuleSnapshot: product.fulfillmentRule
+      }
+    };
+  }
+
+  async createPaymentOrder(actor: UserActor, orderNo: string, input: { paymentMethodId?: string } = {}) {
+    const orderRows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      order_no: string;
+      user_id: string;
+      merchant_id: string | null;
+      shop_id: string;
+      payment_status: string;
+      fulfillment_status: string;
+      refund_status: string;
+      paid_amount_cents: bigint;
+      fulfillment_rule_snapshot_json: unknown;
+      product_snapshot_json: unknown;
+    }>>`
+      SELECT o.id, o.order_no, o.user_id, o.merchant_id, o.shop_id, o.payment_status, o.fulfillment_status,
+             o.refund_status, o.paid_amount_cents, oas.fulfillment_rule_snapshot_json,
+             oas.product_snapshot_json
+        FROM orders o
+        LEFT JOIN order_amount_snapshots oas ON oas.order_id = o.id
+       WHERE o.order_no = ${orderNo}
+       LIMIT 1
+    `;
+    const order = orderRows[0];
+    if (!order) throw new ApiError(404, "RESOURCE_NOT_FOUND", "order not found");
+    if (order.user_id !== actor.userId) throw new ApiError(403, "FORBIDDEN_USER_SCOPE", "user cannot access another user resource");
+    if (order.payment_status === "paid") {
+      return { status: "already_paid" as const, orderNo, order: { orderNo, paymentStatus: "paid", fulfillmentStatus: order.fulfillment_status } };
+    }
+    if (order.refund_status !== "none") throw new ApiError(400, "PAYMENT_ORDER_NOT_ALLOWED", "refunded orders cannot create payment");
+
+    const method = input.paymentMethodId === "balance"
+      ? { id: "balance", provider: "balance", confirmMode: "balance_deduct", qrUrl: null as string | null, returnUrl: null as string | null }
+      : await this.findDirectPaymentMethod(order.shop_id, input.paymentMethodId);
+    const baseAmountCents = order.paid_amount_cents;
+    const feeBps = method.provider === "balance" ? 0 : 100;
+    const feeCents = calculateServiceFeeCents(baseAmountCents, BigInt(feeBps));
+    const amountCents = baseAmountCents + feeCents;
+    const paymentNo = `payment-${orderNo}`;
+    const paymentId = stableDbId("payment", paymentNo);
+    const now = new Date();
+
+    if (method.provider === "balance") {
+      const result = await this.prisma.$transaction(async (tx) => {
+        const wallets = await tx.$queryRaw<Array<{ id: string; available_balance_cents: bigint }>>`
+          SELECT id, available_balance_cents
+            FROM user_wallets
+           WHERE user_id = ${actor.userId}
+           FOR UPDATE
+        `;
+        const wallet = wallets[0];
+        if (!wallet || wallet.available_balance_cents < amountCents) {
+          throw new ApiError(400, "WALLET_BALANCE_INSUFFICIENT", "wallet balance is not enough for this order");
+        }
+        const balanceBeforeCents = wallet.available_balance_cents;
+        const balanceAfterCents = wallet.available_balance_cents - amountCents;
+        await tx.$executeRaw`
+          UPDATE user_wallets
+             SET available_balance_cents = available_balance_cents - ${amountCents},
+                 total_spend_cents = total_spend_cents + ${amountCents},
+                 version = version + 1,
+                 updated_at = now()
+           WHERE id = ${wallet.id}
+        `;
+        const collectionSnapshot = this.directPaymentCollectionSnapshot(method);
+        await tx.$executeRaw`
+          INSERT INTO payments (
+            id, payment_no, order_id, user_id, merchant_id, collection_snapshot_json, channel, provider, confirm_mode,
+            base_amount_cents, fee_bps, fee_cents, amount_cents, channel_fee_cents,
+            status, confirm_source, idempotency_key, paid_at, created_at, updated_at
+          )
+          VALUES (
+            ${paymentId}, ${paymentNo}, ${order.id}, ${actor.userId}, ${order.merchant_id}, ${jsonForDb(collectionSnapshot)}::jsonb,
+            CAST('balance' AS "PaymentChannel"),
+            CAST('balance' AS "PaymentProvider"), CAST('balance_deduct' AS "PaymentConfirmMode"),
+            ${baseAmountCents}, 0, 0, ${amountCents}, 0, CAST('paid' AS "PaymentStatus"),
+            CAST('balance' AS "PaymentConfirmSource"), ${`payment:${paymentNo}`}, ${now}, ${now}, ${now}
+          )
+          ON CONFLICT (idempotency_key) DO NOTHING
+        `;
+        await this.persistDirectPaymentSnapshot(tx, {
+          orderId: order.id,
+          orderNo,
+          userId: actor.userId,
+          paymentId,
+          paymentNo,
+          method,
+          baseAmountCents,
+          feeBps: 0,
+          feeCents: 0n,
+          amountCents,
+          status: "paid",
+          confirmSource: "balance",
+          paidAt: now,
+          expiresAt: null,
+          collectionSnapshot
+        });
+        await this.updateDirectOrderPaymentAmountSnapshot(tx, order.id, {
+          feeBps: 0,
+          feeCents: 0n,
+          baseAmountCents,
+          amountCents,
+          provider: "balance",
+          collectionSnapshot
+        });
+        await tx.$executeRaw`
+          INSERT INTO wallet_transactions (
+            id, transaction_no, user_id, wallet_id, type, direction, amount_cents,
+            balance_before_cents, balance_after_cents, frozen_before_cents, frozen_after_cents,
+            order_id, payment_id, source_type, source_id, note, idempotency_key, created_at
+          )
+          VALUES (
+            ${stableDbId("wallet_tx", paymentNo)}, ${`wallet-tx-${paymentNo}`}, ${actor.userId}, ${wallet.id},
+            CAST('payment_capture' AS "WalletTransactionType"), CAST('debit' AS "LedgerDirection"), ${amountCents},
+            ${balanceBeforeCents}, ${balanceAfterCents}, 0, 0,
+            ${order.id}, ${paymentId}, 'order_payment', ${orderNo}, '余额支付扣款',
+            ${`wallet-tx:${paymentNo}`}, ${now}
+          )
+          ON CONFLICT (idempotency_key) DO NOTHING
+        `;
+        await tx.$executeRaw`
+          UPDATE orders
+             SET payment_status = CAST('paid' AS "PaymentStatus"),
+                 status = CAST('paid' AS "OrderStatus"),
+                 paid_at = ${now},
+                 updated_at = now()
+           WHERE id = ${order.id}
+        `;
+        if (fulfillmentRuleMode(order.fulfillment_rule_snapshot_json) === "code_pool") {
+          await tx.$executeRaw`
+            UPDATE rights_codes
+               SET status = CAST('issued' AS "RightsCodeStatus"),
+                   issued_at = ${now},
+                   updated_at = now()
+             WHERE order_id = ${order.id}
+               AND status = CAST('locked' AS "RightsCodeStatus")
+          `;
+          await tx.$executeRaw`
+            UPDATE orders
+               SET fulfillment_status = CAST('success' AS "FulfillmentStatus"),
+                   fulfilled_at = ${now},
+                   updated_at = now()
+             WHERE id = ${order.id}
+          `;
+        }
+        return { fulfillmentStatus: fulfillmentRuleMode(order.fulfillment_rule_snapshot_json) === "code_pool" ? "success" : "not_started" };
+      }, { maxWait: 10_000, timeout: 30_000 });
+      return {
+        status: "processed" as const,
+        orderNo,
+        provider: "balance",
+        amountCents,
+        paymentNo,
+        order: { orderNo, paymentStatus: "paid", fulfillmentStatus: result.fulfillmentStatus }
+      };
+    }
+
+    const status = method.confirmMode === "manual_confirm" ? "pending_manual_confirmation" : "created";
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+    const collectionSnapshot = this.directPaymentCollectionSnapshot(method);
+    const epayParams = method.provider === "epay"
+      ? await this.buildDirectEpayPaymentParams(method, order.order_no, order.product_snapshot_json, amountCents)
+      : undefined;
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`
+        INSERT INTO payments (
+          id, payment_no, order_id, user_id, merchant_id, collection_payment_config_id, collection_snapshot_json,
+          channel, provider, confirm_mode, base_amount_cents, fee_bps, fee_cents,
+          amount_cents, channel_fee_cents, status, confirm_source, idempotency_key,
+          expires_at, created_at, updated_at
+        )
+        VALUES (
+          ${paymentId}, ${paymentNo}, ${order.id}, ${actor.userId}, ${order.merchant_id}, ${method.id === "balance" ? null : method.id},
+          ${jsonForDb(collectionSnapshot)}::jsonb,
+          CAST(${method.provider === "epay" ? "epay" : method.provider.startsWith("wechat") ? "wechat_h5" : "alipay_wap"} AS "PaymentChannel"),
+          CAST(${method.provider} AS "PaymentProvider"), CAST(${method.confirmMode} AS "PaymentConfirmMode"),
+          ${baseAmountCents}, ${feeBps}, ${feeCents}, ${amountCents}, 0,
+          CAST(${method.confirmMode === "manual_confirm" ? "unpaid" : "paying"} AS "PaymentStatus"),
+          CAST('unconfirmed' AS "PaymentConfirmSource"), ${`payment:${paymentNo}`},
+          ${expiresAt}, ${now}, ${now}
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+      await this.persistDirectPaymentSnapshot(tx, {
+        orderId: order.id,
+        orderNo,
+        userId: actor.userId,
+        paymentId,
+        paymentNo,
+        method,
+        baseAmountCents,
+        feeBps,
+        feeCents,
+        amountCents,
+        status: method.confirmMode === "manual_confirm" ? "unpaid" : "paying",
+        confirmSource: "unconfirmed",
+        paidAt: null,
+        expiresAt,
+        collectionSnapshot
+      });
+      await this.updateDirectOrderPaymentAmountSnapshot(tx, order.id, {
+        feeBps,
+        feeCents,
+        baseAmountCents,
+        amountCents,
+        provider: method.provider,
+        collectionSnapshot
+      });
+    }, { maxWait: 10_000, timeout: 30_000 });
+    return {
+      status,
+      orderNo,
+      provider: method.provider,
+      amountCents,
+      paymentNo,
+      qrCodeUrl: epayParams?.qrCodeUrl ?? method.qrUrl ?? undefined,
+      payUrl: epayParams?.paymentUrl ?? method.returnUrl ?? undefined,
+      paymentParams: epayParams,
+      paymentMethod: {
+        id: method.id,
+        provider: mapPaymentProviderFromDb(method.provider as "alipay_merchant" | "wechat_merchant" | "epay" | "alipay_personal" | "wechat_personal" | "balance")
+      }
+    };
+  }
+
+  async confirmMerchantOfflinePayment(actor: MerchantActor, orderNo: string, input: { amountCents: bigint; voucherUrl?: string; note?: string }) {
+    const orderRows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      order_no: string;
+      user_id: string;
+      merchant_id: string | null;
+      shop_id: string;
+      payment_status: string;
+      refund_status: string;
+      paid_amount_cents: bigint;
+      buyer_email: string | null;
+      fulfillment_rule_snapshot_json: unknown;
+    }>>`
+      SELECT o.id, o.order_no, o.user_id, o.merchant_id, o.shop_id, o.payment_status,
+             o.refund_status, o.paid_amount_cents, o.buyer_email,
+             oas.fulfillment_rule_snapshot_json
+        FROM orders o
+        LEFT JOIN order_amount_snapshots oas ON oas.order_id = o.id
+       WHERE o.order_no = ${orderNo}
+       LIMIT 1
+    `;
+    const order = orderRows[0];
+    if (!order) throw new ApiError(404, "RESOURCE_NOT_FOUND", "order not found");
+    if (order.merchant_id !== actor.merchantId || order.shop_id !== actor.shopId) {
+      throw new ApiError(403, "FORBIDDEN_MERCHANT_SCOPE", "merchant cannot access another merchant resource");
+    }
+    if (order.refund_status !== "none") throw new ApiError(400, "MANUAL_CONFIRM_NOT_ALLOWED", "refunded orders cannot be manually confirmed");
+
+    const paymentRows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      payment_no: string;
+      provider: string | null;
+      confirm_mode: string | null;
+      amount_cents: bigint;
+      base_amount_cents: bigint;
+      fee_bps: number;
+      fee_cents: bigint;
+      collection_payment_config_id: string | null;
+      collection_snapshot_json: unknown;
+    }>>`
+      SELECT id, payment_no, provider, confirm_mode, amount_cents, base_amount_cents,
+             fee_bps, fee_cents, collection_payment_config_id, collection_snapshot_json
+        FROM payments
+       WHERE order_id = ${order.id}
+       ORDER BY created_at DESC
+       LIMIT 1
+    `;
+    const existingPayment = paymentRows[0];
+    if (existingPayment?.provider && !["alipay_personal", "wechat_personal"].includes(existingPayment.provider)) {
+      throw new ApiError(400, "MANUAL_CONFIRM_NOT_ALLOWED", "only personal payment orders can be manually confirmed");
+    }
+    const expectedAmount = existingPayment?.amount_cents ?? order.paid_amount_cents;
+    if (input.amountCents !== expectedAmount) {
+      throw new ApiError(400, "AMOUNT_MISMATCH", "offline payment amount does not match order amount");
+    }
+    if (order.payment_status === "paid") {
+      return {
+        status: "already_paid" as const,
+        idempotencyKey: `offline-payment:${orderNo}:${input.voucherUrl ?? expectedAmount.toString()}`,
+        order: { orderNo, paymentStatus: "paid", fulfillmentStatus: "success" }
+      };
+    }
+
+    const manualMethods = existingPayment?.collection_payment_config_id ? [] : await this.prisma.$queryRaw<Array<{
+      id: string;
+      provider: "alipay_personal" | "wechat_personal";
+      confirm_mode: "manual_confirm";
+      owner_type: string;
+      owner_merchant_id: string | null;
+      shop_id: string | null;
+      display_name: string;
+      merchant_no_masked: string | null;
+      app_id_masked: string | null;
+      service_provider_masked: string | null;
+      gateway_url: string | null;
+      api_mode: string | null;
+    }>>`
+      SELECT id, provider, confirm_mode, owner_type, owner_merchant_id, shop_id, display_name,
+             merchant_no_masked, app_id_masked, service_provider_masked, gateway_url, api_mode
+        FROM collection_payment_configs
+       WHERE enabled_at IS NOT NULL
+         AND status = 'active'
+         AND confirm_mode = CAST('manual_confirm' AS "PaymentConfirmMode")
+         AND provider IN (CAST('alipay_personal' AS "PaymentProvider"), CAST('wechat_personal' AS "PaymentProvider"))
+         AND owner_type = CAST('merchant' AS "CollectionConfigOwnerType")
+         AND shop_id = ${order.shop_id}
+       ORDER BY is_default DESC, updated_at DESC
+       LIMIT 1
+    `;
+    const manualMethod = manualMethods[0];
+    const paymentNo = existingPayment?.payment_no ?? `payment-${orderNo}`;
+    const paymentId = existingPayment?.id ?? stableDbId("payment", paymentNo);
+    const provider = existingPayment?.provider ?? manualMethod?.provider ?? "alipay_personal";
+    const method = {
+      id: existingPayment?.collection_payment_config_id ?? manualMethod?.id ?? "manual-payment",
+      provider,
+      confirmMode: "manual_confirm",
+      ownerType: manualMethod?.owner_type,
+      merchantId: manualMethod?.owner_merchant_id,
+      shopId: manualMethod?.shop_id,
+      displayName: manualMethod?.display_name ?? paymentProviderDisplay(mapPaymentProviderFromDb(provider)),
+      merchantNo: manualMethod?.merchant_no_masked ?? undefined,
+      appId: manualMethod?.app_id_masked ?? undefined,
+      serviceProviderId: manualMethod?.service_provider_masked ?? undefined,
+      gatewayUrl: manualMethod?.gateway_url ?? undefined,
+      apiMode: manualMethod?.api_mode ?? undefined
+    };
+    const collectionSnapshot = isRecord(existingPayment?.collection_snapshot_json)
+      ? existingPayment.collection_snapshot_json
+      : this.directPaymentCollectionSnapshot(method);
+    const baseAmountCents = existingPayment?.base_amount_cents ?? order.paid_amount_cents;
+    const feeBps = existingPayment?.fee_bps ?? 0;
+    const feeCents = existingPayment?.fee_cents ?? 0n;
+    const now = new Date();
+    const isCodePool = fulfillmentRuleMode(order.fulfillment_rule_snapshot_json) === "code_pool";
+    const idempotencyKey = `offline-payment:${orderNo}:${input.voucherUrl ?? expectedAmount.toString()}`;
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`
+        INSERT INTO payments (
+          id, payment_no, order_id, user_id, merchant_id, collection_payment_config_id, collection_snapshot_json,
+          channel, provider, confirm_mode, base_amount_cents, fee_bps, fee_cents,
+          amount_cents, channel_fee_cents, status, confirm_source, idempotency_key,
+          paid_at, created_at, updated_at
+        )
+        VALUES (
+          ${paymentId}, ${paymentNo}, ${order.id}, ${order.user_id}, ${order.merchant_id},
+          ${method.id === "manual-payment" ? null : method.id}, ${jsonForDb(collectionSnapshot)}::jsonb,
+          CAST(${provider.startsWith("wechat") ? "wechat_h5" : "alipay_wap"} AS "PaymentChannel"),
+          CAST(${provider} AS "PaymentProvider"), CAST('manual_confirm' AS "PaymentConfirmMode"),
+          ${baseAmountCents}, ${feeBps}, ${feeCents}, ${expectedAmount}, 0,
+          CAST('paid' AS "PaymentStatus"), CAST('manual_confirm' AS "PaymentConfirmSource"),
+          ${`payment:${paymentNo}`}, ${now}, ${now}, ${now}
+        )
+        ON CONFLICT (idempotency_key) DO UPDATE SET
+          status = CAST('paid' AS "PaymentStatus"),
+          confirm_source = CAST('manual_confirm' AS "PaymentConfirmSource"),
+          paid_at = EXCLUDED.paid_at,
+          updated_at = now()
+      `;
+      await this.persistDirectPaymentSnapshot(tx, {
+        orderId: order.id,
+        orderNo,
+        userId: order.user_id,
+        paymentId,
+        paymentNo,
+        method,
+        baseAmountCents,
+        feeBps,
+        feeCents,
+        amountCents: expectedAmount,
+        status: "paid",
+        confirmSource: "manual_confirm",
+        paidAt: now,
+        expiresAt: null,
+        collectionSnapshot: collectionSnapshot as Record<string, unknown>
+      });
+      await tx.$executeRaw`
+        INSERT INTO payment_confirmations (
+          id, confirmation_no, order_id, payment_id, shop_id, amount_cents, voucher_url, note,
+          status, reviewed_by, reviewed_at, idempotency_key, created_at, updated_at
+        )
+        VALUES (
+          ${stableDbId("payment_confirmation", idempotencyKey)}, ${`confirm:${orderNo}`},
+          ${order.id}, ${paymentId}, ${order.shop_id}, ${expectedAmount}, ${input.voucherUrl ?? null},
+          ${input.note ?? null}, CAST('confirmed' AS "PaymentConfirmationStatus"),
+          ${actor.merchantId}, ${now}, ${idempotencyKey}, ${now}, ${now}
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+      await tx.$executeRaw`
+        UPDATE orders
+           SET payment_status = CAST('paid' AS "PaymentStatus"),
+               status = CAST(${isCodePool ? "fulfilled" : "fulfilling"} AS "OrderStatus"),
+               fulfillment_status = CAST(${isCodePool ? "success" : "processing"} AS "FulfillmentStatus"),
+               paid_at = ${now},
+               fulfilled_at = ${isCodePool ? now : null},
+               updated_at = now()
+         WHERE id = ${order.id}
+      `;
+      let issuedCodes: Array<{ id: string; code_ciphertext: string; order_item_id: string }> = [];
+      if (isCodePool) {
+        issuedCodes = await tx.$queryRaw<Array<{ id: string; code_ciphertext: string; order_item_id: string }>>`
+          UPDATE rights_codes rc
+             SET status = CAST('issued' AS "RightsCodeStatus"),
+                 issued_at = ${now},
+                 issue_key = COALESCE(rc.issue_key, ${`issue:${orderNo}:`} || rc.id),
+                 updated_at = now()
+            FROM order_items oi
+           WHERE rc.order_id = ${order.id}
+             AND oi.order_id = ${order.id}
+             AND rc.status IN (CAST('locked' AS "RightsCodeStatus"), CAST('issued' AS "RightsCodeStatus"))
+           RETURNING rc.id, rc.code_ciphertext, oi.id AS order_item_id
+        `;
+        for (const code of issuedCodes) {
+          await tx.$executeRaw`
+            INSERT INTO entitlements (
+              id, order_id, order_item_id, user_id, rights_code, rights_payload_json,
+              status, idempotency_key, issued_at, created_at, updated_at
+            )
+            VALUES (
+              ${stableDbId("entitlement", `${orderNo}:${code.id}`)}, ${order.id}, ${code.order_item_id}, ${order.user_id},
+              ${code.code_ciphertext}, ${jsonForDb({ rightsCodeId: code.id })}::jsonb,
+              CAST('success' AS "FulfillmentStatus"), ${`entitlement:${orderNo}:${code.id}`}, ${now}, ${now}, ${now}
+            )
+            ON CONFLICT (idempotency_key) DO NOTHING
+          `;
+        }
+        const firstCode = issuedCodes[0];
+        if (firstCode) {
+          await tx.$executeRaw`
+            INSERT INTO fulfillment_records (
+              id, order_id, order_item_id, merchant_id, shop_id, idempotency_key,
+              fulfillment_type, status, success_at, created_at, updated_at
+            )
+            VALUES (
+              ${stableDbId("fulfillment", orderNo)}, ${order.id}, ${firstCode.order_item_id},
+              ${order.merchant_id}, ${order.shop_id}, ${`fulfillment:${orderNo}`},
+              CAST('code_pool' AS "FulfillmentType"), CAST('success' AS "FulfillmentStatus"),
+              ${now}, ${now}, ${now}
+            )
+            ON CONFLICT (idempotency_key) DO UPDATE SET
+              status = CAST('success' AS "FulfillmentStatus"),
+              success_at = EXCLUDED.success_at,
+              updated_at = now()
+          `;
+        }
+      }
+      if (isCodePool && order.buyer_email && issuedCodes.length > 0) {
+        await tx.$executeRaw`
+          INSERT INTO email_delivery_records (
+            id, delivery_no, order_id, order_item_id, email, scope, status, code_count,
+            error_code, error_message, actor_type, actor_id, source, idempotency_key, created_at, updated_at
+          )
+          VALUES (
+            ${stableDbId("email_delivery", orderNo)}, ${`email:${orderNo}`}, ${order.id},
+            ${issuedCodes[0]?.order_item_id ?? null}, ${order.buyer_email}, CAST('extract_link' AS "EmailDeliveryScope"),
+            CAST('provider_not_configured' AS "EmailDeliveryStatus"), ${issuedCodes.length},
+            'EMAIL_PROVIDER_NOT_CONFIGURED', 'email provider is not configured',
+            CAST('system' AS "ActorType"), 'system', 'auto_fulfillment',
+            ${`email:${orderNo}`}, ${now}, ${now}
+          )
+          ON CONFLICT (idempotency_key) DO NOTHING
+        `;
+      }
+      await tx.$executeRaw`
+        INSERT INTO ledger_entries (
+          id, ledger_no, merchant_id, shop_id, subject_type, subject_id,
+          account_type, entry_type, direction, amount_cents, currency, source_type,
+          source_id, order_id, idempotency_key, created_at
+        )
+        VALUES (
+          ${stableDbId("ledger", `manual-payment:${orderNo}`)}, ${`ledger:manual-payment:${orderNo}`},
+          ${order.merchant_id}, ${order.shop_id}, CAST('merchant' AS "LedgerSubjectType"),
+          ${order.merchant_id ?? "platform"}, CAST('merchant_pending_income' AS "LedgerAccountType"),
+          CAST('MANUAL_ADJUST' AS "LedgerEntryType"), CAST('credit' AS "LedgerDirection"),
+          ${expectedAmount}, 'CNY', 'order', ${orderNo}, ${order.id},
+          ${`ledger:manual-payment:${orderNo}`}, ${now}
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+      await tx.$executeRaw`
+        INSERT INTO audit_logs (
+          id, actor_type, actor_id, action, target_type, target_id,
+          after_json, idempotency_key, request_id, ip, created_at
+        )
+        VALUES (
+          ${stableDbId("audit", `order.offline_payment.confirm:${idempotencyKey}`)},
+          CAST('merchant' AS "ActorType"), ${actor.merchantId}, 'order.offline_payment.confirm',
+          'order', ${orderNo}, ${jsonForDb({ amountCents: expectedAmount, voucherUrl: input.voucherUrl, note: input.note })}::jsonb,
+          ${`audit:order.offline_payment.confirm:${idempotencyKey}`}, ${idempotencyKey}, '127.0.0.1', ${now}
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+      if (isCodePool) {
+        await tx.$executeRaw`
+          INSERT INTO audit_logs (
+            id, actor_type, actor_id, action, target_type, target_id,
+            after_json, idempotency_key, request_id, ip, created_at
+          )
+          VALUES (
+            ${stableDbId("audit", `fulfillment.auto_code_pool:${orderNo}`)},
+            CAST('system' AS "ActorType"), 'system', 'fulfillment.auto_code_pool',
+            'order', ${orderNo}, ${jsonForDb({ codeIds: issuedCodes.map((code) => code.id) })}::jsonb,
+            ${`audit:fulfillment.auto_code_pool:${orderNo}`}, ${`fulfillment.auto_code_pool:${orderNo}`}, '127.0.0.1', ${now}
+          )
+          ON CONFLICT (idempotency_key) DO NOTHING
+        `;
+      }
+      return { fulfillmentStatus: isCodePool ? "success" : "processing" };
+    }, { maxWait: 10_000, timeout: 30_000 });
+
+    return {
+      status: "processed" as const,
+      idempotencyKey,
+      order: { orderNo, paymentStatus: "paid", fulfillmentStatus: result.fulfillmentStatus }
+    };
+  }
+
+  async extractOrderCodes(actor: UserActor, orderNo: string, extractionCode: string) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      order_id: string;
+      order_no: string;
+      user_id: string;
+      payment_status: string;
+      fulfillment_status: string;
+      refund_status: string;
+      secret_id: string | null;
+      order_item_id: string | null;
+      claim_code_hash: string | null;
+      failed_attempts: number | null;
+      locked_until: Date | null;
+    }>>`
+      SELECT o.id AS order_id, o.order_no, o.user_id, o.payment_status, o.fulfillment_status,
+             o.refund_status, oes.id AS secret_id, oes.order_item_id, oes.claim_code_hash,
+             oes.failed_attempts, oes.locked_until
+        FROM orders o
+        LEFT JOIN order_extract_secrets oes ON oes.order_id = o.id AND oes.status = CAST('active' AS "ExtractSecretStatus")
+       WHERE o.order_no = ${orderNo}
+       LIMIT 1
+    `;
+    const order = rows[0];
+    if (!order) throw new ApiError(404, "RESOURCE_NOT_FOUND", "order not found");
+    if (order.user_id !== actor.userId) throw new ApiError(403, "FORBIDDEN_USER_SCOPE", "user cannot access another user resource");
+    if (order.payment_status !== "paid" || order.fulfillment_status !== "success") {
+      throw new ApiError(400, "EXTRACTION_NOT_READY", "delivery codes are not ready");
+    }
+    if (order.refund_status !== "none") throw new ApiError(403, "EXTRACTION_FORBIDDEN_AFTER_REFUND", "refunded orders cannot view delivery codes");
+    if (!order.secret_id || !order.claim_code_hash || !order.order_item_id) {
+      throw new ApiError(400, "EXTRACTION_NOT_REQUIRED", "this order is manually delivered");
+    }
+    const now = new Date();
+    if (order.locked_until && order.locked_until > now) {
+      await this.insertDirectExtractLog(order.order_id, order.secret_id, actor.userId, "locked", "too_many_attempts");
+      throw new ApiError(423, "EXTRACTION_LOCKED", "too many wrong attempts, try again later");
+    }
+    if (hashSecret(extractionCode) !== order.claim_code_hash) {
+      const failedAttempts = (order.failed_attempts ?? 0) + 1;
+      const lockedUntil = failedAttempts >= 3 ? new Date(now.getTime() + 30 * 60 * 1000) : null;
+      await this.prisma.$executeRaw`
+        UPDATE order_extract_secrets
+           SET failed_attempts = ${lockedUntil ? 0 : failedAttempts},
+               locked_until = ${lockedUntil},
+               updated_at = now()
+         WHERE id = ${order.secret_id}
+      `;
+      await this.insertDirectExtractLog(order.order_id, order.secret_id, actor.userId, lockedUntil ? "locked" : "failed", "invalid_code");
+      throw new ApiError(403, "PURCHASE_PASSWORD_INVALID", "purchase password is incorrect");
+    }
+    const codes = await this.prisma.$queryRaw<Array<{ id: string; code_ciphertext: string; issued_at: Date | null }>>`
+      SELECT id, code_ciphertext, issued_at
+        FROM rights_codes
+       WHERE order_id = ${order.order_id}
+         AND status = CAST('issued' AS "RightsCodeStatus")
+       ORDER BY issued_at ASC, id ASC
+    `;
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`
+        UPDATE order_extract_secrets
+           SET failed_attempts = 0,
+               locked_until = NULL,
+               first_viewed_at = COALESCE(first_viewed_at, ${now}),
+               updated_at = now()
+         WHERE id = ${order.secret_id}
+      `;
+      await tx.$executeRaw`
+        INSERT INTO order_extract_logs (
+          id, extract_secret_id, order_id, actor_type, actor_id, result,
+          idempotency_key, created_at
+        )
+        VALUES (
+          ${stableDbId("extract_log", `${orderNo}:success:${Date.now()}`)}, ${order.secret_id}, ${order.order_id},
+          CAST('user' AS "ActorType"), ${actor.userId}, CAST('success' AS "ExtractLogResult"),
+          ${`extract:${orderNo}:success:${Date.now()}`}, ${now}
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+      await tx.$executeRaw`
+        INSERT INTO audit_logs (
+          id, actor_type, actor_id, action, target_type, target_id,
+          after_json, idempotency_key, request_id, ip, created_at
+        )
+        VALUES (
+          ${stableDbId("audit", `order.extract.success:${orderNo}:${actor.userId}:${Date.now()}`)},
+          CAST('user' AS "ActorType"), ${actor.userId}, 'order.extract.success',
+          'order', ${orderNo}, ${jsonForDb({ codeCount: codes.length })}::jsonb,
+          ${`audit:order.extract.success:${orderNo}:${actor.userId}:${Date.now()}`},
+          ${`order.extract.success:${orderNo}`}, '127.0.0.1', ${now}
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING
+      `;
+    }, { maxWait: 10_000, timeout: 30_000 });
+    return {
+      orderNo,
+      status: "success",
+      codes: codes.map((code) => ({ codeId: code.id, code: code.code_ciphertext, issuedAt: code.issued_at ?? undefined })),
+      message: "卡密已提取，请妥善保存。"
+    };
+  }
+
+  private async insertDirectExtractLog(orderId: string, extractSecretId: string, userId: string, result: "failed" | "locked", reasonCode: string) {
+    const now = new Date();
+    await this.prisma.$executeRaw`
+      INSERT INTO order_extract_logs (
+        id, extract_secret_id, order_id, actor_type, actor_id, result,
+        reason_code, idempotency_key, created_at
+      )
+      VALUES (
+        ${stableDbId("extract_log", `${orderId}:${result}:${now.getTime()}`)}, ${extractSecretId}, ${orderId},
+        CAST('user' AS "ActorType"), ${userId}, CAST(${result} AS "ExtractLogResult"),
+        ${reasonCode}, ${`extract:${orderId}:${result}:${now.getTime()}`}, ${now}
+      )
+      ON CONFLICT (idempotency_key) DO NOTHING
+    `;
+  }
+
+  private async findQuotableProduct(shopId: string, listingId: string) {
+    const platformRows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      shop_id: string;
+      platform_product_id: string;
+      sale_price_cents: bigint;
+      status: string;
+      product_status: string;
+      fulfillment_rule_json: unknown;
+    }>>`
+      SELECT psp.id, psp.shop_id, psp.platform_product_id, psp.sale_price_cents,
+             psp.status, pp.status AS product_status, pp.fulfillment_rule_json
+        FROM platform_shop_products psp
+        JOIN platform_products pp ON pp.id = psp.platform_product_id
+       WHERE psp.id = ${listingId}
+       LIMIT 1
+    `;
+    const platform = platformRows[0];
+    if (platform) {
+      if (platform.shop_id !== shopId) throw new ApiError(400, "RESOURCE_SCOPE_MISMATCH", "product does not belong to shop");
+      if (platform.status !== "listed" || platform.product_status !== "active") throw new ApiError(400, "PRODUCT_NOT_LISTED", "product is not listed");
+      return {
+        salePriceCents: platform.sale_price_cents,
+        platformProductId: platform.platform_product_id,
+        fulfillmentMode: fulfillmentRuleMode(platform.fulfillment_rule_json)
+      };
+    }
+
+    const listingRows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      shop_id: string;
+      platform_product_id: string | null;
+      sale_price_cents: bigint;
+      status: string;
+      product_status: string | null;
+      fulfillment_rule_json: unknown;
+    }>>`
+      SELECT mpl.id, mpl.shop_id, mpl.platform_product_id, mpl.sale_price_cents,
+             mpl.status, pp.status AS product_status, pp.fulfillment_rule_json
+        FROM merchant_product_listings mpl
+        LEFT JOIN platform_products pp ON pp.id = mpl.platform_product_id
+       WHERE mpl.id = ${listingId}
+       LIMIT 1
+    `;
+    const listing = listingRows[0];
+    if (listing) {
+      if (listing.shop_id !== shopId) throw new ApiError(400, "RESOURCE_SCOPE_MISMATCH", "product does not belong to shop");
+      if (listing.status !== "listed" || listing.product_status !== "active") throw new ApiError(400, "PRODUCT_NOT_LISTED", "product is not listed");
+      return {
+        salePriceCents: listing.sale_price_cents,
+        platformProductId: listing.platform_product_id ?? undefined,
+        fulfillmentMode: fulfillmentRuleMode(listing.fulfillment_rule_json)
+      };
+    }
+
+    const ownRows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      shop_id: string;
+      sale_price_cents: bigint;
+      status: string;
+      review_status: string | null;
+      fulfillment_rule_json: unknown;
+    }>>`
+      SELECT mp.id, mp.shop_id, mp.sale_price_cents, mp.status, mpr.status AS review_status,
+             mpr.fulfillment_rule_json
+        FROM merchant_products mp
+        LEFT JOIN merchant_product_reviews mpr ON mpr.id = mp.own_product_review_id
+       WHERE mp.id = ${listingId}
+       LIMIT 1
+    `;
+    const own = ownRows[0];
+    if (!own) throw new ApiError(404, "RESOURCE_NOT_FOUND", "product not found");
+    if (own.shop_id !== shopId) throw new ApiError(400, "RESOURCE_SCOPE_MISMATCH", "product does not belong to shop");
+    if (own.status !== "listed" || own.review_status !== "approved") throw new ApiError(400, "PRODUCT_NOT_LISTED", "product is not listed");
+    return {
+      salePriceCents: own.sale_price_cents,
+      merchantProductId: own.id,
+      fulfillmentMode: fulfillmentRuleMode(own.fulfillment_rule_json)
+    };
+  }
+
+  private async requirePublicShop(shopIdentifier: string): Promise<DemoShop> {
+    const shop = await this.findPublicShop(shopIdentifier);
+    if (!shop) throw new ApiError(404, "RESOURCE_NOT_FOUND", "shop not found");
+    return shop;
+  }
+
+  private async assertDirectShopAcceptsOrders(shop: DemoShop) {
+    if ((shop.ownerType ?? "merchant") !== "merchant") return;
+    const merchantId = shop.merchantId;
+    if (!merchantId) throw new ApiError(400, "SHOP_NOT_OPEN", "merchant shop is not open");
+    const rows = await this.prisma.$queryRaw<Array<{
+      merchant_status: string;
+      deposit_status: string | null;
+      shop_status: string;
+      merchant_risk_status: string | null;
+      shop_risk_status: string | null;
+    }>>`
+      SELECT m.status AS merchant_status, da.status AS deposit_status,
+             s.status AS shop_status, m.risk_status AS merchant_risk_status,
+             s.risk_status AS shop_risk_status
+        FROM merchants m
+        JOIN shops s ON s.merchant_id = m.id
+        LEFT JOIN deposit_accounts da ON da.merchant_id = m.id
+       WHERE m.id = ${merchantId}
+         AND s.id = ${shop.id}
+       LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) throw new ApiError(404, "RESOURCE_NOT_FOUND", "merchant shop not found");
+    if (row.deposit_status !== "paid" || row.merchant_status !== "active") {
+      throw new ApiError(400, "DEPOSIT_INSUFFICIENT", "merchant deposit is insufficient");
+    }
+    if (row.shop_status !== "open") throw new ApiError(400, "SHOP_NOT_OPEN", "merchant shop is not open");
+    if (row.merchant_risk_status !== "normal" || row.shop_risk_status !== "normal") {
+      throw new ApiError(400, "RISK_BLOCKED", "risk freeze blocks order creation");
+    }
+  }
+
+  private async findOrderProduct(shopId: string, listingId: string) {
+    const platformRows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      shop_id: string;
+      platform_product_id: string;
+      sale_price_cents: bigint;
+      fulfillment_cost_cents: bigint;
+      status: string;
+      product_status: string;
+      product_name: string;
+      fulfillment_rule_json: unknown;
+      after_sale_rule_json: unknown;
+      shop_owner_type: "platform" | "merchant";
+    }>>`
+      SELECT psp.id, psp.shop_id, psp.platform_product_id, psp.sale_price_cents,
+             psp.fulfillment_cost_cents, psp.status, pp.status AS product_status,
+             pp.name AS product_name, pp.fulfillment_rule_json, pp.after_sale_rule_json,
+             s.owner_type AS shop_owner_type
+        FROM platform_shop_products psp
+        JOIN platform_products pp ON pp.id = psp.platform_product_id
+        JOIN shops s ON s.id = psp.shop_id
+       WHERE psp.id = ${listingId}
+       LIMIT 1
+    `;
+    const platform = platformRows[0];
+    if (platform) {
+      if (platform.shop_id !== shopId) throw new ApiError(400, "RESOURCE_SCOPE_MISMATCH", "product does not belong to shop");
+      if (platform.status !== "listed" || platform.product_status !== "active") throw new ApiError(400, "PRODUCT_NOT_LISTED", "product is not listed");
+      return {
+        merchantId: null as string | null,
+        platformShopProductId: platform.id,
+        merchantProductListingId: null as string | null,
+        merchantProductId: null as string | null,
+        platformProductId: platform.platform_product_id,
+        productIdSnapshot: platform.platform_product_id,
+        productName: platform.product_name,
+        productType: "platform",
+        saleSourceType: "platform_shop_product",
+        salesChannelType: "platform_self_operated",
+        salePriceCents: platform.sale_price_cents,
+        supplyAmountCents: platform.fulfillment_cost_cents,
+        fulfillmentRule: platform.fulfillment_rule_json,
+        afterSaleRule: platform.after_sale_rule_json,
+        fulfillmentMode: fulfillmentRuleMode(platform.fulfillment_rule_json),
+        shopOwnerType: platform.shop_owner_type
+      };
+    }
+
+    const listingRows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      merchant_id: string;
+      shop_id: string;
+      platform_product_id: string;
+      sale_price_cents: bigint;
+      status: string;
+      display_name: string | null;
+      product_name: string;
+      supply_price_cents: bigint;
+      fulfillment_rule_json: unknown;
+      after_sale_rule_json: unknown;
+      product_status: string;
+      shop_owner_type: "platform" | "merchant";
+    }>>`
+      SELECT mpl.id, mpl.merchant_id, mpl.shop_id, mpl.platform_product_id,
+             mpl.sale_price_cents, mpl.status, mpl.display_name,
+             pp.name AS product_name, pp.supply_price_cents,
+             pp.fulfillment_rule_json, pp.after_sale_rule_json,
+             pp.status AS product_status, s.owner_type AS shop_owner_type
+        FROM merchant_product_listings mpl
+        JOIN platform_products pp ON pp.id = mpl.platform_product_id
+        JOIN shops s ON s.id = mpl.shop_id
+       WHERE mpl.id = ${listingId}
+       LIMIT 1
+    `;
+    const listing = listingRows[0];
+    if (listing) {
+      if (listing.shop_id !== shopId) throw new ApiError(400, "RESOURCE_SCOPE_MISMATCH", "product does not belong to shop");
+      if (listing.status !== "listed" || listing.product_status !== "active") throw new ApiError(400, "PRODUCT_NOT_LISTED", "product is not listed");
+      return {
+        merchantId: listing.merchant_id,
+        platformShopProductId: null as string | null,
+        merchantProductListingId: listing.id,
+        merchantProductId: null as string | null,
+        platformProductId: listing.platform_product_id,
+        productIdSnapshot: listing.platform_product_id,
+        productName: listing.display_name ?? listing.product_name,
+        productType: "platform",
+        saleSourceType: "merchant_product_listing",
+        salesChannelType: "single_merchant",
+        salePriceCents: listing.sale_price_cents,
+        supplyAmountCents: listing.supply_price_cents,
+        fulfillmentRule: listing.fulfillment_rule_json,
+        afterSaleRule: listing.after_sale_rule_json,
+        fulfillmentMode: fulfillmentRuleMode(listing.fulfillment_rule_json),
+        shopOwnerType: listing.shop_owner_type
+      };
+    }
+
+    const ownRows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      merchant_id: string;
+      shop_id: string;
+      sale_price_cents: bigint;
+      status: string;
+      own_name: string;
+      detail_json: unknown;
+      fulfillment_rule_json: unknown;
+      after_sale_rule_json: unknown;
+      review_status: string | null;
+      shop_owner_type: "platform" | "merchant";
+    }>>`
+      SELECT mp.id, mp.merchant_id, mp.shop_id, mp.sale_price_cents, mp.status,
+             mpr.name AS own_name, mpr.detail_json, mpr.fulfillment_rule_json, mpr.after_sale_rule_json,
+             mpr.status AS review_status, s.owner_type AS shop_owner_type
+        FROM merchant_products mp
+        JOIN merchant_product_reviews mpr ON mpr.id = mp.own_product_review_id
+        JOIN shops s ON s.id = mp.shop_id
+       WHERE mp.id = ${listingId}
+       LIMIT 1
+    `;
+    const own = ownRows[0];
+    if (!own) throw new ApiError(404, "RESOURCE_NOT_FOUND", "product not found");
+    if (own.shop_id !== shopId) throw new ApiError(400, "RESOURCE_SCOPE_MISMATCH", "product does not belong to shop");
+    if (own.status !== "listed" || own.review_status !== "approved") throw new ApiError(400, "PRODUCT_NOT_LISTED", "product is not listed");
+    return {
+      merchantId: own.merchant_id,
+      platformShopProductId: null as string | null,
+      merchantProductListingId: null as string | null,
+      merchantProductId: own.id,
+      platformProductId: undefined,
+      productIdSnapshot: own.id,
+      productName: own.own_name,
+      productType: "merchant_owned",
+      saleSourceType: "merchant_product",
+      salesChannelType: "single_merchant",
+      salePriceCents: own.sale_price_cents,
+      supplyAmountCents: 0n,
+      fulfillmentRule: own.fulfillment_rule_json,
+      afterSaleRule: own.after_sale_rule_json,
+      fulfillmentMode: fulfillmentRuleMode(own.fulfillment_rule_json),
+      shopOwnerType: own.shop_owner_type
+    };
+  }
+
+  private async activeDirectServiceFeeConfig() {
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      enabled: boolean;
+      fee_bps: number;
+      basis_type: string;
+      status: string;
+      updated_at: Date;
+      updated_by: string | null;
+    }>>`
+      SELECT id, enabled, fee_bps, basis_type, status, updated_at, updated_by
+        FROM platform_service_fee_configs
+       WHERE status = 'active'
+       ORDER BY effective_from DESC, updated_at DESC
+       LIMIT 1
+    `;
+    const row = rows[0];
+    return {
+      id: row?.id ?? "default",
+      enabled: row?.enabled ?? true,
+      feeBps: row?.fee_bps ?? 50,
+      basisType: row?.basis_type ?? "final_sale_price",
+      status: row?.status ?? "active",
+      updatedAt: row?.updated_at ?? new Date(),
+      updatedBy: row?.updated_by ?? undefined
+    };
+  }
+
+  private async findDirectPaymentMethod(shopId: string, paymentMethodId?: string) {
+    const shop = await this.requirePublicShop(shopId);
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      owner_type: "platform" | "merchant";
+      owner_merchant_id: string | null;
+      shop_id: string | null;
+      provider: "alipay_merchant" | "wechat_merchant" | "epay" | "alipay_personal" | "wechat_personal" | "balance";
+      confirm_mode: "callback_query" | "manual_confirm" | "balance_deduct";
+      display_name: string;
+      merchant_no_masked: string | null;
+      app_id_masked: string | null;
+      service_provider_masked: string | null;
+      gateway_url: string | null;
+      api_mode: string | null;
+      credential_ciphertext: string | null;
+      qr_url: string | null;
+      return_url: string | null;
+      is_default: boolean;
+    }>>`
+      SELECT id, owner_type, owner_merchant_id, shop_id, provider, confirm_mode, display_name,
+             merchant_no_masked, app_id_masked, service_provider_masked, gateway_url, api_mode,
+             credential_ciphertext, qr_url, return_url, is_default
+        FROM collection_payment_configs
+       WHERE enabled_at IS NOT NULL
+         AND status = 'active'
+         AND provider <> 'balance'
+         AND (
+           (provider IN ('alipay_personal', 'wechat_personal') AND qr_url IS NOT NULL)
+           OR (provider = 'epay' AND gateway_url IS NOT NULL AND merchant_no_masked IS NOT NULL AND credential_ciphertext LIKE 'aes256gcm:%')
+           OR (provider IN ('alipay_merchant', 'wechat_merchant') AND merchant_no_masked IS NOT NULL AND app_id_masked IS NOT NULL AND credential_ciphertext LIKE 'aes256gcm:%')
+         )
+         AND (
+           (owner_type = 'platform' AND ${shop.ownerType} = 'platform')
+           OR (owner_type = 'merchant' AND shop_id = ${shop.id})
+         )
+         AND (${paymentMethodId ?? null} IS NULL OR id = ${paymentMethodId ?? null})
+       ORDER BY is_default DESC, updated_at DESC
+       LIMIT 1
+    `;
+    const method = rows[0];
+    if (!method) throw new ApiError(400, "PAYMENT_METHOD_UNAVAILABLE", "payment method is unavailable");
+    const credential = decryptPaymentCredentialBundle(method.credential_ciphertext);
+    if (
+      (method.provider === "epay" && !(method.gateway_url && (credential.merchantNo ?? method.merchant_no_masked) && credential.signingSecret))
+      || ((method.provider === "alipay_merchant" || method.provider === "wechat_merchant") && !((credential.merchantNo ?? method.merchant_no_masked) && (credential.appId ?? method.app_id_masked)))
+      || ((method.provider === "alipay_personal" || method.provider === "wechat_personal") && !method.qr_url)
+    ) {
+      throw new ApiError(400, "PAYMENT_METHOD_UNAVAILABLE", "payment method is unavailable");
+    }
+    return {
+      id: method.id,
+      ownerType: method.owner_type,
+      merchantId: method.owner_merchant_id,
+      shopId: method.shop_id,
+      provider: method.provider,
+      confirmMode: method.confirm_mode,
+      displayName: method.display_name,
+      merchantNo: credential.merchantNo ?? method.merchant_no_masked ?? undefined,
+      appId: credential.appId ?? method.app_id_masked ?? undefined,
+      serviceProviderId: credential.serviceProviderId ?? method.service_provider_masked ?? undefined,
+      signingSecret: credential.signingSecret,
+      gatewayUrl: method.gateway_url ?? undefined,
+      apiMode: parsePaymentApiMode(method.api_mode),
+      qrUrl: method.qr_url,
+      returnUrl: method.return_url
+    };
+  }
+
+  private directPaymentCollectionSnapshot(method: {
+    id: string;
+    ownerType?: string;
+    merchantId?: string | null;
+    shopId?: string | null;
+    provider: string;
+    confirmMode: string;
+    displayName?: string;
+    merchantNo?: string;
+    appId?: string;
+    serviceProviderId?: string;
+    gatewayUrl?: string;
+    apiMode?: string;
+  }) {
+    return {
+      id: method.id,
+      ownerType: method.ownerType,
+      ownerMerchantId: method.merchantId ?? undefined,
+      shopId: method.shopId ?? undefined,
+      provider: method.provider,
+      confirmMode: method.confirmMode,
+      displayName: method.displayName,
+      merchantNoMasked: maskSecret(method.merchantNo),
+      appIdMasked: maskSecret(method.appId),
+      serviceProviderMasked: maskSecret(method.serviceProviderId),
+      gatewayUrl: method.gatewayUrl,
+      apiMode: method.apiMode
+    };
+  }
+
+  private async buildDirectEpayPaymentParams(method: {
+    provider: string;
+    merchantNo?: string;
+    signingSecret?: string;
+    gatewayUrl?: string;
+    apiMode?: PaymentApiMode;
+    returnUrl?: string | null;
+  }, orderNo: string, productSnapshot: unknown, amountCents: bigint) {
+    const gatewayUrl = required(method.gatewayUrl, "epay gatewayUrl");
+    const merchantNo = required(method.merchantNo, "epay merchantNo");
+    const signingSecret = required(method.signingSecret, "epay signingSecret");
+    const notifyUrl = absoluteCallbackUrl("/api/callbacks/payments/epay");
+    const returnUrl = method.returnUrl ?? publicSiteUrl();
+    const endpoints = epayGatewayEndpoints(gatewayUrl);
+    const submitParams: Record<string, string> = {
+      pid: merchantNo,
+      type: "alipay",
+      out_trade_no: orderNo,
+      notify_url: notifyUrl,
+      return_url: returnUrl,
+      name: productNameFromSnapshot(productSnapshot, orderNo),
+      money: centsString(amountCents),
+      sign_type: "MD5"
+    };
+    submitParams.sign = signEpayParams(submitParams, signingSecret);
+    const submitPaymentUrl = appendQuery(endpoints.submitUrl, submitParams);
+    const mapi = method.apiMode === "submit" ? undefined : await requestEpayMapi(endpoints.mapiUrl, submitParams);
+    const paymentUrl = mapi?.directAppUrl ?? mapi?.cashierUrl ?? submitPaymentUrl;
+    return {
+      method: mapi?.directAppUrl ? "APP" : mapi?.ok ? "MAPI" : "GET",
+      gatewayUrl: endpoints.submitUrl,
+      mapiUrl: endpoints.mapiUrl,
+      paymentUrl,
+      submitPaymentUrl,
+      directAppUrl: mapi?.directAppUrl,
+      cashierUrl: mapi?.cashierUrl,
+      qrCodeUrl: mapi?.qrCodeUrl ?? paymentUrl,
+      submitParams,
+      apiMode: method.apiMode ?? "mapi_first",
+      mapiStatus: mapi?.ok ? "resolved" : mapi ? "fallback" : "skipped",
+      mapiMessage: mapi?.message,
+      notifyUrl,
+      returnUrl
+    };
+  }
+
+  private async resolveDirectCouponDiscount(userId: string, couponId: string, paidAmountCents: bigint, platformProductId: string | undefined, merchantProductId: string | undefined, shopId: string) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      discount_amount_cents: bigint;
+      threshold_amount_cents: bigint;
+      user_coupon_status: string;
+      template_status: string;
+      valid_from: Date;
+      valid_to: Date;
+      has_matching_scope: boolean;
+    }>>`
+      SELECT ct.discount_amount_cents, ct.threshold_amount_cents,
+             uc.status AS user_coupon_status, ct.status AS template_status,
+             uc.valid_from, uc.valid_to,
+             EXISTS (
+               SELECT 1
+                 FROM coupon_scopes cs
+                WHERE cs.coupon_template_id = ct.id
+                  AND (
+                    cs.scope_type = 'all_products'
+                    OR (cs.scope_type = 'platform_product' AND cs.platform_product_id = ${platformProductId ?? null})
+                    OR (cs.scope_type = 'merchant_product' AND cs.merchant_product_id = ${merchantProductId ?? null})
+                    OR (cs.scope_type = 'shop' AND cs.shop_id = ${shopId})
+                  )
+             ) AS has_matching_scope
+        FROM user_coupons uc
+        JOIN coupon_templates ct ON ct.id = uc.coupon_template_id
+       WHERE uc.id = ${couponId}
+         AND uc.user_id = ${userId}
+       LIMIT 1
+    `;
+    const coupon = rows[0];
+    if (!coupon) throw new ApiError(400, "COUPON_UNAVAILABLE", "coupon is not available");
+    const now = new Date();
+    if (coupon.user_coupon_status !== "active" || coupon.template_status !== "active" || coupon.valid_from > now || coupon.valid_to < now || !coupon.has_matching_scope) {
+      throw new ApiError(400, "COUPON_UNAVAILABLE", "coupon is not available");
+    }
+    if (paidAmountCents < coupon.threshold_amount_cents) throw new ApiError(400, "COUPON_THRESHOLD_NOT_MET", "coupon threshold is not met");
+    return coupon.discount_amount_cents > paidAmountCents ? paidAmountCents : coupon.discount_amount_cents;
+  }
+
+  private async lockAndApplyDirectCoupon(tx: PrismaTx, input: {
+    userId: string;
+    couponId: string;
+    orderId: string;
+    orderNo: string;
+    paidAmountCents: bigint;
+    platformProductId?: string;
+    merchantProductId?: string | null;
+    shopId: string;
+  }) {
+    const rows = await tx.$queryRaw<Array<{
+      user_coupon_id: string;
+      coupon_template_id: string;
+      discount_amount_cents: bigint;
+      platform_subsidy_cents: bigint;
+      threshold_amount_cents: bigint;
+      user_coupon_status: string;
+      template_status: string;
+      valid_from: Date;
+      valid_to: Date;
+      template_name: string;
+      has_matching_scope: boolean;
+    }>>`
+      SELECT uc.id AS user_coupon_id, ct.id AS coupon_template_id,
+             ct.discount_amount_cents, ct.platform_subsidy_cents, ct.threshold_amount_cents,
+             uc.status AS user_coupon_status, ct.status AS template_status,
+             uc.valid_from, uc.valid_to, ct.name AS template_name,
+             EXISTS (
+               SELECT 1
+                 FROM coupon_scopes cs
+                WHERE cs.coupon_template_id = ct.id
+                  AND (
+                    cs.scope_type = 'all_products'
+                    OR (cs.scope_type = 'platform_product' AND cs.platform_product_id = ${input.platformProductId ?? null})
+                    OR (cs.scope_type = 'merchant_product' AND cs.merchant_product_id = ${input.merchantProductId ?? null})
+                    OR (cs.scope_type = 'shop' AND cs.shop_id = ${input.shopId})
+                  )
+             ) AS has_matching_scope
+       FROM user_coupons uc
+        JOIN coupon_templates ct ON ct.id = uc.coupon_template_id
+       WHERE uc.id = ${input.couponId}
+         AND uc.user_id = ${input.userId}
+       LIMIT 1
+       FOR UPDATE OF uc
+    `;
+    const coupon = rows[0];
+    if (!coupon) throw new ApiError(400, "COUPON_UNAVAILABLE", "coupon is not available");
+    const now = new Date();
+    if (
+      coupon.user_coupon_status !== "active"
+      || coupon.template_status !== "active"
+      || coupon.valid_from > now
+      || coupon.valid_to < now
+      || !coupon.has_matching_scope
+    ) {
+      throw new ApiError(400, "COUPON_UNAVAILABLE", "coupon is not available");
+    }
+    if (input.paidAmountCents < coupon.threshold_amount_cents) throw new ApiError(400, "COUPON_THRESHOLD_NOT_MET", "coupon threshold is not met");
+    const discountCents = coupon.discount_amount_cents > input.paidAmountCents ? input.paidAmountCents : coupon.discount_amount_cents;
+    const usageIdempotencyKey = `coupon-usage:${coupon.user_coupon_id}:${input.orderNo}`;
+    await tx.$executeRaw`
+      UPDATE user_coupons
+         SET status = CAST('used' AS "CouponStatus"),
+             source_id = ${input.orderNo},
+             updated_at = now()
+       WHERE id = ${coupon.user_coupon_id}
+         AND status = CAST('active' AS "CouponStatus")
+    `;
+    await tx.$executeRaw`
+      UPDATE coupon_templates
+         SET used_count = used_count + 1,
+             updated_at = now()
+       WHERE id = ${coupon.coupon_template_id}
+    `;
+    return {
+      discountCents,
+      usage: {
+        userCouponId: coupon.user_coupon_id,
+        couponTemplateId: coupon.coupon_template_id,
+        discountCents,
+        subsidyCents: coupon.platform_subsidy_cents,
+        idempotencyKey: usageIdempotencyKey
+      },
+      snapshot: {
+        userCouponId: coupon.user_coupon_id,
+        couponTemplateId: coupon.coupon_template_id,
+        name: coupon.template_name,
+        discountCents,
+        platformSubsidyCents: coupon.platform_subsidy_cents,
+        usedAt: now.toISOString()
+      }
+    };
+  }
+
+  private async persistDirectPaymentSnapshot(tx: PrismaTx, input: {
+    orderId: string;
+    orderNo: string;
+    userId: string;
+    paymentId: string;
+    paymentNo: string;
+    method: {
+      id: string;
+      provider: string;
+      confirmMode: string;
+      merchantNo?: string;
+      appId?: string;
+      serviceProviderId?: string;
+    };
+    baseAmountCents: bigint;
+    feeBps: number;
+    feeCents: bigint;
+    amountCents: bigint;
+    status: "unpaid" | "paying" | "paid";
+    confirmSource: "unconfirmed" | "callback" | "query" | "manual_confirm" | "balance";
+    expiresAt: Date | null;
+    paidAt: Date | null;
+    collectionSnapshot: Record<string, unknown>;
+  }) {
+    await tx.$executeRaw`
+      INSERT INTO payment_snapshots (
+        id, snapshot_no, order_id, payment_id, collection_config_id, provider,
+        confirm_mode, environment, config_snapshot_json, merchant_no_masked,
+        app_id_masked, service_provider_masked, base_amount_cents, fee_bps,
+        fee_cents, payable_amount_cents, currency, payment_no, status,
+        confirm_source, expires_at, paid_at, idempotency_key, created_at, updated_at
+      )
+      VALUES (
+        ${stableDbId("payment_snapshot", input.orderNo)}, ${`snapshot:${input.orderNo}`},
+        ${input.orderId}, ${input.paymentId}, ${input.method.provider === "balance" ? null : input.method.id},
+        CAST(${input.method.provider} AS "PaymentProvider"),
+        CAST(${input.method.confirmMode} AS "PaymentConfirmMode"),
+        CAST('production' AS "PaymentEnvironment"),
+        ${jsonForDb(input.collectionSnapshot)}::jsonb,
+        ${maskSecret(input.method.merchantNo) ?? null}, ${maskSecret(input.method.appId) ?? null},
+        ${maskSecret(input.method.serviceProviderId) ?? null},
+        ${input.baseAmountCents}, ${input.feeBps}, ${input.feeCents}, ${input.amountCents}, 'CNY',
+        ${input.paymentNo}, CAST(${input.status} AS "PaymentStatus"),
+        CAST(${input.confirmSource} AS "PaymentConfirmSource"), ${input.expiresAt}, ${input.paidAt},
+        ${`payment-snapshot:${input.orderNo}`}, now(), now()
+      )
+      ON CONFLICT (snapshot_no) DO UPDATE SET
+        payment_id = EXCLUDED.payment_id,
+        collection_config_id = EXCLUDED.collection_config_id,
+        provider = EXCLUDED.provider,
+        confirm_mode = EXCLUDED.confirm_mode,
+        config_snapshot_json = EXCLUDED.config_snapshot_json,
+        base_amount_cents = EXCLUDED.base_amount_cents,
+        fee_bps = EXCLUDED.fee_bps,
+        fee_cents = EXCLUDED.fee_cents,
+        payable_amount_cents = EXCLUDED.payable_amount_cents,
+        status = EXCLUDED.status,
+        confirm_source = EXCLUDED.confirm_source,
+        expires_at = EXCLUDED.expires_at,
+        paid_at = EXCLUDED.paid_at,
+        updated_at = now()
+    `;
+  }
+
+  private async updateDirectOrderPaymentAmountSnapshot(tx: PrismaTx, orderId: string, input: {
+    feeBps: number;
+    feeCents: bigint;
+    baseAmountCents: bigint;
+    amountCents: bigint;
+    provider: string;
+    collectionSnapshot: Record<string, unknown>;
+  }) {
+    await tx.$executeRaw`
+      UPDATE order_amount_snapshots
+         SET payment_fee_bps = ${input.feeBps},
+             payment_fee_cents = ${input.feeCents},
+             balance_paid_cents = ${input.provider === "balance" ? input.baseAmountCents : 0n},
+             external_paid_cents = ${input.provider === "balance" ? 0n : input.amountCents}
+       WHERE order_id = ${orderId}
+    `;
+    await tx.$executeRaw`
+      UPDATE orders
+         SET paid_amount_cents = ${input.amountCents},
+             collection_snapshot_json = ${jsonForDb(input.collectionSnapshot)}::jsonb,
+             updated_at = now()
+       WHERE id = ${orderId}
+    `;
+  }
+
+  private async listPublicPlatformShopProducts(shopId: string) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      shop_id: string;
+      platform_product_id: string;
+      sale_price_cents: bigint;
+      status: string;
+      name: string | null;
+      category_name: string | null;
+      tags_json: unknown;
+      image_url: string | null;
+      specs_json: unknown;
+      detail_sections_json: unknown;
+      stock_count: number | null;
+      public_stock_count: number | null;
+      sold_count: number | null;
+      display_badge: string | null;
+      is_recommended: boolean | null;
+      display_sort: number | null;
+      detail: string | null;
+      rights_desc: string | null;
+      fulfillment_rule_json: unknown;
+      after_sale_rule_json: unknown;
+      product_status: string | null;
+    }>>`
+      SELECT psp.id, psp.shop_id, psp.platform_product_id, psp.sale_price_cents, psp.status,
+             pp.name, pp.category_name, pp.tags_json, pp.image_url, pp.specs_json,
+             pp.detail_sections_json, pp.stock_count,
+             CASE WHEN pp.fulfillment_rule_json->>'mode' = 'code_pool'
+               THEN (
+                 SELECT COUNT(*)::int
+                   FROM rights_codes rc
+                  WHERE rc.product_id = pp.id
+                    AND rc.status = 'available'
+               )
+               ELSE pp.stock_count
+             END AS public_stock_count,
+             pp.sold_count, pp.display_badge,
+             pp.is_recommended, pp.display_sort, pp.detail, pp.rights_desc,
+             pp.fulfillment_rule_json, pp.after_sale_rule_json, pp.status AS product_status
+        FROM platform_shop_products psp
+        JOIN platform_products pp ON pp.id = psp.platform_product_id
+       WHERE psp.shop_id = ${shopId} AND psp.status = 'listed'
+       ORDER BY pp.display_sort DESC, psp.id ASC
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      shopId: row.shop_id,
+      productType: "platform_self_operated",
+      salePriceCents: row.sale_price_cents,
+      status: row.status,
+      product: {
+        id: row.platform_product_id,
+        name: row.name,
+        category: row.category_name ?? undefined,
+        tags: Array.isArray(row.tags_json) ? row.tags_json : undefined,
+        subtitle: row.rights_desc ?? undefined,
+        description: row.detail ?? undefined,
+        imageUrl: row.image_url ?? undefined,
+        specs: Array.isArray(row.specs_json) ? row.specs_json : undefined,
+        detailSections: Array.isArray(row.detail_sections_json) ? row.detail_sections_json : undefined,
+        stockCount: row.public_stock_count ?? row.stock_count ?? undefined,
+        soldCount: row.sold_count ?? undefined,
+        displayBadge: row.display_badge ?? undefined,
+        isRecommended: row.is_recommended ?? undefined,
+        displaySort: row.display_sort ?? undefined,
+        fulfillmentRule: row.fulfillment_rule_json,
+        afterSaleRule: row.after_sale_rule_json,
+        status: row.product_status ?? undefined
+      }
+    }));
+  }
+
+  private async findPublicShop(shopIdentifier: string): Promise<DemoShop | undefined> {
+    const normalized = normalizeShopIdentifier(shopIdentifier);
+    const configured = process.env.DEFAULT_PLATFORM_SHOP_ID || process.env.VITE_PLATFORM_SHOP_ID;
+    if (!normalized || ["default", "platform", "home"].includes(normalized)) {
+      if (configured) {
+        const configuredShop = await this.findPublicShop(configured);
+        if (configuredShop) return configuredShop;
+      }
+      const rows = await this.prisma.$queryRaw<Array<PublicShopRow>>`
+        SELECT id, owner_type, merchant_id, shop_no, name, share_path, status,
+               risk_status, announcement, customer_service_wechat, customer_service_qr_url,
+               customer_service_qq, customer_service_qq_qr_url, customer_service_note,
+               collection_account_name, collection_qr_url, collection_note,
+               theme_color, banner_url, share_title
+          FROM shops
+         WHERE status = 'open'
+         ORDER BY CASE WHEN owner_type = 'platform' THEN 0 ELSE 1 END, created_at ASC
+         LIMIT 1
+      `;
+      return rows[0] ? this.mapPublicShopRow(rows[0]) : undefined;
+    }
+    const rows = await this.prisma.$queryRaw<Array<PublicShopRow>>`
+      SELECT id, owner_type, merchant_id, shop_no, name, share_path, status,
+             risk_status, announcement, customer_service_wechat, customer_service_qr_url,
+             customer_service_qq, customer_service_qq_qr_url, customer_service_note,
+             collection_account_name, collection_qr_url, collection_note,
+             theme_color, banner_url, share_title
+        FROM shops
+       WHERE id = ${normalized}
+          OR shop_no = ${normalized}
+          OR share_path = ${normalized}
+          OR share_path = ${`/s/${normalized}`}
+          OR share_path = ${`/shops/${normalized}`}
+       LIMIT 1
+    `;
+    return rows[0] ? this.mapPublicShopRow(rows[0]) : undefined;
+  }
+
+  private mapPublicShopRow(row: PublicShopRow): DemoShop {
+    return {
+      id: row.id,
+      ownerType: row.owner_type === "merchant" ? "merchant" : "platform",
+      merchantId: row.merchant_id ?? undefined,
+      shopNo: row.shop_no,
+      sharePath: row.share_path,
+      name: row.name,
+      status: row.status,
+      riskStatus: row.risk_status,
+      announcement: row.announcement ?? undefined,
+      customerServiceWechat: row.customer_service_wechat ?? undefined,
+      customerServiceQrUrl: row.customer_service_qr_url ?? undefined,
+      customerServiceQq: row.customer_service_qq ?? undefined,
+      customerServiceQqQrUrl: row.customer_service_qq_qr_url ?? undefined,
+      customerServiceNote: row.customer_service_note ?? undefined,
+      collectionAccountName: row.collection_account_name ?? undefined,
+      collectionQrUrl: row.collection_qr_url ?? undefined,
+      collectionNote: row.collection_note ?? undefined,
+      themeColor: row.theme_color ?? undefined,
+      bannerUrl: row.banner_url ?? undefined,
+      shareTitle: row.share_title ?? undefined
+    };
+  }
+
+  private serializePublicShopRow(shop: DemoShop) {
+    return {
+      id: shop.id,
+      merchantId: shop.merchantId,
+      ownerType: shop.ownerType ?? "merchant",
+      shopNo: shop.shopNo,
+      sharePath: shop.sharePath,
+      publicPath: publicShopPath(shop),
+      name: shop.name,
+      status: shop.status,
+      announcement: shop.announcement,
+      customerServiceWechat: shop.customerServiceWechat,
+      customerServiceQrUrl: shop.customerServiceQrUrl,
+      customerServiceQq: shop.customerServiceQq,
+      customerServiceQqQrUrl: shop.customerServiceQqQrUrl,
+      customerServiceNote: shop.customerServiceNote,
+      themeColor: shop.themeColor,
+      bannerUrl: shop.bannerUrl,
+      shareTitle: shop.shareTitle,
+      collectionAccountName: shop.collectionAccountName,
+      collectionQrUrl: shop.collectionQrUrl,
+      collectionNote: shop.collectionNote,
+      productGroups: shop.productGroups ?? []
+    };
+  }
+
   async load(): Promise<MemoryStore> {
     const store = createEmptyMemoryStore();
     await Promise.all([
-      this.loadAgentsAndDeposits(store),
+      this.loadMerchantsAndDeposits(store),
       this.loadShops(store),
       this.loadPlatformProducts(store),
-      this.loadOwnProductReviews(store),
-      this.loadAgentProducts(store),
-      this.loadCollectionChannels(store),
+      this.loadOwnProductReviews(store)
+    ]);
+    await Promise.all([
+      this.loadMerchantProducts(store),
       this.loadRightsCodes(store),
-      this.loadOrders(store),
+      this.loadOrders(store)
+    ]);
+    await Promise.all([
       this.loadCoupons(store),
       this.loadInviteAndChannelState(store),
       this.loadFinancialState(store),
       this.loadEmailDeliveries(store)
     ]);
-    await this.loadPaymentConfig(store);
-    await this.loadPaymentMethodConfigs(store);
-    await this.loadPaymentRuntimeState(store);
+    await Promise.all([
+      this.loadWalletState(store),
+      this.loadServiceFeeConfig(store),
+      this.loadPaymentConfig(store),
+      this.loadPaymentMethodConfigs(store),
+      this.loadPaymentRuntimeState(store)
+    ]);
     return store;
+  }
+
+  async repairRuntimeSchema(): Promise<void> {
+    await this.ensureCollectionPaymentConfigRuntimeSchema();
+    await this.ensureMerchantProductRuntimeSchema();
   }
 
   async save(_store: MemoryStore): Promise<void> {
     await this.persistInShortTransaction((tx) => this.persistUsers(tx, _store));
-    await this.persistInShortTransaction((tx) => this.persistAgents(tx, _store));
+    await this.persistInShortTransaction((tx) => this.persistMerchants(tx, _store));
     await this.persistInShortTransaction((tx) => this.persistMerchantAccounts(tx, _store));
     await this.persistInShortTransaction((tx) => this.persistShops(tx, _store));
     await this.persistInShortTransaction((tx) => this.persistProducts(tx, _store));
-    await this.persistInShortTransaction((tx) => this.persistCollectionChannels(tx, _store));
     await this.persistInShortTransaction((tx) => this.persistCoupons(tx, _store));
     await this.persistInShortTransaction((tx) => this.persistInviteAndChannelState(tx, _store));
     await this.persistInShortTransaction((tx) => this.persistDeposits(tx, _store));
@@ -4890,27 +9119,28 @@ class PrismaStateRepository {
   }
 
 	  async saveForMethod(method: string, store: MemoryStore): Promise<void> {
-	    if (method === "createAgentByAdmin") {
-	      await this.persistInShortTransaction((tx) => this.persistLatestManualAgentCreation(tx, store));
+	    if (method === "createMerchantByAdmin" || method === "createMerchantByAdmin") {
+	      await this.persistInShortTransaction((tx) => this.persistLatestManualMerchantCreation(tx, store));
 	      return;
 	    }
-    if (method === "createPlatformInviteCode" || method === "createAgentInviteCode") {
+    if (method === "createPlatformInviteCode" || method === "createMerchantInviteCode" || method === "createMerchantInviteCode") {
       await this.persistInShortTransaction((tx) => this.persistLatestInviteCodeCreation(tx, store));
       return;
     }
-	    if (method === "registerAgentByInvite") {
+	    if (method === "registerMerchantByInvite" || method === "registerMerchantByInvite") {
 	      await this.persistInShortTransaction((tx) => this.persistLatestInviteRegistration(tx, store));
 	      return;
 	    }
-    if (method === "reviewAgent") {
-      await this.persistInShortTransaction((tx) => this.persistLatestAgentReview(tx, store));
+    if (method === "reviewMerchant" || method === "reviewMerchant") {
+      await this.persistInShortTransaction((tx) => this.persistLatestMerchantReview(tx, store));
       return;
     }
 	    if ([
-	      "submitAgentApplication"
+	      "submitMerchantApplication",
+        "submitMerchantApplication"
 	    ].includes(method)) {
       await this.persistInShortTransaction((tx) => this.persistUsers(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistAgents(tx, store));
+      await this.persistInShortTransaction((tx) => this.persistMerchants(tx, store));
       await this.persistInShortTransaction((tx) => this.persistMerchantAccounts(tx, store));
       await this.persistInShortTransaction((tx) => this.persistShops(tx, store));
       await this.persistInShortTransaction((tx) => this.persistInviteAndChannelState(tx, store));
@@ -4923,7 +9153,7 @@ class PrismaStateRepository {
       return;
     }
     if (method === "deductDeposit") {
-      await this.persistInShortTransaction((tx) => this.persistAgents(tx, store));
+      await this.persistInShortTransaction((tx) => this.persistMerchants(tx, store));
       await this.persistInShortTransaction((tx) => this.persistDeposits(tx, store));
       await this.persistInShortTransaction((tx) => this.persistRiskAuditLedger(tx, store));
       return;
@@ -4936,16 +9166,8 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestRightsCodeImport(tx, store));
       return;
     }
-    if (method === "addAgentRightsCodes") {
-      await this.persistInShortTransaction((tx) => this.persistLatestAgentRightsCodeImport(tx, store));
-      return;
-    }
-    if (method === "submitAgentCollectionChannel") {
-      await this.persistInShortTransaction((tx) => this.persistLatestCollectionChannelSubmission(tx, store));
-      return;
-    }
-    if (method === "reviewCollectionChannel") {
-      await this.persistInShortTransaction((tx) => this.persistLatestCollectionChannelReview(tx, store));
+    if (method === "addMerchantRightsCodes" || method === "addMerchantRightsCodes") {
+      await this.persistInShortTransaction((tx) => this.persistLatestMerchantRightsCodeImport(tx, store));
       return;
     }
     if (method === "selectPlatformProduct") {
@@ -4960,7 +9182,7 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestPlatformShopProductUpdate(tx, store));
       return;
     }
-    if (method === "upsertChannelProductOffer" || method === "upsertAgentChannelProductOffer") {
+    if (method === "upsertChannelProductOffer" || method === "upsertMerchantChannelProductOffer" || method === "upsertMerchantChannelProductOffer") {
       await this.persistInShortTransaction((tx) => this.persistLatestChannelProductOfferUpsert(tx, store));
       return;
     }
@@ -4992,23 +9214,24 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestPlatformProductBatchSelection(tx, store));
       return;
     }
-    if (method === "setAgentProductPrice") {
-      await this.persistInShortTransaction((tx) => this.persistLatestAgentProductPriceUpdate(tx, store));
+    if (method === "setMerchantProductPrice" || method === "setMerchantProductPrice") {
+      await this.persistInShortTransaction((tx) => this.persistLatestMerchantProductPriceUpdate(tx, store));
       return;
     }
-    if (method === "updateAgentProductDetail") {
-      await this.persistInShortTransaction((tx) => this.persistLatestAgentProductDetailUpdate(tx, store));
+    if (method === "updateMerchantProductDetail" || method === "updateMerchantProductDetail") {
+      await this.persistInShortTransaction((tx) => this.persistLatestMerchantProductDetailUpdate(tx, store));
       return;
     }
     if ([
-      "updateAgentShop",
-      "updateAgentShopCollection",
+      "updateMerchantShop",
+      "updateMerchantShop",
+      "updateMerchantShopCollection",
+      "updateMerchantShopCollection",
       "updateShopDecor",
       "updateShopCollection",
       "updateShopServiceQrCode"
     ].includes(method)) {
       await this.persistInShortTransaction((tx) => this.persistShops(tx, store));
-      await this.persistInShortTransaction((tx) => this.persistCollectionChannels(tx, store));
       await this.persistInShortTransaction((tx) => this.persistRiskAuditLedger(tx, store));
       return;
     }
@@ -5020,11 +9243,15 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestRegistrationCouponGrant(tx, store));
       return;
     }
+    if (method === "grantCouponTemplate") {
+      await this.persistInShortTransaction((tx) => this.persistLatestAdminCouponGrant(tx, store));
+      return;
+    }
     if (method === "createOrder") {
       await this.persistInShortTransaction((tx) => this.persistLatestOrderCreation(tx, store));
       return;
     }
-    if (method === "confirmAgentOfflinePayment" || method === "confirmOfflinePayment") {
+    if (method === "confirmMerchantOfflinePayment" || method === "confirmMerchantOfflinePayment" || method === "confirmOfflinePayment") {
       await this.persistInShortTransaction((tx) => this.persistLatestOfflinePaymentConfirmation(tx, store));
       return;
     }
@@ -5040,7 +9267,15 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestPaymentOrderCreation(tx, store));
       return;
     }
-    if (method === "fulfillAgentOrder") {
+    if (method === "createWalletRecharge" || method === "confirmWalletRecharge") {
+      await this.persistInShortTransaction((tx) => this.persistLatestWalletRechargeMutation(tx, store));
+      return;
+    }
+    if (method === "updatePlatformServiceFeeConfig") {
+      await this.persistInShortTransaction((tx) => this.persistServiceFeeConfig(tx, store.serviceFeeConfig));
+      return;
+    }
+    if (method === "fulfillMerchantOrder" || method === "fulfillMerchantOrder") {
       await this.persistInShortTransaction((tx) => this.persistLatestFulfillmentUpdate(tx, store));
       return;
     }
@@ -5052,9 +9287,9 @@ class PrismaStateRepository {
       await this.persistInShortTransaction((tx) => this.persistLatestAfterSaleCreation(tx, store));
       return;
     }
-    if (method === "updateAgentAfterSaleAssist") {
+    if (method === "updateMerchantAfterSaleAssist" || method === "updateMerchantAfterSaleAssist") {
       await this.persistInShortTransaction((tx) => {
-        const audit = this.latestAuditLog(store, ["after_sale.agent_assist"]);
+        const audit = this.latestAuditLog(store, ["after_sale.merchant_assist"]);
         return this.persistAuditLogs(tx, audit ? [audit] : []);
       });
       return;
@@ -5112,10 +9347,14 @@ class PrismaStateRepository {
       "setAdminPaymentMethodDefault",
       "deleteAdminPaymentMethod",
       "testAdminPaymentMethod",
-      "upsertAgentPaymentMethod",
-      "setAgentPaymentMethodDefault",
-      "deleteAgentPaymentMethod",
-      "testAgentPaymentMethod"
+      "upsertMerchantPaymentMethod",
+      "setMerchantPaymentMethodDefault",
+      "deleteMerchantPaymentMethod",
+      "testMerchantPaymentMethod",
+      "upsertMerchantPaymentMethod",
+      "setMerchantPaymentMethodDefault",
+      "deleteMerchantPaymentMethod",
+      "testMerchantPaymentMethod"
     ].includes(method)) {
       await this.persistInShortTransaction((tx) => this.persistLatestPaymentMethodMutation(tx, store));
       return;
@@ -5134,8 +9373,8 @@ class PrismaStateRepository {
 
   private async persistUsers(tx: PrismaTx, store: MemoryStore) {
     const userIds = new Set<string>();
-    for (const agent of store.agents.values()) userIds.add(agent.userId);
-    for (const application of store.agentApplications.values()) userIds.add(application.userId);
+    for (const merchant of store.merchants.values()) userIds.add(merchant.userId);
+    for (const application of store.merchantApplications.values()) userIds.add(application.userId);
     for (const order of store.orders.values()) userIds.add(order.userId);
     for (const coupon of store.userCoupons.values()) userIds.add(coupon.userId);
     for (const userId of userIds) {
@@ -5148,33 +9387,46 @@ class PrismaStateRepository {
   }
 
   private async persistMerchantAccounts(tx: PrismaTx, store: MemoryStore) {
-    for (const agent of store.agents.values()) {
-      if (agent.initialPasswordSet && agent.passwordHash) {
-        await this.persistMerchantAccountForAgent(tx, agent);
+    for (const merchant of store.merchants.values()) {
+      if (merchant.initialPasswordSet && merchant.passwordHash) {
+        await this.persistMerchantAccountForMerchant(tx, merchant);
       }
     }
   }
 
-  private async persistLatestManualAgentCreation(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["agent.admin_create_first_tier"]);
-    const agentId = audit ? stringValue(audit.targetId) : undefined;
-    const agent = agentId ? store.agents.get(agentId) : undefined;
-    if (!agent) throw new Error("manual agent creation missing current agent");
-    const shop = [...store.shops.values()].find((item) => item.agentId === agent.id);
-    if (!shop) throw new Error("manual agent creation missing current shop");
-    const depositAccount = store.depositAccounts.get(agent.id);
-    if (!depositAccount) throw new Error("manual agent creation missing deposit account");
+  private async persistLatestManualMerchantCreation(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["merchant.admin_create_first_tier"]);
+    const merchantId = audit ? stringValue(audit.targetId) : undefined;
+    const merchant = merchantId ? store.merchants.get(merchantId) : undefined;
+    if (!merchant) throw new Error("manual merchant creation missing current merchant");
+    const shop = [...store.shops.values()].find((item) => item.merchantId === merchant.id);
+    if (!shop) throw new Error("manual merchant creation missing current shop");
+    const depositAccount = store.depositAccounts.get(merchant.id);
+    if (!depositAccount) throw new Error("manual merchant creation missing deposit account");
     const depositTransaction = [...store.depositTransactions]
       .reverse()
-      .find((item) => item.agentId === agent.id && item.reasonCode === "admin_manual_create");
+      .find((item) => item.merchantId === merchant.id && item.reasonCode === "admin_manual_create");
 
-    await this.persistUserId(tx, agent.userId);
-    await this.persistAgent(tx, agent);
-    await this.persistMerchantAccountForAgent(tx, agent);
+    await this.persistUserId(tx, merchant.userId);
+    if (merchant.createdByAdminId) await this.persistAdminPlaceholder(tx, merchant.createdByAdminId);
+    if (shop.createdByAdminId && shop.createdByAdminId !== merchant.createdByAdminId) await this.persistAdminPlaceholder(tx, shop.createdByAdminId);
+    await this.persistMerchant(tx, merchant);
+    await this.persistMerchantAccountForMerchant(tx, merchant);
     await this.persistShop(tx, shop);
-    await this.persistDepositAccount(tx, agent.id, depositAccount);
+    await this.persistDepositAccount(tx, merchant.id, depositAccount);
     if (depositTransaction) await this.persistDepositTransaction(tx, depositTransaction);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistAdminPlaceholder(tx: PrismaTx, adminId: string) {
+    await tx.$executeRaw`
+      INSERT INTO admin_users (id, username, display_name, password_hash, status, created_at, updated_at)
+      VALUES (
+        ${adminId}, ${adminId}, 'Bootstrap Admin', 'sha256:bootstrap-placeholder',
+        CAST('active' AS "UserStatus"), now(), now()
+      )
+      ON CONFLICT (id) DO NOTHING
+    `;
   }
 
 	  private async persistUserId(tx: PrismaTx, userId: string) {
@@ -5186,7 +9438,7 @@ class PrismaStateRepository {
 	  }
 
   private async persistLatestInviteCodeCreation(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["invite_code.create.platform", "invite_code.create.agent"]);
+    const audit = this.latestAuditLog(store, ["invite_code.create.platform", "invite_code.create.merchant"]);
     const inviteId = audit ? stringValue(audit.targetId) : undefined;
     const invite = inviteId ? store.inviteCodes.get(inviteId) : undefined;
     if (!invite) throw new Error("invite code creation missing current invite");
@@ -5195,62 +9447,62 @@ class PrismaStateRepository {
   }
 
   private async persistLatestInviteRegistration(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["agent.register_by_invite"]);
-    const agentId = audit ? stringValue(audit.targetId) : undefined;
-    const agent = agentId ? store.agents.get(agentId) : undefined;
-    if (!agent) throw new Error("invite registration missing current agent");
-    const shop = [...store.shops.values()].find((item) => item.agentId === agent.id);
+    const audit = this.latestAuditLog(store, ["merchant.register_by_invite"]);
+    const merchantId = audit ? stringValue(audit.targetId) : undefined;
+    const merchant = merchantId ? store.merchants.get(merchantId) : undefined;
+    if (!merchant) throw new Error("invite registration missing current merchant");
+    const shop = [...store.shops.values()].find((item) => item.merchantId === merchant.id);
     if (!shop) throw new Error("invite registration missing current shop");
-    const application = [...store.agentApplications.values()].find((item) => item.agentId === agent.id);
+    const application = [...store.merchantApplications.values()].find((item) => item.merchantId === merchant.id);
     if (!application) throw new Error("invite registration missing current application");
-    const depositAccount = store.depositAccounts.get(agent.id);
+    const depositAccount = store.depositAccounts.get(merchant.id);
     if (!depositAccount) throw new Error("invite registration missing deposit account");
     const inviteId = stringValue((audit?.after as Record<string, unknown> | undefined)?.inviteCodeId) ?? application.inviteCodeId;
     const invite = inviteId ? store.inviteCodes.get(inviteId) : undefined;
     if (!invite) throw new Error("invite registration missing invite code");
     const relation = store.channelRelations.find((item) =>
       item.reason === "invite_registration"
-      && (item.secondTierAgentId === agent.id || item.thirdTierAgentId === agent.id)
+      && (item.secondTierMerchantId === merchant.id || item.thirdTierMerchantId === merchant.id)
     );
 
-    await this.persistUserId(tx, agent.userId);
-    await this.persistAgent(tx, agent);
-    await this.persistMerchantAccountForAgent(tx, agent);
+    await this.persistUserId(tx, merchant.userId);
+    await this.persistMerchant(tx, merchant);
+    await this.persistMerchantAccountForMerchant(tx, merchant);
     await this.persistShop(tx, shop);
-    await this.persistAgentApplication(tx, application);
+    await this.persistMerchantApplication(tx, application);
     await this.persistInviteCode(tx, invite);
     if (relation) await this.persistChannelRelation(tx, relation);
-    await this.persistDepositAccount(tx, agent.id, depositAccount);
+    await this.persistDepositAccount(tx, merchant.id, depositAccount);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestAgentReview(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["agent.review"]);
-    const agentId = audit ? stringValue(audit.targetId) : undefined;
-    const agent = agentId ? store.agents.get(agentId) : undefined;
-    if (!agent) throw new Error("agent review missing current agent");
-    const shop = [...store.shops.values()].find((item) => item.agentId === agent.id);
-    const application = [...store.agentApplications.values()].find((item) => item.agentId === agent.id);
-    const depositAccount = store.depositAccounts.get(agent.id);
+  private async persistLatestMerchantReview(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["merchant.review"]);
+    const merchantId = audit ? stringValue(audit.targetId) : undefined;
+    const merchant = merchantId ? store.merchants.get(merchantId) : undefined;
+    if (!merchant) throw new Error("merchant review missing current merchant");
+    const shop = [...store.shops.values()].find((item) => item.merchantId === merchant.id);
+    const application = [...store.merchantApplications.values()].find((item) => item.merchantId === merchant.id);
+    const depositAccount = store.depositAccounts.get(merchant.id);
     const relations = store.channelRelations.filter((item) =>
-      item.secondTierAgentId === agent.id || item.thirdTierAgentId === agent.id
+      item.secondTierMerchantId === merchant.id || item.thirdTierMerchantId === merchant.id
     );
 
-    await this.persistUserId(tx, agent.userId);
-    await this.persistAgent(tx, agent);
-    await this.persistMerchantAccountForAgent(tx, agent);
+    await this.persistUserId(tx, merchant.userId);
+    await this.persistMerchant(tx, merchant);
+    await this.persistMerchantAccountForMerchant(tx, merchant);
     if (shop) await this.persistShop(tx, shop);
-    if (application) await this.persistAgentApplication(tx, application);
-    if (depositAccount) await this.persistDepositAccount(tx, agent.id, depositAccount);
+    if (application) await this.persistMerchantApplication(tx, application);
+    if (depositAccount) await this.persistDepositAccount(tx, merchant.id, depositAccount);
     for (const relation of relations) await this.persistChannelRelation(tx, relation);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
   private async persistLatestChannelAuthorizationReview(tx: PrismaTx, store: MemoryStore) {
     const audit = this.latestAuditLog(store, ["channel.authorization.review"]);
-    const agentId = audit ? stringValue(audit.targetId) : undefined;
-    const authorization = agentId
-      ? store.channelAuthorizations.find((item) => item.firstTierAgentId === agentId)
+    const merchantId = audit ? stringValue(audit.targetId) : undefined;
+    const authorization = merchantId
+      ? store.channelAuthorizations.find((item) => item.firstTierMerchantId === merchantId)
       : undefined;
     if (!authorization) throw new Error("channel authorization review missing current authorization");
     await this.persistChannelAuthorization(tx, authorization);
@@ -5267,9 +9519,9 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, [audit]);
   }
 
-			  private async persistMerchantAccountForAgent(tx: PrismaTx, agent: DemoAgent) {
-    if (!agent.initialPasswordSet || !agent.passwordHash) return;
-    const username = agent.merchantUsername ?? agent.id;
+			  private async persistMerchantAccountForMerchant(tx: PrismaTx, merchant: DemoMerchant) {
+    if (!merchant.initialPasswordSet || !merchant.passwordHash) return;
+    const username = merchant.merchantUsername ?? merchant.id;
     await tx.$executeRaw`
       INSERT INTO merchant_accounts (
         id, user_id, merchant_id, username, phone, password_hash, role, status,
@@ -5277,14 +9529,15 @@ class PrismaStateRepository {
         created_by_admin_id, created_at, updated_at
       )
       VALUES (
-        ${stableDbId("merchant_account", agent.id)}, ${agent.userId}, NULL,
-        ${username}, ${agent.contactPhone ?? null}, ${agent.passwordHash},
+        ${stableDbId("merchant_account", merchant.id)}, ${merchant.userId}, ${merchant.id},
+        ${username}, ${merchant.contactPhone ?? null}, ${merchant.passwordHash},
         CAST('owner' AS "MerchantAccountRole"), CAST('active' AS "MerchantAccountStatus"),
         CAST('delivered' AS "InitialAccountDeliveryStatus"), now(), true,
         NULL, now(), now()
       )
       ON CONFLICT (username) DO UPDATE SET
         user_id = EXCLUDED.user_id,
+        merchant_id = EXCLUDED.merchant_id,
         phone = EXCLUDED.phone,
         password_hash = EXCLUDED.password_hash,
         status = EXCLUDED.status,
@@ -5294,31 +9547,11 @@ class PrismaStateRepository {
     `;
   }
 
-	  private async persistAgent(tx: PrismaTx, agent: DemoAgent) {
-	    await tx.$executeRaw`
-      INSERT INTO agents (
-        id, user_id, agent_no, name, contact_phone, status, risk_status,
-        deposit_status, approved_at, created_at, updated_at
-      )
-      VALUES (
-        ${agent.id}, ${agent.userId}, ${agent.id}, ${agent.name}, ${agent.contactPhone ?? null},
-        CAST(${mapAgentStatus(agent.status)} AS "AgentStatus"),
-        CAST(${mapRiskStatus(agent.riskStatus)} AS "RiskStatus"),
-        CAST(${mapDepositStatus(agent.depositStatus)} AS "DepositStatus"),
-        ${agent.status === "active" ? new Date() : null}, now(), now()
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        name = EXCLUDED.name,
-        contact_phone = EXCLUDED.contact_phone,
-        status = EXCLUDED.status,
-        risk_status = EXCLUDED.risk_status,
-        deposit_status = EXCLUDED.deposit_status,
-        updated_at = now()
-	      `;
-      await this.persistMerchantForAgent(tx, agent);
-	  }
+	  private async persistMerchant(tx: PrismaTx, merchant: DemoMerchant) {
+      await this.persistMerchantForMerchant(tx, merchant);
+		  }
 
-  private async persistMerchantForAgent(tx: PrismaTx, agent: DemoAgent) {
+  private async persistMerchantForMerchant(tx: PrismaTx, merchant: DemoMerchant) {
     await tx.$executeRaw`
       INSERT INTO merchants (
         id, merchant_no, tier, name, contact_phone, status, risk_status,
@@ -5326,15 +9559,15 @@ class PrismaStateRepository {
         initial_account_status, approved_at, created_at, updated_at
       )
       VALUES (
-        ${agent.id}, ${agent.id}, CAST(${agent.tier ?? "first_tier"} AS "MerchantTier"),
-        ${agent.name}, ${agent.contactPhone ?? null},
-        CAST(${mapAgentStatus(agent.status)} AS "AgentStatus"),
-        CAST(${mapRiskStatus(agent.riskStatus)} AS "RiskStatus"),
-        CAST(${mapDepositStatus(agent.depositStatus)} AS "DepositStatus"),
-        CAST(${agent.createdByAdminId ? "admin_manual" : "invite_application"} AS "MerchantCreationSource"),
-        ${agent.createdByAdminId ?? null},
-        CAST(${agent.initialPasswordSet ? "delivered" : "pending"} AS "InitialAccountDeliveryStatus"),
-        ${agent.status === "active" ? new Date() : null}, now(), now()
+        ${merchant.id}, ${merchant.id}, CAST(${merchant.tier ?? "first_tier"} AS "MerchantTier"),
+        ${merchant.name}, ${merchant.contactPhone ?? null},
+	        CAST(${mapMerchantStatus(merchant.status)} AS "MerchantStatus"),
+        CAST(${mapRiskStatus(merchant.riskStatus)} AS "RiskStatus"),
+        CAST(${mapDepositStatus(merchant.depositStatus)} AS "DepositStatus"),
+        CAST(${merchant.createdByAdminId ? "admin_manual" : "invite_application"} AS "MerchantCreationSource"),
+        ${merchant.createdByAdminId ?? null},
+        CAST(${merchant.initialPasswordSet ? "delivered" : "pending"} AS "InitialAccountDeliveryStatus"),
+        ${merchant.status === "active" ? new Date() : null}, now(), now()
       )
       ON CONFLICT (id) DO UPDATE SET
         tier = EXCLUDED.tier,
@@ -5349,23 +9582,25 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistAgentApplication(tx: PrismaTx, application: AgentApplication) {
+  private async persistMerchantApplication(tx: PrismaTx, application: MerchantApplication) {
     await tx.$executeRaw`
-      INSERT INTO agent_applications (
-        id, agent_id, user_id, identity_info_json, contact_info_json,
+      INSERT INTO merchant_applications (
+        id, merchant_id, user_id, invite_code_id, tier, identity_info_json, contact_info_json,
         customer_service_wechat, status, reject_reason, reviewed_by,
-        reviewed_at, created_at, updated_at
+        reviewed_at, idempotency_key, created_at, updated_at
       )
       VALUES (
-        ${application.applicationNo}, ${application.agentId}, ${application.userId},
-        ${jsonForDb({ inviteCodeId: application.inviteCodeId, targetTier: application.targetTier, parentAgentId: application.parentAgentId })}::jsonb,
+        ${application.applicationNo}, ${application.merchantId}, ${application.userId}, ${application.inviteCodeId ?? null},
+        CAST(${application.targetTier ?? "first_tier"} AS "MerchantTier"),
+        ${jsonForDb({ inviteCodeId: application.inviteCodeId, targetTier: application.targetTier, parentMerchantId: application.parentMerchantId })}::jsonb,
         ${jsonForDb({ phone: application.contactPhone, inviteCode: application.inviteCode })}::jsonb,
         ${application.customerServiceWechat},
         CAST(${mapReviewStatus(application.status)} AS "ReviewStatus"),
-        NULL, NULL, NULL, now(), now()
+        NULL, NULL, NULL, ${`merchant-application:${application.applicationNo}`}, now(), now()
       )
       ON CONFLICT (id) DO UPDATE SET
         status = EXCLUDED.status,
+        tier = EXCLUDED.tier,
         contact_info_json = EXCLUDED.contact_info_json,
         customer_service_wechat = EXCLUDED.customer_service_wechat,
         updated_at = now()
@@ -5373,17 +9608,18 @@ class PrismaStateRepository {
   }
 
 	  private async persistShop(tx: PrismaTx, shop: DemoShop) {
+    const ownerType = shop.ownerType === "platform" ? "platform" : "merchant";
     await tx.$executeRaw`
       INSERT INTO shops (
-        id, owner_type, agent_id, merchant_id, shop_no, name, announcement,
+        id, owner_type, merchant_id, shop_no, name, announcement,
         customer_service_wechat, customer_service_qr_url, customer_service_qq,
         customer_service_qq_qr_url, customer_service_note, collection_account_name, collection_qr_url,
         collection_note, theme_color, banner_url, share_title, share_path,
         status, risk_status, creation_source, created_by_admin_id, created_at, updated_at
       )
       VALUES (
-        ${shop.id}, CAST(${shop.ownerType ?? "agent"} AS "ShopOwnerType"),
-        ${shop.ownerType === "platform" ? null : shop.agentId ?? null}, NULL,
+        ${shop.id}, CAST(${ownerType} AS "ShopOwnerType"),
+        ${ownerType === "merchant" ? shop.merchantId ?? null : null},
         ${shop.id}, ${shop.name}, ${shop.announcement ?? null},
         ${shop.customerServiceWechat ?? null}, ${shop.customerServiceQrUrl ?? null},
         ${shop.customerServiceQq ?? null}, ${shop.customerServiceQqQrUrl ?? null},
@@ -5392,7 +9628,7 @@ class PrismaStateRepository {
         ${shop.themeColor ?? null}, ${shop.bannerUrl ?? null}, ${shop.shareTitle ?? null},
         ${`/shops/${shop.id}`}, CAST(${mapShopStatus(shop.status)} AS "ShopStatus"),
         CAST(${mapRiskStatus(shop.riskStatus)} AS "RiskStatus"),
-        CAST(${shop.createdByAdminId ? "admin_manual" : shop.agentId ? "self_application" : "migration"} AS "MerchantCreationSource"),
+        CAST(${shop.createdByAdminId ? "admin_manual" : shop.merchantId ? "self_application" : "migration"} AS "MerchantCreationSource"),
         ${shop.createdByAdminId ?? null}, now(), now()
       )
       ON CONFLICT (id) DO UPDATE SET
@@ -5415,7 +9651,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistDepositAccount(tx: PrismaTx, agentId: string, account: {
+  private async persistDepositAccount(tx: PrismaTx, merchantId: string, account: {
     requiredAmountCents: bigint;
     availableAmountCents: bigint;
     frozenAmountCents: bigint;
@@ -5424,16 +9660,16 @@ class PrismaStateRepository {
   }) {
     await tx.$executeRaw`
       INSERT INTO deposit_accounts (
-        id, agent_id, merchant_id, required_amount_cents, available_amount_cents,
+        id, merchant_id, required_amount_cents, available_amount_cents,
         frozen_amount_cents, deducted_amount_cents, status, created_at, updated_at
       )
       VALUES (
-        ${stableDbId("deposit_account", agentId)}, ${agentId}, NULL,
+        ${stableDbId("deposit_account", merchantId)}, ${merchantId},
         ${account.requiredAmountCents}, ${account.availableAmountCents},
         ${account.frozenAmountCents}, ${account.deductedAmountCents},
         CAST(${mapDepositStatus(account.status)} AS "DepositStatus"), now(), now()
       )
-      ON CONFLICT (agent_id) DO UPDATE SET
+      ON CONFLICT (merchant_id) DO UPDATE SET
         required_amount_cents = EXCLUDED.required_amount_cents,
         available_amount_cents = EXCLUDED.available_amount_cents,
         frozen_amount_cents = EXCLUDED.frozen_amount_cents,
@@ -5446,13 +9682,13 @@ class PrismaStateRepository {
   private async persistDepositTransaction(tx: PrismaTx, txItem: DepositTransaction) {
     await tx.$executeRaw`
       INSERT INTO deposit_transactions (
-        id, agent_id, merchant_id, account_id, type, amount_cents,
+        id, merchant_id, account_id, type, amount_cents,
         balance_before_cents, balance_after_cents, reason_code, related_type,
         related_id, voucher_url, note, idempotency_key, operator_id, created_at
       )
       VALUES (
-        ${stableDbId("deposit_tx", txItem.idempotencyKey)}, ${txItem.agentId}, NULL,
-        (SELECT id FROM deposit_accounts WHERE agent_id = ${txItem.agentId} LIMIT 1),
+        ${stableDbId("deposit_tx", txItem.idempotencyKey)}, ${txItem.merchantId},
+        (SELECT id FROM deposit_accounts WHERE merchant_id = ${txItem.merchantId} LIMIT 1),
         CAST(${mapDepositTransactionType(txItem.type)} AS "DepositTransactionType"),
         ${txItem.amountCents}, ${txItem.balanceBeforeCents}, ${txItem.balanceAfterCents},
         ${txItem.reasonCode}, ${txItem.relatedType}, ${txItem.relatedId},
@@ -5465,25 +9701,25 @@ class PrismaStateRepository {
 
   private async persistLatestDepositConfirmation(tx: PrismaTx, store: MemoryStore) {
     const audit = this.latestAuditLog(store, ["deposit.confirm"]);
-    const agentId = audit ? stringValue(audit.targetId) : undefined;
-    const agent = agentId ? store.agents.get(agentId) : undefined;
-    if (!agent) throw new Error("deposit confirmation missing current agent");
-    const shop = [...store.shops.values()].find((item) => item.agentId === agent.id);
-    const account = store.depositAccounts.get(agent.id);
+    const merchantId = audit ? stringValue(audit.targetId) : undefined;
+    const merchant = merchantId ? store.merchants.get(merchantId) : undefined;
+    if (!merchant) throw new Error("deposit confirmation missing current merchant");
+    const shop = [...store.shops.values()].find((item) => item.merchantId === merchant.id);
+    const account = store.depositAccounts.get(merchant.id);
     if (!account) throw new Error("deposit confirmation missing deposit account");
     const transaction = [...store.depositTransactions]
       .reverse()
-      .find((item) => item.agentId === agent.id && item.reasonCode === "manual_confirm");
+      .find((item) => item.merchantId === merchant.id && item.reasonCode === "manual_confirm");
     const ledger = [...store.ledgerEntries]
       .reverse()
-      .find((item) => item.agentId === agent.id && item.entryType === "DEPOSIT_CONFIRMED");
+      .find((item) => item.merchantId === merchant.id && item.entryType === "DEPOSIT_CONFIRMED");
     const relations = store.channelRelations.filter((item) =>
-      item.secondTierAgentId === agent.id || item.thirdTierAgentId === agent.id
+      item.secondTierMerchantId === merchant.id || item.thirdTierMerchantId === merchant.id
     );
 
-    await this.persistAgent(tx, agent);
+    await this.persistMerchant(tx, merchant);
     if (shop) await this.persistShop(tx, shop);
-    await this.persistDepositAccount(tx, agent.id, account);
+    await this.persistDepositAccount(tx, merchant.id, account);
     if (transaction) await this.persistDepositTransaction(tx, transaction);
     for (const relation of relations) await this.persistChannelRelation(tx, relation);
     await this.persistLedgerEntries(tx, ledger ? [ledger] : []);
@@ -5527,11 +9763,11 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestAgentRightsCodeImport(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["rights_code.agent_import"]);
-    const agentProductId = audit ? stringValue(audit.targetId) : undefined;
-    const agentProduct = agentProductId ? store.agentProducts.get(agentProductId) : undefined;
-    if (!agentProduct) throw new Error("agent rights code import missing current product");
+  private async persistLatestMerchantRightsCodeImport(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["rights_code.merchant_import"]);
+    const merchantProductListingId = audit ? stringValue(audit.targetId) : undefined;
+    const merchantProductListing = merchantProductListingId ? store.merchantProductListings.get(merchantProductListingId) : undefined;
+    if (!merchantProductListing) throw new Error("merchant rights code import missing current product");
     const auditAfter = isRecord(audit?.after) ? audit.after : {};
     const importedCodeIds = Array.isArray(auditAfter.codeIds)
       ? auditAfter.codeIds.filter((value): value is string => typeof value === "string" && value.length > 0)
@@ -5539,7 +9775,7 @@ class PrismaStateRepository {
     const batchNo = stringValue(auditAfter.batchNo);
     const importedAt = dateValue(audit?.createdAt) ?? new Date(0);
     const codes = store.rightsCodes.filter((code) =>
-      (code.agentProductId ?? code.productId) === agentProduct.id
+      (code.merchantProductListingId ?? code.productId) === merchantProductListing.id
       && code.status === "available"
       && !code.orderNo
       && (
@@ -5550,48 +9786,19 @@ class PrismaStateRepository {
             : code.createdAt >= importedAt
       )
     );
-    await this.persistAgentProductWithDependencies(tx, store, agentProduct);
+    await this.persistMerchantProductWithDependencies(tx, store, merchantProductListing);
     for (const code of codes) await this.persistAvailableRightsCode(tx, code, store);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestCollectionChannelSubmission(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["collection_channel.submit"]);
-    const channelId = audit ? stringValue(audit.targetId) : undefined;
-    const channel = channelId ? store.collectionChannels.get(channelId) : undefined;
-    if (!channel) throw new Error("collection channel submission missing current channel");
-    await this.persistCollectionChannel(tx, channel);
-    await this.persistAuditLogs(tx, audit ? [audit] : []);
-  }
-
-  private async persistLatestCollectionChannelReview(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["collection_channel.review"]);
-    const channelId = audit ? stringValue(audit.targetId) : undefined;
-    const channel = channelId ? store.collectionChannels.get(channelId) : undefined;
-    if (!channel) throw new Error("collection channel review missing current channel");
-    if (channel.status === "active" && channel.isDefault) {
-      await tx.$executeRaw`
-        UPDATE shop_collection_channels
-           SET is_default = false,
-               updated_at = now()
-         WHERE shop_id = ${channel.shopId}
-           AND id <> ${channel.id}
-           AND status = CAST('active' AS "CollectionChannelStatus")
-           AND is_default = true
-      `;
-    }
-    await this.persistCollectionChannel(tx, channel);
-    await this.persistAuditLogs(tx, audit ? [audit] : []);
-  }
-
   private async persistLatestPlatformProductSelection(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["agent_product.select_platform"]);
-    const agentProductId = audit ? stringValue(audit.targetId) : undefined;
-    const agentProduct = agentProductId ? store.agentProducts.get(agentProductId) : undefined;
-    if (!agentProduct || agentProduct.productType !== "platform" || !agentProduct.platformProductId) {
-      throw new Error("platform product selection missing current agent product");
+    const audit = this.latestAuditLog(store, ["merchant_product_listing.select_platform"]);
+    const merchantProductListingId = audit ? stringValue(audit.targetId) : undefined;
+    const merchantProductListing = merchantProductListingId ? store.merchantProductListings.get(merchantProductListingId) : undefined;
+    if (!merchantProductListing || merchantProductListing.productType !== "platform" || !merchantProductListing.platformProductId) {
+      throw new Error("platform product selection missing current merchant product");
     }
-    await this.persistAgentProductWithDependencies(tx, store, agentProduct);
+    await this.persistMerchantProductWithDependencies(tx, store, merchantProductListing);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
@@ -5609,12 +9816,12 @@ class PrismaStateRepository {
     const ownProductId = audit ? stringValue(audit.targetId) : undefined;
     const ownProduct = ownProductId ? store.ownProducts.get(ownProductId) : undefined;
     if (!ownProduct) throw new Error("own product submission missing current product");
-    const agent = store.agents.get(ownProduct.agentId);
+    const merchant = store.merchants.get(ownProduct.merchantId);
     const shop = store.shops.get(ownProduct.shopId);
-    if (!agent) throw new Error("own product submission missing current agent");
+    if (!merchant) throw new Error("own product submission missing current merchant");
     if (!shop) throw new Error("own product submission missing current shop");
-    await this.persistAgent(tx, agent);
-    await this.persistMerchantAccountForAgent(tx, agent);
+    await this.persistMerchant(tx, merchant);
+    await this.persistMerchantAccountForMerchant(tx, merchant);
     await this.persistShop(tx, shop);
     await this.persistOwnProductReview(tx, ownProduct);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
@@ -5626,9 +9833,9 @@ class PrismaStateRepository {
     const ownProduct = ownProductId ? store.ownProducts.get(ownProductId) : undefined;
     if (!ownProduct) throw new Error("own product review missing current product");
     await this.persistOwnProductReview(tx, ownProduct);
-    const agentProduct = [...store.agentProducts.values()]
+    const merchantProductListing = [...store.merchantProductListings.values()]
       .find((product) => product.ownProductReviewId === ownProduct.id);
-    if (agentProduct) await this.persistAgentProductWithDependencies(tx, store, agentProduct);
+    if (merchantProductListing) await this.persistMerchantProductWithDependencies(tx, store, merchantProductListing);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
@@ -5638,36 +9845,36 @@ class PrismaStateRepository {
     const ownProduct = ownProductId ? store.ownProducts.get(ownProductId) : undefined;
     if (!ownProduct) throw new Error("own product update missing current product");
     await this.persistOwnProductReview(tx, ownProduct);
-    const agentProduct = [...store.agentProducts.values()].find((product) => product.ownProductReviewId === ownProduct.id);
-    if (agentProduct) await this.persistAgentProductWithDependencies(tx, store, agentProduct);
+    const merchantProductListing = [...store.merchantProductListings.values()].find((product) => product.ownProductReviewId === ownProduct.id);
+    if (merchantProductListing) await this.persistMerchantProductWithDependencies(tx, store, merchantProductListing);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
   private async persistLatestPlatformProductBatchSelection(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["agent_product.batch_select_platform"]);
+    const audit = this.latestAuditLog(store, ["merchant_product_listing.batch_select_platform"]);
     const shopId = audit ? stringValue(audit.targetId) : undefined;
     if (!shopId) throw new Error("platform product batch selection missing current shop");
-    const products = [...store.agentProducts.values()]
+    const products = [...store.merchantProductListings.values()]
       .filter((product) => product.shopId === shopId && product.productType === "platform");
-    for (const product of products) await this.persistAgentProductWithDependencies(tx, store, product);
+    for (const product of products) await this.persistMerchantProductWithDependencies(tx, store, product);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestAgentProductPriceUpdate(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["agent_product.price_update"]);
-    const agentProductId = audit ? stringValue(audit.targetId) : undefined;
-    const agentProduct = agentProductId ? store.agentProducts.get(agentProductId) : undefined;
-    if (!agentProduct) throw new Error("agent product price update missing current product");
-    await this.persistAgentProductWithDependencies(tx, store, agentProduct);
+  private async persistLatestMerchantProductPriceUpdate(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["merchant_product_listing.price_update"]);
+    const merchantProductListingId = audit ? stringValue(audit.targetId) : undefined;
+    const merchantProductListing = merchantProductListingId ? store.merchantProductListings.get(merchantProductListingId) : undefined;
+    if (!merchantProductListing) throw new Error("merchant product price update missing current product");
+    await this.persistMerchantProductWithDependencies(tx, store, merchantProductListing);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestAgentProductDetailUpdate(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["agent_product.detail_update", "agent_product.price_update"]);
-    const agentProductId = audit ? stringValue(audit.targetId) : undefined;
-    const agentProduct = agentProductId ? store.agentProducts.get(agentProductId) : undefined;
-    if (!agentProduct) throw new Error("agent product detail update missing current product");
-    await this.persistAgentProductWithDependencies(tx, store, agentProduct);
+  private async persistLatestMerchantProductDetailUpdate(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["merchant_product_listing.detail_update", "merchant_product_listing.price_update"]);
+    const merchantProductListingId = audit ? stringValue(audit.targetId) : undefined;
+    const merchantProductListing = merchantProductListingId ? store.merchantProductListings.get(merchantProductListingId) : undefined;
+    if (!merchantProductListing) throw new Error("merchant product detail update missing current product");
+    await this.persistMerchantProductWithDependencies(tx, store, merchantProductListing);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
@@ -5721,6 +9928,25 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, [audit]);
   }
 
+  private async persistLatestAdminCouponGrant(tx: PrismaTx, store: MemoryStore) {
+    const audit = this.latestAuditLog(store, ["coupon.grant.admin"]);
+    if (!audit) return;
+    const templateId = stringValue(audit.targetId);
+    const template = templateId ? store.couponTemplates.get(templateId) : undefined;
+    if (!template) throw new Error("admin coupon grant missing coupon template");
+    const after = isRecord(audit.after) ? audit.after : {};
+    const couponIds = Array.isArray(after.couponIds)
+      ? after.couponIds.map((item) => stringValue(item)).filter((item): item is string => Boolean(item))
+      : [];
+    for (const couponId of couponIds) {
+      const coupon = store.userCoupons.get(couponId);
+      if (!coupon) continue;
+      await this.persistUserId(tx, coupon.userId);
+      await this.persistUserCoupon(tx, coupon, template);
+    }
+    await this.persistAuditLogs(tx, [audit]);
+  }
+
   private async persistLatestOrderCreation(tx: PrismaTx, store: MemoryStore) {
     const audit = this.latestAuditLog(store, ["order.create"]);
     const orderNo = audit ? stringValue(audit.targetId) : undefined;
@@ -5730,15 +9956,15 @@ class PrismaStateRepository {
     await this.persistUserId(tx, order.userId);
     const shop = store.shops.get(order.shopId);
     if (!shop) throw new Error("order creation missing current shop");
-    if (order.salesChannelType !== "platform_self_operated" && order.agentId !== PLATFORM_AGENT_ID) {
-      const agent = store.agents.get(order.agentId);
-      if (!agent) throw new Error("order creation missing current agent");
-      await this.persistAgent(tx, agent);
+    if (order.salesChannelType !== "platform_self_operated" && order.merchantId !== PLATFORM_MERCHANT_ID) {
+      const merchant = store.merchants.get(order.merchantId);
+      if (!merchant) throw new Error("order creation missing current merchant");
+      await this.persistMerchant(tx, merchant);
     }
     await this.persistShop(tx, shop);
 
     if (order.salesChannelType === "platform_self_operated") {
-      const platformShopProduct = store.platformShopProducts.get(order.agentProductId);
+      const platformShopProduct = store.platformShopProducts.get(order.merchantProductListingId);
       if (platformShopProduct) {
         const product = store.platformProducts.get(platformShopProduct.platformProductId);
         if (!product) throw new Error("order creation missing current platform product");
@@ -5746,21 +9972,20 @@ class PrismaStateRepository {
         await this.persistPlatformShopProduct(tx, platformShopProduct);
       }
     } else {
-      const agentProduct = store.agentProducts.get(order.agentProductId);
-      if (!agentProduct) throw new Error("order creation missing current agent product");
-      const product = agentProduct.platformProductId ? store.platformProducts.get(agentProduct.platformProductId) : undefined;
+      const merchantProductListing = store.merchantProductListings.get(order.merchantProductListingId);
+      if (!merchantProductListing) throw new Error("order creation missing current merchant product");
+      const product = merchantProductListing.platformProductId ? store.platformProducts.get(merchantProductListing.platformProductId) : undefined;
       if (product) await this.persistPlatformProduct(tx, product);
-      await this.persistAgentProduct(tx, agentProduct);
+      await this.persistMerchantProduct(tx, merchantProductListing);
     }
 
-    const collectionChannel = order.collectionChannelId ? store.collectionChannels.get(order.collectionChannelId) : undefined;
-    if (collectionChannel) await this.persistCollectionChannel(tx, collectionChannel);
     if (order.couponId) {
       const coupon = store.userCoupons.get(order.couponId);
       if (!coupon) throw new Error("order creation missing current user coupon");
       await this.persistUserCoupon(tx, coupon, store.couponTemplates.get(coupon.templateId));
     }
     await this.persistOrder(tx, order);
+    await this.persistLockedRightsCodesForOrder(tx, store, order);
     if (order.extractionCodeHash) await this.persistOrderExtractSecret(tx, order);
     if (order.couponId) await this.persistCouponUsageForOrder(tx, order);
     const ledger = [...store.ledgerEntries]
@@ -5825,7 +10050,7 @@ class PrismaStateRepository {
   }
 
   private async persistLatestPaymentOrderCreation(tx: PrismaTx, store: MemoryStore) {
-    const audit = this.latestAuditLog(store, ["payment.manual.create", "payment.order.create"]);
+    const audit = this.latestAuditLog(store, ["payment.manual.create", "payment.order.create", "wallet.payment.capture"]);
     const orderNo = audit ? stringValue(audit.targetId) : undefined;
     const order = orderNo ? store.orders.get(orderNo) : undefined;
     if (!order) throw new Error("payment order persistence missing current order");
@@ -5833,7 +10058,136 @@ class PrismaStateRepository {
     const method = this.paymentMethodForOrder(store, order);
     if (method) await this.persistPaymentMethodConfig(tx, method);
     await this.persistPaymentSnapshotForOrder(tx, store, order);
+    if (order.paymentSnapshot?.provider === "balance") await this.persistWalletState(tx, store);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistLatestWalletRechargeMutation(tx: PrismaTx, store: MemoryStore) {
+    await this.persistWalletState(tx, store);
+    const audit = this.latestAuditLog(store, ["wallet.recharge.create", "wallet.recharge.confirm", "wallet.payment.capture"]);
+    await this.persistAuditLogs(tx, audit ? [audit] : []);
+  }
+
+  private async persistServiceFeeConfig(tx: PrismaTx, config: PlatformServiceFeeConfig) {
+    await tx.$executeRaw`
+      INSERT INTO platform_service_fee_configs (
+        id, enabled, fee_bps, basis_type, effective_from, effective_to, status,
+        created_by, updated_by, idempotency_key, created_at, updated_at
+      )
+      VALUES (
+        ${config.id}, ${config.enabled}, ${config.feeBps}, ${config.basisType},
+        now(), NULL, ${config.status}, ${config.updatedBy ?? null}, ${config.updatedBy ?? null},
+        'platform-service-fee-active', now(), ${config.updatedAt}
+      )
+      ON CONFLICT (idempotency_key) DO UPDATE SET
+        enabled = EXCLUDED.enabled,
+        fee_bps = EXCLUDED.fee_bps,
+        basis_type = EXCLUDED.basis_type,
+        status = EXCLUDED.status,
+        updated_by = EXCLUDED.updated_by,
+        updated_at = now()
+    `;
+  }
+
+  private async persistWalletState(tx: PrismaTx, store: MemoryStore) {
+    for (const wallet of store.userWallets.values()) {
+      await tx.$executeRaw`
+        INSERT INTO users (id, status, created_at, updated_at)
+        VALUES (${wallet.userId}, CAST('active' AS "UserStatus"), now(), now())
+        ON CONFLICT (id) DO NOTHING
+      `;
+      await tx.$executeRaw`
+        INSERT INTO user_wallets (
+          id, user_id, wallet_no, available_balance_cents, frozen_balance_cents,
+          total_recharge_cents, total_spend_cents, status, version, created_at, updated_at
+        )
+        VALUES (
+          ${wallet.id}, ${wallet.userId}, ${wallet.walletNo}, ${wallet.availableBalanceCents},
+          ${wallet.frozenBalanceCents}, ${wallet.totalRechargeCents}, ${wallet.totalSpendCents},
+          CAST(${wallet.status} AS "WalletStatus"), ${wallet.version}, ${wallet.createdAt}, ${wallet.updatedAt}
+        )
+        ON CONFLICT (user_id) DO UPDATE SET
+          wallet_no = EXCLUDED.wallet_no,
+          available_balance_cents = EXCLUDED.available_balance_cents,
+          frozen_balance_cents = EXCLUDED.frozen_balance_cents,
+          total_recharge_cents = EXCLUDED.total_recharge_cents,
+          total_spend_cents = EXCLUDED.total_spend_cents,
+          status = EXCLUDED.status,
+          version = EXCLUDED.version,
+          updated_at = now()
+      `;
+    }
+
+    for (const recharge of store.walletRecharges.values()) {
+      await tx.$executeRaw`
+        INSERT INTO wallet_recharge_orders (
+          id, recharge_no, user_id, wallet_id, provider, confirm_mode,
+          recharge_cents, fee_bps, fee_cents, payable_cents, status, paid_at,
+          idempotency_key, created_at, updated_at
+        )
+        VALUES (
+          ${stableDbId("wallet_recharge", recharge.rechargeNo)}, ${recharge.rechargeNo},
+          ${recharge.userId}, ${recharge.walletId}, CAST(${mapPaymentProviderToDb(recharge.provider)} AS "PaymentProvider"),
+          CAST(${mapPaymentConfirmModeToDb(recharge.confirmationMode)} AS "PaymentConfirmMode"),
+          ${recharge.rechargeCents}, ${recharge.feeBps}, ${recharge.feeCents}, ${recharge.payableCents},
+          CAST(${recharge.status} AS "WalletRechargeStatus"), ${recharge.paidAt ?? null}, ${recharge.idempotencyKey},
+          ${recharge.createdAt}, ${recharge.updatedAt}
+        )
+        ON CONFLICT (recharge_no) DO UPDATE SET
+          status = EXCLUDED.status,
+          paid_at = EXCLUDED.paid_at,
+          fee_bps = EXCLUDED.fee_bps,
+          fee_cents = EXCLUDED.fee_cents,
+          payable_cents = EXCLUDED.payable_cents,
+          updated_at = now()
+      `;
+    }
+
+    for (const hold of store.walletHolds.values()) {
+      await tx.$executeRaw`
+        INSERT INTO wallet_payment_holds (
+          id, hold_no, user_id, wallet_id, order_id, payment_id, amount_cents,
+          status, expires_at, captured_at, released_at, idempotency_key, created_at, updated_at
+        )
+        VALUES (
+          ${stableDbId("wallet_hold", hold.holdNo)}, ${hold.holdNo}, ${hold.userId}, ${hold.walletId},
+          ${stableDbId("order", hold.orderNo)}, NULL,
+          ${hold.amountCents}, CAST(${hold.status} AS "WalletHoldStatus"), NULL, ${hold.capturedAt ?? null}, NULL,
+          ${hold.idempotencyKey}, now(), now()
+        )
+        ON CONFLICT (hold_no) DO UPDATE SET
+          payment_id = EXCLUDED.payment_id,
+          amount_cents = EXCLUDED.amount_cents,
+          status = EXCLUDED.status,
+          captured_at = EXCLUDED.captured_at,
+          updated_at = now()
+      `;
+    }
+
+    for (const transaction of store.walletTransactions) {
+      await tx.$executeRaw`
+        INSERT INTO wallet_transactions (
+          id, transaction_no, user_id, wallet_id, type, direction, amount_cents,
+          balance_before_cents, balance_after_cents, frozen_before_cents, frozen_after_cents,
+          order_id, payment_id, recharge_order_id, hold_id, source_type, source_id, note,
+          idempotency_key, created_at
+        )
+        VALUES (
+          ${stableDbId("wallet_tx", transaction.transactionNo)}, ${transaction.transactionNo},
+          ${transaction.userId}, ${transaction.walletId}, CAST(${transaction.type} AS "WalletTransactionType"),
+          CAST(${transaction.direction} AS "LedgerDirection"), ${transaction.amountCents},
+          ${transaction.balanceBeforeCents}, ${transaction.balanceAfterCents},
+          ${transaction.frozenBeforeCents}, ${transaction.frozenAfterCents},
+          ${transaction.orderNo ? stableDbId("order", transaction.orderNo) : null},
+          NULL,
+          ${transaction.rechargeNo ? stableDbId("wallet_recharge", transaction.rechargeNo) : null},
+          ${transaction.holdNo ? stableDbId("wallet_hold", transaction.holdNo) : null},
+          ${transaction.sourceType}, ${transaction.sourceId}, ${transaction.note ?? null},
+          ${transaction.idempotencyKey}, ${transaction.createdAt}
+        )
+        ON CONFLICT (transaction_no) DO NOTHING
+      `;
+    }
   }
 
   private async persistLatestPaymentResult(tx: PrismaTx, store: MemoryStore, methodName: string) {
@@ -5887,6 +10241,22 @@ class PrismaStateRepository {
   }
 
   private paymentMethodForOrder(store: MemoryStore, order: DemoOrder) {
+    if (order.paymentSnapshot?.paymentMethodId === "balance") {
+      return {
+        id: "balance",
+        ownerType: "platform",
+        provider: "balance",
+        confirmationMode: "automatic",
+        displayName: "余额支付",
+        enabled: true,
+        status: "enabled",
+        isDefault: false,
+        secretConfigured: true,
+        createdAt: new Date(0),
+        updatedAt: new Date(0)
+      } satisfies PaymentMethodConfig;
+    }
+    const paymentMethodId = order.paymentSnapshot?.paymentMethodId;
     return order.paymentSnapshot?.paymentMethodId ? store.paymentMethods.get(order.paymentSnapshot.paymentMethodId) : undefined;
   }
 
@@ -5974,7 +10344,7 @@ class PrismaStateRepository {
     }
     const ledger = [...store.ledgerEntries]
       .reverse()
-      .find((item) => item.entryType === "SETTLEMENT_GENERATED" && item.agentId === sheet.agentId);
+      .find((item) => item.entryType === "SETTLEMENT_GENERATED" && item.merchantId === sheet.merchantId);
     await this.persistLedgerEntries(tx, ledger ? [ledger] : []);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
@@ -5995,63 +10365,44 @@ class PrismaStateRepository {
     }
     const ledger = [...store.ledgerEntries]
       .reverse()
-      .find((item) => item.entryType === "PAYOUT_CONFIRMED" && item.agentId === sheet.agentId);
+      .find((item) => item.entryType === "PAYOUT_CONFIRMED" && item.merchantId === sheet.merchantId);
     await this.persistLedgerEntries(tx, ledger ? [ledger] : []);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistAgents(tx: PrismaTx, store: MemoryStore) {
-    for (const agent of store.agents.values()) {
-      await tx.$executeRaw`
-        INSERT INTO agents (
-          id, user_id, agent_no, name, contact_phone, status, risk_status,
-          deposit_status, approved_at, created_at, updated_at
-        )
-        VALUES (
-          ${agent.id}, ${agent.userId}, ${agent.id}, ${agent.name}, ${agent.contactPhone ?? null},
-          CAST(${mapAgentStatus(agent.status)} AS "AgentStatus"),
-          CAST(${mapRiskStatus(agent.riskStatus)} AS "RiskStatus"),
-          CAST(${mapDepositStatus(agent.depositStatus)} AS "DepositStatus"),
-          ${agent.status === "active" ? new Date() : null}, now(), now()
-        )
-        ON CONFLICT (id) DO UPDATE SET
-          name = EXCLUDED.name,
-          contact_phone = EXCLUDED.contact_phone,
-          status = EXCLUDED.status,
-          risk_status = EXCLUDED.risk_status,
-          deposit_status = EXCLUDED.deposit_status,
-          updated_at = now()
-      `;
-      await this.persistMerchantAccountForAgent(tx, agent);
+  private async persistMerchants(tx: PrismaTx, store: MemoryStore) {
+    for (const merchant of store.merchants.values()) {
+      await this.persistMerchantForMerchant(tx, merchant);
+      await this.persistMerchantAccountForMerchant(tx, merchant);
     }
 
-	    for (const application of store.agentApplications.values()) {
-      await this.persistAgentApplication(tx, application);
+	    for (const application of store.merchantApplications.values()) {
+      await this.persistMerchantApplication(tx, application);
 	    }
 	  }
 
   private async persistShops(tx: PrismaTx, store: MemoryStore) {
     for (const shop of store.shops.values()) {
       await tx.$executeRaw`
-        INSERT INTO shops (
-          id, owner_type, agent_id, merchant_id, shop_no, name, announcement,
+          INSERT INTO shops (
+	          id, owner_type, merchant_id, shop_no, name, announcement,
           customer_service_wechat, customer_service_qr_url, customer_service_qq,
           customer_service_qq_qr_url, customer_service_note, collection_account_name, collection_qr_url,
           collection_note, theme_color, banner_url, share_title, share_path,
           status, risk_status, creation_source, created_by_admin_id, created_at, updated_at
         )
         VALUES (
-          ${shop.id}, CAST(${shop.ownerType ?? "agent"} AS "ShopOwnerType"),
-          ${shop.ownerType === "platform" ? null : shop.agentId ?? null}, NULL,
-          ${shop.id}, ${shop.name}, ${shop.announcement ?? null},
+	          ${shop.id}, CAST(${shop.ownerType === "platform" ? "platform" : "merchant"} AS "ShopOwnerType"),
+	          ${shop.ownerType === "platform" ? null : shop.merchantId ?? null},
+          ${shop.shopNo ?? shop.id}, ${shop.name}, ${shop.announcement ?? null},
           ${shop.customerServiceWechat ?? null}, ${shop.customerServiceQrUrl ?? null},
           ${shop.customerServiceQq ?? null}, ${shop.customerServiceQqQrUrl ?? null},
           ${shop.customerServiceNote ?? null}, ${shop.collectionAccountName ?? null},
           ${shop.collectionQrUrl ?? null}, ${shop.collectionNote ?? null},
           ${shop.themeColor ?? null}, ${shop.bannerUrl ?? null}, ${shop.shareTitle ?? null},
-          ${`/shops/${shop.id}`}, CAST(${mapShopStatus(shop.status)} AS "ShopStatus"),
+          ${shop.sharePath ?? publicShopPath(shop)}, CAST(${mapShopStatus(shop.status)} AS "ShopStatus"),
           CAST(${mapRiskStatus(shop.riskStatus)} AS "RiskStatus"),
-          CAST(${shop.agentId ? "self_application" : "migration"} AS "MerchantCreationSource"),
+          CAST(${shop.merchantId ? "self_application" : "migration"} AS "MerchantCreationSource"),
           NULL, now(), now()
         )
         ON CONFLICT (id) DO UPDATE SET
@@ -6075,13 +10426,13 @@ class PrismaStateRepository {
       await tx.$executeRaw`DELETE FROM shop_product_groups WHERE shop_id = ${shop.id}`;
       for (const [index, group] of (shop.productGroups ?? []).entries()) {
         await tx.$executeRaw`
-          INSERT INTO shop_product_groups (id, shop_id, name, sort_order, agent_product_ids, created_at, updated_at)
+          INSERT INTO shop_product_groups (id, shop_id, name, sort_order, product_listing_ids, created_at, updated_at)
           VALUES (${stableDbId("shop_group", `${shop.id}:${group.name}:${index}`)}, ${shop.id}, ${group.name}, ${index + 1},
-                  ${jsonForDb(group.agentProductIds)}::jsonb, now(), now())
+                  ${jsonForDb(group.merchantProductListingIds)}::jsonb, now(), now())
           ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             sort_order = EXCLUDED.sort_order,
-            agent_product_ids = EXCLUDED.agent_product_ids,
+            product_listing_ids = EXCLUDED.product_listing_ids,
             updated_at = now()
         `;
       }
@@ -6101,49 +10452,50 @@ class PrismaStateRepository {
       await this.persistOwnProductReview(tx, ownProduct);
     }
 
-    for (const product of store.agentProducts.values()) {
-      await this.persistAgentProduct(tx, product);
+    for (const product of store.merchantProductListings.values()) {
+      await this.persistMerchantProduct(tx, product);
     }
   }
 
-  private async persistAgentProductWithDependencies(tx: PrismaTx, store: MemoryStore, product: DemoAgentProduct) {
-    const agent = store.agents.get(product.agentId);
+  private async persistMerchantProductWithDependencies(tx: PrismaTx, store: MemoryStore, product: DemoMerchantProductListing) {
+    const merchant = store.merchants.get(product.merchantId);
     const shop = store.shops.get(product.shopId);
-    if (!agent) throw new Error("agent product persistence missing current agent");
-    if (!shop) throw new Error("agent product persistence missing current shop");
-    await this.persistAgent(tx, agent);
-    await this.persistMerchantAccountForAgent(tx, agent);
+    if (!merchant) throw new Error("merchant product persistence missing current merchant");
+    if (!shop) throw new Error("merchant product persistence missing current shop");
+    await this.persistMerchant(tx, merchant);
+    await this.persistMerchantAccountForMerchant(tx, merchant);
     await this.persistShop(tx, shop);
 
     if (product.productType === "platform" && product.platformProductId) {
       const platformProduct = store.platformProducts.get(product.platformProductId);
-      if (!platformProduct) throw new Error("agent product persistence missing current platform product");
+      if (!platformProduct) throw new Error("merchant product persistence missing current platform product");
       await this.persistPlatformProduct(tx, platformProduct);
     }
 
-    if (product.productType === "agent_owned" && product.ownProductReviewId) {
+    if (product.productType === "merchant_owned" && product.ownProductReviewId) {
       const ownProduct = store.ownProducts.get(product.ownProductReviewId);
-      if (!ownProduct) throw new Error("agent product persistence missing current own product review");
+      if (!ownProduct) throw new Error("merchant product persistence missing current own product review");
       await this.persistOwnProductReview(tx, ownProduct);
     }
 
-    await this.persistAgentProduct(tx, product);
+    await this.persistMerchantProduct(tx, product);
   }
 
   private async persistOwnProductReview(tx: PrismaTx, ownProduct: DemoOwnProduct) {
     await tx.$executeRaw`
-      INSERT INTO agent_product_reviews (
-        id, agent_id, shop_id, name, detail_json, sale_price_cents,
+	      INSERT INTO merchant_product_reviews (
+	        id, merchant_id, shop_id, name, detail_json, sale_price_cents,
         after_sale_rule_json, fulfillment_rule_json, fulfillment_type, status, reject_reason,
-        risk_reason, reviewed_by, reviewed_at, created_at, updated_at
+        risk_reason, reviewed_by, reviewed_at, idempotency_key, created_at, updated_at
       )
       VALUES (
-        ${ownProduct.id}, ${ownProduct.agentId}, ${ownProduct.shopId}, ${ownProduct.name},
+        ${ownProduct.id}, ${ownProduct.merchantId}, ${ownProduct.shopId}, ${ownProduct.name},
         ${jsonForDb(ownProduct)}::jsonb, ${ownProduct.salePriceCents},
         ${jsonForDb(ownProduct.afterSaleRule)}::jsonb, ${jsonForDb(ownProduct.fulfillmentRule)}::jsonb,
         CAST(${fulfillmentModeFromRule(ownProduct.fulfillmentRule)} AS "FulfillmentType"),
         CAST(${mapReviewStatus(ownProduct.reviewStatus)} AS "ReviewStatus"), NULL, NULL, NULL,
         ${ownProduct.reviewStatus === "approved" ? ownProduct.updatedAt ?? new Date() : null},
+        ${`merchant-product-review:${ownProduct.id}`},
         ${ownProduct.createdAt ?? new Date()}, ${ownProduct.updatedAt ?? new Date()}
       )
       ON CONFLICT (id) DO UPDATE SET
@@ -6158,21 +10510,57 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistAgentProduct(tx: PrismaTx, product: DemoAgentProduct) {
+  private async persistMerchantProduct(tx: PrismaTx, product: DemoMerchantProductListing) {
+    if (product.productType === "merchant_owned") {
+      await tx.$executeRaw`
+        INSERT INTO merchant_products (
+          id, merchant_id, shop_id, product_type, platform_product_id, own_product_review_id,
+          sale_price_cents, status, listed_at, created_at, updated_at
+        )
+        VALUES (
+          ${product.id}, ${product.merchantId}, ${product.shopId}, CAST('merchant_owned' AS "ProductType"),
+          ${product.platformProductId ?? null}, ${product.ownProductReviewId ?? null},
+          ${product.salePriceCents}, CAST(${mapProductListingStatus(product.status)} AS "ProductListingStatus"),
+          ${product.status === "listed" ? new Date() : null}, now(), now()
+        )
+        ON CONFLICT (id) DO UPDATE SET
+          sale_price_cents = EXCLUDED.sale_price_cents,
+          status = EXCLUDED.status,
+          listed_at = EXCLUDED.listed_at,
+          updated_at = now()
+      `;
+      return;
+    }
     await tx.$executeRaw`
-      INSERT INTO agent_products (
-        id, agent_id, shop_id, product_type, platform_product_id, own_product_review_id,
-        sale_price_cents, status, listed_at, created_at, updated_at
+      INSERT INTO merchant_product_listings (
+        id, merchant_id, shop_id, source_type, platform_product_id, upstream_listing_id,
+        sale_price_cents, display_name, display_subtitle, display_description,
+        display_usage_guide, display_image_url, display_category, display_tags_json,
+        display_specs_json, display_detail_sections_json, status, listed_at, created_at, updated_at
       )
       VALUES (
-        ${product.id}, ${product.agentId}, ${product.shopId},
-        CAST(${product.productType} AS "ProductType"), ${product.platformProductId ?? null},
-        ${product.ownProductReviewId ?? null}, ${product.salePriceCents},
-        CAST(${mapAgentProductStatus(product.status)} AS "AgentProductStatus"),
+        ${product.id}, ${product.merchantId}, ${product.shopId}, CAST('platform_product' AS "MerchantProductListingSourceType"),
+        ${product.platformProductId ?? null}, NULL,
+        ${product.salePriceCents},
+        ${product.displayName ?? null}, ${product.displaySubtitle ?? null}, ${product.displayDescription ?? null},
+        ${product.displayUsageGuide ?? null}, ${product.displayImageUrl ?? null}, ${product.displayCategory ?? null},
+        ${product.displayTags ? jsonForDb(product.displayTags) : null}::jsonb,
+        ${product.displaySpecs ? jsonForDb(product.displaySpecs) : null}::jsonb,
+        ${product.displayDetailSections ? jsonForDb(product.displayDetailSections) : null}::jsonb,
+        CAST(${mapProductListingStatus(product.status)} AS "ProductListingStatus"),
         ${product.status === "listed" ? new Date() : null}, now(), now()
       )
       ON CONFLICT (id) DO UPDATE SET
         sale_price_cents = EXCLUDED.sale_price_cents,
+        display_name = EXCLUDED.display_name,
+        display_subtitle = EXCLUDED.display_subtitle,
+        display_description = EXCLUDED.display_description,
+        display_usage_guide = EXCLUDED.display_usage_guide,
+        display_image_url = EXCLUDED.display_image_url,
+        display_category = EXCLUDED.display_category,
+        display_tags_json = EXCLUDED.display_tags_json,
+        display_specs_json = EXCLUDED.display_specs_json,
+        display_detail_sections_json = EXCLUDED.display_detail_sections_json,
         status = EXCLUDED.status,
         listed_at = EXCLUDED.listed_at,
         updated_at = now()
@@ -6187,7 +10575,7 @@ class PrismaStateRepository {
       )
       VALUES (
         ${product.id}, ${product.shopId}, ${product.platformProductId}, ${product.salePriceCents},
-        ${product.fulfillmentCostCents}, CAST(${mapAgentProductStatus(product.status)} AS "AgentProductStatus"),
+        ${product.fulfillmentCostCents}, CAST(${mapProductListingStatus(product.status)} AS "ProductListingStatus"),
         ${product.status === "listed" ? new Date() : null}, now(), now()
       )
       ON CONFLICT (id) DO UPDATE SET
@@ -6199,21 +10587,8 @@ class PrismaStateRepository {
   }
 
   private async persistChannelProductOffer(tx: PrismaTx, offer: ChannelProductOffer) {
-    await tx.$executeRaw`
-      INSERT INTO channel_product_offers (
-        id, channel_relation_id, platform_product_id, resell_supply_price_cents,
-        status, listed_at, idempotency_key, created_at, updated_at
-      )
-      VALUES (
-        ${offer.id}, ${offer.channelRelationId}, ${offer.platformProductId},
-        ${offer.resellSupplyPriceCents}, CAST(${mapAgentProductStatus(offer.status)} AS "AgentProductStatus"),
-        ${offer.status === "listed" ? new Date() : null}, ${`channel-offer:${offer.id}`}, now(), now()
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        resell_supply_price_cents = EXCLUDED.resell_supply_price_cents,
-        status = EXCLUDED.status,
-        updated_at = now()
-    `;
+    void tx;
+    void offer;
   }
 
   private async persistPlatformProduct(tx: PrismaTx, product: DemoPlatformProduct) {
@@ -6269,14 +10644,14 @@ class PrismaStateRepository {
     const shape = this.rightsCodeDbShape(code, store);
     await tx.$executeRaw`
       INSERT INTO rights_codes (
-        id, product_id, agent_product_id, code_ciphertext, code_hash, secret_preview,
-        owner_type, owner_agent_id, shop_id, batch_no, status, order_id,
+        id, product_id, merchant_product_listing_id, code_ciphertext, code_hash, secret_preview,
+        owner_type, owner_merchant_id, shop_id, batch_no, status, order_id,
         issue_key, issued_at, import_audit_json, created_at, updated_at
       )
       VALUES (
-        ${code.codeId}, ${shape.platformProductId}, ${shape.agentProductId}, ${code.code},
+        ${code.codeId}, ${shape.platformProductId}, ${shape.merchantProductListingId}, ${code.code},
         ${shape.codeHash}, ${shape.secretPreview}, CAST(${shape.ownerType} AS "RightsCodeOwnerType"),
-        ${shape.ownerAgentId}, ${shape.shopId}, ${code.batchNo},
+        ${shape.ownerMerchantId}, ${shape.shopId}, ${code.batchNo},
         CAST('available' AS "RightsCodeStatus"), NULL, NULL, NULL,
         ${jsonForDb({ batchNo: code.batchNo, source: "targeted_import" })}::jsonb,
         ${code.createdAt}, now()
@@ -6289,7 +10664,7 @@ class PrismaStateRepository {
         code_hash = COALESCE(rights_codes.code_hash, EXCLUDED.code_hash),
         secret_preview = COALESCE(rights_codes.secret_preview, EXCLUDED.secret_preview),
         owner_type = EXCLUDED.owner_type,
-        owner_agent_id = EXCLUDED.owner_agent_id,
+        owner_merchant_id = EXCLUDED.owner_merchant_id,
         shop_id = EXCLUDED.shop_id,
         updated_at = now()
     `;
@@ -6297,54 +10672,17 @@ class PrismaStateRepository {
 
   private rightsCodeDbShape(code: RightsCode, store: MemoryStore) {
     const platformProductId = code.platformProductId ?? (store.platformProducts.has(code.productId) ? code.productId : null);
-    const agentProductId = code.agentProductId ?? (store.agentProducts.has(code.productId) ? code.productId : null);
-    const agentProduct = agentProductId ? store.agentProducts.get(agentProductId) : undefined;
+    const merchantProductListingId = code.merchantProductListingId ?? (store.merchantProductListings.has(code.productId) ? code.productId : null);
+    const merchantProductListing = merchantProductListingId ? store.merchantProductListings.get(merchantProductListingId) : undefined;
     return {
       platformProductId,
-      agentProductId,
-      ownerType: agentProductId ? "agent" : "platform",
-      ownerAgentId: agentProduct?.agentId ?? null,
-      shopId: agentProduct?.shopId ?? null,
+      merchantProductListingId,
+      ownerType: merchantProductListingId ? "merchant" : "platform",
+      ownerMerchantId: merchantProductListing?.merchantId ?? null,
+      shopId: merchantProductListing?.shopId ?? null,
       codeHash: hashSecret(code.code),
       secretPreview: previewSecret(code.code)
     };
-  }
-
-  private async persistCollectionChannels(tx: PrismaTx, store: MemoryStore) {
-    for (const channel of store.collectionChannels.values()) {
-      await this.persistCollectionChannel(tx, channel);
-    }
-  }
-
-  private async persistCollectionChannel(tx: PrismaTx, channel: CollectionChannel) {
-    await tx.$executeRaw`
-      INSERT INTO shop_collection_channels (
-        id, shop_id, channel_type, account_name, qr_url, note, status,
-        review_status, is_default, reviewed_by, reviewed_at, idempotency_key,
-        created_at, updated_at
-      )
-      VALUES (
-        ${channel.id}, ${channel.shopId},
-        CAST(${mapCollectionChannelType(channel.channelType)} AS "CollectionChannelType"),
-        ${channel.accountName ?? channel.displayName}, ${channel.qrUrl ?? channel.paymentUrl ?? null},
-        ${channel.rejectReason ?? null},
-        CAST(${mapCollectionStatus(channel.status)} AS "CollectionChannelStatus"),
-        CAST(${mapReviewStatus(channel.reviewStatus)} AS "ReviewStatus"),
-        ${channel.isDefault}, ${channel.reviewedBy}, ${channel.reviewedAt},
-        ${`collection:${channel.id}`}, ${channel.createdAt}, ${channel.updatedAt}
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        channel_type = EXCLUDED.channel_type,
-        account_name = EXCLUDED.account_name,
-        qr_url = EXCLUDED.qr_url,
-        note = EXCLUDED.note,
-        status = EXCLUDED.status,
-        review_status = EXCLUDED.review_status,
-        is_default = EXCLUDED.is_default,
-        reviewed_by = EXCLUDED.reviewed_by,
-        reviewed_at = EXCLUDED.reviewed_at,
-        updated_at = now()
-    `;
   }
 
   private async persistCoupons(tx: PrismaTx, store: MemoryStore) {
@@ -6423,35 +10761,8 @@ class PrismaStateRepository {
   }
 
   private async persistChannelRelation(tx: PrismaTx, relation: ChannelRelation) {
-    await tx.$executeRaw`
-      INSERT INTO channel_relations (
-        id, relation_type, first_tier_agent_id, second_tier_agent_id,
-        third_tier_agent_id, first_tier_merchant_id, second_tier_merchant_id,
-        third_tier_merchant_id, status, reviewed_by, reviewed_at, reason,
-        active_unique_key, idempotency_key, created_at, updated_at
-      )
-      VALUES (
-        ${relation.id}, CAST(${relation.thirdTierAgentId ? "three_tier" : "two_tier"} AS "ChannelRelationType"),
-        ${relation.firstTierAgentId}, ${relation.secondTierAgentId}, ${relation.thirdTierAgentId ?? null},
-        ${relation.firstTierAgentId}, ${relation.secondTierAgentId}, ${relation.thirdTierAgentId ?? null},
-        CAST(${mapChannelStatus(relation.status)} AS "ChannelStatus"), NULL,
-        ${relation.reviewedAt}, ${relation.reason}, ${relation.activeUniqueKey ?? null},
-        ${`channel-relation:${relation.id}`}, now(), now()
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        relation_type = EXCLUDED.relation_type,
-        first_tier_agent_id = EXCLUDED.first_tier_agent_id,
-        second_tier_agent_id = EXCLUDED.second_tier_agent_id,
-        third_tier_agent_id = EXCLUDED.third_tier_agent_id,
-        first_tier_merchant_id = EXCLUDED.first_tier_merchant_id,
-        second_tier_merchant_id = EXCLUDED.second_tier_merchant_id,
-        third_tier_merchant_id = EXCLUDED.third_tier_merchant_id,
-        status = EXCLUDED.status,
-        reviewed_at = EXCLUDED.reviewed_at,
-        reason = EXCLUDED.reason,
-        active_unique_key = EXCLUDED.active_unique_key,
-        updated_at = now()
-    `;
+    void tx;
+    void relation;
   }
 
 		  private latestAuditLog(store: MemoryStore, actions: string[]) {
@@ -6523,39 +10834,24 @@ class PrismaStateRepository {
 	  }
 
   private async persistChannelAuthorization(tx: PrismaTx, authorization: ChannelAuthorization) {
-    await tx.$executeRaw`
-      INSERT INTO channel_authorizations (
-        id, first_tier_agent_id, status, reviewed_by, reviewed_at,
-        reason, idempotency_key, created_at, updated_at
-      )
-      VALUES (
-        ${authorization.id}, ${authorization.firstTierAgentId},
-        CAST(${mapChannelStatus(authorization.status)} AS "ChannelStatus"),
-        NULL, ${authorization.reviewedAt}, ${authorization.reason},
-        ${`channel-auth:${authorization.id}`}, now(), now()
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        status = EXCLUDED.status,
-        reviewed_at = EXCLUDED.reviewed_at,
-        reason = EXCLUDED.reason,
-        updated_at = now()
-    `;
+    void tx;
+    void authorization;
   }
 
   private async persistDeposits(tx: PrismaTx, store: MemoryStore) {
-    for (const [agentId, account] of store.depositAccounts.entries()) {
+    for (const [merchantId, account] of store.depositAccounts.entries()) {
       await tx.$executeRaw`
         INSERT INTO deposit_accounts (
-          id, agent_id, merchant_id, required_amount_cents, available_amount_cents,
+          id, merchant_id, required_amount_cents, available_amount_cents,
           frozen_amount_cents, deducted_amount_cents, status, created_at, updated_at
         )
         VALUES (
-          ${stableDbId("deposit_account", agentId)}, ${agentId}, NULL,
+          ${stableDbId("deposit_account", merchantId)}, ${merchantId},
           ${account.requiredAmountCents}, ${account.availableAmountCents},
           ${account.frozenAmountCents}, ${account.deductedAmountCents},
           CAST(${mapDepositStatus(account.status)} AS "DepositStatus"), now(), now()
         )
-        ON CONFLICT (agent_id) DO UPDATE SET
+        ON CONFLICT (merchant_id) DO UPDATE SET
           required_amount_cents = EXCLUDED.required_amount_cents,
           available_amount_cents = EXCLUDED.available_amount_cents,
           frozen_amount_cents = EXCLUDED.frozen_amount_cents,
@@ -6568,13 +10864,13 @@ class PrismaStateRepository {
     for (const txItem of store.depositTransactions) {
       await tx.$executeRaw`
         INSERT INTO deposit_transactions (
-          id, agent_id, merchant_id, account_id, type, amount_cents,
+          id, merchant_id, account_id, type, amount_cents,
           balance_before_cents, balance_after_cents, reason_code, related_type,
           related_id, voucher_url, note, idempotency_key, operator_id, created_at
         )
         VALUES (
-          ${stableDbId("deposit_tx", txItem.idempotencyKey)}, ${txItem.agentId}, NULL,
-          (SELECT id FROM deposit_accounts WHERE agent_id = ${txItem.agentId} LIMIT 1),
+          ${stableDbId("deposit_tx", txItem.idempotencyKey)}, ${txItem.merchantId},
+          (SELECT id FROM deposit_accounts WHERE merchant_id = ${txItem.merchantId} LIMIT 1),
           CAST(${mapDepositTransactionType(txItem.type)} AS "DepositTransactionType"),
           ${txItem.amountCents}, ${txItem.balanceBeforeCents}, ${txItem.balanceAfterCents},
           ${txItem.reasonCode}, ${txItem.relatedType}, ${txItem.relatedId},
@@ -6588,15 +10884,15 @@ class PrismaStateRepository {
     for (const clawback of store.clawbacks) {
       const item = clawback as Record<string, unknown>;
       const clawbackNo = stringValue(item.clawbackNo) ?? stringValue(item.id) ?? stableDbId("clawback_no", JSON.stringify(item));
-      const agentId = requiredStringValue(item.agentId, "agentId");
+      const merchantId = requiredStringValue(item.merchantId, "merchantId");
       await tx.$executeRaw`
         INSERT INTO clawbacks (
-          id, clawback_no, agent_id, source_type, source_id, order_id,
+          id, clawback_no, merchant_id, source_type, source_id, order_id,
           settlement_role, amount_cents, status, deduct_from, reason_code,
           idempotency_key, created_at, updated_at
         )
         VALUES (
-          ${stableDbId("clawback", clawbackNo)}, ${clawbackNo}, ${agentId},
+          ${stableDbId("clawback", clawbackNo)}, ${clawbackNo}, ${merchantId},
           ${stringValue(item.sourceType) ?? "manual"}, ${stringValue(item.sourceId) ?? clawbackNo},
           NULL, NULL, ${bigintValue(item.amountCents)}, CAST(${mapClawbackStatus(stringValue(item.status) ?? "pending")} AS "ClawbackStatus"),
           NULL, ${stringValue(item.reasonCode) ?? "manual_adjustment"},
@@ -6622,23 +10918,24 @@ class PrismaStateRepository {
     const orderId = stableDbId("order", order.orderNo);
     const itemId = stableDbId("order_item", order.orderNo);
     const amountId = stableDbId("amount_snapshot", order.orderNo);
-    const agentId = order.salesChannelType === "platform_self_operated" || order.agentId === PLATFORM_AGENT_ID ? null : order.agentId;
-    const platformShopProductId = order.salesChannelType === "platform_self_operated" ? order.agentProductId : null;
-    const agentProductId = platformShopProductId ? null : order.agentProductId;
+    const merchantId = order.salesChannelType === "platform_self_operated" || order.merchantId === PLATFORM_MERCHANT_ID ? null : order.merchantId;
+    const platformShopProductId = order.salesChannelType === "platform_self_operated" ? order.merchantProductListingId : null;
+    const merchantProductListingId = platformShopProductId ? null : order.merchantProductListingId;
     await tx.$executeRaw`
       INSERT INTO orders (
-        id, order_no, user_id, agent_id, merchant_id, shop_id, buyer_email,
-        sales_channel_type, first_tier_agent_id, second_tier_agent_id, third_tier_agent_id,
-        channel_relation_id, collection_channel_id, collection_snapshot_json,
+        id, order_no, user_id, merchant_id, shop_id, buyer_email, buyer_phone, purchase_password_hash,
+        sales_channel_type, first_tier_merchant_id, second_tier_merchant_id, third_tier_merchant_id,
+        collection_snapshot_json,
         coupon_discount_cents, status, payment_status, fulfillment_status, refund_status,
         settlement_status, risk_status, paid_amount_cents, paid_at, fulfilled_at,
         created_at, updated_at
       )
       VALUES (
-        ${orderId}, ${order.orderNo}, ${order.userId}, ${agentId}, NULL, ${order.shopId}, ${order.buyerEmail ?? null},
+        ${orderId}, ${order.orderNo}, ${order.userId}, ${merchantId}, ${order.shopId}, ${order.buyerEmail ?? null}, ${order.buyerPhone ?? null},
+        ${order.extractionCodeHash ?? null},
         CAST(${order.salesChannelType} AS "SalesChannelType"),
-        ${channel?.firstTierAgentId ?? null}, ${channel?.secondTierAgentId ?? null}, ${channel?.thirdTierAgentId ?? null},
-        ${channel?.relationId ?? null}, ${order.collectionChannelId ?? null}, ${jsonForDb(order.collectionChannelSnapshot)}::jsonb,
+        ${channel?.firstTierMerchantId ?? null}, ${channel?.secondTierMerchantId ?? null}, ${channel?.thirdTierMerchantId ?? null},
+        ${jsonForDb(order.collectionPaymentSnapshot)}::jsonb,
         ${order.couponDiscountCents ?? 0n},
         CAST(${mapOrderStatus(order.status)} AS "OrderStatus"),
         CAST(${mapPaymentStatus(order.paymentStatus)} AS "PaymentStatus"),
@@ -6661,45 +10958,52 @@ class PrismaStateRepository {
     `;
     await tx.$executeRaw`
       INSERT INTO order_items (
-        id, order_id, agent_product_id, merchant_product_id, platform_shop_product_id,
+        id, order_id, merchant_product_listing_id, merchant_product_id, platform_shop_product_id,
         sale_source_type, product_type, product_id_snapshot, product_name_snapshot,
         sale_price_cents, quantity, supply_price_cents, service_fee_cents,
-        agent_income_cents, created_at
+        merchant_income_cents, created_at
       )
       VALUES (
-        ${itemId}, (SELECT id FROM orders WHERE order_no = ${order.orderNo}), ${agentProductId}, NULL, ${platformShopProductId},
-        CAST(${platformShopProductId ? "platform_shop_product" : "agent_product"} AS "SaleSourceType"),
-        CAST(${order.snapshot.productType} AS "ProductType"), ${getSnapshotProductId(order.snapshot) ?? order.agentProductId},
+        ${itemId}, (SELECT id FROM orders WHERE order_no = ${order.orderNo}), ${merchantProductListingId}, NULL, ${platformShopProductId},
+        CAST(${platformShopProductId ? "platform_shop_product" : "merchant_product_listing"} AS "SaleSourceType"),
+        CAST(${order.snapshot.productType} AS "ProductType"), ${getSnapshotProductId(order.snapshot) ?? order.merchantProductListingId},
         ${order.snapshot.productNameSnapshot}, ${amount.paidAmountCents}, ${order.snapshot.quantity},
-        ${amount.supplyAmountCents}, ${amount.serviceFeeCents}, ${amount.agentExpectedIncomeCents}, now()
+        ${amount.supplyAmountCents}, ${amount.serviceFeeCents}, ${amount.merchantExpectedIncomeCents}, now()
       )
       ON CONFLICT (id) DO UPDATE SET
         sale_price_cents = EXCLUDED.sale_price_cents,
         quantity = EXCLUDED.quantity,
         supply_price_cents = EXCLUDED.supply_price_cents,
         service_fee_cents = EXCLUDED.service_fee_cents,
-        agent_income_cents = EXCLUDED.agent_income_cents
+        merchant_income_cents = EXCLUDED.merchant_income_cents
     `;
     await tx.$executeRaw`
       INSERT INTO order_amount_snapshots (
         id, order_id, service_fee_bps, paid_amount_cents, supply_amount_cents,
-        service_fee_cents, agent_expected_income_cents, platform_supply_price_cents,
+        service_fee_cents, merchant_expected_income_cents, platform_supply_price_cents,
         resell_supply_price_cents, first_tier_supply_price_cents, second_tier_supply_price_cents,
         final_sale_price_cents, first_tier_income_cents, second_tier_income_cents,
         third_tier_income_cents, fulfillment_cost_cents, payment_channel_fee_cents,
-        platform_gross_profit_cents, product_snapshot_json, shop_snapshot_json,
+        platform_gross_profit_cents, payment_fee_bps, payment_fee_cents,
+        balance_paid_cents, external_paid_cents, service_fee_enabled,
+        service_fee_basis_amount_cents, service_fee_config_snapshot_json,
+        product_snapshot_json, shop_snapshot_json,
         pricing_snapshot_json, fulfillment_rule_snapshot_json, after_sale_rule_snapshot_json,
         created_at
       )
       VALUES (
         ${amountId}, (SELECT id FROM orders WHERE order_no = ${order.orderNo}), ${Number(amount.serviceFeeBps)},
         ${amount.paidAmountCents}, ${amount.supplyAmountCents}, ${amount.serviceFeeCents},
-        ${amount.agentExpectedIncomeCents}, ${channel?.platformSupplyPriceCents ?? amount.supplyAmountCents},
+        ${amount.merchantExpectedIncomeCents}, ${channel?.platformSupplyPriceCents ?? amount.supplyAmountCents},
         ${channel?.resellSupplyPriceCents ?? 0n}, ${channel?.firstTierSupplyPriceCents ?? 0n},
         ${channel?.secondTierSupplyPriceCents ?? 0n}, ${channel?.finalSalePriceCents ?? amount.paidAmountCents},
         ${channel?.firstTierIncomeCents ?? 0n}, ${channel?.secondTierIncomeCents ?? 0n},
         ${channel?.thirdTierIncomeCents ?? 0n}, ${getPlatformSelfGrossMargin(order.snapshot) > 0n ? amount.supplyAmountCents : 0n},
-        0, ${getPlatformSelfGrossMargin(order.snapshot)}, ${jsonForDb(order.snapshot.productSnapshot)}::jsonb,
+        0, ${getPlatformSelfGrossMargin(order.snapshot)}, ${Number((amount as DemoAmountSnapshot).paymentFeeBps ?? 0n)},
+        ${(amount as DemoAmountSnapshot).paymentFeeCents ?? 0n}, ${(amount as DemoAmountSnapshot).balancePaidCents ?? 0n},
+        ${(amount as DemoAmountSnapshot).externalPaidCents ?? 0n}, ${(amount as DemoAmountSnapshot).serviceFeeEnabled ?? true},
+        ${(amount as DemoAmountSnapshot).serviceFeeBasisAmountCents ?? amount.paidAmountCents},
+        ${jsonForDb((amount as DemoAmountSnapshot).serviceFeeConfigSnapshot)}::jsonb, ${jsonForDb(order.snapshot.productSnapshot)}::jsonb,
         ${jsonForDb(order.snapshot.shopSnapshot)}::jsonb, ${jsonForDb(order.snapshot.pricingSnapshot)}::jsonb,
         ${jsonForDb(order.snapshot.fulfillmentRuleSnapshot)}::jsonb, ${jsonForDb(order.snapshot.afterSaleRuleSnapshot)}::jsonb,
         now()
@@ -6708,19 +11012,26 @@ class PrismaStateRepository {
         paid_amount_cents = EXCLUDED.paid_amount_cents,
         supply_amount_cents = EXCLUDED.supply_amount_cents,
         service_fee_cents = EXCLUDED.service_fee_cents,
-        agent_expected_income_cents = EXCLUDED.agent_expected_income_cents
+        merchant_expected_income_cents = EXCLUDED.merchant_expected_income_cents,
+        payment_fee_bps = EXCLUDED.payment_fee_bps,
+        payment_fee_cents = EXCLUDED.payment_fee_cents,
+        balance_paid_cents = EXCLUDED.balance_paid_cents,
+        external_paid_cents = EXCLUDED.external_paid_cents,
+        service_fee_enabled = EXCLUDED.service_fee_enabled,
+        service_fee_basis_amount_cents = EXCLUDED.service_fee_basis_amount_cents,
+        service_fee_config_snapshot_json = EXCLUDED.service_fee_config_snapshot_json
     `;
     if (order.paymentStatus === "paid") {
       await tx.$executeRaw`
         INSERT INTO payments (
-          id, payment_no, order_id, user_id, collection_channel_id, channel,
+          id, payment_no, order_id, user_id, merchant_id, collection_payment_config_id, channel,
           amount_cents, channel_fee_cents, status, idempotency_key, paid_at,
           created_at, updated_at
         )
         VALUES (
           ${stableDbId("payment", order.orderNo)}, ${`payment:${order.orderNo}`},
           (SELECT id FROM orders WHERE order_no = ${order.orderNo}), ${order.userId},
-          ${order.collectionChannelId ?? null}, CAST('alipay_wap' AS "PaymentChannel"),
+          ${merchantId}, ${order.paymentSnapshot?.paymentMethodId ?? null}, CAST('alipay_wap' AS "PaymentChannel"),
           ${payableAmount(order)}, 0, CAST('paid' AS "PaymentStatus"),
           ${`payment:offline:${order.orderNo}`}, ${order.paidAt ?? new Date()}, now(), now()
         )
@@ -6785,7 +11096,7 @@ class PrismaStateRepository {
     const idempotencyKey = `offline-payment:${order.orderNo}:${voucherUrl ?? amountCents.toString()}`;
     await tx.$executeRaw`
       INSERT INTO payment_confirmations (
-        id, confirmation_no, order_id, payment_id, shop_id, collection_channel_id,
+        id, confirmation_no, order_id, payment_id, shop_id,
         amount_cents, payer_name, voucher_url, note, status, reviewed_by,
         reviewed_at, reject_reason, idempotency_key, created_at, updated_at
       )
@@ -6793,7 +11104,7 @@ class PrismaStateRepository {
         ${stableDbId("payment_confirmation", idempotencyKey)}, ${idempotencyKey},
         (SELECT id FROM orders WHERE order_no = ${order.orderNo}),
         (SELECT id FROM payments WHERE payment_no = ${`payment:${order.orderNo}`}),
-        ${order.shopId}, ${order.collectionChannelId ?? null}, ${amountCents}, NULL,
+        ${order.shopId}, ${amountCents}, NULL,
         ${voucherUrl ?? null}, ${note ?? null}, CAST('confirmed' AS "PaymentConfirmationStatus"),
         ${stringValue(audit?.actorId) ?? stringValue(after.operatorId) ?? null},
         ${dateValue(audit?.createdAt) ?? order.paidAt ?? new Date()}, NULL,
@@ -6811,7 +11122,7 @@ class PrismaStateRepository {
   private async persistPaymentVoucher(tx: PrismaTx, voucher: PaymentVoucher) {
     await tx.$executeRaw`
       INSERT INTO payment_confirmations (
-        id, confirmation_no, order_id, payment_id, shop_id, collection_channel_id,
+        id, confirmation_no, order_id, payment_id, shop_id,
         amount_cents, payer_name, voucher_url, note, status, reviewed_by,
         reviewed_at, reject_reason, idempotency_key, created_at, updated_at
       )
@@ -6819,7 +11130,7 @@ class PrismaStateRepository {
         ${stableDbId("payment_voucher", voucher.id)}, ${voucher.id},
         (SELECT id FROM orders WHERE order_no = ${voucher.orderNo}),
         (SELECT id FROM payments WHERE payment_no = ${`payment:${voucher.orderNo}`}),
-        ${voucher.shopId}, NULL, ${voucher.amountCents}, ${voucher.payerName ?? null},
+        ${voucher.shopId}, ${voucher.amountCents}, ${voucher.payerName ?? null},
         ${voucher.voucherUrl ?? null}, ${voucher.note ?? null},
         CAST(${mapPaymentVoucherStatus(voucher.status)} AS "PaymentConfirmationStatus"),
         ${voucher.reviewedBy}, ${voucher.reviewedAt}, ${voucher.reason ?? null},
@@ -6840,27 +11151,33 @@ class PrismaStateRepository {
   private async persistPaymentMethodOwnerDefaults(tx: PrismaTx, store: MemoryStore, changed: PaymentMethodConfig) {
     const scoped = [...store.paymentMethods.values()].filter((method) =>
       method.ownerType === changed.ownerType
-      && (method.agentId ?? null) === (changed.agentId ?? null)
+      && (method.merchantId ?? null) === (changed.merchantId ?? null)
       && (method.shopId ?? null) === (changed.shopId ?? null)
     );
     for (const method of scoped) await this.persistPaymentMethodConfig(tx, method);
   }
 
   private async persistPaymentMethodConfig(tx: PrismaTx, method: PaymentMethodConfig) {
-    const ownerType = method.ownerType === "agent" ? "agent" : "platform";
+    const ownerType = method.ownerType === "merchant" ? "merchant" : "platform";
     const status = mapCollectionPaymentConfigStatus(method.status, method.enabled);
-    const actorType = method.ownerType === "agent" ? "agent" : "admin";
-    const credentialStatus = method.secretConfigured || method.provider === "personal_alipay" ? "configured" : "not_configured";
+    const actorType = method.ownerType === "merchant" ? "merchant" : "admin";
+    const credentialStatus = method.secretConfigured || isManualPaymentProvider(method.provider) || method.provider === "balance" ? "configured" : "not_configured";
     const maskedIdentity = {
       merchantNoMasked: maskSecret(method.merchantNo),
       appIdMasked: maskSecret(method.appId),
       serviceProviderMasked: maskSecret(method.serviceProviderId)
     };
+    const credentialCiphertext = encryptPaymentCredentialBundle({
+      merchantNo: method.merchantNo,
+      appId: method.appId,
+      serviceProviderId: method.serviceProviderId,
+      signingSecret: method.signingSecret
+    }) ?? method.signingSecretEncrypted ?? null;
     await tx.$executeRaw`
       INSERT INTO collection_payment_configs (
-        id, config_no, owner_type, owner_agent_id, owner_merchant_id, shop_id,
+        id, config_no, owner_type, owner_merchant_id, shop_id,
         provider, confirm_mode, environment, status, is_default, display_name,
-        merchant_no_masked, app_id_masked, service_provider_masked,
+        merchant_no_masked, app_id_masked, service_provider_masked, gateway_url, api_mode,
         credential_ref, credential_ciphertext, secret_version, credential_status,
         notify_url, return_url, test_status, last_test_at, last_test_result_json,
         last_callback_at, qr_url, account_masked, instruction,
@@ -6869,15 +11186,16 @@ class PrismaStateRepository {
       )
       VALUES (
         ${method.id}, ${method.id}, CAST(${ownerType} AS "CollectionConfigOwnerType"),
-        ${method.agentId ?? null}, NULL, ${method.shopId ?? null},
+        ${method.merchantId ?? null}, ${method.shopId ?? null},
         CAST(${mapPaymentProviderToDb(method.provider)} AS "PaymentProvider"),
-        CAST(${mapPaymentConfirmModeToDb(method.confirmationMode)} AS "PaymentConfirmMode"),
+        CAST(${mapPaymentConfirmModeToDbForProvider(method.provider, method.confirmationMode)} AS "PaymentConfirmMode"),
         CAST('production' AS "PaymentEnvironment"),
         CAST(${status} AS "CollectionConfigStatus"),
         ${method.isDefault}, ${method.displayName},
         ${maskedIdentity.merchantNoMasked ?? null}, ${maskedIdentity.appIdMasked ?? null}, ${maskedIdentity.serviceProviderMasked ?? null},
+        ${method.gatewayUrl ?? null}, ${method.apiMode ?? defaultPaymentApiMode(method.provider) ?? null},
         ${method.signingSecretPreview ?? method.privateKeyPreview ?? method.publicKeyPreview ?? method.certificatePreview ?? null},
-        ${method.signingSecretEncrypted ?? null}, 1, CAST(${credentialStatus} AS "CredentialStatus"),
+        ${credentialCiphertext}, 1, CAST(${credentialStatus} AS "CredentialStatus"),
         ${providerCallbackUrlForPersistence(method.provider)}, ${method.returnUrl ?? null},
         ${method.lastTestResult ?? null}, ${method.lastTestAt ?? null},
         ${method.lastTestResult ? jsonForDb({ status: method.lastTestResult }) : null}::jsonb,
@@ -6890,7 +11208,6 @@ class PrismaStateRepository {
       )
       ON CONFLICT (id) DO UPDATE SET
         owner_type = EXCLUDED.owner_type,
-        owner_agent_id = EXCLUDED.owner_agent_id,
         owner_merchant_id = EXCLUDED.owner_merchant_id,
         shop_id = EXCLUDED.shop_id,
         provider = EXCLUDED.provider,
@@ -6901,6 +11218,8 @@ class PrismaStateRepository {
         merchant_no_masked = EXCLUDED.merchant_no_masked,
         app_id_masked = EXCLUDED.app_id_masked,
         service_provider_masked = EXCLUDED.service_provider_masked,
+        gateway_url = EXCLUDED.gateway_url,
+        api_mode = EXCLUDED.api_mode,
         credential_ref = EXCLUDED.credential_ref,
         credential_ciphertext = EXCLUDED.credential_ciphertext,
         credential_status = EXCLUDED.credential_status,
@@ -6933,6 +11252,10 @@ class PrismaStateRepository {
     const status = mapPaymentSnapshotStatus(snapshot.status ?? order.paymentStatus);
     const confirmSource = mapPaymentConfirmSource(snapshot.confirmationSource);
     const amountCents = snapshot.amountCents ?? payableAmount(order);
+    const orderAmountSnapshot = order.snapshot.amountSnapshot as DemoAmountSnapshot;
+    const feeBps = Number(orderAmountSnapshot.paymentFeeBps ?? 0n);
+    const feeCents = orderAmountSnapshot.paymentFeeCents ?? 0n;
+    const baseAmountCents = amountCents >= feeCents ? amountCents - feeCents : amountCents;
     const configSnapshot = method ? serializePaymentMethodForPersistence(method) : {
       id: snapshot.paymentMethodId,
       provider: snapshot.provider,
@@ -6940,22 +11263,24 @@ class PrismaStateRepository {
     };
     await tx.$executeRaw`
       INSERT INTO payments (
-        id, payment_no, order_id, user_id, collection_channel_id, collection_payment_config_id,
+        id, payment_no, order_id, user_id, merchant_id, collection_payment_config_id,
         collection_snapshot_json, channel, provider, confirm_mode, environment,
-        channel_trade_no, provider_payment_no, provider_trade_no, amount_cents,
+        channel_trade_no, provider_payment_no, provider_trade_no, base_amount_cents,
+        fee_bps, fee_cents, amount_cents,
         channel_fee_cents, status, confirm_source, idempotency_key, expires_at,
         paid_at, callback_handled_at, exception_reason, created_at, updated_at
       )
       VALUES (
         ${paymentId}, ${paymentNo},
         (SELECT id FROM orders WHERE order_no = ${order.orderNo}), ${order.userId},
-        ${order.collectionChannelId ?? null}, ${snapshot.paymentMethodId},
-        ${jsonForDb(order.collectionChannelSnapshot ?? {})}::jsonb,
+        ${order.merchantId === PLATFORM_MERCHANT_ID ? null : order.merchantId}, ${snapshot.paymentMethodId},
+        ${jsonForDb(order.collectionPaymentSnapshot ?? {})}::jsonb,
         CAST(${mapProviderToLegacyPaymentChannel(snapshot.provider)} AS "PaymentChannel"),
         CAST(${mapPaymentProviderToDb(snapshot.provider)} AS "PaymentProvider"),
-        CAST(${mapPaymentConfirmModeToDb(snapshot.confirmationMode ?? "automatic")} AS "PaymentConfirmMode"),
+        CAST(${mapPaymentConfirmModeToDbForProvider(snapshot.provider, snapshot.confirmationMode ?? "automatic")} AS "PaymentConfirmMode"),
         CAST('production' AS "PaymentEnvironment"),
-        ${channelTradeNo}, ${providerPaymentNo}, ${providerTradeNo}, ${amountCents},
+        ${channelTradeNo}, ${providerPaymentNo}, ${providerTradeNo}, ${baseAmountCents},
+        ${feeBps}, ${feeCents}, ${amountCents},
         0, CAST(${status} AS "PaymentStatus"),
         CAST(${confirmSource} AS "PaymentConfirmSource"),
         ${`payment:${paymentNo}`}, ${snapshot.expiresAt ?? null}, ${snapshot.paidAt ?? order.paidAt ?? null},
@@ -6963,6 +11288,7 @@ class PrismaStateRepository {
         ${snapshot.createdAt ?? new Date()}, now()
       )
       ON CONFLICT (payment_no) DO UPDATE SET
+        merchant_id = EXCLUDED.merchant_id,
         collection_payment_config_id = EXCLUDED.collection_payment_config_id,
         collection_snapshot_json = EXCLUDED.collection_snapshot_json,
         provider = EXCLUDED.provider,
@@ -6970,6 +11296,9 @@ class PrismaStateRepository {
         channel_trade_no = COALESCE(EXCLUDED.channel_trade_no, payments.channel_trade_no),
         provider_payment_no = COALESCE(EXCLUDED.provider_payment_no, payments.provider_payment_no),
         provider_trade_no = COALESCE(EXCLUDED.provider_trade_no, payments.provider_trade_no),
+        base_amount_cents = EXCLUDED.base_amount_cents,
+        fee_bps = EXCLUDED.fee_bps,
+        fee_cents = EXCLUDED.fee_cents,
         amount_cents = EXCLUDED.amount_cents,
         status = EXCLUDED.status,
         confirm_source = EXCLUDED.confirm_source,
@@ -6983,20 +11312,22 @@ class PrismaStateRepository {
       INSERT INTO payment_snapshots (
         id, snapshot_no, order_id, payment_id, collection_config_id, provider,
         confirm_mode, environment, config_snapshot_json, merchant_no_masked,
-        app_id_masked, service_provider_masked, payable_amount_cents, currency,
+        app_id_masked, service_provider_masked, base_amount_cents, fee_bps,
+        fee_cents, payable_amount_cents, currency,
         payment_no, provider_payment_no, provider_trade_no, status, confirm_source,
         expires_at, paid_at, callback_handled_at, exception_reason, idempotency_key,
         created_at, updated_at
       )
       VALUES (
         ${stableDbId("payment_snapshot", order.orderNo)}, ${`snapshot:${order.orderNo}`},
-        (SELECT id FROM orders WHERE order_no = ${order.orderNo}), ${paymentId}, ${snapshot.paymentMethodId},
+        (SELECT id FROM orders WHERE order_no = ${order.orderNo}),
+        (SELECT id FROM payments WHERE payment_no = ${paymentNo}), ${snapshot.paymentMethodId},
         CAST(${mapPaymentProviderToDb(snapshot.provider)} AS "PaymentProvider"),
-        CAST(${mapPaymentConfirmModeToDb(snapshot.confirmationMode ?? "automatic")} AS "PaymentConfirmMode"),
+        CAST(${mapPaymentConfirmModeToDbForProvider(snapshot.provider, snapshot.confirmationMode ?? "automatic")} AS "PaymentConfirmMode"),
         CAST('production' AS "PaymentEnvironment"),
         ${jsonForDb(configSnapshot)}::jsonb,
         ${snapshot.merchantNoMasked ?? null}, ${snapshot.appIdMasked ?? null}, ${snapshot.serviceProviderMasked ?? null},
-        ${amountCents}, ${snapshot.currency ?? "CNY"}, ${paymentNo}, ${providerPaymentNo}, ${providerTradeNo},
+        ${baseAmountCents}, ${feeBps}, ${feeCents}, ${amountCents}, ${snapshot.currency ?? "CNY"}, ${paymentNo}, ${providerPaymentNo}, ${providerTradeNo},
         CAST(${status} AS "PaymentStatus"),
         CAST(${confirmSource} AS "PaymentConfirmSource"),
         ${snapshot.expiresAt ?? null}, ${snapshot.paidAt ?? order.paidAt ?? null},
@@ -7009,6 +11340,9 @@ class PrismaStateRepository {
         provider = EXCLUDED.provider,
         confirm_mode = EXCLUDED.confirm_mode,
         config_snapshot_json = EXCLUDED.config_snapshot_json,
+        base_amount_cents = EXCLUDED.base_amount_cents,
+        fee_bps = EXCLUDED.fee_bps,
+        fee_cents = EXCLUDED.fee_cents,
         provider_payment_no = COALESCE(EXCLUDED.provider_payment_no, payment_snapshots.provider_payment_no),
         provider_trade_no = COALESCE(EXCLUDED.provider_trade_no, payment_snapshots.provider_trade_no),
         status = EXCLUDED.status,
@@ -7139,14 +11473,14 @@ class PrismaStateRepository {
       const shape = this.rightsCodeDbShape(code, store);
       await tx.$executeRaw`
         INSERT INTO rights_codes (
-          id, product_id, agent_product_id, code_ciphertext, code_hash, secret_preview,
-          owner_type, owner_agent_id, shop_id, batch_no, status, order_id,
+          id, product_id, merchant_product_listing_id, code_ciphertext, code_hash, secret_preview,
+          owner_type, owner_merchant_id, shop_id, batch_no, status, order_id,
           issue_key, issued_at, import_audit_json, created_at, updated_at
         )
         VALUES (
-          ${code.codeId}, ${shape.platformProductId}, ${shape.agentProductId}, ${code.code},
+          ${code.codeId}, ${shape.platformProductId}, ${shape.merchantProductListingId}, ${code.code},
           ${shape.codeHash}, ${shape.secretPreview}, CAST(${shape.ownerType} AS "RightsCodeOwnerType"),
-          ${shape.ownerAgentId}, ${shape.shopId}, ${code.batchNo},
+          ${shape.ownerMerchantId}, ${shape.shopId}, ${code.batchNo},
           CAST('issued' AS "RightsCodeStatus"),
           (SELECT id FROM orders WHERE order_no = ${order.orderNo}),
           ${code.issueKey ?? null}, ${code.issuedAt ?? new Date()},
@@ -7161,7 +11495,7 @@ class PrismaStateRepository {
           code_hash = COALESCE(rights_codes.code_hash, EXCLUDED.code_hash),
           secret_preview = COALESCE(rights_codes.secret_preview, EXCLUDED.secret_preview),
           owner_type = EXCLUDED.owner_type,
-          owner_agent_id = EXCLUDED.owner_agent_id,
+          owner_merchant_id = EXCLUDED.owner_merchant_id,
           shop_id = EXCLUDED.shop_id,
           updated_at = now()
       `;
@@ -7186,17 +11520,64 @@ class PrismaStateRepository {
     }
   }
 
+  private async persistLockedRightsCodesForOrder(tx: PrismaTx, store: MemoryStore, order: DemoOrder) {
+    const codes = store.rightsCodes.filter((code) => code.orderNo === order.orderNo && code.status === "locked");
+    for (const code of codes) {
+      const shape = this.rightsCodeDbShape(code, store);
+      await tx.$executeRaw`
+        INSERT INTO rights_codes (
+          id, product_id, merchant_product_listing_id, code_ciphertext, code_hash, secret_preview,
+          owner_type, owner_merchant_id, shop_id, batch_no, status, order_id,
+          issue_key, issued_at, import_audit_json, created_at, updated_at
+        )
+        VALUES (
+          ${code.codeId}, ${shape.platformProductId}, ${shape.merchantProductListingId}, ${code.code},
+          ${shape.codeHash}, ${shape.secretPreview}, CAST(${shape.ownerType} AS "RightsCodeOwnerType"),
+          ${shape.ownerMerchantId}, ${shape.shopId}, ${code.batchNo},
+          CAST('locked' AS "RightsCodeStatus"),
+          (SELECT id FROM orders WHERE order_no = ${order.orderNo}),
+          ${code.issueKey ?? null}, ${code.issuedAt ?? new Date()},
+          ${jsonForDb({ batchNo: code.batchNo, orderNo: order.orderNo, source: "order_reservation" })}::jsonb,
+          ${code.createdAt}, now()
+        )
+        ON CONFLICT (id) DO UPDATE SET
+          status = CASE
+            WHEN rights_codes.status = CAST('available' AS "RightsCodeStatus") OR rights_codes.order_id = EXCLUDED.order_id THEN EXCLUDED.status
+            ELSE rights_codes.status
+          END,
+          order_id = CASE
+            WHEN rights_codes.status = CAST('available' AS "RightsCodeStatus") OR rights_codes.order_id = EXCLUDED.order_id THEN EXCLUDED.order_id
+            ELSE rights_codes.order_id
+          END,
+          issue_key = CASE
+            WHEN rights_codes.status = CAST('available' AS "RightsCodeStatus") OR rights_codes.order_id = EXCLUDED.order_id THEN EXCLUDED.issue_key
+            ELSE rights_codes.issue_key
+          END,
+          issued_at = CASE
+            WHEN rights_codes.status = CAST('available' AS "RightsCodeStatus") OR rights_codes.order_id = EXCLUDED.order_id THEN EXCLUDED.issued_at
+            ELSE rights_codes.issued_at
+          END,
+          code_hash = COALESCE(rights_codes.code_hash, EXCLUDED.code_hash),
+          secret_preview = COALESCE(rights_codes.secret_preview, EXCLUDED.secret_preview),
+          owner_type = EXCLUDED.owner_type,
+          owner_merchant_id = EXCLUDED.owner_merchant_id,
+          shop_id = EXCLUDED.shop_id,
+          updated_at = now()
+      `;
+    }
+  }
+
   private async persistFulfillmentRecordForOrder(tx: PrismaTx, store: MemoryStore, order: DemoOrder) {
     const record = store.fulfillmentRecords.get(order.orderNo);
     if (!record) return;
     await tx.$executeRaw`
       INSERT INTO fulfillment_records (
-        id, order_id, order_item_id, agent_id, shop_id, idempotency_key,
+        id, order_id, order_item_id, merchant_id, shop_id, idempotency_key,
         fulfillment_type, status, success_at, fail_reason, created_at, updated_at
       )
       VALUES (
         ${stableDbId("fulfillment", order.orderNo)}, (SELECT id FROM orders WHERE order_no = ${order.orderNo}),
-        ${stableDbId("order_item", order.orderNo)}, (SELECT agent_id FROM orders WHERE order_no = ${order.orderNo}),
+        ${stableDbId("order_item", order.orderNo)}, (SELECT merchant_id FROM orders WHERE order_no = ${order.orderNo}),
         (SELECT shop_id FROM orders WHERE order_no = ${order.orderNo}), ${`fulfillment:${order.orderNo}`},
         CAST(${fulfillmentMode(order.snapshot) === "code_pool" ? "automatic" : "manual"} AS "FulfillmentType"),
         CAST(${mapFulfillmentStatus(record.status)} AS "FulfillmentStatus"),
@@ -7252,6 +11633,13 @@ class PrismaStateRepository {
     if (coupon.status !== "voided_after_refund") return;
     const idempotencyKey = `coupon-void:${coupon.id}:${refund.refundNo}`;
     await tx.$executeRaw`
+      UPDATE user_coupons
+         SET status = CAST('voided' AS "CouponStatus"),
+             void_reason = 'voided_after_refund',
+             updated_at = now()
+       WHERE id = ${coupon.id}
+    `;
+    await tx.$executeRaw`
       INSERT INTO coupon_void_records (
         id, user_coupon_id, coupon_template_id, reason_code, source_type,
         source_id, voided_by, idempotency_key, created_at
@@ -7276,14 +11664,14 @@ class PrismaStateRepository {
       const shape = this.rightsCodeDbShape(code, store);
       await tx.$executeRaw`
         INSERT INTO rights_codes (
-          id, product_id, agent_product_id, code_ciphertext, code_hash, secret_preview,
-          owner_type, owner_agent_id, shop_id, batch_no, status, order_id,
+          id, product_id, merchant_product_listing_id, code_ciphertext, code_hash, secret_preview,
+          owner_type, owner_merchant_id, shop_id, batch_no, status, order_id,
           issue_key, issued_at, import_audit_json, created_at, updated_at
         )
         VALUES (
-          ${code.codeId}, ${shape.platformProductId}, ${shape.agentProductId}, ${code.code},
+          ${code.codeId}, ${shape.platformProductId}, ${shape.merchantProductListingId}, ${code.code},
           ${shape.codeHash}, ${shape.secretPreview}, CAST(${shape.ownerType} AS "RightsCodeOwnerType"),
-          ${shape.ownerAgentId}, ${shape.shopId}, ${code.batchNo},
+          ${shape.ownerMerchantId}, ${shape.shopId}, ${code.batchNo},
           CAST(${code.status} AS "RightsCodeStatus"),
           ${code.orderNo ? stableDbId("order", code.orderNo) : null},
           ${code.issueKey ?? null}, ${code.issuedAt ?? null},
@@ -7298,7 +11686,7 @@ class PrismaStateRepository {
           code_hash = COALESCE(rights_codes.code_hash, EXCLUDED.code_hash),
           secret_preview = COALESCE(rights_codes.secret_preview, EXCLUDED.secret_preview),
           owner_type = EXCLUDED.owner_type,
-          owner_agent_id = EXCLUDED.owner_agent_id,
+          owner_merchant_id = EXCLUDED.owner_merchant_id,
           shop_id = EXCLUDED.shop_id,
           updated_at = now()
       `;
@@ -7328,12 +11716,12 @@ class PrismaStateRepository {
     for (const [orderNo, record] of store.fulfillmentRecords.entries()) {
       await tx.$executeRaw`
         INSERT INTO fulfillment_records (
-          id, order_id, order_item_id, agent_id, shop_id, idempotency_key,
+          id, order_id, order_item_id, merchant_id, shop_id, idempotency_key,
           fulfillment_type, status, success_at, fail_reason, created_at, updated_at
         )
         VALUES (
           ${stableDbId("fulfillment", orderNo)}, (SELECT id FROM orders WHERE order_no = ${orderNo}),
-          ${stableDbId("order_item", orderNo)}, (SELECT agent_id FROM orders WHERE order_no = ${orderNo}),
+          ${stableDbId("order_item", orderNo)}, (SELECT merchant_id FROM orders WHERE order_no = ${orderNo}),
           (SELECT shop_id FROM orders WHERE order_no = ${orderNo}), ${`fulfillment:${orderNo}`},
           CAST('manual' AS "FulfillmentType"),
           CAST(${mapFulfillmentStatus(record.status)} AS "FulfillmentStatus"),
@@ -7436,20 +11824,20 @@ class PrismaStateRepository {
   private async persistAfterSale(tx: PrismaTx, afterSale: DemoAfterSale) {
     await tx.$executeRaw`
       INSERT INTO after_sales (
-        id, after_sale_no, order_id, user_id, agent_id, merchant_id, shop_id,
+        id, after_sale_no, order_id, user_id, merchant_id, shop_id,
         status, reason_code, responsibility, requested_refund_cents,
-        approved_refund_cents, platform_bear_cents, agent_bear_cents,
+        approved_refund_cents, platform_bear_cents, merchant_bear_cents,
         service_fee_refund_cents, service_fee_bearer, evidence_json,
         created_at, updated_at
       )
       VALUES (
         ${stableDbId("after_sale", afterSale.afterSaleNo)}, ${afterSale.afterSaleNo},
         (SELECT id FROM orders WHERE order_no = ${afterSale.orderNo}), ${afterSale.userId},
-        ${afterSale.agentId === PLATFORM_AGENT_ID ? null : afterSale.agentId}, NULL, ${afterSale.shopId},
+        ${afterSale.merchantId === PLATFORM_MERCHANT_ID ? null : afterSale.merchantId}, ${afterSale.shopId},
         CAST(${mapAfterSaleStatus(afterSale.status)} AS "AfterSaleStatus"), ${afterSale.reasonCode},
         CAST(${afterSale.allocation ? "mixed" : "undecided"} AS "Responsibility"),
         ${afterSale.requestedRefundCents}, ${afterSale.allocation?.refundAmountCents ?? 0n},
-        ${afterSale.allocation?.platformBearCents ?? 0n}, ${afterSale.allocation?.agentBearCents ?? 0n},
+        ${afterSale.allocation?.platformBearCents ?? 0n}, ${afterSale.allocation?.merchantBearCents ?? 0n},
         ${afterSale.allocation?.serviceFeeRefundCents ?? 0n},
         CAST(${afterSale.allocation?.serviceFeeBearer ?? "none"} AS "ServiceFeeBearer"),
         ${jsonForDb({ description: afterSale.description, allocation: afterSale.allocation })}::jsonb,
@@ -7460,7 +11848,7 @@ class PrismaStateRepository {
         responsibility = EXCLUDED.responsibility,
         approved_refund_cents = EXCLUDED.approved_refund_cents,
         platform_bear_cents = EXCLUDED.platform_bear_cents,
-        agent_bear_cents = EXCLUDED.agent_bear_cents,
+        merchant_bear_cents = EXCLUDED.merchant_bear_cents,
         service_fee_refund_cents = EXCLUDED.service_fee_refund_cents,
         service_fee_bearer = EXCLUDED.service_fee_bearer,
         evidence_json = EXCLUDED.evidence_json,
@@ -7481,44 +11869,44 @@ class PrismaStateRepository {
   private async persistSettlementSheet(tx: PrismaTx, sheet: SettlementSheet) {
     await tx.$executeRaw`
       INSERT INTO settlement_sheets (
-        id, settlement_no, agent_id, period_start, period_end, status,
+        id, settlement_no, merchant_id, period_start, period_end, status,
         total_order_count, total_paid_cents, total_service_fee_cents,
-        total_agent_income_cents, idempotency_key, created_at, updated_at
+        total_merchant_income_cents, idempotency_key, created_at, updated_at
       )
       VALUES (
-        ${stableDbId("settlement", sheet.settlementNo)}, ${sheet.settlementNo}, ${sheet.agentId},
+        ${stableDbId("settlement", sheet.settlementNo)}, ${sheet.settlementNo}, ${sheet.merchantId},
         ${new Date(0)}, ${new Date()}, CAST(${mapSettlementSheetStatus(sheet.status)} AS "SettlementSheetStatus"),
         ${sheet.totalOrderCount}, ${sheet.totalPaidCents}, ${sheet.totalServiceFeeCents},
-        ${sheet.totalAgentIncomeCents}, ${sheet.idempotencyKey}, now(), now()
+        ${sheet.totalMerchantIncomeCents}, ${sheet.idempotencyKey}, now(), now()
       )
       ON CONFLICT (settlement_no) DO UPDATE SET
         status = EXCLUDED.status,
         total_order_count = EXCLUDED.total_order_count,
         total_paid_cents = EXCLUDED.total_paid_cents,
         total_service_fee_cents = EXCLUDED.total_service_fee_cents,
-        total_agent_income_cents = EXCLUDED.total_agent_income_cents,
+        total_merchant_income_cents = EXCLUDED.total_merchant_income_cents,
         updated_at = now()
     `;
     for (const item of sheet.items) {
       await tx.$executeRaw`
         INSERT INTO settlement_items (
-          id, settlement_id, order_id, settlement_role, agent_id, shop_id,
+          id, settlement_id, order_id, settlement_role, merchant_id, shop_id,
           paid_amount_cents, supply_amount_cents, service_fee_cents,
-          agent_income_cents, deducted_cents, settle_amount_cents,
+          merchant_income_cents, deducted_cents, settle_amount_cents,
           fulfilled_at, settleable_at, created_at
         )
         VALUES (
-          ${stableDbId("settlement_item", `${sheet.settlementNo}:${item.orderId}:${item.settlementRole ?? "single_agent"}`)},
+          ${stableDbId("settlement_item", `${sheet.settlementNo}:${item.orderId}:${item.settlementRole ?? "single_merchant"}`)},
           (SELECT id FROM settlement_sheets WHERE settlement_no = ${sheet.settlementNo}),
           (SELECT id FROM orders WHERE order_no = ${item.orderId}),
-          CAST(${item.settlementRole ?? "single_agent"} AS "SettlementRole"), ${item.agentId}, ${item.shopId},
+          CAST(${item.settlementRole ?? "single_merchant"} AS "SettlementRole"), ${item.merchantId}, ${item.shopId},
           ${item.paidAmountCents}, ${item.supplyAmountCents}, ${item.serviceFeeCents},
-          ${item.agentIncomeCents}, ${item.deductedCents ?? 0n}, ${item.settleAmountCents},
+          ${item.merchantIncomeCents}, ${item.deductedCents ?? 0n}, ${item.settleAmountCents},
           ${item.fulfilledAt}, ${item.settleableAt}, now()
         )
         ON CONFLICT (order_id, settlement_role) DO UPDATE SET
           settlement_id = EXCLUDED.settlement_id,
-          agent_income_cents = EXCLUDED.agent_income_cents,
+          merchant_income_cents = EXCLUDED.merchant_income_cents,
           settle_amount_cents = EXCLUDED.settle_amount_cents
       `;
     }
@@ -7529,13 +11917,13 @@ class PrismaStateRepository {
     const payoutNo = stringValue(payout.payoutNo) ?? stableDbId("payout_no", JSON.stringify(payout));
     await tx.$executeRaw`
       INSERT INTO manual_payouts (
-        id, settlement_id, agent_id, amount_cents, payee_info_snapshot_json,
+        id, settlement_id, merchant_id, amount_cents, payee_info_snapshot_json,
         payout_method, payout_voucher_url, status, idempotency_key,
         paid_at, created_at, updated_at
       )
       VALUES (
         ${stableDbId("payout", payoutNo)}, (SELECT id FROM settlement_sheets WHERE settlement_no = ${settlementNo}),
-        ${requiredStringValue(payout.agentId, "agentId")}, ${bigintValue(payout.amountCents)},
+        ${requiredStringValue(payout.merchantId, "merchantId")}, ${bigintValue(payout.amountCents)},
         ${jsonForDb(payout)}::jsonb, ${stringValue(payout.payoutMethod) ?? "manual"},
         ${stringValue(payout.voucherUrl) ?? null}, CAST(${mapManualPayoutStatus(stringValue(payout.status) ?? "pending")} AS "ManualPayoutStatus"),
         ${`payout:${payoutNo}`}, ${stringValue(payout.status) === "paid" ? new Date() : null}, now(), now()
@@ -7561,12 +11949,12 @@ class PrismaStateRepository {
     for (const freeze of store.riskFreezes) {
       await tx.$executeRaw`
         INSERT INTO risk_freezes (
-          id, target_type, target_id, agent_id, freeze_type, status,
+          id, target_type, target_id, merchant_id, freeze_type, status,
           reason_code, reason_text, active_unique_key, released_at,
           created_at, updated_at
         )
         VALUES (
-          ${freeze.id}, ${freeze.targetType}, ${freeze.targetId}, ${stringValue(freeze.agentId) ?? null},
+          ${freeze.id}, ${freeze.targetType}, ${freeze.targetId}, ${stringValue(freeze.merchantId) ?? null},
           ${freeze.freezeType}, CAST(${freeze.status === "active" ? "active" : "released"} AS "RiskFreezeStatus"),
           ${stringValue(freeze.reasonCode) ?? "risk"}, ${stringValue(freeze.reasonText) ?? stringValue(freeze.reasonCode) ?? "risk"},
           ${stringValue(freeze.activeUniqueKey) ?? null}, ${freeze.releasedAt}, now(), now()
@@ -7585,17 +11973,18 @@ class PrismaStateRepository {
 
   private async persistLedgerEntries(tx: PrismaTx, ledgerEntries: LedgerEntry[]) {
     for (const ledger of ledgerEntries) {
+      const merchantId = ledger.merchantId && ledger.merchantId !== PLATFORM_MERCHANT_ID ? ledger.merchantId : null;
       await tx.$executeRaw`
         INSERT INTO ledger_entries (
-          id, ledger_no, agent_id, merchant_id, shop_id, subject_type, subject_id,
+          id, ledger_no, merchant_id, shop_id, subject_type, subject_id,
           account_type, entry_type, direction, amount_cents, currency, source_type,
           source_id, idempotency_key, created_at
         )
         VALUES (
-          ${stableDbId("ledger", ledger.ledgerNo)}, ${ledger.ledgerNo}, ${ledger.agentId ?? null}, NULL, NULL,
-          CAST(${ledger.agentId ? "agent" : "platform"} AS "LedgerSubjectType"),
-          ${ledger.agentId ?? "platform"},
-          CAST(${ledger.agentId ? "agent_pending_income" : "platform_service_fee_income"} AS "LedgerAccountType"),
+          ${stableDbId("ledger", ledger.ledgerNo)}, ${ledger.ledgerNo}, ${merchantId}, NULL,
+          CAST(${merchantId ? "merchant" : "platform"} AS "LedgerSubjectType"),
+          ${merchantId ?? "platform"},
+          CAST(${merchantId ? "merchant_pending_income" : "platform_service_fee_income"} AS "LedgerAccountType"),
           CAST(${mapLedgerEntryType(ledger.entryType)} AS "LedgerEntryType"),
           CAST(${ledger.amountCents < 0n ? "debit" : "credit"} AS "LedgerDirection"),
           ${ledger.amountCents < 0n ? -ledger.amountCents : ledger.amountCents}, 'CNY',
@@ -7630,14 +12019,7 @@ class PrismaStateRepository {
   }
 
   private async persistNotificationsAndPaymentConfig(tx: PrismaTx, store: MemoryStore) {
-    for (const notification of store.notifications) {
-      await tx.$executeRaw`
-        INSERT INTO agent_notifications (id, agent_id, type, title, content, read_at, created_at)
-        VALUES (${notification.id}, ${notification.agentId}, ${notification.type}, ${notification.title},
-                ${notification.content}, ${notification.readAt}, ${notification.createdAt})
-        ON CONFLICT (id) DO UPDATE SET read_at = EXCLUDED.read_at
-      `;
-    }
+    void store.notifications;
 
     for (const config of store.paymentChannelConfigs) {
       await tx.$executeRaw`
@@ -7668,12 +12050,12 @@ class PrismaStateRepository {
     const auditId = dbId("audit");
     const amount = order.snapshot.amountSnapshot;
     const channel = getChannelSnapshot(order.snapshot);
-    const agentId = order.salesChannelType === "platform_self_operated" || order.agentId === PLATFORM_AGENT_ID ? null : order.agentId;
-    const platformShopProductId = order.salesChannelType === "platform_self_operated" ? order.agentProductId : null;
-    const agentProductId = platformShopProductId ? null : order.agentProductId;
-    const saleSourceType = platformShopProductId ? "platform_shop_product" : "agent_product";
+    const merchantId = order.salesChannelType === "platform_self_operated" || order.merchantId === PLATFORM_MERCHANT_ID ? null : order.merchantId;
+    const platformShopProductId = order.salesChannelType === "platform_self_operated" ? order.merchantProductListingId : null;
+    const merchantProductListingId = platformShopProductId ? null : order.merchantProductListingId;
+    const saleSourceType = platformShopProductId ? "platform_shop_product" : "merchant_product_listing";
     const finalPaidAmountCents = payableAmount(order);
-    const productIdSnapshot = getSnapshotProductId(order.snapshot) ?? order.agentProductId;
+    const productIdSnapshot = getSnapshotProductId(order.snapshot) ?? order.merchantProductListingId;
     const grossMarginCents = getPlatformSelfGrossMargin(order.snapshot);
     const auditKey = `audit:order.create:${order.orderNo}`;
     const ledgerKey = `ledger:order.create:${order.orderNo}`;
@@ -7686,17 +12068,18 @@ class PrismaStateRepository {
       `;
       await tx.$executeRaw`
         INSERT INTO orders (
-          id, order_no, user_id, agent_id, merchant_id, shop_id, buyer_email,
-          sales_channel_type, first_tier_agent_id, second_tier_agent_id, third_tier_agent_id,
-          channel_relation_id, collection_channel_id, collection_snapshot_json,
+          id, order_no, user_id, merchant_id, shop_id, buyer_email, buyer_phone, purchase_password_hash,
+          sales_channel_type, first_tier_merchant_id, second_tier_merchant_id, third_tier_merchant_id,
+          collection_snapshot_json,
           coupon_discount_cents, status, payment_status, fulfillment_status, refund_status,
           settlement_status, risk_status, paid_amount_cents, paid_at, fulfilled_at,
           created_at, updated_at
         )
         VALUES (
-          ${orderId}, ${order.orderNo}, ${order.userId}, ${agentId}, NULL, ${order.shopId}, ${order.buyerEmail ?? null},
-          ${order.salesChannelType}, ${channel?.firstTierAgentId ?? null}, ${channel?.secondTierAgentId ?? null}, ${channel?.thirdTierAgentId ?? null},
-          ${channel?.relationId ?? null}, ${order.collectionChannelId ?? null}, ${jsonForDb(order.collectionChannelSnapshot)}::jsonb,
+          ${orderId}, ${order.orderNo}, ${order.userId}, ${merchantId}, ${order.shopId}, ${order.buyerEmail ?? null}, ${order.buyerPhone ?? null},
+          ${order.extractionCodeHash ?? null},
+          ${order.salesChannelType}, ${channel?.firstTierMerchantId ?? null}, ${channel?.secondTierMerchantId ?? null}, ${channel?.thirdTierMerchantId ?? null},
+          ${jsonForDb(order.collectionPaymentSnapshot)}::jsonb,
           ${order.couponDiscountCents ?? 0n}, ${mapOrderStatus(order.status)}, ${mapPaymentStatus(order.paymentStatus)}, ${mapFulfillmentStatus(order.fulfillmentStatus)}, ${mapRefundStatus(order.refundStatus)},
           ${mapSettlementStatus(order.settlementStatus)}, ${mapRiskStatus(order.riskStatus)}, ${finalPaidAmountCents}, ${order.paidAt}, ${order.fulfilledAt},
           now(), now()
@@ -7704,51 +12087,55 @@ class PrismaStateRepository {
       `;
       await tx.$executeRaw`
         INSERT INTO order_items (
-          id, order_id, agent_product_id, merchant_product_id, platform_shop_product_id,
+          id, order_id, merchant_product_listing_id, merchant_product_id, platform_shop_product_id,
           sale_source_type, product_type, product_id_snapshot, product_name_snapshot,
-          sale_price_cents, quantity, supply_price_cents, service_fee_cents, agent_income_cents, created_at
+          sale_price_cents, quantity, supply_price_cents, service_fee_cents, merchant_income_cents, created_at
         )
         VALUES (
-          ${orderItemId}, ${orderId}, ${agentProductId}, NULL, ${platformShopProductId},
+          ${orderItemId}, ${orderId}, ${merchantProductListingId}, NULL, ${platformShopProductId},
           ${saleSourceType}, ${order.snapshot.productType}, ${productIdSnapshot}, ${order.snapshot.productNameSnapshot},
           ${amount.paidAmountCents}, ${order.snapshot.quantity}, ${amount.supplyAmountCents},
-          ${amount.serviceFeeCents}, ${amount.agentExpectedIncomeCents}, now()
+          ${amount.serviceFeeCents}, ${amount.merchantExpectedIncomeCents}, now()
         )
       `;
       await tx.$executeRaw`
         INSERT INTO order_amount_snapshots (
           id, order_id, service_fee_bps, paid_amount_cents, supply_amount_cents,
-          service_fee_cents, agent_expected_income_cents, platform_supply_price_cents,
+          service_fee_cents, merchant_expected_income_cents, platform_supply_price_cents,
           resell_supply_price_cents, first_tier_supply_price_cents, second_tier_supply_price_cents,
           final_sale_price_cents, first_tier_income_cents, second_tier_income_cents,
           third_tier_income_cents, fulfillment_cost_cents, payment_channel_fee_cents,
-          platform_gross_profit_cents, product_snapshot_json, shop_snapshot_json,
+          platform_gross_profit_cents, service_fee_enabled, service_fee_basis_amount_cents,
+          service_fee_config_snapshot_json, product_snapshot_json, shop_snapshot_json,
           pricing_snapshot_json, fulfillment_rule_snapshot_json, after_sale_rule_snapshot_json,
           created_at
         )
         VALUES (
           ${amountSnapshotId}, ${orderId}, ${Number(amount.serviceFeeBps)}, ${amount.paidAmountCents}, ${amount.supplyAmountCents},
-          ${amount.serviceFeeCents}, ${amount.agentExpectedIncomeCents}, ${channel?.platformSupplyPriceCents ?? amount.supplyAmountCents},
+          ${amount.serviceFeeCents}, ${amount.merchantExpectedIncomeCents}, ${channel?.platformSupplyPriceCents ?? amount.supplyAmountCents},
           ${channel?.resellSupplyPriceCents ?? 0n}, ${channel?.firstTierSupplyPriceCents ?? 0n}, ${channel?.secondTierSupplyPriceCents ?? 0n},
           ${channel?.finalSalePriceCents ?? amount.paidAmountCents}, ${channel?.firstTierIncomeCents ?? 0n}, ${channel?.secondTierIncomeCents ?? 0n},
           ${channel?.thirdTierIncomeCents ?? 0n}, ${grossMarginCents > 0n ? amount.supplyAmountCents : 0n}, 0,
-          ${grossMarginCents}, ${jsonForDb(order.snapshot.productSnapshot)}::jsonb, ${jsonForDb(order.snapshot.shopSnapshot)}::jsonb,
+          ${grossMarginCents}, ${(amount as DemoAmountSnapshot).serviceFeeEnabled ?? true},
+          ${(amount as DemoAmountSnapshot).serviceFeeBasisAmountCents ?? amount.paidAmountCents},
+          ${jsonForDb((amount as DemoAmountSnapshot).serviceFeeConfigSnapshot)}::jsonb,
+          ${jsonForDb(order.snapshot.productSnapshot)}::jsonb, ${jsonForDb(order.snapshot.shopSnapshot)}::jsonb,
           ${jsonForDb(order.snapshot.pricingSnapshot)}::jsonb, ${jsonForDb(order.snapshot.fulfillmentRuleSnapshot)}::jsonb, ${jsonForDb(order.snapshot.afterSaleRuleSnapshot)}::jsonb,
           now()
         )
       `;
       await tx.$executeRaw`
         INSERT INTO ledger_entries (
-          id, ledger_no, agent_id, merchant_id, shop_id, subject_type, subject_id,
+          id, ledger_no, merchant_id, shop_id, subject_type, subject_id,
           account_type, entry_type, direction, amount_cents, currency, source_type, source_id,
           order_id, idempotency_key, created_at
         )
         VALUES (
-          ${ledgerId}, ${`ledger-${order.orderNo}`}, ${agentId}, NULL, ${order.shopId},
-          ${agentId ? "agent" : "platform"}, ${agentId ?? "platform"},
-          ${agentId ? "agent_pending_income" : "platform_self_operated_revenue"},
-          ${agentId ? "ORDER_AGENT_INCOME_PENDING" : "ORDER_PLATFORM_SELF_REVENUE"},
-          'credit', ${agentId ? amount.agentExpectedIncomeCents : finalPaidAmountCents}, 'CNY', 'order', ${order.orderNo},
+          ${ledgerId}, ${`ledger-${order.orderNo}`}, ${merchantId}, ${order.shopId},
+          ${merchantId ? "merchant" : "platform"}, ${merchantId ?? "platform"},
+          ${merchantId ? "merchant_pending_income" : "platform_self_operated_revenue"},
+          ${merchantId ? "ORDER_MERCHANT_INCOME_PENDING" : "ORDER_PLATFORM_SELF_REVENUE"},
+          'credit', ${merchantId ? amount.merchantExpectedIncomeCents : finalPaidAmountCents}, 'CNY', 'order', ${order.orderNo},
           ${orderId}, ${ledgerKey}, now()
         )
       `;
@@ -7759,15 +12146,15 @@ class PrismaStateRepository {
         )
         VALUES (
           ${auditId}, 'system', 'api', 'order.create', 'order', ${order.orderNo},
-          ${jsonForDb({ orderNo: order.orderNo, userId: order.userId, shopId: order.shopId, agentId: order.agentId })}::jsonb,
+          ${jsonForDb({ orderNo: order.orderNo, userId: order.userId, shopId: order.shopId, merchantId: order.merchantId })}::jsonb,
           ${auditKey}, ${auditKey}, now()
         )
       `;
     });
   }
 
-  private async loadAgentsAndDeposits(store: MemoryStore) {
-    const agents = await this.prisma.$queryRaw<Array<{
+  private async loadMerchantsAndDeposits(store: MemoryStore) {
+    const merchants = await this.prisma.$queryRaw<Array<{
       id: string;
       user_id: string;
       name: string;
@@ -7776,11 +12163,19 @@ class PrismaStateRepository {
       risk_status: string;
       deposit_status: string;
     }>>`
-      SELECT id, user_id, name, contact_phone, status, risk_status, deposit_status
-        FROM agents
+      SELECT m.id, COALESCE(ma.user_id, m.id) AS user_id, m.name, m.contact_phone,
+             m.status, m.risk_status, m.deposit_status
+        FROM merchants m
+        LEFT JOIN LATERAL (
+          SELECT user_id
+            FROM merchant_accounts
+           WHERE merchant_id = m.id
+           ORDER BY created_at ASC
+           LIMIT 1
+        ) ma ON TRUE
     `;
-    for (const row of agents) {
-      store.agents.set(row.id, {
+    for (const row of merchants) {
+      store.merchants.set(row.id, {
         id: row.id,
         userId: row.user_id,
         name: row.name,
@@ -7792,21 +12187,21 @@ class PrismaStateRepository {
     }
 
     const deposits = await this.prisma.$queryRaw<Array<{
-      agent_id: string;
+      merchant_id: string;
       required_amount_cents: bigint;
       available_amount_cents: bigint;
       frozen_amount_cents: bigint;
       deducted_amount_cents: bigint;
       status: string;
     }>>`
-      SELECT agent_id, required_amount_cents, available_amount_cents, frozen_amount_cents,
+      SELECT merchant_id, required_amount_cents, available_amount_cents, frozen_amount_cents,
              deducted_amount_cents, status
         FROM deposit_accounts
-       WHERE agent_id IS NOT NULL
+       WHERE merchant_id IS NOT NULL
     `;
     for (const row of deposits) {
-      store.depositAccounts.set(row.agent_id, {
-        agentId: row.agent_id,
+      store.depositAccounts.set(row.merchant_id, {
+        merchantId: row.merchant_id,
         requiredAmountCents: row.required_amount_cents,
         availableAmountCents: row.available_amount_cents,
         frozenAmountCents: row.frozen_amount_cents,
@@ -7819,10 +12214,11 @@ class PrismaStateRepository {
   private async loadShops(store: MemoryStore) {
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
-      owner_type: "platform" | "agent";
-      agent_id: string | null;
+      owner_type: "platform" | "merchant";
       merchant_id: string | null;
+      shop_no: string;
       name: string;
+      share_path: string;
       status: string;
       risk_status: string;
       announcement: string | null;
@@ -7838,7 +12234,8 @@ class PrismaStateRepository {
       banner_url: string | null;
       share_title: string | null;
     }>>`
-      SELECT s.id, s.owner_type, s.agent_id, s.merchant_id, s.name, s.status, s.risk_status, s.announcement,
+      SELECT s.id, s.owner_type, s.merchant_id, s.shop_no, s.name, s.share_path,
+             s.status, s.risk_status, s.announcement,
              COALESCE(s.customer_service_wechat, cs.wechat_id) AS customer_service_wechat,
              COALESCE(s.customer_service_qr_url, cs.qr_code_url) AS customer_service_qr_url,
              s.customer_service_qq, s.customer_service_qq_qr_url, s.customer_service_note,
@@ -7852,12 +12249,15 @@ class PrismaStateRepository {
            ORDER BY updated_at DESC
            LIMIT 1
         ) cs ON TRUE
+       ORDER BY CASE WHEN s.owner_type = 'platform' THEN 0 ELSE 1 END, s.created_at ASC
     `;
     for (const row of rows) {
       store.shops.set(row.id, {
         id: row.id,
-        ownerType: row.owner_type,
-        agentId: row.agent_id ?? row.merchant_id ?? undefined,
+        ownerType: row.owner_type === "merchant" ? "merchant" : "platform",
+        merchantId: row.merchant_id ?? undefined,
+        shopNo: row.shop_no,
+        sharePath: row.share_path,
         name: row.name,
         status: row.status,
         riskStatus: row.risk_status,
@@ -7936,7 +12336,7 @@ class PrismaStateRepository {
   private async loadOwnProductReviews(store: MemoryStore) {
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
-      agent_id: string;
+      merchant_id: string;
       shop_id: string;
       name: string;
       detail_json: unknown;
@@ -7947,15 +12347,15 @@ class PrismaStateRepository {
       created_at: Date;
       updated_at: Date;
     }>>`
-      SELECT id, agent_id, shop_id, name, detail_json, sale_price_cents,
+      SELECT id, merchant_id, shop_id, name, detail_json, sale_price_cents,
              after_sale_rule_json, fulfillment_rule_json, status, created_at, updated_at
-        FROM agent_product_reviews
+        FROM merchant_product_reviews
     `;
     for (const row of rows) {
       const detail = decodeStoreValue(row.detail_json);
       store.ownProducts.set(row.id, {
         id: row.id,
-        agentId: row.agent_id,
+        merchantId: row.merchant_id,
         shopId: row.shop_id,
         name: row.name,
         category: isRecord(detail) ? stringValue(detail.category) : undefined,
@@ -7969,7 +12369,7 @@ class PrismaStateRepository {
         stockCount: isRecord(detail) && typeof detail.stockCount === "number" ? detail.stockCount : undefined,
         soldCount: isRecord(detail) && typeof detail.soldCount === "number" ? detail.soldCount : undefined,
         salePriceCents: row.sale_price_cents,
-        minSalePriceCents: isRecord(detail) ? bigintValue(detail.minSalePriceCents) || undefined : undefined,
+        minSalePriceCents: isRecord(detail) ? bigintValue(detail.minSalePriceCents) || row.sale_price_cents : row.sale_price_cents,
         fulfillmentRule: decodeStoreValue(row.fulfillment_rule_json),
         afterSaleRule: decodeStoreValue(row.after_sale_rule_json),
         reviewStatus: row.status,
@@ -7980,30 +12380,59 @@ class PrismaStateRepository {
     }
   }
 
-  private async loadAgentProducts(store: MemoryStore) {
-    const agentRows = await this.prisma.$queryRaw<Array<{
+  private async loadMerchantProducts(store: MemoryStore) {
+    const merchantRows = await this.prisma.$queryRaw<Array<{
       id: string;
-      agent_id: string;
+      merchant_id: string;
       shop_id: string;
-      product_type: "platform" | "agent_owned";
+      product_type: "platform" | "merchant_owned";
       platform_product_id: string | null;
       own_product_review_id: string | null;
       sale_price_cents: bigint;
+      display_name: string | null;
+      display_subtitle: string | null;
+      display_description: string | null;
+      display_usage_guide: string | null;
+      display_image_url: string | null;
+      display_category: string | null;
+      display_tags_json: unknown;
+      display_specs_json: unknown;
+      display_detail_sections_json: unknown;
       status: string;
     }>>`
-      SELECT id, agent_id, shop_id, product_type, platform_product_id, own_product_review_id,
-             sale_price_cents, status
-        FROM agent_products
+      SELECT id, merchant_id, shop_id, 'platform'::text AS product_type, platform_product_id,
+             NULL::text AS own_product_review_id, sale_price_cents,
+             display_name, display_subtitle, display_description,
+             display_usage_guide, display_image_url, display_category,
+             display_tags_json, display_specs_json, display_detail_sections_json, status
+        FROM merchant_product_listings
+      UNION ALL
+      SELECT id, merchant_id, shop_id, product_type::text AS product_type, platform_product_id,
+             own_product_review_id, sale_price_cents,
+             NULL::text AS display_name, NULL::text AS display_subtitle, NULL::text AS display_description,
+             NULL::text AS display_usage_guide, NULL::text AS display_image_url, NULL::text AS display_category,
+             NULL::jsonb AS display_tags_json, NULL::jsonb AS display_specs_json,
+             NULL::jsonb AS display_detail_sections_json, status
+        FROM merchant_products
     `;
-    for (const row of agentRows) {
-      store.agentProducts.set(row.id, {
+    for (const row of merchantRows) {
+      store.merchantProductListings.set(row.id, {
         id: row.id,
-        agentId: row.agent_id,
+        merchantId: row.merchant_id,
         shopId: row.shop_id,
-        productType: row.product_type,
+        productType: row.product_type === "merchant_owned" ? "merchant_owned" : row.product_type,
         platformProductId: row.platform_product_id,
         ownProductReviewId: row.own_product_review_id,
         salePriceCents: row.sale_price_cents,
+        displayName: row.display_name ?? undefined,
+        displaySubtitle: row.display_subtitle ?? undefined,
+        displayDescription: row.display_description ?? undefined,
+        displayUsageGuide: row.display_usage_guide ?? undefined,
+        displayImageUrl: row.display_image_url ?? undefined,
+        displayCategory: row.display_category ?? undefined,
+        displayTags: Array.isArray(row.display_tags_json) ? row.display_tags_json as string[] : undefined,
+        displaySpecs: Array.isArray(row.display_specs_json) ? row.display_specs_json as string[] : undefined,
+        displayDetailSections: Array.isArray(row.display_detail_sections_json) ? row.display_detail_sections_json as ProductDetailSection[] : undefined,
         status: row.status
       });
     }
@@ -8030,48 +12459,6 @@ class PrismaStateRepository {
       });
     }
   }
-
-  private async loadCollectionChannels(store: MemoryStore) {
-    const rows = await this.prisma.$queryRaw<Array<{
-      id: string;
-      shop_id: string;
-      channel_type: CollectionChannelType;
-      account_name: string;
-      qr_url: string | null;
-      note: string | null;
-      status: string;
-      review_status: string;
-      is_default: boolean;
-      reviewed_by: string | null;
-      reviewed_at: Date | null;
-      created_at: Date;
-      updated_at: Date;
-    }>>`
-      SELECT id, shop_id, channel_type, account_name, qr_url, note, status, review_status,
-             is_default, reviewed_by, reviewed_at, created_at, updated_at
-        FROM shop_collection_channels
-    `;
-    for (const row of rows) {
-      store.collectionChannels.set(row.id, {
-        id: row.id,
-        shopId: row.shop_id,
-        ownerType: "agent",
-        channelType: row.channel_type,
-        displayName: row.account_name,
-        accountName: row.account_name,
-        qrUrl: row.qr_url ?? undefined,
-        status: row.status as CollectionChannel["status"],
-        reviewStatus: row.review_status as CollectionChannel["reviewStatus"],
-        isDefault: row.is_default,
-        sortOrder: 0,
-        reviewedBy: row.reviewed_by,
-        reviewedAt: row.reviewed_at,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at
-      });
-    }
-  }
-
   private async loadPaymentConfig(store: MemoryStore) {
     const rows = await this.prisma.$queryRaw<Array<PaymentChannelConfig>>`
       SELECT channel, enabled, fee_bps AS "feeBps", fixed_fee_cents AS "fixedFeeCents",
@@ -8081,11 +12468,116 @@ class PrismaStateRepository {
     if (rows.length) store.paymentChannelConfigs = rows;
   }
 
+  private async loadServiceFeeConfig(store: MemoryStore) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      enabled: boolean;
+      fee_bps: number;
+      basis_type: "final_sale_price" | "paid_amount";
+      status: "active" | "disabled";
+      updated_at: Date;
+      updated_by: string | null;
+    }>>`
+      SELECT id, enabled, fee_bps, basis_type, status, updated_at, updated_by
+        FROM platform_service_fee_configs
+       WHERE status = 'active'
+       ORDER BY effective_from DESC, updated_at DESC
+       LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row) return;
+    store.serviceFeeConfig = {
+      id: row.id,
+      enabled: row.enabled,
+      feeBps: row.fee_bps,
+      basisType: row.basis_type,
+      status: row.status,
+      updatedAt: row.updated_at,
+      updatedBy: row.updated_by ?? undefined
+    };
+  }
+
+  private async loadWalletState(store: MemoryStore) {
+    const wallets = await this.prisma.$queryRaw<Array<{
+      id: string;
+      user_id: string;
+      wallet_no: string;
+      available_balance_cents: bigint;
+      frozen_balance_cents: bigint;
+      total_recharge_cents: bigint;
+      total_spend_cents: bigint;
+      status: "active" | "frozen" | "disabled";
+      version: number;
+      created_at: Date;
+      updated_at: Date;
+    }>>`
+      SELECT id, user_id, wallet_no, available_balance_cents, frozen_balance_cents,
+             total_recharge_cents, total_spend_cents, status, version, created_at, updated_at
+        FROM user_wallets
+    `;
+    for (const row of wallets) {
+      store.userWallets.set(row.user_id, {
+        id: row.id,
+        userId: row.user_id,
+        walletNo: row.wallet_no,
+        availableBalanceCents: row.available_balance_cents,
+        frozenBalanceCents: row.frozen_balance_cents,
+        totalRechargeCents: row.total_recharge_cents,
+        totalSpendCents: row.total_spend_cents,
+        status: row.status,
+        version: row.version,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      });
+    }
+
+    const recharges = await this.prisma.$queryRaw<Array<{
+      recharge_no: string;
+      user_id: string;
+      wallet_id: string;
+      provider: string;
+      confirm_mode: string;
+      recharge_cents: bigint;
+      fee_bps: number;
+      fee_cents: bigint;
+      payable_cents: bigint;
+      status: "pending_payment" | "paid" | "failed" | "cancelled" | "expired";
+      paid_at: Date | null;
+      idempotency_key: string;
+      created_at: Date;
+      updated_at: Date;
+    }>>`
+      SELECT recharge_no, user_id, wallet_id, provider, confirm_mode, recharge_cents,
+             fee_bps, fee_cents, payable_cents, status, paid_at, idempotency_key,
+             created_at, updated_at
+        FROM wallet_recharge_orders
+    `;
+    for (const row of recharges) {
+      store.walletRecharges.set(row.recharge_no, {
+        rechargeNo: row.recharge_no,
+        userId: row.user_id,
+        walletId: row.wallet_id,
+        provider: mapPaymentProviderFromDb(row.provider),
+        confirmationMode: mapPaymentConfirmModeFromDb(row.confirm_mode),
+        rechargeCents: row.recharge_cents,
+        feeBps: row.fee_bps,
+        feeCents: row.fee_cents,
+        payableCents: row.payable_cents,
+        status: row.status,
+        paidAt: row.paid_at ?? undefined,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        idempotencyKey: row.idempotency_key
+      });
+    }
+  }
+
   private async loadPaymentMethodConfigs(store: MemoryStore) {
+    await this.ensureCollectionPaymentConfigRuntimeSchema();
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
       owner_type: string;
-      owner_agent_id: string | null;
+      owner_merchant_id: string | null;
       shop_id: string | null;
       provider: string;
       confirm_mode: string;
@@ -8095,6 +12587,8 @@ class PrismaStateRepository {
       merchant_no_masked: string | null;
       app_id_masked: string | null;
       service_provider_masked: string | null;
+      gateway_url: string | null;
+      api_mode: string | null;
       credential_ref: string | null;
       credential_ciphertext: string | null;
       credential_status: string;
@@ -8110,9 +12604,9 @@ class PrismaStateRepository {
       created_at: Date;
       updated_at: Date;
     }>>`
-      SELECT id, owner_type, owner_agent_id, shop_id, provider, confirm_mode, status,
+      SELECT id, owner_type, owner_merchant_id, shop_id, provider, confirm_mode, status,
              is_default, display_name, merchant_no_masked, app_id_masked, service_provider_masked,
-             credential_ref, credential_ciphertext, credential_status, return_url, test_status,
+             gateway_url, api_mode, credential_ref, credential_ciphertext, credential_status, return_url, test_status,
              last_test_at, last_test_result_json, last_callback_at, qr_url, account_masked,
              instruction, updated_by_id, created_at, updated_at
         FROM collection_payment_configs
@@ -8120,17 +12614,21 @@ class PrismaStateRepository {
     for (const row of rows) {
       const provider = mapPaymentProviderFromDb(row.provider);
       const status = mapCollectionPaymentConfigStatusFromDb(row.status);
+      const credentialBundle = decryptPaymentCredentialBundle(row.credential_ciphertext);
+      const legacyHash = row.credential_ciphertext?.startsWith("sha256:") ? row.credential_ciphertext.slice("sha256:".length) : undefined;
       store.paymentMethods.set(row.id, {
         id: row.id,
-        ownerType: row.owner_type === "agent" ? "agent" : "platform",
-        agentId: row.owner_agent_id ?? undefined,
+        ownerType: row.owner_type === "merchant" ? "merchant" : "platform",
+        merchantId: row.owner_merchant_id ?? undefined,
         shopId: row.shop_id ?? undefined,
         provider,
         confirmationMode: mapPaymentConfirmModeFromDb(row.confirm_mode),
         displayName: row.display_name,
-        merchantNo: row.merchant_no_masked ?? undefined,
-        appId: row.app_id_masked ?? undefined,
-        serviceProviderId: row.service_provider_masked ?? undefined,
+        merchantNo: credentialBundle.merchantNo ?? row.merchant_no_masked ?? undefined,
+        appId: credentialBundle.appId ?? row.app_id_masked ?? undefined,
+        serviceProviderId: credentialBundle.serviceProviderId ?? row.service_provider_masked ?? undefined,
+        gatewayUrl: row.gateway_url ?? undefined,
+        apiMode: parsePaymentApiMode(row.api_mode),
         accountName: row.account_masked ?? undefined,
         qrUrl: row.qr_url ?? undefined,
         paymentUrl: row.qr_url ?? undefined,
@@ -8139,9 +12637,11 @@ class PrismaStateRepository {
         enabled: row.status === "active",
         status,
         isDefault: row.is_default,
+        signingSecret: credentialBundle.signingSecret,
+        signingSecretHash: legacyHash,
         signingSecretEncrypted: row.credential_ciphertext ?? undefined,
         signingSecretPreview: row.credential_ref ?? undefined,
-        secretConfigured: row.credential_status === "configured",
+        secretConfigured: row.credential_status === "configured" || Boolean(credentialBundle.signingSecret),
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         updatedBy: row.updated_by_id ?? undefined,
@@ -8150,6 +12650,91 @@ class PrismaStateRepository {
         lastCallbackAt: row.last_callback_at ?? undefined
       });
     }
+  }
+
+  private async ensureCollectionPaymentConfigRuntimeSchema() {
+    await this.prisma.$executeRawUnsafe(`
+      ALTER TABLE "collection_payment_configs"
+        ADD COLUMN IF NOT EXISTS "display_name" TEXT NOT NULL DEFAULT '收款方式',
+        ADD COLUMN IF NOT EXISTS "merchant_no_masked" TEXT,
+        ADD COLUMN IF NOT EXISTS "app_id_masked" TEXT,
+        ADD COLUMN IF NOT EXISTS "service_provider_masked" TEXT,
+        ADD COLUMN IF NOT EXISTS "gateway_url" TEXT,
+        ADD COLUMN IF NOT EXISTS "api_mode" TEXT,
+        ADD COLUMN IF NOT EXISTS "credential_ref" TEXT,
+        ADD COLUMN IF NOT EXISTS "credential_ciphertext" TEXT,
+        ADD COLUMN IF NOT EXISTS "secret_version" INTEGER NOT NULL DEFAULT 1,
+        ADD COLUMN IF NOT EXISTS "credential_status" "CredentialStatus" NOT NULL DEFAULT 'not_configured',
+        ADD COLUMN IF NOT EXISTS "notify_url" TEXT,
+        ADD COLUMN IF NOT EXISTS "return_url" TEXT,
+        ADD COLUMN IF NOT EXISTS "test_status" TEXT,
+        ADD COLUMN IF NOT EXISTS "last_test_at" TIMESTAMP(3),
+        ADD COLUMN IF NOT EXISTS "last_test_result_json" JSONB,
+        ADD COLUMN IF NOT EXISTS "last_callback_at" TIMESTAMP(3),
+        ADD COLUMN IF NOT EXISTS "qr_url" TEXT,
+        ADD COLUMN IF NOT EXISTS "account_masked" TEXT,
+        ADD COLUMN IF NOT EXISTS "instruction" TEXT,
+        ADD COLUMN IF NOT EXISTS "created_by_type" "ActorType" NOT NULL DEFAULT 'system',
+        ADD COLUMN IF NOT EXISTS "created_by_id" TEXT,
+        ADD COLUMN IF NOT EXISTS "updated_by_type" "ActorType",
+        ADD COLUMN IF NOT EXISTS "updated_by_id" TEXT,
+        ADD COLUMN IF NOT EXISTS "enabled_at" TIMESTAMP(3),
+        ADD COLUMN IF NOT EXISTS "disabled_at" TIMESTAMP(3),
+        ADD COLUMN IF NOT EXISTS "idempotency_key" TEXT,
+        ADD COLUMN IF NOT EXISTS "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS "updated_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+    `);
+    await this.prisma.$executeRawUnsafe(`
+      UPDATE "collection_payment_configs"
+         SET "idempotency_key" = COALESCE("idempotency_key", 'collection-payment-config:' || "id"),
+             "display_name" = COALESCE(NULLIF("display_name", ''), '收款方式'),
+             "updated_at" = COALESCE("updated_at", CURRENT_TIMESTAMP)
+    `);
+    await this.prisma.$executeRawUnsafe(`
+      CREATE UNIQUE INDEX IF NOT EXISTS "collection_payment_configs_idempotency_key_key"
+        ON "collection_payment_configs"("idempotency_key")
+        WHERE "idempotency_key" IS NOT NULL
+    `);
+    await this.prisma.$executeRawUnsafe(`
+      DO $$
+      DECLARE item RECORD;
+      BEGIN
+        FOR item IN
+          SELECT conname
+            FROM pg_constraint
+           WHERE conrelid = 'collection_payment_configs'::regclass
+             AND contype = 'u'
+             AND pg_get_constraintdef(oid) LIKE '%shop_id%'
+        LOOP
+          EXECUTE format('ALTER TABLE "collection_payment_configs" DROP CONSTRAINT IF EXISTS %I', item.conname);
+        END LOOP;
+
+        FOR item IN
+          SELECT indexrelid::regclass::text AS index_name
+            FROM pg_index
+           WHERE indrelid = 'collection_payment_configs'::regclass
+             AND indisunique = true
+             AND pg_get_indexdef(indexrelid) LIKE '%shop_id%'
+        LOOP
+          EXECUTE format('DROP INDEX IF EXISTS %s', item.index_name);
+        END LOOP;
+      END $$;
+    `);
+  }
+
+  private async ensureMerchantProductRuntimeSchema() {
+    await this.prisma.$executeRawUnsafe(`
+      ALTER TABLE "merchant_product_listings"
+        ADD COLUMN IF NOT EXISTS "display_name" TEXT,
+        ADD COLUMN IF NOT EXISTS "display_subtitle" TEXT,
+        ADD COLUMN IF NOT EXISTS "display_description" TEXT,
+        ADD COLUMN IF NOT EXISTS "display_usage_guide" TEXT,
+        ADD COLUMN IF NOT EXISTS "display_image_url" TEXT,
+        ADD COLUMN IF NOT EXISTS "display_category" TEXT,
+        ADD COLUMN IF NOT EXISTS "display_tags_json" JSONB,
+        ADD COLUMN IF NOT EXISTS "display_specs_json" JSONB,
+        ADD COLUMN IF NOT EXISTS "display_detail_sections_json" JSONB
+    `);
   }
 
   private async loadPaymentRuntimeState(store: MemoryStore) {
@@ -8162,6 +12747,9 @@ class PrismaStateRepository {
       merchant_no_masked: string | null;
       app_id_masked: string | null;
       service_provider_masked: string | null;
+      base_amount_cents: bigint;
+      fee_bps: number;
+      fee_cents: bigint;
       payable_amount_cents: bigint;
       currency: string;
       provider_payment_no: string | null;
@@ -8175,6 +12763,7 @@ class PrismaStateRepository {
     }>>`
       SELECT o.order_no, ps.payment_no, ps.collection_config_id, ps.provider, ps.confirm_mode,
              ps.merchant_no_masked, ps.app_id_masked, ps.service_provider_masked,
+             ps.base_amount_cents, ps.fee_bps, ps.fee_cents,
              ps.payable_amount_cents, ps.currency, ps.provider_payment_no, ps.provider_trade_no,
              ps.status, ps.confirm_source, ps.expires_at, ps.paid_at, ps.callback_handled_at,
              ps.created_at
@@ -8193,6 +12782,9 @@ class PrismaStateRepository {
         appIdMasked: row.app_id_masked ?? undefined,
         serviceProviderMasked: row.service_provider_masked ?? undefined,
         amountCents: row.payable_amount_cents,
+        baseAmountCents: row.base_amount_cents,
+        feeBps: row.fee_bps,
+        feeCents: row.fee_cents,
         currency: row.currency,
         orderNo: row.order_no,
         providerPaymentNo: row.provider_payment_no ?? undefined,
@@ -8312,27 +12904,29 @@ class PrismaStateRepository {
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
       product_id: string | null;
-      agent_product_id: string | null;
+      merchant_product_listing_id: string | null;
       code_ciphertext: string;
       batch_no: string;
       status: RightsCode["status"];
-      order_id: string | null;
+      order_no: string | null;
       issue_key: string | null;
       issued_at: Date | null;
       created_at: Date;
     }>>`
-      SELECT id, product_id, agent_product_id, code_ciphertext, batch_no, status, order_id, issue_key, issued_at, created_at
-        FROM rights_codes
+      SELECT rc.id, rc.product_id, rc.merchant_product_listing_id, rc.code_ciphertext, rc.batch_no,
+             rc.status, o.order_no, rc.issue_key, rc.issued_at, rc.created_at
+        FROM rights_codes rc
+        LEFT JOIN orders o ON o.id = rc.order_id
     `;
     store.rightsCodes = rows.map((row) => ({
       codeId: row.id,
-      productId: row.product_id ?? row.agent_product_id ?? row.id,
+      productId: row.product_id ?? row.merchant_product_listing_id ?? row.id,
       platformProductId: row.product_id ?? undefined,
-      agentProductId: row.agent_product_id ?? undefined,
+      merchantProductListingId: row.merchant_product_listing_id ?? undefined,
       code: row.code_ciphertext,
       batchNo: row.batch_no,
       status: row.status,
-      orderNo: row.order_id ?? undefined,
+      orderNo: row.order_no ?? undefined,
       issueKey: row.issue_key ?? undefined,
       issuedAt: row.issued_at ?? undefined,
       createdAt: row.created_at
@@ -8340,11 +12934,18 @@ class PrismaStateRepository {
   }
 
   private async loadOrders(store: MemoryStore) {
+    const couponUsageByOrderId = new Map<string, string>();
+    const couponUsages = await this.prisma.$queryRaw<Array<{ order_id: string; user_coupon_id: string }>>`
+      SELECT order_id, user_coupon_id
+        FROM coupon_usage
+       WHERE reversed_at IS NULL
+    `;
+    for (const usage of couponUsages) couponUsageByOrderId.set(usage.order_id, usage.user_coupon_id);
+
     const rows = await this.prisma.order.findMany({
       include: {
         amountSnapshot: true,
-        items: true,
-        collectionChannel: true
+        items: true
       }
     });
     for (const order of rows) {
@@ -8355,9 +12956,9 @@ class PrismaStateRepository {
       const snapshot: DemoOrderSnapshot = {
         orderNo: order.orderNo,
         userId: order.userId,
-        agentId: order.agentId ?? PLATFORM_AGENT_ID,
+        merchantId: order.merchantId ?? PLATFORM_MERCHANT_ID,
         shopId: order.shopId,
-        agentProductId: item.agentProductId ?? item.platformShopProductId ?? item.productIdSnapshot,
+        merchantProductListingId: item.merchantProductListingId ?? item.platformShopProductId ?? item.productIdSnapshot,
         salesChannelType: order.salesChannelType as SalesChannelType,
         productType: "platform",
         productNameSnapshot: item.productNameSnapshot,
@@ -8367,7 +12968,7 @@ class PrismaStateRepository {
           salePriceCents: item.salePriceCents,
           supplyAmountCents: amount.supplyAmountCents,
           serviceFeeCents: amount.serviceFeeCents,
-          agentExpectedIncomeCents: amount.agentExpectedIncomeCents,
+          merchantExpectedIncomeCents: amount.merchantExpectedIncomeCents,
           serviceFeeBps: BigInt(amount.serviceFeeBps)
         },
         amountSnapshot: {
@@ -8375,7 +12976,14 @@ class PrismaStateRepository {
           paidAmountCents: amount.paidAmountCents,
           supplyAmountCents: amount.supplyAmountCents,
           serviceFeeCents: amount.serviceFeeCents,
-          agentExpectedIncomeCents: amount.agentExpectedIncomeCents
+          merchantExpectedIncomeCents: amount.merchantExpectedIncomeCents,
+          serviceFeeEnabled: amount.serviceFeeEnabled,
+          serviceFeeBasisAmountCents: amount.serviceFeeBasisAmountCents,
+          serviceFeeConfigSnapshot: amount.serviceFeeConfigSnapshotJson,
+          paymentFeeBps: BigInt(amount.paymentFeeBps),
+          paymentFeeCents: amount.paymentFeeCents,
+          balancePaidCents: amount.balancePaidCents,
+          externalPaidCents: amount.externalPaidCents
         },
         productSnapshot: amount.productSnapshotJson,
         shopSnapshot: amount.shopSnapshotJson,
@@ -8386,9 +12994,9 @@ class PrismaStateRepository {
       store.orders.set(order.orderNo, {
         orderNo: order.orderNo,
         userId: order.userId,
-        agentId: order.agentId ?? PLATFORM_AGENT_ID,
+        merchantId: order.merchantId ?? PLATFORM_MERCHANT_ID,
         shopId: order.shopId,
-        agentProductId: item.agentProductId ?? item.platformShopProductId ?? item.productIdSnapshot,
+        merchantProductListingId: item.merchantProductListingId ?? item.platformShopProductId ?? item.productIdSnapshot,
         salesChannelType: order.salesChannelType as SalesChannelType,
         status: order.status,
         paymentStatus: order.paymentStatus,
@@ -8400,10 +13008,13 @@ class PrismaStateRepository {
         fulfilledAt: order.fulfilledAt,
         paidAt: order.paidAt,
         buyerEmail: order.buyerEmail ?? undefined,
+        buyerPhone: order.buyerPhone ?? undefined,
+        extractionCodeSet: Boolean(order.purchasePasswordHash),
+        couponId: couponUsageByOrderId.get(order.id),
         couponDiscountCents: order.couponDiscountCents,
         buyerPaidAmountCents: order.paidAmountCents,
-        collectionChannelId: order.collectionChannelId ?? undefined,
-        collectionChannelSnapshot: order.collectionSnapshotJson as unknown as CollectionChannelPublicSnapshot | undefined,
+        collectionPaymentConfigId: undefined,
+        collectionPaymentSnapshot: order.collectionSnapshotJson as unknown as PaymentMethodPublicSnapshot | undefined,
         refundedAmountCents: 0n,
         snapshot
       });
@@ -8452,10 +13063,11 @@ class PrismaStateRepository {
       status: string;
       source_type: string;
       source_id: string | null;
+      void_reason: string | null;
       created_at: Date;
       updated_at: Date;
     }>>`
-      SELECT id, coupon_template_id, user_id, status, source_type, source_id, created_at, updated_at
+      SELECT id, coupon_template_id, user_id, status, source_type, source_id, void_reason, created_at, updated_at
         FROM user_coupons
     `;
     for (const row of userCoupons) {
@@ -8463,7 +13075,9 @@ class PrismaStateRepository {
         id: row.id,
         templateId: row.coupon_template_id,
         userId: row.user_id,
-        status: row.status === "active" ? "available" : mapUserCouponMemoryStatus(row.status),
+        status: row.status === "voided" && row.void_reason === "voided_after_refund"
+          ? "voided_after_refund"
+          : row.status === "active" ? "available" : mapUserCouponMemoryStatus(row.status),
         grantReason: row.source_type,
         grantedAt: row.created_at,
         usedAt: row.status === "used" ? row.updated_at : null,
@@ -8476,7 +13090,7 @@ class PrismaStateRepository {
     const invites = await this.prisma.$queryRaw<Array<{
       id: string;
       code_hash: string;
-      tier: AgentTier;
+      tier: MerchantTier;
       max_uses: number;
       used_count: number;
       deposit_required_amount_cents: bigint | null;
@@ -8504,94 +13118,36 @@ class PrismaStateRepository {
       });
     }
 
-    const authorizations = await this.prisma.$queryRaw<Array<{
-      id: string;
-      first_tier_agent_id: string;
-      status: string;
-      reason: string | null;
-      reviewed_at: Date | null;
-    }>>`
-      SELECT id, first_tier_agent_id, status, reason, reviewed_at
-        FROM channel_authorizations
-    `;
-    store.channelAuthorizations = authorizations.map((row) => ({
-      id: row.id,
-      firstTierAgentId: row.first_tier_agent_id,
-      status: row.status,
-      reason: row.reason,
-      reviewedAt: row.reviewed_at
-    }));
-
-    const relations = await this.prisma.$queryRaw<Array<{
-      id: string;
-      first_tier_agent_id: string;
-      second_tier_agent_id: string;
-      third_tier_agent_id: string | null;
-      status: string;
-      reason: string | null;
-      reviewed_at: Date | null;
-      active_unique_key: string | null;
-    }>>`
-      SELECT id, first_tier_agent_id, second_tier_agent_id, third_tier_agent_id,
-             status, reason, reviewed_at, active_unique_key
-        FROM channel_relations
-       WHERE first_tier_agent_id IS NOT NULL AND second_tier_agent_id IS NOT NULL
-    `;
-    store.channelRelations = relations.map((row) => ({
-      id: row.id,
-      firstTierAgentId: row.first_tier_agent_id,
-      secondTierAgentId: row.second_tier_agent_id,
-      thirdTierAgentId: row.third_tier_agent_id ?? undefined,
-      status: row.status,
-      reason: row.reason,
-      reviewedAt: row.reviewed_at,
-      activeUniqueKey: row.active_unique_key ?? undefined
-    }));
-
-    const offers = await this.prisma.$queryRaw<Array<{
-      id: string;
-      channel_relation_id: string;
-      platform_product_id: string;
-      resell_supply_price_cents: bigint;
-      status: string;
-    }>>`
-      SELECT id, channel_relation_id, platform_product_id, resell_supply_price_cents, status
-        FROM channel_product_offers
-    `;
-    store.channelProductOffers = offers.map((row) => ({
-      id: row.id,
-      channelRelationId: row.channel_relation_id,
-      platformProductId: row.platform_product_id,
-      resellSupplyPriceCents: row.resell_supply_price_cents,
-      status: row.status
-    }));
+    store.channelAuthorizations = [];
+    store.channelRelations = [];
+    store.channelProductOffers = [];
   }
 
   private async loadFinancialState(store: MemoryStore) {
     const settlements = await this.prisma.$queryRaw<Array<{
       settlement_no: string;
-      agent_id: string;
+      merchant_id: string;
       status: string;
       total_order_count: number;
       total_paid_cents: bigint;
       total_service_fee_cents: bigint;
-      total_agent_income_cents: bigint;
+      total_merchant_income_cents: bigint;
       idempotency_key: string;
     }>>`
-      SELECT settlement_no, agent_id, status, total_order_count, total_paid_cents,
-             total_service_fee_cents, total_agent_income_cents, idempotency_key
+      SELECT settlement_no, merchant_id, status, total_order_count, total_paid_cents,
+             total_service_fee_cents, total_merchant_income_cents, idempotency_key
         FROM settlement_sheets
     `;
     store.settlementSheets = settlements.map((row) => ({
       settlementNo: row.settlement_no,
-      agentId: row.agent_id,
+      merchantId: row.merchant_id,
       idempotencyKey: row.idempotency_key,
       status: row.status,
       items: [],
       totalOrderCount: row.total_order_count,
       totalPaidCents: row.total_paid_cents,
       totalServiceFeeCents: row.total_service_fee_cents,
-      totalAgentIncomeCents: row.total_agent_income_cents
+      totalMerchantIncomeCents: row.total_merchant_income_cents
     }));
 
     const paymentVouchers = await this.prisma.$queryRaw<Array<{
@@ -8669,13 +13225,13 @@ class PrismaStateRepository {
     const ledgers = await this.prisma.$queryRaw<Array<{
       ledger_no: string;
       entry_type: string;
-      agent_id: string | null;
+      merchant_id: string | null;
       amount_cents: bigint;
       source_type: string;
       source_id: string;
       created_at: Date;
     }>>`
-      SELECT ledger_no, entry_type, agent_id, amount_cents, source_type, source_id, created_at
+      SELECT ledger_no, entry_type, merchant_id, amount_cents, source_type, source_id, created_at
         FROM ledger_entries
        ORDER BY created_at DESC
        LIMIT 500
@@ -8683,7 +13239,7 @@ class PrismaStateRepository {
     store.ledgerEntries = ledgers.map((row) => ({
       ledgerNo: row.ledger_no,
       entryType: row.entry_type,
-      agentId: row.agent_id ?? undefined,
+      merchantId: row.merchant_id ?? undefined,
       amountCents: row.amount_cents,
       orderNo: row.source_type === "order" ? row.source_id : undefined,
       metadata: { sourceType: row.source_type, sourceId: row.source_id },
@@ -8784,9 +13340,7 @@ function parseExtractionToken(token: string): { expiresAt: number; signature: st
 }
 
 function requiresExtractionCode(snapshot: DemoOrderSnapshot) {
-  const rule = snapshot.fulfillmentRuleSnapshot;
-  if (!isRecord(rule) || fulfillmentMode(snapshot) !== "code_pool") return false;
-  return rule.extractCodeRequired === true;
+  return fulfillmentMode(snapshot) === "code_pool";
 }
 
 function hashSecret(value: string) {
@@ -8804,6 +13358,239 @@ function maskSecret(value?: string) {
   const trimmed = value.trim();
   if (trimmed.length <= 4) return "***";
   return `${trimmed.slice(0, 2)}***${trimmed.slice(-2)}`;
+}
+
+type PaymentCredentialBundle = {
+  merchantNo?: string;
+  appId?: string;
+  serviceProviderId?: string;
+  signingSecret?: string;
+};
+
+function encryptPaymentCredentialBundle(bundle: PaymentCredentialBundle) {
+  const clean = Object.fromEntries(Object.entries(bundle).filter(([, value]) => typeof value === "string" && value.length > 0));
+  if (Object.keys(clean).length === 0) return undefined;
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", paymentCredentialKey(), iv);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(clean), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `aes256gcm:${iv.toString("base64url")}:${tag.toString("base64url")}:${ciphertext.toString("base64url")}`;
+}
+
+function decryptPaymentCredentialBundle(value?: string | null): PaymentCredentialBundle {
+  if (!value?.startsWith("aes256gcm:")) return {};
+  try {
+    const [, ivBase64, tagBase64, ciphertextBase64] = value.split(":");
+    if (!ivBase64 || !tagBase64 || !ciphertextBase64) return {};
+    const decipher = createDecipheriv("aes-256-gcm", paymentCredentialKey(), Buffer.from(ivBase64, "base64url"));
+    decipher.setAuthTag(Buffer.from(tagBase64, "base64url"));
+    const plaintext = Buffer.concat([decipher.update(Buffer.from(ciphertextBase64, "base64url")), decipher.final()]).toString("utf8");
+    const parsed = JSON.parse(plaintext);
+    if (!isRecord(parsed)) return {};
+    return {
+      merchantNo: stringValue(parsed.merchantNo),
+      appId: stringValue(parsed.appId),
+      serviceProviderId: stringValue(parsed.serviceProviderId),
+      signingSecret: stringValue(parsed.signingSecret)
+    };
+  } catch {
+    return {};
+  }
+}
+
+function paymentCredentialKey() {
+  const source = process.env.PAYMENT_CREDENTIAL_SECRET
+    ?? process.env.AUTH_TOKEN_SECRET
+    ?? process.env.ADMIN_TOKEN_SECRET
+    ?? process.env.JWT_SECRET
+    ?? "tosell-local-development-payment-credential-secret";
+  return createHash("sha256").update(source).digest();
+}
+
+function signEpayParams(params: Record<string, unknown>, signingSecret: string) {
+  const payload = Object.keys(params)
+    .filter((key) => key !== "sign" && key !== "sign_type")
+    .sort()
+    .map((key) => {
+      const value = params[key];
+      return value === undefined || value === null || value === "" ? undefined : `${key}=${String(value)}`;
+    })
+    .filter((item): item is string => Boolean(item))
+    .join("&");
+  return createHash("md5").update(`${payload}${signingSecret}`).digest("hex").toLowerCase();
+}
+
+function normalizeEpayCallbackPayload(rawPayload: Record<string, unknown>) {
+  const orderNo = requiredCallbackString(rawPayload.out_trade_no, "out_trade_no");
+  return {
+    orderNo,
+    providerTradeNo: stringValue(rawPayload.trade_no) ?? orderNo,
+    amountCents: yuanStringToCents(requiredCallbackString(rawPayload.money, "money")),
+    merchantNo: requiredCallbackString(rawPayload.pid, "pid"),
+    tradeStatus: normalizeEpayTradeStatus(stringValue(rawPayload.trade_status))
+  };
+}
+
+function normalizeEpayTradeStatus(status?: string) {
+  if (!status) return "UNKNOWN";
+  return ["TRADE_SUCCESS", "SUCCESS", "PAID"].includes(status) ? "TRADE_SUCCESS" : status;
+}
+
+function requiredCallbackString(value: unknown, field: string) {
+  const result = stringValue(value);
+  if (!result) throw new ApiError(400, "PAYMENT_CALLBACK_FIELD_MISSING", `${field} is required`);
+  return result;
+}
+
+function yuanStringToCents(value: string) {
+  const normalized = value.trim();
+  if (!/^\d+(\.\d{1,2})?$/.test(normalized)) throw new ApiError(400, "PAYMENT_CALLBACK_AMOUNT_INVALID", "epay money is invalid");
+  const [yuan, fraction = ""] = normalized.split(".");
+  return BigInt(yuan) * 100n + BigInt(fraction.padEnd(2, "0"));
+}
+
+function centsString(value: bigint) {
+  const yuan = value / 100n;
+  const cents = value % 100n;
+  return `${yuan.toString()}.${cents.toString().padStart(2, "0")}`;
+}
+
+function appendQuery(url: string, params: Record<string, string>) {
+  const parsed = new URL(url);
+  for (const [key, value] of Object.entries(params)) parsed.searchParams.set(key, value);
+  return parsed.toString();
+}
+
+function epayGatewayEndpoints(gatewayUrl: string) {
+  const trimmed = gatewayUrl.trim();
+  if (/\/mapi\.php(?:\?.*)?$/i.test(trimmed)) {
+    return {
+      mapiUrl: trimmed,
+      submitUrl: trimmed.replace(/\/mapi\.php(?:\?.*)?$/i, "/submit.php")
+    };
+  }
+  if (/\/submit\.php(?:\?.*)?$/i.test(trimmed)) {
+    return {
+      submitUrl: trimmed,
+      mapiUrl: trimmed.replace(/\/submit\.php(?:\?.*)?$/i, "/mapi.php")
+    };
+  }
+  const base = trimmed.replace(/\/+$/, "");
+  return {
+    submitUrl: `${base}/submit.php`,
+    mapiUrl: `${base}/mapi.php`
+  };
+}
+
+async function requestEpayMapi(mapiUrl: string, submitParams: Record<string, string>) {
+  if (/\.example\.test\b/i.test(mapiUrl)) return { ok: false, message: "mapi skipped for test gateway" };
+  try {
+    const response = await fetch(mapiUrl, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(submitParams),
+      signal: AbortSignal.timeout(5000)
+    });
+    const rawText = await response.text();
+    const payload = parseJsonObject(rawText);
+    if (!response.ok) return { ok: false, message: `mapi http ${response.status}` };
+    if (!payload) return { ok: false, message: "mapi returned non-json response" };
+    const directAppUrl = findUrlInObject(payload, ["appurl", "app_url", "alipay_url", "alipays_url", "deeplink", "deep_link", "scheme_url", "scheme"]);
+    const cashierUrl = findUrlInObject(payload, ["payurl", "pay_url", "payment_url", "jump_url", "h5_url", "url", "checkout_url"]);
+    const qrCodeUrl = findUrlInObject(payload, ["qrcode", "qr_code", "code_url", "qrurl"]);
+    const message = stringValue(payload.msg) ?? stringValue(payload.message);
+    return {
+      ok: Boolean(directAppUrl || cashierUrl || qrCodeUrl),
+      directAppUrl,
+      cashierUrl,
+      qrCodeUrl,
+      message
+    };
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : "mapi request failed" };
+  }
+}
+
+function parseJsonObject(rawText: string) {
+  try {
+    const parsed = JSON.parse(rawText);
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function findUrlInObject(value: unknown, preferredKeys: string[], depth = 0): string | undefined {
+  if (depth > 4) return undefined;
+  if (typeof value === "string" && isPaymentNavigationUrl(value)) return value;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findUrlInObject(item, preferredKeys, depth + 1);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!isRecord(value)) return undefined;
+  for (const key of preferredKeys) {
+    const found = findUrlInObject(value[key], preferredKeys, depth + 1);
+    if (found) return found;
+  }
+  for (const nested of Object.values(value)) {
+    const found = findUrlInObject(nested, preferredKeys, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function isPaymentNavigationUrl(value: string) {
+  return /^(https?:\/\/|alipays?:\/\/|weixin:\/\/)/i.test(value);
+}
+
+function publicSiteUrl() {
+  const vercelUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined;
+  const url = process.env.TOSELL_PUBLIC_URL
+    ?? process.env.PUBLIC_SITE_URL
+    ?? process.env.PUBLIC_BASE_URL
+    ?? process.env.APP_URL
+    ?? vercelUrl
+    ?? (isProductionRuntime() ? undefined : "http://localhost:5174");
+  return required(url, "TOSELL_PUBLIC_URL").replace(/\/+$/, "");
+}
+
+function publicApiUrl() {
+  const vercelUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined;
+  const url = process.env.TOSELL_API_PUBLIC_URL
+    ?? process.env.API_PUBLIC_URL
+    ?? process.env.PUBLIC_API_URL
+    ?? process.env.API_BASE_URL
+    ?? vercelUrl
+    ?? (isProductionRuntime() ? undefined : "http://localhost:3000");
+  return required(url, "TOSELL_API_PUBLIC_URL").replace(/\/+$/, "");
+}
+
+function absoluteCallbackUrl(path: string) {
+  if (/^https?:\/\//.test(path)) return path;
+  return `${publicApiUrl()}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+function safeEqualHex(left: string, right: string) {
+  const normalizedLeft = left.toLowerCase();
+  const normalizedRight = right.toLowerCase();
+  const leftBuffer = Buffer.from(normalizedLeft, "utf8");
+  const rightBuffer = Buffer.from(normalizedRight, "utf8");
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function orderProductNameForPayment(order: DemoOrder) {
+  return String(order.snapshot.productNameSnapshot ?? order.merchantProductListingId ?? order.orderNo).slice(0, 80);
+}
+
+function productNameFromSnapshot(snapshot: unknown, fallback: string) {
+  if (isRecord(snapshot)) {
+    const name = stringValue(snapshot.name) ?? stringValue(snapshot.productName) ?? stringValue(snapshot.productNameSnapshot);
+    if (name) return name.slice(0, 80);
+  }
+  return fallback.slice(0, 80);
 }
 
 function verifyPassword(password: string, storedHash: string) {
@@ -8835,9 +13622,9 @@ function jsonValue(value: unknown): never {
   return encodeStoreValue(value ?? {}) as never;
 }
 
-function mapAgentStatus(status: string): "draft" | "pending_review" | "rejected" | "pending_deposit" | "active" | "frozen" | "disabled" | "exit_observation" | "exited" {
+function mapMerchantStatus(status: string): "draft" | "pending_review" | "rejected" | "pending_deposit" | "active" | "frozen" | "disabled" | "exit_observation" | "exited" {
   return ["draft", "pending_review", "rejected", "pending_deposit", "active", "frozen", "disabled", "exit_observation", "exited"].includes(status)
-    ? status as ReturnType<typeof mapAgentStatus>
+    ? status as ReturnType<typeof mapMerchantStatus>
     : "draft";
 }
 
@@ -8869,9 +13656,9 @@ function mapProductStatus(status: string): "draft" | "active" | "inactive" | "ri
   return ["draft", "active", "inactive", "risk_removed"].includes(status) ? status as ReturnType<typeof mapProductStatus> : "draft";
 }
 
-function mapAgentProductStatus(status: string): "draft" | "pending_review" | "rejected" | "approved" | "listed" | "delisted" | "risk_removed" {
+function mapProductListingStatus(status: string): "draft" | "pending_review" | "rejected" | "approved" | "listed" | "delisted" | "risk_removed" {
   return ["draft", "pending_review", "rejected", "approved", "listed", "delisted", "risk_removed"].includes(status)
-    ? status as ReturnType<typeof mapAgentProductStatus>
+    ? status as ReturnType<typeof mapProductListingStatus>
     : "draft";
 }
 
@@ -8945,8 +13732,8 @@ function dateValue(value: unknown): Date | undefined {
   return undefined;
 }
 
-function mapAfterSaleStatus(status: string): "pending" | "agent_processing" | "platform_intervening" | "refund_approved" | "refunding" | "refunded" | "rejected" | "cancelled" {
-  return ["pending", "agent_processing", "platform_intervening", "refund_approved", "refunding", "refunded", "rejected", "cancelled"].includes(status)
+function mapAfterSaleStatus(status: string): "pending" | "merchant_processing" | "platform_intervening" | "refund_approved" | "refunding" | "refunded" | "rejected" | "cancelled" {
+  return ["pending", "merchant_processing", "platform_intervening", "refund_approved", "refunding", "refunded", "rejected", "cancelled"].includes(status)
     ? status as ReturnType<typeof mapAfterSaleStatus>
     : "pending";
 }
@@ -8968,14 +13755,14 @@ function mapManualPayoutStatus(status: string): "pending" | "paid" | "failed" | 
     : "pending";
 }
 
-function mapActorType(status: string): "user" | "agent" | "admin" | "system" {
-  if (status === "user" || status === "agent" || status === "system") return status;
+function mapActorType(status: string): "user" | "merchant" | "admin" | "system" {
+  if (status === "user" || status === "merchant" || status === "system") return status;
   if (status === "admin" || status === "operator" || status === "finance") return "admin";
   return "system";
 }
 
-function mapLedgerEntryType(status: string): "ORDER_AGENT_INCOME_PENDING" | "ORDER_SERVICE_FEE_ACCRUAL" | "ORDER_PLATFORM_SELF_REVENUE" | "ORDER_PLATFORM_SELF_COST" | "ORDER_PAYMENT_CHANNEL_FEE" | "ORDER_FIRST_TIER_INCOME_PENDING" | "ORDER_SECOND_TIER_INCOME_PENDING" | "ORDER_THIRD_TIER_INCOME_PENDING" | "REFUND_AGENT_BEAR" | "REFUND_PLATFORM_BEAR" | "REFUND_FIRST_TIER_BEAR" | "REFUND_SECOND_TIER_BEAR" | "REFUND_THIRD_TIER_BEAR" | "SERVICE_FEE_REFUND" | "SETTLEMENT_LOCK" | "SETTLEMENT_PAYOUT" | "CLAWBACK_CREATE" | "CLAWBACK_DEDUCT_PENDING" | "CLAWBACK_DEDUCT_PAYOUT" | "CLAWBACK_DEDUCT_DEPOSIT" | "DEPOSIT_PAY" | "DEPOSIT_DEDUCT" | "DEPOSIT_REFUND" | "RISK_FREEZE" | "RISK_UNFREEZE" | "MANUAL_ADJUST" {
-  if (status === "ORDER_AGENT_INCOME_PENDING" || status === "ORDER_PLATFORM_SELF_REVENUE") return status;
+function mapLedgerEntryType(status: string): "ORDER_MERCHANT_INCOME_PENDING" | "ORDER_SERVICE_FEE_ACCRUAL" | "ORDER_PLATFORM_SELF_REVENUE" | "ORDER_PLATFORM_SELF_COST" | "ORDER_PAYMENT_CHANNEL_FEE" | "ORDER_FIRST_TIER_INCOME_PENDING" | "ORDER_SECOND_TIER_INCOME_PENDING" | "ORDER_THIRD_TIER_INCOME_PENDING" | "REFUND_MERCHANT_BEAR" | "REFUND_PLATFORM_BEAR" | "REFUND_FIRST_TIER_BEAR" | "REFUND_SECOND_TIER_BEAR" | "REFUND_THIRD_TIER_BEAR" | "SERVICE_FEE_REFUND" | "SETTLEMENT_LOCK" | "SETTLEMENT_PAYOUT" | "CLAWBACK_CREATE" | "CLAWBACK_DEDUCT_PENDING" | "CLAWBACK_DEDUCT_PAYOUT" | "CLAWBACK_DEDUCT_DEPOSIT" | "DEPOSIT_PAY" | "DEPOSIT_DEDUCT" | "DEPOSIT_REFUND" | "RISK_FREEZE" | "RISK_UNFREEZE" | "MANUAL_ADJUST" {
+  if (status === "ORDER_MERCHANT_INCOME_PENDING" || status === "ORDER_PLATFORM_SELF_REVENUE") return status;
   if (status === "DEPOSIT_CONFIRMED") return "DEPOSIT_PAY";
   if (status === "DEPOSIT_DEDUCTED") return "DEPOSIT_DEDUCT";
   if (status === "SETTLEMENT_GENERATED") return "SETTLEMENT_LOCK";
@@ -8994,7 +13781,7 @@ function mapPaymentStatus(status: string): "unpaid" | "paying" | "paid" | "faile
   return ["unpaid", "paying", "paid", "failed", "cancelled", "expired"].includes(status) ? status as ReturnType<typeof mapPaymentStatus> : "unpaid";
 }
 
-function mapPaymentProviderToDb(provider: PaymentProviderType): "alipay_merchant" | "wechat_merchant" | "epay" | "alipay_personal" {
+function mapPaymentProviderToDb(provider: PaymentProviderType): "alipay_merchant" | "wechat_merchant" | "epay" | "alipay_personal" | "wechat_personal" | "balance" {
   return provider === "personal_alipay" ? "alipay_personal" : provider;
 }
 
@@ -9004,6 +13791,11 @@ function mapPaymentProviderFromDb(provider: string): PaymentProviderType {
 
 function mapPaymentConfirmModeToDb(mode: "automatic" | "manual"): "callback_query" | "manual_confirm" {
   return mode === "manual" ? "manual_confirm" : "callback_query";
+}
+
+function mapPaymentConfirmModeToDbForProvider(provider: PaymentProviderType, mode: "automatic" | "manual"): "callback_query" | "manual_confirm" | "balance_deduct" {
+  if (provider === "balance") return "balance_deduct";
+  return mapPaymentConfirmModeToDb(mode);
 }
 
 function mapPaymentConfirmModeFromDb(mode: string): "automatic" | "manual" {
@@ -9030,15 +13822,17 @@ function mapPaymentSnapshotStatus(status: string): "unpaid" | "paying" | "paid" 
   return mapPaymentStatus(status);
 }
 
-function mapPaymentConfirmSource(source?: "callback" | "query" | "manual"): "unconfirmed" | "callback" | "query" | "manual_confirm" {
+function mapPaymentConfirmSource(source?: "callback" | "query" | "manual" | "balance"): "unconfirmed" | "callback" | "query" | "manual_confirm" | "balance" {
   if (source === "callback" || source === "query") return source;
   if (source === "manual") return "manual_confirm";
+  if (source === "balance") return "balance";
   return "unconfirmed";
 }
 
 function mapPaymentConfirmSourceFromDb(source: string): PaymentSnapshot["confirmationSource"] | undefined {
   if (source === "callback" || source === "query") return source;
   if (source === "manual_confirm") return "manual";
+  if (source === "balance") return "balance";
   return undefined;
 }
 
@@ -9074,7 +13868,90 @@ function mapPaymentExceptionReasonCodeFromDb(type: string): string {
 }
 
 function mapProviderToLegacyPaymentChannel(provider: PaymentProviderType): "wechat_h5" | "alipay_wap" {
-  return provider === "wechat_merchant" ? "wechat_h5" : "alipay_wap";
+  if (provider === "wechat_merchant" || provider === "wechat_personal") return "wechat_h5";
+  return "alipay_wap";
+}
+
+function paymentChannelForProvider(provider: PaymentProviderType): PaymentChannel {
+  if (provider === "wechat_merchant" || provider === "wechat_personal") return "wechat_h5";
+  if (provider === "epay") return "epay";
+  if (provider === "balance") return "balance";
+  return "alipay_wap";
+}
+
+function paymentChannelProvider(channel: PaymentChannel): PaymentProviderType | "wechat_miniprogram" | "wechat_h5_jsapi" | "mock" {
+  if (channel === "wechat_h5") return "wechat_merchant";
+  if (channel === "wechat_h5_jsapi") return "wechat_h5_jsapi";
+  if (channel === "wechat_miniprogram") return "wechat_miniprogram";
+  if (channel === "epay") return "epay";
+  if (channel === "balance") return "balance";
+  if (channel === "mock") return "mock";
+  return "alipay_merchant";
+}
+
+function paymentChannelDisplay(channel: PaymentChannel) {
+  if (channel === "wechat_miniprogram") return "微信小程序";
+  if (channel === "wechat_h5_jsapi") return "微信 JSAPI";
+  if (channel === "wechat_h5") return "微信商户";
+  if (channel === "alipay_wap") return "支付宝商户";
+  if (channel === "epay") return "e支付";
+  if (channel === "balance") return "余额支付";
+  return "开发模拟";
+}
+
+function isManualPaymentProvider(provider: PaymentProviderType) {
+  return provider === "personal_alipay" || provider === "wechat_personal";
+}
+
+function defaultPaymentApiMode(provider: PaymentProviderType): PaymentApiMode | undefined {
+  return provider === "epay" ? "mapi_first" : undefined;
+}
+
+function parsePaymentApiMode(value?: string | null): PaymentApiMode | undefined {
+  return value === "submit" || value === "mapi_first" ? value : undefined;
+}
+
+function paymentProviderDisplay(provider: PaymentProviderType) {
+  if (provider === "wechat_merchant") return "微信商户";
+  if (provider === "wechat_personal") return "微信个人";
+  if (provider === "alipay_merchant") return "支付宝商户";
+  if (provider === "personal_alipay") return "支付宝个人";
+  if (provider === "epay") return "e支付";
+  return "余额支付";
+}
+
+function paymentProviderPublicLabel(provider: PaymentProviderType, feeBps: number) {
+  const suffix = feeBps === 0 ? "" : `+${(feeBps / 100).toFixed(0)}%`;
+  if (provider === "balance") return "余额支付";
+  if (provider === "wechat_merchant") return `微信${suffix}（商家）`;
+  if (provider === "wechat_personal") return `微信${suffix}（个人）`;
+  if (provider === "alipay_merchant") return `支付宝${suffix}（商家）`;
+  if (provider === "personal_alipay") return `支付宝${suffix}（个人）`;
+  return `e支付${suffix}（商家）`;
+}
+
+function paymentProviderSort(provider: PaymentProviderType) {
+  return provider === "balance" ? 0 : isManualPaymentProvider(provider) ? 2 : 1;
+}
+
+function dedupePublicPaymentChannels<T extends { provider?: PaymentProviderType; id?: string; isDefault?: boolean; sortOrder?: number }>(channels: T[]) {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const channel of channels) {
+    const key = channel.provider ?? channel.id ?? "";
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(channel);
+  }
+  return result.sort((left, right) => Number(right.isDefault) - Number(left.isDefault) || (left.sortOrder ?? 0) - (right.sortOrder ?? 0));
+}
+
+function paymentDisplayTypeForProvider(provider: PaymentProviderType): PaymentDisplayType {
+  if (provider === "wechat_merchant") return "wechat_merchant_link";
+  if (provider === "wechat_personal") return "wechat_personal_qr";
+  if (provider === "epay") return "epay_link";
+  if (provider === "personal_alipay") return "alipay_personal_qr";
+  return "alipay_merchant_link";
 }
 
 function providerCallbackUrlForPersistence(provider: PaymentProviderType) {
@@ -9085,7 +13962,7 @@ function serializePaymentMethodForPersistence(method: PaymentMethodConfig) {
   return {
     id: method.id,
     ownerType: method.ownerType,
-    agentId: method.agentId,
+    merchantId: method.merchantId,
     shopId: method.shopId,
     provider: method.provider,
     confirmationMode: method.confirmationMode,
@@ -9095,9 +13972,10 @@ function serializePaymentMethodForPersistence(method: PaymentMethodConfig) {
     appIdMasked: maskSecret(method.appId),
     serviceProviderMasked: maskSecret(method.serviceProviderId),
     gatewayUrl: method.gatewayUrl,
-    accountName: method.provider === "personal_alipay" ? method.accountName : maskSecret(method.accountName),
-    qrUrl: method.provider === "personal_alipay" ? method.qrUrl : undefined,
-    paymentUrl: method.provider === "personal_alipay" ? method.paymentUrl : undefined,
+    apiMode: method.apiMode ?? defaultPaymentApiMode(method.provider),
+    accountName: isManualPaymentProvider(method.provider) ? method.accountName : maskSecret(method.accountName),
+    qrUrl: isManualPaymentProvider(method.provider) ? method.qrUrl : undefined,
+    paymentUrl: isManualPaymentProvider(method.provider) ? method.paymentUrl : undefined,
     note: method.note,
     returnUrl: method.returnUrl,
     callbackUrl: providerCallbackUrlForPersistence(method.provider),
@@ -9131,7 +14009,7 @@ function mapSettlementStatus(status: string): "pending" | "frozen" | "settleable
     : "pending";
 }
 
-function mapCollectionChannelType(type: CollectionChannelType): "wechat_qr" | "alipay_qr" | "bank_transfer" | "other" {
+function mapPaymentDisplayType(type: PaymentDisplayType): "wechat_qr" | "alipay_qr" | "bank_transfer" | "other" {
   if (type.startsWith("wechat_")) return "wechat_qr";
   if (type.startsWith("alipay_")) return "alipay_qr";
   return "other";
@@ -9151,7 +14029,7 @@ function payableAmount(order: DemoOrder) {
   return order.buyerPaidAmountCents ?? order.snapshot.amountSnapshot.paidAmountCents;
 }
 
-const PLATFORM_AGENT_ID = "platform";
+const PLATFORM_MERCHANT_ID = "platform";
 
 function getPlatformSelfGrossMargin(snapshot: DemoOrderSnapshot) {
   const amount = snapshot.amountSnapshot as { platformSelfOperatedGrossMarginCents?: bigint };
@@ -9171,6 +14049,34 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function optionalTrimmedText(value: string | undefined): string | undefined {
+  const next = value?.trim();
+  return next ? next : undefined;
+}
+
+function normalizeOptionalStringArray(value: string[] | undefined): string[] | undefined {
+  if (!value) return undefined;
+  const next = value.map((item) => item.trim()).filter(Boolean);
+  return next.length ? next : undefined;
+}
+
+function normalizeOptionalDetailSections(value: ProductDetailSection[] | undefined): ProductDetailSection[] | undefined {
+  if (!value) return undefined;
+  const next = value
+    .map((section) => ({
+      title: section.title.trim(),
+      items: section.items.map((item) => item.trim()).filter(Boolean)
+    }))
+    .filter((section) => section.title && section.items.length > 0);
+  return next.length ? next : undefined;
+}
+
+function maxBigInt(values: Array<bigint | undefined | null>): bigint {
+  return values
+    .filter((value): value is bigint => typeof value === "bigint")
+    .reduce((max, value) => value > max ? value : max, 0n);
+}
+
 function assignDefined<T extends object>(target: T, input: object) {
   const writable = target as Record<string, unknown>;
   for (const [key, value] of Object.entries(input)) {
@@ -9182,30 +14088,33 @@ function assignDefined<T extends object>(target: T, input: object) {
 function createMemoryStore(): MemoryStore {
   const store = createEmptyMemoryStore();
 
-  store.agents.set("agent-1", { id: "agent-1", userId: "agent-user-1", name: "测试代理 A", tier: "first_tier", status: "active", riskStatus: "normal", depositStatus: "paid", contactPhone: "13800000000" });
-  store.agents.set("agent-2", { id: "agent-2", userId: "agent-user-2", name: "测试代理 B", tier: "second_tier", parentAgentId: "agent-1", status: "active", riskStatus: "normal", depositStatus: "paid", contactPhone: "13900000000" });
-  store.agents.set("agent-3", { id: "agent-3", userId: "agent-user-3", name: "测试代理 C", tier: "third_tier", parentAgentId: "agent-2", status: "active", riskStatus: "normal", depositStatus: "paid", contactPhone: "13700000000" });
-  store.agents.set("agent-new", { id: "agent-new", userId: "agent-user-new", name: "新代理", tier: "first_tier", status: "draft", riskStatus: "normal", depositStatus: "pending_payment" });
+  store.merchants.set("merchant-1", { id: "merchant-1", userId: "merchant-user-1", name: "测试代理 A", tier: "first_tier", status: "active", riskStatus: "normal", depositStatus: "paid", contactPhone: "13800000000" });
+  store.merchants.set("merchant-2", { id: "merchant-2", userId: "merchant-user-2", name: "测试代理 B", tier: "second_tier", parentMerchantId: "merchant-1", status: "active", riskStatus: "normal", depositStatus: "paid", contactPhone: "13900000000" });
+  store.merchants.set("merchant-3", { id: "merchant-3", userId: "merchant-user-3", name: "测试代理 C", tier: "third_tier", parentMerchantId: "merchant-2", status: "active", riskStatus: "normal", depositStatus: "paid", contactPhone: "13700000000" });
+  store.merchants.set("merchant-new", { id: "merchant-new", userId: "merchant-user-new", name: "新代理", tier: "first_tier", status: "draft", riskStatus: "normal", depositStatus: "pending_payment" });
   store.shops.set("shop-1", {
     id: "shop-1",
-    agentId: "agent-1",
+    merchantId: "merchant-1",
     name: virtualShopSeed.name,
     status: "open",
     riskStatus: "normal",
     announcement: virtualShopSeed.announcement,
     customerServiceWechat: virtualShopSeed.customerServiceWechat,
-    customerServiceQrUrl: "https://example.test/qr-agent-a.png",
+    customerServiceQrUrl: "https://example.test/qr-merchant-a.png",
     collectionAccountName: virtualShopSeed.collectionAccountName,
-    collectionQrUrl: "https://example.test/pay-agent-a.png",
+    collectionQrUrl: "https://example.test/pay-merchant-a.png",
     collectionNote: virtualShopSeed.collectionNote,
     themeColor: virtualShopSeed.themeColor,
     bannerUrl: virtualShopSeed.bannerUrl,
     shareTitle: virtualShopSeed.shareTitle,
-    productGroups: virtualShopSeed.productGroups
+    productGroups: virtualShopSeed.productGroups.map((group) => ({
+      name: group.name,
+      merchantProductListingIds: group.merchantListingSeedIds
+    }))
   });
-  store.shops.set("shop-2", { id: "shop-2", agentId: "agent-2", ownerType: "agent", name: "测试代理 B 小店", status: "open", riskStatus: "normal", customerServiceWechat: "agent_b_service", customerServiceQrUrl: "https://example.test/qr-agent-b.png", collectionAccountName: "测试代理B人工收款", collectionQrUrl: "https://example.test/pay-agent-b.png", collectionNote: "二级店铺人工收款码" });
-  store.shops.set("shop-3", { id: "shop-3", agentId: "agent-3", ownerType: "agent", name: "测试代理 C 小店", status: "open", riskStatus: "normal", customerServiceWechat: "agent_c_service", customerServiceQrUrl: "https://example.test/qr-agent-c.png", collectionAccountName: "测试代理C人工收款", collectionQrUrl: "https://example.test/pay-agent-c.png", collectionNote: "三级店铺人工收款码" });
-  store.shops.set("shop-new", { id: "shop-new", agentId: "agent-new", name: "新代理小店", status: "not_opened", riskStatus: "normal" });
+  store.shops.set("shop-2", { id: "shop-2", merchantId: "merchant-2", ownerType: "merchant", name: "测试代理 B 小店", status: "open", riskStatus: "normal", customerServiceWechat: "merchant_b_service", customerServiceQrUrl: "https://example.test/qr-merchant-b.png", collectionAccountName: "测试代理B人工收款", collectionQrUrl: "https://example.test/pay-merchant-b.png", collectionNote: "二级店铺人工收款码" });
+  store.shops.set("shop-3", { id: "shop-3", merchantId: "merchant-3", ownerType: "merchant", name: "测试代理 C 小店", status: "open", riskStatus: "normal", customerServiceWechat: "merchant_c_service", customerServiceQrUrl: "https://example.test/qr-merchant-c.png", collectionAccountName: "测试代理C人工收款", collectionQrUrl: "https://example.test/pay-merchant-c.png", collectionNote: "三级店铺人工收款码" });
+  store.shops.set("shop-new", { id: "shop-new", merchantId: "merchant-new", name: "新代理小店", status: "not_opened", riskStatus: "normal" });
   store.shops.set("shop-platform", {
     id: "shop-platform",
     ownerType: "platform",
@@ -9221,64 +14130,77 @@ function createMemoryStore(): MemoryStore {
     themeColor: "#0f5f6f",
     bannerUrl: "https://example.test/banner-platform.png",
     shareTitle: "ToSell 官方权益精选",
-    productGroups: [{ name: "官方精选", agentProductIds: ["psp-1", "psp-code"] }]
+    productGroups: [{ name: "官方精选", merchantProductListingIds: ["psp-1", "psp-code"] }]
   });
-  seedCollectionChannel(store, {
+  seedPaymentMethod(store, {
     id: "collection-shop-1",
     shopId: "shop-1",
-    agentId: "agent-1",
-    ownerType: "agent",
-    channelType: "alipay_personal_qr",
+    merchantId: "merchant-1",
+    ownerType: "merchant",
+    provider: "personal_alipay",
     displayName: "支付宝个人收款码",
     accountName: virtualShopSeed.collectionAccountName,
-    qrUrl: "https://example.test/pay-agent-a.png",
+    qrUrl: "https://example.test/pay-merchant-a.png",
     isDefault: true,
     sortOrder: 10
   });
-  seedCollectionChannel(store, {
+  seedPaymentMethod(store, {
     id: "collection-shop-2",
     shopId: "shop-2",
-    agentId: "agent-2",
-    ownerType: "agent",
-    channelType: "wechat_personal_qr",
+    merchantId: "merchant-2",
+    ownerType: "merchant",
+    provider: "wechat_personal",
     displayName: "微信个人收款码",
     accountName: "测试代理B人工收款",
-    qrUrl: "https://example.test/pay-agent-b.png",
+    qrUrl: "https://example.test/pay-merchant-b.png",
     isDefault: true,
     sortOrder: 10
   });
-  seedCollectionChannel(store, {
+  seedPaymentMethod(store, {
     id: "collection-shop-3",
     shopId: "shop-3",
-    agentId: "agent-3",
-    ownerType: "agent",
-    channelType: "alipay_personal_qr",
+    merchantId: "merchant-3",
+    ownerType: "merchant",
+    provider: "personal_alipay",
     displayName: "支付宝个人收款码",
     accountName: "测试代理C人工收款",
-    qrUrl: "https://example.test/pay-agent-c.png",
+    qrUrl: "https://example.test/pay-merchant-c.png",
     isDefault: true,
     sortOrder: 10
   });
-  seedCollectionChannel(store, {
-    id: "collection-platform",
+  seedPaymentMethod(store, {
+    id: "collection-platform-personal-alipay",
     shopId: "shop-platform",
     ownerType: "platform",
-    channelType: "alipay_merchant_qr",
-    displayName: "平台自营支付宝收款",
+    provider: "personal_alipay",
+    displayName: "平台个人支付宝",
     accountName: "ToSell 平台自营人工收款",
     qrUrl: "https://example.test/pay-platform.png",
     isDefault: true,
     sortOrder: 10
   });
+  seedPaymentMethod(store, {
+    id: "collection-platform-epay",
+    shopId: "shop-platform",
+    ownerType: "platform",
+    provider: "epay",
+    displayName: "平台 e支付",
+    merchantNo: "10783",
+    gatewayUrl: "https://xpay.uumua.com/xpay/epay/",
+    signingSecret: "dev-epay-signing-secret",
+    apiMode: "submit",
+    isDefault: false,
+    sortOrder: 20
+  });
   seedMemoryCatalog(store);
-  store.notifications.push({ id: "notice-1", agentId: "agent-1", type: "system", title: "V2 经营工具已开启", content: "可以使用店铺装修、批量选品、权益码自动履约和经营看板。", createdAt: new Date(), readAt: null });
-  store.depositAccounts.set("agent-1", { agentId: "agent-1", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
-  store.depositAccounts.set("agent-2", { agentId: "agent-2", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
-  store.depositAccounts.set("agent-3", { agentId: "agent-3", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
-  store.depositAccounts.set("agent-new", { agentId: "agent-new", requiredAmountCents: 50_000n, availableAmountCents: 0n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "pending_payment" });
-  store.channelAuthorizations.push({ id: "channel-auth-1", firstTierAgentId: "agent-1", status: "active", reason: null, reviewedAt: new Date() });
-  store.channelRelations.push({ id: "channel-rel-1", firstTierAgentId: "agent-1", secondTierAgentId: "agent-2", status: "active", reason: null, reviewedAt: new Date(), activeUniqueKey: "second-tier:agent-2" });
-  store.channelRelations.push({ id: "channel-rel-2", firstTierAgentId: "agent-1", secondTierAgentId: "agent-2", thirdTierAgentId: "agent-3", status: "active", reason: null, reviewedAt: new Date(), activeUniqueKey: "third-tier:agent-3" });
+  store.notifications.push({ id: "notice-1", merchantId: "merchant-1", type: "system", title: "V2 经营工具已开启", content: "可以使用店铺装修、批量选品、权益码自动履约和经营看板。", createdAt: new Date(), readAt: null });
+  store.depositAccounts.set("merchant-1", { merchantId: "merchant-1", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
+  store.depositAccounts.set("merchant-2", { merchantId: "merchant-2", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
+  store.depositAccounts.set("merchant-3", { merchantId: "merchant-3", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
+  store.depositAccounts.set("merchant-new", { merchantId: "merchant-new", requiredAmountCents: 50_000n, availableAmountCents: 0n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "pending_payment" });
+  store.channelAuthorizations.push({ id: "channel-auth-1", firstTierMerchantId: "merchant-1", status: "active", reason: null, reviewedAt: new Date() });
+  store.channelRelations.push({ id: "channel-rel-1", firstTierMerchantId: "merchant-1", secondTierMerchantId: "merchant-2", status: "active", reason: null, reviewedAt: new Date(), activeUniqueKey: "second-tier:merchant-2" });
+  store.channelRelations.push({ id: "channel-rel-2", firstTierMerchantId: "merchant-1", secondTierMerchantId: "merchant-2", thirdTierMerchantId: "merchant-3", status: "active", reason: null, reviewedAt: new Date(), activeUniqueKey: "third-tier:merchant-3" });
   store.channelProductOffers.push({ id: "channel-offer-1", channelRelationId: "channel-rel-1", platformProductId: "prod-1", resellSupplyPriceCents: 11_000n, status: "listed" });
   store.channelProductOffers.push({ id: "channel-offer-2", channelRelationId: "channel-rel-2", platformProductId: "prod-1", resellSupplyPriceCents: 13_000n, status: "listed" });
   store.couponTemplates.set("coupon-first-register", {
@@ -9299,7 +14221,7 @@ function createMemoryStore(): MemoryStore {
     status: "active",
     maxUses: null,
     usedCount: 0,
-    depositRequiredAmountCents: store.depositAccounts.get("agent-1")?.requiredAmountCents,
+    depositRequiredAmountCents: store.depositAccounts.get("merchant-1")?.requiredAmountCents,
     expiresAt: null,
     createdBy: "seed",
     createdAt: new Date()
@@ -9311,13 +14233,13 @@ function createMemoryStore(): MemoryStore {
 function createEmptyMemoryStore(): MemoryStore {
   return {
     sequence: 0,
-    agentApplications: new Map(),
-    agents: new Map(),
+    merchantApplications: new Map(),
+    merchants: new Map(),
     shops: new Map(),
     platformProducts: new Map(),
     platformShopProducts: new Map(),
     ownProducts: new Map(),
-    agentProducts: new Map(),
+    merchantProductListings: new Map(),
     depositAccounts: new Map(),
     depositTransactions: [],
     orders: new Map(),
@@ -9341,33 +14263,46 @@ function createEmptyMemoryStore(): MemoryStore {
     couponTemplates: new Map(),
     userCoupons: new Map(),
     inviteCodes: new Map(),
-    collectionChannels: new Map(),
-    paymentMethods: new Map(),
+        paymentMethods: new Map(),
     paymentCallbackLogs: [],
     paymentExceptions: [],
     extractLogs: [],
     emailDeliveries: [],
+    serviceFeeConfig: {
+      id: "service-fee-default",
+      enabled: true,
+      feeBps: 50,
+      basisType: "final_sale_price",
+      status: "active",
+      updatedAt: new Date()
+    },
+    userWallets: new Map(),
+    walletRecharges: new Map(),
+    walletHolds: new Map(),
+    walletTransactions: [],
     paymentChannelConfigs: [
-      { channel: "mock", enabled: true, feeBps: 50, fixedFeeCents: 0n, statusNote: "dev_only", updatedAt: new Date() },
-      { channel: "wechat_miniprogram", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
-      { channel: "wechat_h5_jsapi", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
-      { channel: "wechat_h5", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
-      { channel: "alipay_wap", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "alipay_account_required", updatedAt: new Date() }
+      { channel: "mock", enabled: true, feeBps: 100, fixedFeeCents: 0n, statusNote: "dev_only", updatedAt: new Date() },
+      { channel: "wechat_miniprogram", enabled: false, feeBps: 100, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
+      { channel: "wechat_h5_jsapi", enabled: false, feeBps: 100, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
+      { channel: "wechat_h5", enabled: false, feeBps: 100, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
+      { channel: "alipay_wap", enabled: false, feeBps: 100, fixedFeeCents: 0n, statusNote: "alipay_account_required", updatedAt: new Date() },
+      { channel: "epay", enabled: false, feeBps: 100, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
+      { channel: "balance", enabled: true, feeBps: 0, fixedFeeCents: 0n, statusNote: "wallet_balance_ready", updatedAt: new Date() }
     ],
-    pendingIncomeByAgent: new Map(),
-    payableIncomeByAgent: new Map(),
-    paidIncomeByAgent: new Map()
+    pendingIncomeByMerchant: new Map(),
+    payableIncomeByMerchant: new Map(),
+    paidIncomeByMerchant: new Map()
   };
 }
 
 const storeMapKeys = [
-  "agentApplications",
-  "agents",
+  "merchantApplications",
+  "merchants",
   "shops",
   "platformProducts",
   "platformShopProducts",
   "ownProducts",
-  "agentProducts",
+  "merchantProductListings",
   "depositAccounts",
   "orders",
   "afterSales",
@@ -9377,8 +14312,10 @@ const storeMapKeys = [
   "couponTemplates",
   "userCoupons",
   "inviteCodes",
-  "collectionChannels",
-  "paymentMethods"
+  "paymentMethods",
+  "userWallets",
+  "walletRecharges",
+  "walletHolds"
 ] as const;
 
 const storeSetKeys = ["settlementItemKeys", "activeRiskFreezeKeys"] as const;
@@ -9408,9 +14345,9 @@ function serializeMemoryStore(store: MemoryStore) {
   for (const key of storeMapKeys) output[key] = [...store[key].entries()];
   for (const key of storeSetKeys) output[key] = [...store[key].values()];
   for (const key of storeArrayKeys) output[key] = store[key];
-  output.pendingIncomeByAgent = [...store.pendingIncomeByAgent.entries()];
-  output.payableIncomeByAgent = [...store.payableIncomeByAgent.entries()];
-  output.paidIncomeByAgent = [...store.paidIncomeByAgent.entries()];
+  output.pendingIncomeByMerchant = [...store.pendingIncomeByMerchant.entries()];
+  output.payableIncomeByMerchant = [...store.payableIncomeByMerchant.entries()];
+  output.paidIncomeByMerchant = [...store.paidIncomeByMerchant.entries()];
   return encodeStoreValue(output);
 }
 
@@ -9429,9 +14366,9 @@ function hydrateMemoryStore(snapshot: unknown): MemoryStore {
   for (const key of storeArrayKeys) {
     store[key] = (Array.isArray(decoded[key]) ? decoded[key] : []) as never;
   }
-  store.pendingIncomeByAgent = new Map(Array.isArray(decoded.pendingIncomeByAgent) ? decoded.pendingIncomeByAgent as Array<[string, bigint]> : []);
-  store.payableIncomeByAgent = new Map(Array.isArray(decoded.payableIncomeByAgent) ? decoded.payableIncomeByAgent as Array<[string, bigint]> : []);
-  store.paidIncomeByAgent = new Map(Array.isArray(decoded.paidIncomeByAgent) ? decoded.paidIncomeByAgent as Array<[string, bigint]> : []);
+  store.pendingIncomeByMerchant = new Map(Array.isArray(decoded.pendingIncomeByMerchant) ? decoded.pendingIncomeByMerchant as Array<[string, bigint]> : []);
+  store.payableIncomeByMerchant = new Map(Array.isArray(decoded.payableIncomeByMerchant) ? decoded.payableIncomeByMerchant as Array<[string, bigint]> : []);
+  store.paidIncomeByMerchant = new Map(Array.isArray(decoded.paidIncomeByMerchant) ? decoded.paidIncomeByMerchant as Array<[string, bigint]> : []);
   return store;
 }
 
@@ -9455,25 +14392,46 @@ function decodeStoreValue(value: unknown): unknown {
   return value;
 }
 
-function seedCollectionChannel(store: MemoryStore, input: {
+function seedPaymentMethod(store: MemoryStore, input: {
   id: string;
   shopId: string;
-  agentId?: string;
-  ownerType: "platform" | "agent";
-  channelType: CollectionChannelType;
+  merchantId?: string;
+  ownerType: "platform" | "merchant";
+  provider: PaymentProviderType;
   displayName: string;
+  merchantNo?: string;
+  appId?: string;
+  serviceProviderId?: string;
+  gatewayUrl?: string;
+  signingSecret?: string;
+  apiMode?: PaymentApiMode;
   accountName?: string;
   qrUrl?: string;
   paymentUrl?: string;
   isDefault: boolean;
   sortOrder: number;
 }) {
-  store.collectionChannels.set(input.id, {
-    ...input,
-    status: "active",
-    reviewStatus: "approved",
-    reviewedBy: "seed",
-    reviewedAt: new Date(),
+  store.paymentMethods.set(input.id, {
+    id: input.id,
+    ownerType: input.ownerType,
+    merchantId: input.merchantId,
+    shopId: input.shopId,
+    provider: input.provider,
+    confirmationMode: isManualPaymentProvider(input.provider) ? "manual" : "automatic",
+    displayName: input.displayName,
+    merchantNo: input.merchantNo,
+    appId: input.appId,
+    serviceProviderId: input.serviceProviderId,
+    gatewayUrl: input.gatewayUrl,
+    signingSecret: input.signingSecret,
+    apiMode: input.apiMode,
+    accountName: input.accountName,
+    qrUrl: input.qrUrl,
+    paymentUrl: input.paymentUrl,
+    enabled: true,
+    status: "enabled",
+    isDefault: input.isDefault,
+    secretConfigured: isManualPaymentProvider(input.provider) ? false : Boolean(input.signingSecret) || input.provider !== "epay",
     createdAt: new Date(),
     updatedAt: new Date()
   });
@@ -9515,14 +14473,14 @@ function seedMemoryCatalog(store: MemoryStore) {
         groupName: "官方精选"
       });
     }
-    store.agentProducts.set(item.agentProductId, {
-      id: item.agentProductId,
-      agentId: "agent-1",
+    store.merchantProductListings.set(item.merchantListingSeedId, {
+      id: item.merchantListingSeedId,
+      merchantId: "merchant-1",
       shopId: "shop-1",
       productType: "platform",
       platformProductId: item.demoId,
       ownProductReviewId: null,
-      salePriceCents: item.agentSalePriceCents,
+      salePriceCents: item.merchantSalePriceCents,
       status: "listed",
       groupName: item.groupName
     });
@@ -9538,8 +14496,8 @@ function seedMemoryCatalog(store: MemoryStore) {
       });
     }
   }
-  store.agentProducts.set("ap-2", { id: "ap-2", agentId: "agent-2", shopId: "shop-2", productType: "platform", platformProductId: "prod-1", ownProductReviewId: null, salePriceCents: 16_000n, status: "listed" });
-  store.agentProducts.set("ap-3", { id: "ap-3", agentId: "agent-3", shopId: "shop-3", productType: "platform", platformProductId: "prod-1", ownProductReviewId: null, salePriceCents: 15_000n, status: "listed" });
+  store.merchantProductListings.set("ap-2", { id: "ap-2", merchantId: "merchant-2", shopId: "shop-2", productType: "platform", platformProductId: "prod-1", ownProductReviewId: null, salePriceCents: 16_000n, status: "listed" });
+  store.merchantProductListings.set("ap-3", { id: "ap-3", merchantId: "merchant-3", shopId: "shop-3", productType: "platform", platformProductId: "prod-1", ownProductReviewId: null, salePriceCents: 15_000n, status: "listed" });
 }
 
 function requireEntity<T>(value: T | undefined, code: string, message: string): T {
@@ -9568,37 +14526,37 @@ function getErrorMessage(error: unknown) {
 export type RefundAllocationRequest = {
   paidAmountCents: bigint;
   supplyAmountCents: bigint;
-  agentIncomeCents: bigint;
+  merchantIncomeCents: bigint;
   alreadyRefundedCents?: bigint;
   refundAmountCents: bigint;
   responsibility: RefundResponsibility;
   platformBearCents?: bigint;
-  agentBearCents?: bigint;
-  serviceFeeBearer?: "platform" | "agent" | "mixed" | "none";
+  merchantBearCents?: bigint;
+  serviceFeeBearer?: "platform" | "merchant" | "mixed" | "none";
 };
 
-type AgentApplication = {
+type MerchantApplication = {
   applicationNo: string;
-  agentId: string;
+  merchantId: string;
   userId: string;
   status: string;
   contactPhone: string;
   customerServiceWechat: string;
   inviteCode?: string;
   inviteCodeId?: string;
-  targetTier?: AgentTier;
-  parentAgentId?: string;
+  targetTier?: MerchantTier;
+  parentMerchantId?: string;
 };
 
-type AgentTier = "first_tier" | "second_tier" | "third_tier";
+type MerchantTier = "first_tier" | "second_tier" | "third_tier";
 
-type DemoAgent = {
+type DemoMerchant = {
   id: string;
   userId: string;
   name: string;
   contactPhone?: string;
-  tier?: AgentTier;
-  parentAgentId?: string;
+  tier?: MerchantTier;
+  parentMerchantId?: string;
   status: string;
   riskStatus: string;
   depositStatus: string;
@@ -9610,8 +14568,10 @@ type DemoAgent = {
 
 type DemoShop = {
   id: string;
-  ownerType?: "platform" | "agent";
-  agentId?: string;
+  ownerType?: "platform" | "merchant";
+  merchantId?: string;
+  shopNo?: string;
+  sharePath?: string;
   name: string;
   status: string;
   riskStatus: string;
@@ -9628,7 +14588,30 @@ type DemoShop = {
   bannerUrl?: string;
   shareTitle?: string;
   createdByAdminId?: string;
-  productGroups?: Array<{ name: string; agentProductIds: string[] }>;
+  productGroups?: Array<{ name: string; merchantProductListingIds: string[] }>;
+};
+
+type PublicShopRow = {
+  id: string;
+  owner_type: "platform" | "merchant";
+  merchant_id: string | null;
+  shop_no: string;
+  name: string;
+  share_path: string;
+  status: string;
+  risk_status: string;
+  announcement: string | null;
+  customer_service_wechat: string | null;
+  customer_service_qr_url: string | null;
+  customer_service_qq: string | null;
+  customer_service_qq_qr_url: string | null;
+  customer_service_note: string | null;
+  collection_account_name: string | null;
+  collection_qr_url: string | null;
+  collection_note: string | null;
+  theme_color: string | null;
+  banner_url: string | null;
+  share_title: string | null;
 };
 
 type DemoPlatformProduct = {
@@ -9657,7 +14640,7 @@ type DemoPlatformProduct = {
 
 type DemoOwnProduct = {
   id: string;
-  agentId: string;
+  merchantId: string;
   shopId: string;
   name: string;
   category?: string;
@@ -9685,22 +14668,54 @@ type ProductDetailSection = {
   items: string[];
 };
 
-type DemoAgentProduct = {
+type MerchantProductListingDisplayOverrideInput = {
+  displayName?: string;
+  displaySubtitle?: string;
+  displayDescription?: string;
+  displayUsageGuide?: string;
+  displayImageUrl?: string;
+  displayCategory?: string;
+  displayTags?: string[];
+  displaySpecs?: string[];
+  displayDetailSections?: ProductDetailSection[];
+};
+
+type MerchantProductListingSelectionInput = MerchantProductListingDisplayOverrideInput & {
+  platformProductId: string;
+  salePriceCents: bigint;
+};
+
+type MerchantProductListingDetailUpdateInput = MerchantProductListingDisplayOverrideInput & {
+  salePriceCents?: bigint;
+  status?: string;
+};
+
+type DemoMerchantProductListing = {
   id: string;
-  agentId: string;
+  merchantId: string;
   shopId: string;
-  productType: "platform" | "agent_owned";
+  productType: "platform" | "merchant_owned";
   platformProductId?: string | null;
   ownProductReviewId?: string | null;
   salePriceCents: bigint;
+  displayName?: string;
+  displaySubtitle?: string;
+  displayDescription?: string;
+  displayUsageGuide?: string;
+  displayImageUrl?: string;
+  displayCategory?: string;
+  displayTags?: string[];
+  displaySpecs?: string[];
+  displayDetailSections?: ProductDetailSection[];
   status: string;
   groupName?: string;
 };
 
-type SalesChannelType = "platform_self_operated" | "single_agent" | "two_tier" | "three_tier";
-type PaymentChannel = "wechat_miniprogram" | "wechat_h5_jsapi" | "wechat_h5" | "alipay_wap" | "mock";
-type PaymentProviderType = "alipay_merchant" | "wechat_merchant" | "epay" | "personal_alipay";
-type CollectionChannelType =
+type SalesChannelType = "platform_self_operated" | "single_merchant" | "two_tier" | "three_tier";
+type PaymentChannel = "wechat_miniprogram" | "wechat_h5_jsapi" | "wechat_h5" | "alipay_wap" | "epay" | "balance" | "mock";
+type PaymentProviderType = "alipay_merchant" | "wechat_merchant" | "epay" | "personal_alipay" | "wechat_personal" | "balance";
+type PaymentApiMode = "mapi_first" | "submit";
+type PaymentDisplayType =
   | "alipay_personal_qr"
   | "alipay_merchant_qr"
   | "alipay_merchant_link"
@@ -9721,6 +14736,15 @@ type DemoPlatformShopProduct = {
 };
 
 type DemoOrderSnapshot = ReturnType<typeof buildOrderSnapshot> | PlatformSelfOperatedSnapshot;
+type DemoAmountSnapshot = DemoOrderSnapshot["amountSnapshot"] & {
+  serviceFeeEnabled?: boolean;
+  serviceFeeBasisAmountCents?: bigint;
+  serviceFeeConfigSnapshot?: unknown;
+  paymentFeeBps?: bigint;
+  paymentFeeCents?: bigint;
+  balancePaidCents?: bigint;
+  externalPaidCents?: bigint;
+};
 
 type PlatformSelfOperatedSnapshot = Omit<ReturnType<typeof buildOrderSnapshot>, "salesChannelType" | "amountSnapshot" | "shopSnapshot"> & {
   salesChannelType: "platform_self_operated";
@@ -9751,9 +14775,9 @@ type PlatformSelfOperatedSnapshot = Omit<ReturnType<typeof buildOrderSnapshot>, 
 type DemoOrder = {
   orderNo: string;
   userId: string;
-  agentId: string;
+  merchantId: string;
   shopId: string;
-  agentProductId: string;
+  merchantProductListingId: string;
   salesChannelType: SalesChannelType;
   status: string;
   paymentStatus: string;
@@ -9765,6 +14789,7 @@ type DemoOrder = {
   fulfilledAt: Date | null;
   paidAt: Date | null;
   buyerEmail?: string;
+  buyerPhone?: string;
   extractionCodeSet?: boolean;
   extractionCodeHash?: string;
   extractionAttemptCount?: number;
@@ -9772,18 +14797,95 @@ type DemoOrder = {
   couponId?: string;
   couponDiscountCents?: bigint;
   buyerPaidAmountCents?: bigint;
-  collectionChannelId?: string;
-  collectionChannelSnapshot?: CollectionChannelPublicSnapshot;
+  collectionPaymentConfigId?: string;
+  collectionPaymentSnapshot?: PaymentMethodPublicSnapshot;
+  preferredPaymentMethodId?: string;
   paymentSnapshot?: PaymentSnapshot;
   refundedAmountCents: bigint;
   snapshot: DemoOrderSnapshot;
+};
+
+type PlatformServiceFeeConfig = {
+  id: string;
+  enabled: boolean;
+  feeBps: number;
+  basisType: "final_sale_price" | "paid_amount";
+  status: "active" | "disabled";
+  updatedAt: Date;
+  updatedBy?: string;
+};
+
+type UserWalletState = {
+  id: string;
+  userId: string;
+  walletNo: string;
+  availableBalanceCents: bigint;
+  frozenBalanceCents: bigint;
+  totalRechargeCents: bigint;
+  totalSpendCents: bigint;
+  status: "active" | "frozen" | "disabled";
+  version: number;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+type WalletRecharge = {
+  rechargeNo: string;
+  userId: string;
+  walletId: string;
+  paymentMethodId?: string;
+  provider: PaymentProviderType;
+  confirmationMode: "automatic" | "manual";
+  rechargeCents: bigint;
+  feeBps: number;
+  feeCents: bigint;
+  payableCents: bigint;
+  status: "pending_payment" | "paid" | "failed" | "cancelled" | "expired";
+  paidAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+  idempotencyKey: string;
+};
+
+type WalletPaymentHold = {
+  holdNo: string;
+  userId: string;
+  walletId: string;
+  orderNo: string;
+  paymentNo?: string;
+  amountCents: bigint;
+  status: "active" | "captured" | "released" | "expired" | "cancelled";
+  capturedAt?: Date;
+  idempotencyKey: string;
+};
+
+type WalletTransactionState = {
+  transactionNo: string;
+  userId: string;
+  walletId: string;
+  type: "recharge" | "payment_hold" | "payment_capture" | "payment_release" | "refund" | "adjustment";
+  direction: "credit" | "debit";
+  amountCents: bigint;
+  balanceBeforeCents: bigint;
+  balanceAfterCents: bigint;
+  frozenBeforeCents: bigint;
+  frozenAfterCents: bigint;
+  sourceType: string;
+  sourceId: string;
+  orderNo?: string;
+  paymentNo?: string;
+  rechargeNo?: string;
+  holdNo?: string;
+  note?: string;
+  idempotencyKey: string;
+  createdAt: Date;
 };
 
 type DemoAfterSale = {
   afterSaleNo: string;
   orderNo: string;
   userId: string;
-  agentId: string;
+  merchantId: string;
   shopId: string;
   status: string;
   reasonCode: string;
@@ -9797,7 +14899,7 @@ type DemoRefund = {
   afterSaleNo: string;
   orderNo: string;
   amountCents: bigint;
-  agentClawbackCents: bigint;
+  merchantClawbackCents: bigint;
   wasSettled: boolean;
   pendingIncomeDeductedCents?: bigint;
   channelRefundNo?: string;
@@ -9809,7 +14911,7 @@ type DemoRefund = {
 
 type DepositTransaction = {
   transactionNo: string;
-  agentId: string;
+  merchantId: string;
   type: string;
   amountCents: bigint;
   balanceBeforeCents: bigint;
@@ -9825,25 +14927,25 @@ type DepositTransaction = {
 
 type SettlementSheet = {
   settlementNo: string;
-  agentId: string;
+  merchantId: string;
   idempotencyKey: string;
   status: string;
   items: Array<ReturnType<typeof buildSettlementItems>[number] & { settlementRole?: string }>;
   totalOrderCount: number;
   totalPaidCents: bigint;
   totalServiceFeeCents: bigint;
-  totalAgentIncomeCents: bigint;
+  totalMerchantIncomeCents: bigint;
 };
 
 type SettlementCandidateDraft = Parameters<typeof buildSettlementItems>[0][number];
 
 type ChannelSnapshot = {
   relationId: string;
-  firstTierAgentId: string;
+  firstTierMerchantId: string;
   firstTierShopId: string;
-  secondTierAgentId: string;
+  secondTierMerchantId: string;
   secondTierShopId: string;
-  thirdTierAgentId?: string;
+  thirdTierMerchantId?: string;
   thirdTierShopId?: string;
   platformSupplyPriceCents: bigint;
   resellSupplyPriceCents: bigint;
@@ -9859,7 +14961,7 @@ type LedgerEntry = {
   ledgerNo: string;
   entryType: string;
   orderNo?: string;
-  agentId?: string;
+  merchantId?: string;
   amountCents: bigint;
   metadata: unknown;
   createdAt: Date;
@@ -9869,10 +14971,10 @@ type RightsCode = {
   codeId: string;
   productId: string;
   platformProductId?: string;
-  agentProductId?: string;
+  merchantProductListingId?: string;
   code: string;
   batchNo: string;
-  status: "available" | "issued" | "voided";
+  status: "available" | "locked" | "issued" | "voided";
   orderNo?: string;
   issueKey?: string;
   createdAt: Date;
@@ -9914,7 +15016,7 @@ type EmailDelivery = {
 
 type NotificationItem = {
   id: string;
-  agentId: string;
+  merchantId: string;
   type: string;
   title: string;
   content: string;
@@ -9924,7 +15026,7 @@ type NotificationItem = {
 
 type ChannelAuthorization = {
   id: string;
-  firstTierAgentId: string;
+  firstTierMerchantId: string;
   status: string;
   reason: string | null;
   reviewedAt: Date | null;
@@ -9932,9 +15034,9 @@ type ChannelAuthorization = {
 
 type ChannelRelation = {
   id: string;
-  firstTierAgentId: string;
-  secondTierAgentId: string;
-  thirdTierAgentId?: string;
+  firstTierMerchantId: string;
+  secondTierMerchantId: string;
+  thirdTierMerchantId?: string;
   status: string;
   reason: string | null;
   reviewedAt: Date | null;
@@ -9960,8 +15062,8 @@ type PaymentChannelConfig = {
 
 type PaymentMethodConfig = {
   id: string;
-  ownerType: "platform" | "agent";
-  agentId?: string;
+  ownerType: "platform" | "merchant";
+  merchantId?: string;
   shopId?: string;
   provider: PaymentProviderType;
   confirmationMode: "automatic" | "manual";
@@ -9971,6 +15073,7 @@ type PaymentMethodConfig = {
   appId?: string;
   serviceProviderId?: string;
   gatewayUrl?: string;
+  apiMode?: PaymentApiMode;
   accountName?: string;
   qrUrl?: string;
   paymentUrl?: string;
@@ -9979,6 +15082,7 @@ type PaymentMethodConfig = {
   enabled: boolean;
   status: "pending_test" | "enabled" | "disabled" | "paused";
   isDefault: boolean;
+  signingSecret?: string;
   signingSecretEncrypted?: string;
   signingSecretHash?: string;
   signingSecretPreview?: string;
@@ -10012,13 +15116,16 @@ type PaymentSnapshot = {
   merchantNoMasked?: string;
   appIdMasked?: string;
   serviceProviderMasked?: string;
+  baseAmountCents?: bigint;
+  feeBps?: number;
+  feeCents?: bigint;
   amountCents?: bigint;
   currency?: string;
   orderNo?: string;
   providerPaymentNo?: string;
   providerTradeNo?: string;
   status?: string;
-  confirmationSource?: "callback" | "query" | "manual";
+  confirmationSource?: "callback" | "query" | "manual" | "balance";
   expiresAt?: Date;
   createdAt?: Date;
   paidAt?: Date;
@@ -10060,34 +15167,11 @@ type PaymentCallbackLog = {
   exceptionId?: string;
 };
 
-type CollectionChannel = {
+type PaymentMethodPublicSnapshot = {
   id: string;
   shopId: string;
-  agentId?: string;
-  ownerType: "platform" | "agent";
-  channelType: CollectionChannelType;
-  displayName: string;
-  accountName?: string;
-  qrUrl?: string;
-  paymentUrl?: string;
-  status: "pending_review" | "active" | "disabled" | "rejected";
-  reviewStatus: "pending_review" | "approved" | "rejected";
-  reviewedBy: string | null;
-  reviewedAt: Date | null;
-  rejectReason?: string;
-  isDefault: boolean;
-  sortOrder: number;
-  dailyLimitCents?: bigint;
-  singleOrderLimitCents?: bigint;
-  createdAt: Date;
-  updatedAt: Date;
-};
-
-type CollectionChannelPublicSnapshot = {
-  id: string;
-  shopId: string;
-  ownerType: "platform" | "agent";
-  channelType: CollectionChannelType;
+  ownerType: "platform" | "merchant";
+  channelType: PaymentDisplayType;
   displayName: string;
   accountName?: string;
   qrUrl?: string;
@@ -10141,9 +15225,9 @@ type InviteCode = {
   id: string;
   code: string;
   codeHash?: string;
-  issuerType: "platform" | "agent";
-  issuerAgentId?: string;
-  targetTier: AgentTier;
+  issuerType: "platform" | "merchant";
+  issuerMerchantId?: string;
+  targetTier: MerchantTier;
   status: "active" | "used_up" | "expired" | "disabled";
   maxUses: number | null;
   usedCount: number;
@@ -10170,13 +15254,13 @@ type RiskFreezeItem = Record<string, unknown> & {
 
 type MemoryStore = {
   sequence: number;
-  agentApplications: Map<string, AgentApplication>;
-  agents: Map<string, DemoAgent>;
+  merchantApplications: Map<string, MerchantApplication>;
+  merchants: Map<string, DemoMerchant>;
   shops: Map<string, DemoShop>;
   platformProducts: Map<string, DemoPlatformProduct>;
   platformShopProducts: Map<string, DemoPlatformShopProduct>;
   ownProducts: Map<string, DemoOwnProduct>;
-  agentProducts: Map<string, DemoAgentProduct>;
+  merchantProductListings: Map<string, DemoMerchantProductListing>;
   depositAccounts: Map<string, Parameters<typeof deductDeposit>[0]["account"]>;
   depositTransactions: DepositTransaction[];
   orders: Map<string, DemoOrder>;
@@ -10200,14 +15284,18 @@ type MemoryStore = {
   couponTemplates: Map<string, CouponTemplate>;
   userCoupons: Map<string, UserCoupon>;
   inviteCodes: Map<string, InviteCode>;
-  collectionChannels: Map<string, CollectionChannel>;
   paymentMethods: Map<string, PaymentMethodConfig>;
   paymentCallbackLogs: PaymentCallbackLog[];
   paymentExceptions: PaymentException[];
   extractLogs: Array<Record<string, unknown>>;
   emailDeliveries: EmailDelivery[];
   paymentChannelConfigs: PaymentChannelConfig[];
-  pendingIncomeByAgent: Map<string, bigint>;
-  payableIncomeByAgent: Map<string, bigint>;
-  paidIncomeByAgent: Map<string, bigint>;
+  serviceFeeConfig: PlatformServiceFeeConfig;
+  userWallets: Map<string, UserWalletState>;
+  walletRecharges: Map<string, WalletRecharge>;
+  walletHolds: Map<string, WalletPaymentHold>;
+  walletTransactions: WalletTransactionState[];
+  pendingIncomeByMerchant: Map<string, bigint>;
+  payableIncomeByMerchant: Map<string, bigint>;
+  paidIncomeByMerchant: Map<string, bigint>;
 };

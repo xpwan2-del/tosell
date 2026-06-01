@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { Prisma, PrismaClient } from "@prisma/client";
 
 const permissions = [
-  "agent.review",
   "product.manage",
   "after_sale.arbitrate",
   "settlement.generate",
@@ -15,24 +14,23 @@ const permissions = [
   "rbac.manage",
   "merchant.manage",
   "shop.manage",
-  "collection_channel.review",
+  "payment_config.review",
   "order.read",
   "payment.confirm",
   "fulfillment.manage",
   "after_sale.manage",
   "coupon.manage",
-  "clearing.manage",
   "ledger.read",
   "risk.manage",
   "rights_code.secret.read"
 ];
 
 const paymentChannels = [
-  "wechat_miniprogram",
   "wechat_h5_jsapi",
   "wechat_h5",
   "alipay_wap",
-  "mock"
+  "epay",
+  "balance"
 ] as const;
 
 const DB_RETRY_ATTEMPTS = Number(process.env.E2E_SETUP_DB_RETRY_ATTEMPTS ?? 5);
@@ -100,7 +98,7 @@ async function setup(prisma: PrismaClient) {
         enabled: false,
         feeBps: 0,
         fixedFeeCents: 0n,
-        statusNote: channel === "mock" ? "disabled_in_production_e2e" : "pending_merchant_configuration",
+        statusNote: "pending_merchant_configuration",
         updatedAt: now
       },
       create: {
@@ -109,7 +107,7 @@ async function setup(prisma: PrismaClient) {
         feeBps: 0,
         fixedFeeCents: 0n,
         configJson: Prisma.JsonNull,
-        statusNote: channel === "mock" ? "disabled_in_production_e2e" : "pending_merchant_configuration",
+        statusNote: "pending_merchant_configuration",
         updatedAt: now
       }
     });

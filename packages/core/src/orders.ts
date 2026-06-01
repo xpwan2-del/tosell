@@ -1,12 +1,12 @@
-import { type PlatformProductQuote, quoteAgentOwnedProduct, quotePlatformProduct } from "./money.js";
+import { type PlatformProductQuote, quoteMerchantOwnedProduct, quotePlatformProduct } from "./money.js";
 
-export type OrderProductType = "platform" | "agent_owned";
+export type OrderProductType = "platform" | "merchant_owned";
 export type SaleRiskStatus = "normal" | "order_frozen" | "shop_frozen" | "settlement_restricted" | "product_removed" | "disabled";
 
 export type OrderSnapshotInput = {
   orderNo: string;
   userId: string;
-  agent: {
+  merchant: {
     id: string;
     name: string;
     status: "active" | string;
@@ -24,9 +24,9 @@ export type OrderSnapshotInput = {
     customerServiceQqQrUrl?: string;
     customerServiceNote?: string;
   };
-  agentProduct: {
+  merchantProductListing: {
     id: string;
-    agentId: string;
+    merchantId: string;
     shopId: string;
     productType: OrderProductType;
     platformProductId?: string | null;
@@ -54,14 +54,15 @@ export type OrderSnapshotInput = {
   };
   quantity?: number;
   entrySource?: string;
+  serviceFeeBps?: bigint;
 };
 
 export type OrderSnapshot = {
   orderNo: string;
   userId: string;
-  agentId: string;
+  merchantId: string;
   shopId: string;
-  agentProductId: string;
+  merchantProductListingId: string;
   productType: OrderProductType;
   productNameSnapshot: string;
   quantity: number;
@@ -71,7 +72,7 @@ export type OrderSnapshot = {
     paidAmountCents: bigint;
     supplyAmountCents: bigint;
     serviceFeeCents: bigint;
-    agentExpectedIncomeCents: bigint;
+    merchantExpectedIncomeCents: bigint;
   };
   productSnapshot: unknown;
   shopSnapshot: unknown;
@@ -81,37 +82,37 @@ export type OrderSnapshot = {
 };
 
 export function assertCanCreateOrder(input: OrderSnapshotInput): void {
-  if (input.agent.status !== "active") throw new Error("agent is not active");
-  if (input.agent.depositStatus !== "paid" && input.agent.depositStatus !== "partially_deducted") {
-    throw new Error("agent deposit is not paid");
+  if (input.merchant.status !== "active") throw new Error("merchant is not active");
+  if (input.merchant.depositStatus !== "paid" && input.merchant.depositStatus !== "partially_deducted") {
+    throw new Error("merchant deposit is not paid");
   }
   if (input.shop.status !== "open") throw new Error("shop is not open");
-  if (input.agentProduct.agentId !== input.agent.id) {
-    throw new Error("agent product does not belong to agent");
+  if (input.merchantProductListing.merchantId !== input.merchant.id) {
+    throw new Error("merchant product does not belong to merchant");
   }
-  if (input.agentProduct.shopId !== input.shop.id) {
-    throw new Error("agent product does not belong to shop");
+  if (input.merchantProductListing.shopId !== input.shop.id) {
+    throw new Error("merchant product does not belong to shop");
   }
-  if (input.agentProduct.status !== "listed") throw new Error("agent product is not listed");
-  if (isSaleBlockedByRisk(input.agent.riskStatus) || isSaleBlockedByRisk(input.shop.riskStatus)) {
+  if (input.merchantProductListing.status !== "listed") throw new Error("merchant product is not listed");
+  if (isSaleBlockedByRisk(input.merchant.riskStatus) || isSaleBlockedByRisk(input.shop.riskStatus)) {
     throw new Error("risk freeze blocks order creation");
   }
-  if (input.agentProduct.productType === "platform") {
+  if (input.merchantProductListing.productType === "platform") {
     if (!input.platformProduct) throw new Error("platform product is required");
-    if (input.agentProduct.platformProductId !== input.platformProduct.id) {
-      throw new Error("agent product does not reference platform product");
+    if (input.merchantProductListing.platformProductId !== input.platformProduct.id) {
+      throw new Error("merchant product does not reference platform product");
     }
-    if (input.agentProduct.ownProductReviewId) {
+    if (input.merchantProductListing.ownProductReviewId) {
       throw new Error("platform product cannot reference own product review");
     }
     if (input.platformProduct.status !== "active") throw new Error("platform product is not active");
     return;
   }
   if (!input.ownProduct) throw new Error("own product is required");
-  if (input.agentProduct.ownProductReviewId !== input.ownProduct.id) {
-    throw new Error("agent product does not reference own product review");
+  if (input.merchantProductListing.ownProductReviewId !== input.ownProduct.id) {
+    throw new Error("merchant product does not reference own product review");
   }
-  if (input.agentProduct.platformProductId) {
+  if (input.merchantProductListing.platformProductId) {
     throw new Error("own product cannot reference platform product");
   }
   if (input.ownProduct.reviewStatus !== "approved") throw new Error("own product is not approved");
@@ -121,28 +122,30 @@ export function buildOrderSnapshot(input: OrderSnapshotInput): OrderSnapshot {
   assertCanCreateOrder(input);
 
   const quantity = input.quantity ?? 1;
-  const quote = input.agentProduct.productType === "platform"
+  const quote = input.merchantProductListing.productType === "platform"
     ? quotePlatformProduct({
-      salePriceCents: input.agentProduct.salePriceCents,
+      salePriceCents: input.merchantProductListing.salePriceCents,
       supplyPriceCents: input.platformProduct!.supplyPriceCents,
       minSalePriceCents: input.platformProduct!.minSalePriceCents,
-      quantity
+      quantity,
+      serviceFeeBps: input.serviceFeeBps
     })
-    : quoteAgentOwnedProduct({
-      salePriceCents: input.agentProduct.salePriceCents,
+    : quoteMerchantOwnedProduct({
+      salePriceCents: input.merchantProductListing.salePriceCents,
       minSalePriceCents: input.ownProduct!.minSalePriceCents,
-      quantity
+      quantity,
+      serviceFeeBps: input.serviceFeeBps
     });
 
-  const product = input.agentProduct.productType === "platform" ? input.platformProduct! : input.ownProduct!;
+  const product = input.merchantProductListing.productType === "platform" ? input.platformProduct! : input.ownProduct!;
 
   return {
     orderNo: input.orderNo,
     userId: input.userId,
-    agentId: input.agent.id,
+    merchantId: input.merchant.id,
     shopId: input.shop.id,
-    agentProductId: input.agentProduct.id,
-    productType: input.agentProduct.productType,
+    merchantProductListingId: input.merchantProductListing.id,
+    productType: input.merchantProductListing.productType,
     productNameSnapshot: product.name,
     quantity,
     quote,
@@ -151,11 +154,11 @@ export function buildOrderSnapshot(input: OrderSnapshotInput): OrderSnapshot {
       paidAmountCents: quote.paidAmountCents,
       supplyAmountCents: quote.supplyAmountCents,
       serviceFeeCents: quote.serviceFeeCents,
-      agentExpectedIncomeCents: quote.agentExpectedIncomeCents
+      merchantExpectedIncomeCents: quote.merchantExpectedIncomeCents
     },
     productSnapshot: {
       id: product.id,
-      type: input.agentProduct.productType,
+      type: input.merchantProductListing.productType,
       name: product.name
     },
     shopSnapshot: {
@@ -166,12 +169,12 @@ export function buildOrderSnapshot(input: OrderSnapshotInput): OrderSnapshot {
       customerServiceQq: input.shop.customerServiceQq,
       customerServiceQqQrUrl: input.shop.customerServiceQqQrUrl,
       customerServiceNote: input.shop.customerServiceNote,
-      agentStatus: input.agent.status,
+      merchantStatus: input.merchant.status,
       shopStatus: input.shop.status,
       entrySource: input.entrySource
     },
     pricingSnapshot: {
-      salePriceCents: input.agentProduct.salePriceCents,
+      salePriceCents: input.merchantProductListing.salePriceCents,
       minSalePriceCents: input.platformProduct?.minSalePriceCents ?? input.ownProduct?.minSalePriceCents ?? null,
       suggestedSalePriceCents: input.platformProduct?.suggestedSalePriceCents ?? null
     },

@@ -1,37 +1,41 @@
 <!-- CCB-ROLE-START -->
-# Role Memory: frontend_dev
+# 角色记忆：frontend_dev
 
-You own the H5 buyer storefront, merchant backend UI, and platform admin UI. You do not own final money calculations.
+你负责 H5 买家商城、商户后台、平台后台。你不负责最终金额计算。
 
-## UI Surfaces
+## 前端页面范围
 
-This project includes at least three frontend surfaces:
+1. H5 买家商城：独立店铺、搜索/分类、商品列表、商品详情、优惠券选择、确认订单、支付方式按钮、个人码支付页、官方/e支付跳转页、余额支付、登录后充值入口、订单查询、可选邮箱、商品级卡密提取、退款/售后申请。
+2. 商户后台：入驻申请、保证金状态、店铺设置、客服微信绑定、收款配置、平台商品代理选择、代理商品展示覆盖编辑、自有商品、卡密库存、订单、收入、冻结金额、供货应付/平台服务费结算。
+3. 平台后台：商户审核、手动创建一级商户/店铺和初始账号、保证金管理、平台商品管理、平台自营商品改价、商品审核、收款配置审核、支付配置、钱包充值管理、订单管理、发货管理、退款仲裁、结算、风控、审计日志和看板。
 
-1. H5 buyer storefront: independent shop, search/category, product list, product details, order confirmation, collection-channel page, order query, optional-email checkout, product-configured virtual-code extraction, refund/s售后 request.
-2. Merchant backend: onboarding application with invite code, deposit status, shop setup, customer-service QR binding, collection-channel binding, product selection, pricing, self-submitted products, inventory/virtual codes, orders, income, frozen amount, supply payable/service-fee clearing records.
-3. Platform admin: merchant review, manual first-tier merchant/shop creation with initial account/password, deposit management/manual confirmation, product management, product review, collection-channel review, order management, fulfillment management, refund arbitration, supply clearing sheets, risk freeze, audit logs, and dashboards.
+## 前端规则
 
-## Frontend Rules
+1. 当前买家端是 H5，不是小程序 P0。
+2. 前端计算的价格、手续费、退款、结算金额都不能作为最终依据。
+3. 销售价、成本可见性、服务费、预计收入、冻结金额、退款金额、结算金额都展示后端返回值。
+4. 状态要清楚：订单状态、发货状态、退款状态、结算状态、保证金状态、店铺状态。
+5. 后台要像真正的运营后台：可搜索、可筛选、可分页、可审计、适合反复操作，中文字段清楚。
+6. 普通用户不能看到平台供货价。
+7. 商户只能看到自己的店铺、订单、客户、商品和财务数据。
+8. 生产 UI 不能硬编码店铺、商品、价格、库存、卡密、客服二维码、收款码、支付链接、商户供货关系、优惠券或 mock 支付结果。
+9. H5 可以参考亚马逊式简洁电商体验，但数据必须来自 API。
+10. 价格隔离要体现在网络返回和页面展示，二级不能看到平台给一级的供货价，三级不能看到平台供货价和一级转供价。
+11. 允许三层 B2B2C 价差供货；不要做第四级、佣金分销、团队奖励、邀请奖励、拉人收入 UI。
+12. 优惠券是平台补贴。页面展示后端计算的券前金额、优惠金额、买家实付和结算数据，不能让前端优惠券计算影响商户结算。
+13. 购买有卡密的虚拟卡密商品时，购买密码和联系电话是 H5 下单必填项；联系电话必须校验中国大陆手机号。`manual` 人工交付商品不强制购买密码和联系电话。邮箱可选，填写后要展示邮件发码状态；页面、按钮、测试描述都不得使用旧称。
+14. H5 店铺要干净、克制、清楚，有电商感，不要演示站感觉。
+15. 保证金未确认前，商户后台要禁用销售、选品、上架、代理、转供价、收款配置和可支付订单操作，并给清楚原因。
+16. 支付方式必须用支付宝/微信/e支付/余额按钮，不用下拉框。展示后端返回的标签和金额，例如“支付宝 +1%（个人）”“支付宝 +1%（商家）”“微信 +1%（个人/商家）”“e支付 +1%（商家）”“余额 0 手续费”。
+17. 个人码支付页必须适配好二维码大小，显示应付金额、复制金额按钮、截图/保存提示、打开支付宝/微信扫码提示，以及“5 分钟未刷新订单和发卡请联系客服”的提醒。
+18. 买家页面不能展示个人收款人的真实姓名或账号。
+19. 充值只能登录/注册后使用，未登录不能出现可用充值动作。
+20. 商户代理商品编辑要符合人类后台习惯：商品卡片列表、缩略图、代理状态、当前代理价、建议价、最低价、分页、清楚编辑页、保存确认弹窗列出变更字段、转圈加载、禁用重复提交、成功/失败提示。
+21. 高风险后台按钮必须有确认、加载、禁用重复点击和结果反馈。
 
-1. Do not implement this as a mini-program P0. The buyer surface is H5.
-2. Do not make frontend-calculated prices, fees, refunds, or clearing amounts authoritative.
-3. Display backend-returned values for sale price, supply price visibility, service fee, expected income, frozen amount, refund amount, and clearing amount.
-4. Make statuses visible: order status, fulfillment status, refund status, clearing status, deposit status, and shop status.
-5. Admin UI should be work-focused: searchable, filterable, auditable, and efficient for repeated operations.
-6. Do not show platform supply price to ordinary users.
-7. Agents must only see their own shop, orders, customers, products, and financial data.
-8. Do not hardcode shop/product/price/inventory/virtual codes/customer-service QR/collection QR/payment links/channel relations/coupons/mock payment results in production UI.
-9. H5 should use Amazon-style clean commerce UI, but every product/detail/payment/customer-service field must come from API.
-10. Respect price visibility: second-tier UI must not show platform-to-first-tier supply price; third-tier UI must not show platform supply price or first-tier transfer price.
-11. Controlled three-tier B2B2C price-spread supply is allowed. Do not build fourth-tier channels, commission distribution, team rewards, invitation rewards, or recruiting-based income UI.
-12. Platform coupons are platform subsidy. UI must display backend-calculated pre-coupon sale amount, coupon discount, buyer paid amount, and clearing values; do not let frontend coupon math change merchant price-spread clearing.
-13. Checkout email is optional. Only show required extract-code input when the product API says extract code is enabled; otherwise do not force extract code.
-14. H5 storefront must be clean, Amazon-inspired, restrained, polished, and brand-recognizable: white commerce surface, dark header, orange action accents, high readability, no clutter, no generic demo look.
-15. Before deposit is confirmed, merchant UI must disable sales, product selection/listing, upstream product proxying, transfer-price configuration, and payable order operations with clear status/reason text.
+## 协作
 
-## Collaboration
+等 `pm_architect`、`database_expert`、`backend_worker` 把流程、数据和 API 说清楚后再做页面。
 
-Wait for `pm_architect`, `database_expert`, and `backend_worker` to define workflows, data contracts, and API contracts before building screens.
-
-When API contracts are unclear, ask `main` to route clarification to `backend_worker` or `pm_architect`.
+API 不清楚时，让 `main` 去找 `backend_worker` 或 `pm_architect`，不要自己猜金额和权限逻辑。
 <!-- CCB-ROLE-END -->

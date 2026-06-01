@@ -5,7 +5,7 @@ import {
   allocateRefund,
   applyClawback,
   applyFulfillmentAttempt,
-  assertAgentScope,
+  assertMerchantScope,
   assertNoDuplicateSettlementItems,
   buildOrderSnapshot,
   buildSettlementItems,
@@ -19,7 +19,7 @@ import {
 } from "./index.js";
 
 describe("pricing", () => {
-  it("calculates supply, service fee, and agent income using cents", () => {
+  it("calculates supply, service fee, and merchant income using cents", () => {
     const quote = quotePlatformProduct({
       salePriceCents: 15_000n,
       supplyPriceCents: 10_000n,
@@ -29,7 +29,7 @@ describe("pricing", () => {
     expect(quote.paidAmountCents).toBe(15_000n);
     expect(quote.supplyAmountCents).toBe(10_000n);
     expect(quote.serviceFeeCents).toBe(75n);
-    expect(quote.agentExpectedIncomeCents).toBe(4_925n);
+    expect(quote.merchantExpectedIncomeCents).toBe(4_925n);
   });
 
   it("rejects sale price below minimum sale price", () => {
@@ -42,7 +42,7 @@ describe("pricing", () => {
     ).toThrow(/below minimum/);
   });
 
-  it("applies quantity before calculating service fee and agent income", () => {
+  it("applies quantity before calculating service fee and merchant income", () => {
     const quote = quotePlatformProduct({
       salePriceCents: 15_000n,
       supplyPriceCents: 10_000n,
@@ -53,17 +53,17 @@ describe("pricing", () => {
     expect(quote.paidAmountCents).toBe(30_000n);
     expect(quote.supplyAmountCents).toBe(20_000n);
     expect(quote.serviceFeeCents).toBe(150n);
-    expect(quote.agentExpectedIncomeCents).toBe(9_850n);
+    expect(quote.merchantExpectedIncomeCents).toBe(9_850n);
   });
 
-  it("rejects prices that would make agent income negative", () => {
+  it("rejects prices that would make merchant income negative", () => {
     expect(() =>
       quotePlatformProduct({
         salePriceCents: 10_000n,
         supplyPriceCents: 10_000n,
         minSalePriceCents: 10_000n
       })
-    ).toThrow(/agent income/);
+    ).toThrow(/merchant income/);
   });
 });
 
@@ -72,13 +72,13 @@ describe("refund allocation", () => {
     const refund = allocateRefund({
       paidAmountCents: 15_000n,
       supplyAmountCents: 10_000n,
-      agentIncomeCents: 4_925n,
+      merchantIncomeCents: 4_925n,
       refundAmountCents: 15_000n,
       responsibility: "platform"
     });
 
     expect(refund.platformBearCents).toBe(15_000n);
-    expect(refund.agentBearCents).toBe(0n);
+    expect(refund.merchantBearCents).toBe(0n);
     expect(refund.serviceFeeRefundCents).toBe(75n);
   });
 
@@ -87,46 +87,46 @@ describe("refund allocation", () => {
       allocateRefund({
         paidAmountCents: 15_000n,
         supplyAmountCents: 10_000n,
-        agentIncomeCents: 4_925n,
+        merchantIncomeCents: 4_925n,
         refundAmountCents: 6_000n,
         responsibility: "mixed"
       })
     ).toThrow(/explicit/);
   });
 
-  it("allocates agent responsibility to agent without refunding platform service fee", () => {
+  it("allocates merchant responsibility to merchant without refunding platform service fee", () => {
     const refund = allocateRefund({
       paidAmountCents: 15_000n,
       supplyAmountCents: 10_000n,
-      agentIncomeCents: 4_925n,
+      merchantIncomeCents: 4_925n,
       refundAmountCents: 5_000n,
-      responsibility: "agent"
+      responsibility: "merchant"
     });
 
     expect(refund.platformBearCents).toBe(0n);
-    expect(refund.agentBearCents).toBe(5_000n);
+    expect(refund.merchantBearCents).toBe(5_000n);
     expect(refund.serviceFeeRefundCents).toBe(25n);
-    expect(refund.serviceFeeBearer).toBe("agent");
-    expect(refund.agentServiceFeeBearCents).toBe(25n);
-    expect(refund.agentTotalCostCents).toBe(5_025n);
+    expect(refund.serviceFeeBearer).toBe("merchant");
+    expect(refund.merchantServiceFeeBearCents).toBe(25n);
+    expect(refund.merchantTotalCostCents).toBe(5_025n);
   });
 
   it("accepts explicit mixed responsibility split", () => {
     const refund = allocateRefund({
       paidAmountCents: 15_000n,
       supplyAmountCents: 10_000n,
-      agentIncomeCents: 4_925n,
+      merchantIncomeCents: 4_925n,
       refundAmountCents: 6_000n,
       responsibility: "mixed",
       platformBearCents: 4_000n,
-      agentBearCents: 2_000n
+      merchantBearCents: 2_000n
     });
 
     expect(refund.platformBearCents).toBe(4_000n);
-    expect(refund.agentBearCents).toBe(2_000n);
+    expect(refund.merchantBearCents).toBe(2_000n);
     expect(refund.serviceFeeRefundCents).toBe(30n);
     expect(refund.platformServiceFeeBearCents).toBe(20n);
-    expect(refund.agentServiceFeeBearCents).toBe(10n);
+    expect(refund.merchantServiceFeeBearCents).toBe(10n);
   });
 });
 
@@ -167,12 +167,12 @@ describe("settlement", () => {
     expect(isSettlementCandidate({ ...base, riskStatus: "order_frozen", now: new Date("2026-05-25T01:00:00.000Z") })).toBe(false);
   });
 
-  it("requires settlement items to belong to the settlement agent batch", () => {
+  it("requires settlement items to belong to the settlement merchant batch", () => {
     expect(() =>
       buildSettlementItems([
         {
           orderId: "order-1",
-          agentId: "agent-2",
+          merchantId: "merchant-2",
           shopId: "shop-2",
           paymentStatus: "paid",
           fulfillmentStatus: "success",
@@ -184,18 +184,18 @@ describe("settlement", () => {
           paidAmountCents: 15_000n,
           supplyAmountCents: 10_000n,
           serviceFeeCents: 75n,
-          agentIncomeCents: 4_925n
+          merchantIncomeCents: 4_925n
         }
-      ], [], "agent-1")
+      ], [], "merchant-1")
     ).toThrow(/does not belong/);
   });
 });
 
 describe("permissions and idempotency", () => {
-  it("rejects cross-agent access", () => {
+  it("rejects cross-merchant access", () => {
     expect(() =>
-      assertAgentScope({ role: "agent", agentId: "a1", shopId: "s1" }, { agentId: "a2" })
-    ).toThrow(/another agent/);
+      assertMerchantScope({ role: "merchant", merchantId: "a1", shopId: "s1" }, { merchantId: "a2" })
+    ).toThrow(/another merchant/);
   });
 
   it("runs duplicate payment callback once", () => {
@@ -205,18 +205,18 @@ describe("permissions and idempotency", () => {
     expect(registry.runOnce(key, () => "again")).toBeUndefined();
   });
 
-  it("allows an agent to access only their own shop resource", () => {
+  it("allows a merchant to access only their own shop resource", () => {
     expect(() =>
-      assertAgentScope(
-        { role: "agent", agentId: "a1", shopId: "s1" },
-        { agentId: "a1", shopId: "s1" }
+      assertMerchantScope(
+        { role: "merchant", merchantId: "a1", shopId: "s1" },
+        { merchantId: "a1", shopId: "s1" }
       )
     ).not.toThrow();
 
     expect(() =>
-      assertAgentScope(
-        { role: "agent", agentId: "a1", shopId: "s1" },
-        { agentId: "a1", shopId: "s2" }
+      assertMerchantScope(
+        { role: "merchant", merchantId: "a1", shopId: "s1" },
+        { merchantId: "a1", shopId: "s2" }
       )
     ).toThrow(/another shop/);
   });
@@ -233,7 +233,7 @@ describe("order, payment, fulfillment, deposit, and clawback helpers", () => {
   const orderInput = {
     orderNo: "order-1",
     userId: "u1",
-    agent: {
+    merchant: {
       id: "a1",
       name: "代理一",
       status: "active",
@@ -247,9 +247,9 @@ describe("order, payment, fulfillment, deposit, and clawback helpers", () => {
       riskStatus: "normal",
       customerServiceWechat: "service-a1"
     },
-    agentProduct: {
+    merchantProductListing: {
       id: "ap1",
-      agentId: "a1",
+      merchantId: "a1",
       shopId: "s1",
       productType: "platform" as const,
       platformProductId: "p1",
@@ -269,18 +269,18 @@ describe("order, payment, fulfillment, deposit, and clawback helpers", () => {
     }
   };
 
-  it("builds an immutable order snapshot only for matching agent, shop, and product", () => {
+  it("builds an immutable order snapshot only for matching merchant, shop, and product", () => {
     const snapshot = buildOrderSnapshot(orderInput);
 
-    expect(snapshot.agentId).toBe("a1");
+    expect(snapshot.merchantId).toBe("a1");
     expect(snapshot.shopId).toBe("s1");
     expect(snapshot.productSnapshot).toEqual({ id: "p1", type: "platform", name: "会员月卡" });
-    expect(snapshot.amountSnapshot.agentExpectedIncomeCents).toBe(4_925n);
+    expect(snapshot.amountSnapshot.merchantExpectedIncomeCents).toBe(4_925n);
 
     expect(() =>
       buildOrderSnapshot({
         ...orderInput,
-        agentProduct: { ...orderInput.agentProduct, shopId: "other-shop" }
+        merchantProductListing: { ...orderInput.merchantProductListing, shopId: "other-shop" }
       })
     ).toThrow(/shop/);
   });
@@ -333,7 +333,7 @@ describe("order, payment, fulfillment, deposit, and clawback helpers", () => {
   it("deducts deposit idempotently and marks restriction when insufficient", () => {
     const registry = new IdempotencyRegistry();
     const account = {
-      agentId: "a1",
+      merchantId: "a1",
       requiredAmountCents: 10_000n,
       availableAmountCents: 3_000n,
       frozenAmountCents: 0n,
@@ -373,6 +373,6 @@ describe("order, payment, fulfillment, deposit, and clawback helpers", () => {
     expect(result.deductedAmountCents).toBe(9_000n);
     expect(result.remainingAmountCents).toBe(1_000n);
     expect(result.status).toBe("insufficient");
-    expect(result.restrictAgent).toBe(true);
+    expect(result.restrictMerchant).toBe(true);
   });
 });

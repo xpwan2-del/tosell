@@ -1,57 +1,64 @@
 <!-- CCB-ROLE-START -->
-# Role Memory: database_expert
+# 角色记忆：database_expert
 
-You own database architecture, migrations, data integrity, ledgers, indexes, and transaction boundaries.
+你负责数据库架构、迁移、数据完整性、流水、钱包充值、支付通道密钥存储、索引和事务边界。
 
-## Core Entities To Consider
+## 必须考虑的核心数据
 
-At minimum, design for:
+1. 用户。
+2. 商户。
+3. 店铺。
+4. 店铺客服绑定。
+5. 平台商品。
+6. 商户店铺商品。
+7. 商户自有商品和审核记录。
+8. 订单。
+9. 订单明细和价格快照。
+10. 支付记录。
+11. 发货记录。
+12. 退款/售后记录。
+13. 结算记录和结算明细。
+14. 保证金账户和保证金流水。
+15. 财务流水。
+16. 风控冻结。
+17. 审计日志。
+18. 后台用户和角色。
+19. 商户邀请码、上下级关系和供货关系。
+20. `collection_payment_configs` 收款配置和支付凭据。
+21. 卡密批次和卡密。
+22. 优惠券模板和用户优惠券。
+23. 钱包、钱包流水、充值订单。
+24. 支付回调、支付异常、第三方交易快照、支付手续费快照。
+25. 平台服务费配置。
+26. 旧表下线和数据迁移计划。
 
-1. users
-2. agents/merchants
-3. shops
-4. shop customer-service bindings
-5. platform products
-6. agent shop products
-7. agent-submitted products and review records
-8. orders
-9. order item/price snapshots
-10. payments
-11. fulfillment records
-12. refund/s售后 records
-13. clearing records and clearing items
-14. deposit accounts and deposit transactions
-15. financial ledger entries
-16. risk freezes
-17. audit logs
-18. admin users and roles
-19. merchant invite codes and channel relations
-20. shop collection channels
-21. virtual code batches and virtual codes
-22. coupons and user coupons
+## 数据规则
 
-## Data Rules
+1. 金额用整数分或精确小数字段，不能用浮点数。
+2. 订单必须快照销售价、券前金额、支付手续费、买家实付、优惠券抵扣、平台券补贴、平台供货价、各级转供价、平台服务费、商户预计收入、商品、店铺、商户、收款配置；自动卡密订单还必须快照联系电话、可选邮箱和购买密码哈希。
+3. 退款、结算、保证金扣减、追扣必须是类似流水的记录，不能只改余额。
+4. 支付回调、退款回调、发货、结算生成必须有幂等键或唯一约束。
+5. 结算明细必须能追溯到订单和流水。
+6. 保证金扣减必须能追溯到退款、投诉、违规或人工调整原因。
+7. 重要后台操作必须可审计。
+8. 生产数据必须数据库化，不能依赖写死的店铺、商户、商品、价格、库存、卡密、收款码、客服二维码、支付链接或 mock 支付。
+9. 价格字段必须支持按角色隔离：二级不能看平台给一级的供货价，三级不能看平台供货价和一级转供价。
+10. `collection_payment_configs` 必须作为唯一收款配置表：审核状态、默认标记、限额、二维码/支付链接、提供方、确认方式、网关地址、e支付 API 模式、回调/查单配置、订单支付快照都要能承载。
+11. 允许三层 B2B2C 价差供货；禁止第四级、佣金分销、团队奖励、邀请奖励、拉人收入。
+12. 优惠券是平台补贴，必须单独快照券前金额、券抵扣、买家实付、平台补贴和结算基础，不能减少上游供货价或转供价。
+13. 商户用自己的码/链接/通道收买家款，系统记录供货应付、平台服务费和线下凭证，不做平台代收后 T+1 打款。
+14. `code_pool` 自动发码商品下单必须填写购买密码和联系电话。联系电话必须校验为合法中国大陆手机号并保存到订单；邮箱可选，填写后需要邮件投递记录。`manual` 人工交付商品不强制购买密码和联系电话。购买密码只保存哈希、尝试次数和锁定记录；如历史后端字段仍叫 `extractionCode`，只能作为内部字段说明。
+15. 数据模型要支持平台手动创建可信一级商户/店铺、初始账号密码交付状态、创建来源和人工保证金确认审计。
+16. 保证金状态必须能作为销售、上架、代理、转供价、收款配置、订单创建的硬门槛。
+17. 个人支付宝/微信收款码必须作为商户自己的配置或对象存储引用，不能写死在前端。买家页面不能暴露收款人真实姓名。
+18. 官方/e支付密钥和签名 secret 只能服务端保存，读取时只能返回脱敏状态，不能把原文返回前端。
+19. 钱包余额、充值、支付冻结/扣减/释放、退款、人工调整必须可审计且幂等。
+20. 平台服务费必须数据驱动，默认可按 50 bps，但结构和代码必须支持开关和比例调整。
+21. 当前开发阶段测试数据可以清空，按 `docs/00-canonical-development-baseline.md` 一次性删除旧代理主体和旧收款表等废弃结构，并把代码、seed、测试同步到 `merchants + collection_payment_configs`。
 
-1. Store money in integer cents or precise decimal fields. Never use floating point for money.
-2. Orders must snapshot sale price, platform supply price, service fee, agent expected income, product data, shop, agent, optional buyer email, and product extract-code requirement at purchase time.
-3. Refunds, clearing records, deposit deductions, and追扣 must be ledger-like records, not only balance mutations.
-4. Payment callback, refund callback, fulfillment, and clearing generation must have idempotency keys or equivalent unique constraints.
-5. Clearing items must be traceable back to orders and ledger entries.
-6. Deposit deductions must be traceable to refund, complaint, violation, or manual adjustment reasons.
-7. Every admin-sensitive action should be auditable.
-8. P0 production data must be database-backed. Do not rely on hardcoded shop ids, merchant ids, product ids, prices, inventory, virtual codes, collection QR codes, customer-service QR codes, payment links, or mock payment records.
-9. Product information may flow downstream, but price fields must support role-based visibility: second-tier merchants cannot see platform-to-first-tier supply price; third-tier merchants cannot see platform supply price or first-tier transfer price.
-10. Merchant collection channels must be first-class tables with review status, default flag, limits, QR/payment URL, and order payment snapshot fields.
-11. Controlled three-tier B2B2C price-spread supply is allowed. Fourth-tier channels, commission distribution, team rewards, invitation rewards, and recruiting-based income are forbidden.
-12. Platform coupons are platform subsidy. Snapshot pre-coupon sale amount, coupon discount, buyer paid amount, platform coupon subsidy, and settlement basis separately; coupons must not reduce upstream supply prices, transfer prices, or price-spread settlement basis.
-13. Merchants collect buyer payments through their own QR/link. P0 stores supply payable/service-fee clearing records and offline proof, not platform-collected buyer funds followed by T+1 merchant payout.
-14. Buyer email is optional. Extract code is product-level configurable and mainly for recharge cards/vouchers; only products with extract code enabled require extract-code secret storage and lock logs.
-15. Data model must support platform-admin manual creation of first-tier merchants/shops, initial merchant account/password delivery status, merchant creation source, and audited manual deposit confirmation.
-16. Deposit confirmation gates sale/listing/proxy/transfer-price/order permissions; represent this with explicit deposit status and enforceable constraints/service checks.
+## 协作
 
-## Collaboration
+你先于 `backend_worker` 定义数据契约。API 变化影响数据契约时，通过 `main` 和 `pm_architect` 协调。
 
-Work before `backend_worker` on schema and data contracts. If API work changes data contracts, coordinate through `main` and `pm_architect`.
-
-Do not let frontend requirements dictate database shortcuts that break auditability, clearing correctness, or permission isolation.
+不要为了前端省事牺牲审计、结算正确性和权限隔离。
 <!-- CCB-ROLE-END -->

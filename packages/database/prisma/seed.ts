@@ -1,23 +1,222 @@
-import { Prisma, PrismaClient } from "@prisma/client";
-import {
-  virtualCatalogProducts,
-  virtualShopSeed
-} from "../src/virtual-catalog.js";
+import { PrismaClient } from "@prisma/client";
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
+import { virtualCatalogProducts, virtualShopSeed } from "../src/virtual-catalog.js";
 
 const prisma = new PrismaClient();
 
+type SeedMerchant = {
+  merchantNo: string;
+  tier: "first_tier" | "second_tier" | "third_tier";
+  name: string;
+  phone: string;
+  username: string;
+  shopNo: string;
+};
+
+const seedMerchants: SeedMerchant[] = [
+  { merchantNo: "MER000001", tier: "first_tier", name: "M1 开发商户", phone: "13800000001", username: "m1", shopNo: "SHOP000101" },
+  { merchantNo: "MER000002", tier: "second_tier", name: "M2 开发商户", phone: "13800000002", username: "m2", shopNo: "SHOP000102" },
+  { merchantNo: "MER000003", tier: "third_tier", name: "M3 开发商户", phone: "13800000003", username: "m3", shopNo: "SHOP000103" }
+];
+
+function paymentCredentialKey() {
+  const source = process.env.PAYMENT_CREDENTIAL_SECRET
+    ?? process.env.AUTH_TOKEN_SECRET
+    ?? process.env.ADMIN_TOKEN_SECRET
+    ?? process.env.JWT_SECRET
+    ?? "tosell-local-development-payment-credential-secret";
+  return createHash("sha256").update(source).digest();
+}
+
+function hashSecret(value: string) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function encryptPaymentCredentialBundle(bundle: Record<string, string | undefined>) {
+  const clean = Object.fromEntries(Object.entries(bundle).filter(([, value]) => typeof value === "string" && value.length > 0));
+  if (Object.keys(clean).length === 0) return undefined;
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", paymentCredentialKey(), iv);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(clean), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `aes256gcm:${iv.toString("base64url")}:${tag.toString("base64url")}:${ciphertext.toString("base64url")}`;
+}
+
+async function upsertMerchantWithShop(input: SeedMerchant, now: Date) {
+  const merchant = await prisma.merchant.upsert({
+    where: { merchantNo: input.merchantNo },
+    update: {
+      tier: input.tier,
+      name: input.name,
+      contactPhone: input.phone,
+      status: "active",
+      depositStatus: "paid",
+      approvedAt: now
+    },
+    create: {
+      merchantNo: input.merchantNo,
+      tier: input.tier,
+      name: input.name,
+      contactPhone: input.phone,
+      status: "active",
+      depositStatus: "paid",
+      creationSource: input.tier === "first_tier" ? "admin_manual" : "invite_application",
+      initialAccountStatus: "delivered",
+      approvedAt: now
+    }
+  });
+
+  await prisma.merchantAccount.upsert({
+    where: { username: input.username },
+    update: {
+      merchantId: merchant.id,
+      phone: input.phone,
+      status: "active",
+      initialDeliveryStatus: "delivered",
+      mustChangePassword: false
+    },
+    create: {
+      merchantId: merchant.id,
+      username: input.username,
+      phone: input.phone,
+      passwordHash: `dev-password-${input.username}`,
+      status: "active",
+      initialDeliveryStatus: "delivered",
+      mustChangePassword: false
+    }
+  });
+
+  const shop = await prisma.shop.upsert({
+    where: { shopNo: input.shopNo },
+    update: {
+      ownerType: "merchant",
+      merchantId: merchant.id,
+      name: `${input.name}小店`,
+      announcement: virtualShopSeed.announcement,
+      customerServiceWechat: virtualShopSeed.customerServiceWechat,
+      customerServiceQrUrl: `https://example.test/qr-${input.username}.png`,
+      customerServiceQq: `8000${input.username}`,
+      customerServiceNote: "开发验收客服资料",
+      themeColor: virtualShopSeed.themeColor,
+      bannerUrl: virtualShopSeed.bannerUrl,
+      shareTitle: `${input.name}小店`,
+      status: "open"
+    },
+    create: {
+      ownerType: "merchant",
+      merchantId: merchant.id,
+      shopNo: input.shopNo,
+      name: `${input.name}小店`,
+      announcement: virtualShopSeed.announcement,
+      customerServiceWechat: virtualShopSeed.customerServiceWechat,
+      customerServiceQrUrl: `https://example.test/qr-${input.username}.png`,
+      customerServiceQq: `8000${input.username}`,
+      customerServiceNote: "开发验收客服资料",
+      themeColor: virtualShopSeed.themeColor,
+      bannerUrl: virtualShopSeed.bannerUrl,
+      shareTitle: `${input.name}小店`,
+      sharePath: `/s/${input.shopNo}`,
+      status: "open"
+    }
+  });
+
+  await prisma.depositAccount.upsert({
+    where: { merchantId: merchant.id },
+    update: {
+      requiredAmountCents: 50_000n,
+      availableAmountCents: 50_000n,
+      status: "paid"
+    },
+    create: {
+      merchantId: merchant.id,
+      requiredAmountCents: 50_000n,
+      availableAmountCents: 50_000n,
+      status: "paid"
+    }
+  });
+
+  await prisma.collectionPaymentConfig.upsert({
+    where: { configNo: `PAYCFG_${input.username.toUpperCase()}_PERSONAL_ALIPAY` },
+    update: { status: "active", isDefault: true, enabledAt: now },
+    create: {
+      configNo: `PAYCFG_${input.username.toUpperCase()}_PERSONAL_ALIPAY`,
+      ownerType: "merchant",
+      ownerMerchantId: merchant.id,
+      shopId: shop.id,
+      provider: "alipay_personal",
+      confirmMode: "manual_confirm",
+      status: "active",
+      isDefault: true,
+      enabledAt: now,
+      displayName: `${input.name}个人支付宝`,
+      qrUrl: `https://example.test/pay/${input.username}-alipay.png`,
+      accountMasked: `${input.username}***pay`,
+      credentialStatus: "not_configured",
+      idempotencyKey: `seed:paycfg:${input.username}:personal-alipay`
+    }
+  });
+
+  return { merchant, shop };
+}
+
+async function upsertSeedMerchantRelation(input: {
+  issuerMerchantId: string;
+  childMerchantId: string;
+  childTier: "second_tier" | "third_tier";
+  code: string;
+  now: Date;
+}) {
+  const invite = await prisma.merchantInviteCode.upsert({
+    where: { idempotencyKey: `seed:merchant-invite:${input.code}` },
+    update: {
+      issuerMerchantId: input.issuerMerchantId,
+      tier: input.childTier,
+      maxUses: 10,
+      usedCount: 1,
+      status: "approved"
+    },
+    create: {
+      codeHash: hashSecret(input.code),
+      issuerMerchantId: input.issuerMerchantId,
+      tier: input.childTier,
+      maxUses: 10,
+      usedCount: 1,
+      status: "approved",
+      idempotencyKey: `seed:merchant-invite:${input.code}`
+    }
+  });
+
+  await prisma.merchantApplication.upsert({
+    where: { idempotencyKey: `seed:merchant-application:${input.code}` },
+    update: {
+      merchantId: input.childMerchantId,
+      inviteCodeId: invite.id,
+      tier: input.childTier,
+      status: "approved",
+      reviewedAt: input.now
+    },
+    create: {
+      merchantId: input.childMerchantId,
+      inviteCodeId: invite.id,
+      tier: input.childTier,
+      identityInfoJson: { source: "seed", relation: input.code },
+      contactInfoJson: { source: "seed" },
+      status: "approved",
+      reviewedAt: input.now,
+      idempotencyKey: `seed:merchant-application:${input.code}`
+    }
+  });
+}
+
 async function main() {
   if (process.env.NODE_ENV === "production") {
-    throw new Error("Refusing to seed production. Production business data must be created through DB-backed APIs/admin workflows.");
+    throw new Error("Refusing to seed production. Production data must be created through admin workflows.");
   }
 
-  const fulfilledAt = new Date("2026-05-24T00:00:00.000Z");
-  const settleableAt = new Date("2026-05-25T00:00:00.000Z");
-  const paidAt = new Date("2026-05-24T00:10:00.000Z");
-
+  const now = new Date();
   const user = await prisma.user.upsert({
     where: { openid: "dev_openid_user_001" },
-    update: {},
+    update: { phone: "13800000000" },
     create: {
       openid: "dev_openid_user_001",
       unionid: "dev_unionid_user_001",
@@ -25,498 +224,77 @@ async function main() {
     }
   });
 
-  const agent = await prisma.agent.upsert({
-    where: { agentNo: "AGT000001" },
-    update: {
-      status: "active",
-      depositStatus: "paid"
-    },
-    create: {
-      userId: user.id,
-      agentNo: "AGT000001",
-      name: "测试代理",
-      contactPhone: "13800000000",
-      status: "active",
-      depositStatus: "paid",
-      approvedAt: new Date()
-    }
-  });
-
-  await ensureAgentApplication(agent.id, user.id);
-
-  const shop = await prisma.shop.upsert({
+  const platformShop = await prisma.shop.upsert({
     where: { shopNo: "SHOP000001" },
     update: {
-      name: virtualShopSeed.name,
-      announcement: virtualShopSeed.announcement,
-      customerServiceQrUrl: "https://example.test/qr-agent-a.png",
-      collectionAccountName: virtualShopSeed.collectionAccountName,
-      collectionQrUrl: "https://example.test/pay-agent-a.png",
-      collectionNote: virtualShopSeed.collectionNote,
+      ownerType: "platform",
+      merchantId: null,
+      name: "ToSell 平台主店",
+      announcement: "平台自营商品与平台收款通道验收店铺。",
+      customerServiceWechat: "platform_service",
+      customerServiceQrUrl: "https://example.test/qr-platform.png",
+      customerServiceQq: "800000",
+      customerServiceNote: "平台主店开发验收客服资料",
       themeColor: virtualShopSeed.themeColor,
       bannerUrl: virtualShopSeed.bannerUrl,
-      shareTitle: virtualShopSeed.shareTitle,
+      shareTitle: "ToSell 平台主店",
       status: "open"
     },
     create: {
-      agentId: agent.id,
+      ownerType: "platform",
+      merchantId: null,
       shopNo: "SHOP000001",
-      name: virtualShopSeed.name,
-      announcement: virtualShopSeed.announcement,
-      customerServiceQrUrl: "https://example.test/qr-agent-a.png",
-      collectionAccountName: virtualShopSeed.collectionAccountName,
-      collectionQrUrl: "https://example.test/pay-agent-a.png",
-      collectionNote: virtualShopSeed.collectionNote,
+      name: "ToSell 平台主店",
+      announcement: "平台自营商品与平台收款通道验收店铺。",
+      customerServiceWechat: "platform_service",
+      customerServiceQrUrl: "https://example.test/qr-platform.png",
+      customerServiceQq: "800000",
+      customerServiceNote: "平台主店开发验收客服资料",
       themeColor: virtualShopSeed.themeColor,
       bannerUrl: virtualShopSeed.bannerUrl,
-      shareTitle: virtualShopSeed.shareTitle,
-      sharePath: "/pages/shop/index?shopNo=SHOP000001",
+      shareTitle: "ToSell 平台主店",
+      sharePath: "/s/SHOP000001",
       status: "open"
     }
   });
 
-  const existingService = await prisma.shopCustomerServiceBinding.findFirst({
-    where: { shopId: shop.id, status: "active" }
-  });
-  if (!existingService) {
-    await prisma.shopCustomerServiceBinding.create({
-      data: {
-      shopId: shop.id,
-        wechatId: virtualShopSeed.customerServiceWechat,
-        qrCodeUrl: "https://example.test/qr-agent-a.png",
-        status: "active",
-        reviewStatus: "approved"
-      }
-    });
+  const merchantFixtures = [];
+  for (const merchantSeed of seedMerchants) {
+    merchantFixtures.push(await upsertMerchantWithShop(merchantSeed, now));
   }
-
-  const { product, agentProduct } = await seedVirtualCatalog(agent.id, shop.id);
-
-  const depositAccount = await prisma.depositAccount.upsert({
-    where: { agentId: agent.id },
-    update: {
-      requiredAmountCents: 50_000n,
-      availableAmountCents: 50_000n,
-      status: "paid"
-    },
-    create: {
-      agentId: agent.id,
-      requiredAmountCents: 50_000n,
-      availableAmountCents: 50_000n,
-      status: "paid"
-    }
+  await upsertSeedMerchantRelation({
+    issuerMerchantId: merchantFixtures[0].merchant.id,
+    childMerchantId: merchantFixtures[1].merchant.id,
+    childTier: "second_tier",
+    code: "seed-m1-to-m2",
+    now
+  });
+  await upsertSeedMerchantRelation({
+    issuerMerchantId: merchantFixtures[1].merchant.id,
+    childMerchantId: merchantFixtures[2].merchant.id,
+    childTier: "third_tier",
+    code: "seed-m2-to-m3",
+    now
   });
 
-  const depositPay = await prisma.depositTransaction.upsert({
-    where: { idempotencyKey: "deposit:pay:manual:AGT000001" },
-    update: {},
+  await prisma.userWallet.upsert({
+    where: { userId: user.id },
+    update: { availableBalanceCents: 20_000n, totalRechargeCents: 20_000n, status: "active" },
     create: {
-      agentId: agent.id,
-      accountId: depositAccount.id,
-      type: "pay",
-      amountCents: 50_000n,
-      balanceBeforeCents: 0n,
-      balanceAfterCents: 50_000n,
-      reasonCode: "initial_deposit",
-      relatedType: "manual_receipt",
-      relatedId: "DEV-DEPOSIT-001",
-      voucherUrl: "dev://voucher/deposit-001",
-      idempotencyKey: "deposit:pay:manual:AGT000001",
-      operatorId: "seed"
-    }
-  });
-
-  const order = await prisma.order.upsert({
-    where: { orderNo: "ORD000001" },
-    update: {
-      status: "fulfilled",
-      paymentStatus: "paid",
-      fulfillmentStatus: "success",
-      refundStatus: "pending",
-      settlementStatus: "clawback_pending",
-      riskStatus: "normal",
-      paidAmountCents: 15_000n,
-      paidAt
-    },
-    create: {
-      orderNo: "ORD000001",
       userId: user.id,
-      agentId: agent.id,
-      shopId: shop.id,
-      status: "fulfilled",
-      paymentStatus: "paid",
-      fulfillmentStatus: "success",
-      refundStatus: "pending",
-      settlementStatus: "clawback_pending",
-      riskStatus: "normal",
-      paidAmountCents: 15_000n,
-      paidAt
+      walletNo: "WALLET000001",
+      availableBalanceCents: 20_000n,
+      totalRechargeCents: 20_000n,
+      status: "active"
     }
   });
 
-  const orderItem = await ensureOrderItem(order.id, agentProduct.id);
-
-  await prisma.orderAmountSnapshot.upsert({
-    where: { orderId: order.id },
-    update: {},
-    create: {
-      orderId: order.id,
-      serviceFeeBps: 50,
-      paidAmountCents: 15_000n,
-      supplyAmountCents: 10_000n,
-      serviceFeeCents: 75n,
-      agentExpectedIncomeCents: 4_925n,
-      productSnapshotJson: {
-        productType: "platform",
-        platformProductId: product.id,
-        productNo: product.productNo,
-        productName: product.name,
-        supplyPriceCents: "10000",
-        minSalePriceCents: "12000",
-        suggestedSalePriceCents: "15000"
-      },
-      shopSnapshotJson: {
-        agentId: agent.id,
-        shopId: shop.id,
-        shopName: shop.name,
-        customerServiceWechat: "dev_service_wechat",
-        agentStatus: "active",
-        shopStatus: "open"
-      },
-      pricingSnapshotJson: {
-        salePriceCents: "15000",
-        serviceFeeBps: 50,
-        serviceFeeCents: "75",
-        agentExpectedIncomeCents: "4925"
-      },
-      fulfillmentRuleSnapshotJson: product.fulfillmentRuleJson as Prisma.InputJsonValue,
-      afterSaleRuleSnapshotJson: product.afterSaleRuleJson as Prisma.InputJsonValue
-    }
-  });
-
-  const payment = await prisma.payment.upsert({
-    where: { paymentNo: "PAY000001" },
-    update: {
-      status: "paid",
-      paidAt
-    },
-    create: {
-      paymentNo: "PAY000001",
-      orderId: order.id,
-      userId: user.id,
-      channel: "wechat_miniprogram",
-      channelTradeNo: "WXTRADE000001",
-      amountCents: 15_000n,
-      status: "paid",
-      idempotencyKey: "pay:wechat:WXTRADE000001",
-      paidAt
-    }
-  });
-
-  await prisma.paymentCallback.upsert({
-    where: { channelEventId: "WXEVENT_PAY_000001" },
-    update: {},
-    create: {
-      paymentId: payment.id,
-      channel: "wechat_miniprogram",
-      channelEventId: "WXEVENT_PAY_000001",
-      rawPayloadJson: { transactionId: "WXTRADE000001", amountCents: "15000" },
-      processedStatus: "processed",
-      idempotencyKey: "pay:wechat:WXTRADE000001",
-      processedAt: paidAt
-    }
-  });
-
-  const fulfillment = await ensureFulfillment(order.id, orderItem.id, agent.id, fulfilledAt);
-
-  await prisma.fulfillmentAttempt.upsert({
-    where: { idempotencyKey: `fulfill:${orderItem.id}:1` },
-    update: {},
-    create: {
-      fulfillmentId: fulfillment.id,
-      attemptNo: 1,
-      idempotencyKey: `fulfill:${orderItem.id}:1`,
-      operatorId: "seed",
-      requestJson: { mode: "manual" },
-      resultJson: { voucher: "DEV-RIGHT-001" },
-      status: "success"
-    }
-  });
-
-  await prisma.entitlement.upsert({
-    where: { idempotencyKey: `entitlement:${orderItem.id}:DEV-RIGHT-001` },
-    update: {},
-    create: {
-      orderId: order.id,
-      orderItemId: orderItem.id,
-      userId: user.id,
-      rightsCode: "DEV-RIGHT-001",
-      rightsPayloadJson: { code: "DEV-RIGHT-001", note: "seed entitlement" },
-      status: "success",
-      idempotencyKey: `entitlement:${orderItem.id}:DEV-RIGHT-001`,
-      issuedAt: fulfilledAt
-    }
-  });
-
-  const settlement = await prisma.settlementSheet.upsert({
-    where: { settlementNo: "SETTLE000001" },
-    update: {},
-    create: {
-      settlementNo: "SETTLE000001",
-      agentId: agent.id,
-      periodStart: new Date("2026-05-25T00:00:00.000Z"),
-      periodEnd: new Date("2026-05-25T23:59:59.000Z"),
-      status: "paid",
-      totalOrderCount: 1,
-      totalPaidCents: 15_000n,
-      totalServiceFeeCents: 75n,
-      totalAgentIncomeCents: 4_925n,
-      idempotencyKey: "settlement:AGT000001:2026-05-25:2026-05-25:batch-001",
-      createdById: "seed",
-      confirmedById: "seed"
-    }
-  });
-
-  await prisma.settlementItem.upsert({
-    where: { orderId_settlementRole: { orderId: order.id, settlementRole: "single_agent" } },
-    update: {},
-    create: {
-      settlementId: settlement.id,
-      orderId: order.id,
-      settlementRole: "single_agent",
-      agentId: agent.id,
-      shopId: shop.id,
-      paidAmountCents: 15_000n,
-      supplyAmountCents: 10_000n,
-      serviceFeeCents: 75n,
-      agentIncomeCents: 4_925n,
-      deductedCents: 0n,
-      settleAmountCents: 4_925n,
-      fulfilledAt,
-      settleableAt
-    }
-  });
-
-  await prisma.manualPayout.upsert({
-    where: { idempotencyKey: "payout:SETTLE000001:paid" },
-    update: {},
-    create: {
-      settlementId: settlement.id,
-      agentId: agent.id,
-      amountCents: 4_925n,
-      payeeInfoSnapshotJson: { name: "测试代理", method: "manual" },
-      payoutMethod: "manual_bank_transfer",
-      payoutVoucherUrl: "dev://voucher/payout-001",
-      status: "paid",
-      idempotencyKey: "payout:SETTLE000001:paid",
-      paidById: "seed",
-      paidAt: new Date("2026-05-25T12:00:00.000Z")
-    }
-  });
-
-  const afterSale = await prisma.afterSale.upsert({
-    where: { afterSaleNo: "AS000001" },
-    update: {},
-    create: {
-      afterSaleNo: "AS000001",
-      orderId: order.id,
-      userId: user.id,
-      agentId: agent.id,
-      shopId: shop.id,
-      status: "refunded",
-      reasonCode: "agent_service_issue",
-      responsibility: "agent",
-      requestedRefundCents: 3_000n,
-      approvedRefundCents: 3_000n,
-      platformBearCents: 0n,
-      agentBearCents: 3_000n,
-      serviceFeeRefundCents: 0n,
-      serviceFeeBearer: "agent",
-      evidenceJson: { note: "seed partial refund after settlement" }
-    }
-  });
-
-  const refund = await prisma.refund.upsert({
-    where: { refundNo: "REF000001" },
-    update: {},
-    create: {
-      refundNo: "REF000001",
-      afterSaleId: afterSale.id,
-      orderId: order.id,
-      paymentId: payment.id,
-      amountCents: 3_000n,
-      status: "refunded",
-      channelRefundNo: "WXREFUND000001",
-      idempotencyKey: "refund:wechat:WXREFUND000001"
-    }
-  });
-
-  await prisma.refundCallback.upsert({
-    where: { channelEventId: "WXEVENT_REFUND_000001" },
-    update: {},
-    create: {
-      refundId: refund.id,
-      channel: "wechat_miniprogram",
-      channelEventId: "WXEVENT_REFUND_000001",
-      rawPayloadJson: { refundId: "WXREFUND000001", amountCents: "3000" },
-      processedStatus: "processed",
-      idempotencyKey: "refund:wechat:WXREFUND000001",
-      processedAt: new Date("2026-05-26T01:00:00.000Z")
-    }
-  });
-
-  const clawback = await prisma.clawback.upsert({
-    where: { clawbackNo: "CLAW000001" },
-    update: {},
-    create: {
-      clawbackNo: "CLAW000001",
-      agentId: agent.id,
-      sourceType: "refund",
-      sourceId: refund.id,
-      orderId: order.id,
-      amountCents: 3_000n,
-      status: "completed",
-      deductFrom: "deposit",
-      reasonCode: "post_settlement_refund",
-      idempotencyKey: `clawback:refund:${refund.id}:${agent.id}`
-    }
-  });
-
-  await prisma.riskFreeze.upsert({
-    where: { activeUniqueKey: `shop:${shop.id}:settlement_restricted` },
-    update: {},
-    create: {
-      targetType: "shop",
-      targetId: shop.id,
-      agentId: agent.id,
-      freezeType: "settlement_restricted",
-      status: "active",
-      reasonCode: "seed_risk_review",
-      reasonText: "Seed active risk freeze for review flow",
-      activeUniqueKey: `shop:${shop.id}:settlement_restricted`,
-      createdById: "seed"
-    }
-  });
-
-  await ensureComplaint(order.id, agent.id, user.id);
-
-  await seedLedgers(agent.id, shop.id, order.id, settlement.id, refund.id, clawback.id, depositPay.id);
-
-  const permissions = [
-    ["agent.review", "代理审核"],
-    ["product.manage", "商品管理"],
-    ["after_sale.arbitrate", "售后仲裁"],
-    ["settlement.confirm", "结算确认"],
-    ["payout.confirm", "人工打款回填"],
-    ["deposit.manage", "保证金管理"],
-    ["risk.freeze", "风控冻结"],
-    ["audit.read", "审计查询"],
-    ["rbac.manage", "权限管理"]
-  ] as const;
-
-  for (const [code, name] of permissions) {
-    await prisma.permission.upsert({
-      where: { code },
-      update: { name },
-      create: { code, name }
-    });
+  const listingIdsByShop = new Map<string, string[]>();
+  for (const fixture of merchantFixtures) {
+    listingIdsByShop.set(fixture.shop.id, []);
   }
-
-  const roles = [
-    ["admin", "管理员", permissions.map(([code]) => code)],
-    ["operator", "运营", ["agent.review", "product.manage", "after_sale.arbitrate", "risk.freeze", "audit.read"]],
-    ["finance", "财务", ["settlement.confirm", "payout.confirm", "deposit.manage", "audit.read"]]
-  ] as const;
-
-  for (const [code, name, permissionCodes] of roles) {
-    const role = await prisma.role.upsert({
-      where: { code },
-      update: { name },
-      create: { code, name }
-    });
-
-    for (const permissionCode of permissionCodes) {
-      const permission = await prisma.permission.findUniqueOrThrow({
-        where: { code: permissionCode }
-      });
-
-      await prisma.rolePermission.upsert({
-        where: {
-          roleId_permissionId: {
-            roleId: role.id,
-            permissionId: permission.id
-          }
-        },
-        update: {},
-        create: {
-          roleId: role.id,
-          permissionId: permission.id
-        }
-      });
-    }
-  }
-
-  const admin = await prisma.adminUser.upsert({
-    where: { username: "admin" },
-    update: {},
-    create: {
-      username: "admin",
-      displayName: "开发管理员",
-      passwordHash: "replace-with-local-dev-hash"
-    }
-  });
-
-  const adminRole = await prisma.role.findUniqueOrThrow({ where: { code: "admin" } });
-  await prisma.adminUserRole.upsert({
-    where: {
-      adminUserId_roleId: {
-        adminUserId: admin.id,
-        roleId: adminRole.id
-      }
-    },
-    update: {},
-    create: {
-      adminUserId: admin.id,
-      roleId: adminRole.id
-    }
-  });
-
-  await prisma.auditLog.upsert({
-    where: { idempotencyKey: "audit:seed:v1-closed-loop" },
-    update: {},
-    create: {
-      actorType: "system",
-      actorId: "seed",
-      action: "seed.v1_closed_loop",
-      targetType: "order",
-      targetId: order.id,
-      beforeJson: {},
-      afterJson: { orderNo: order.orderNo, settlementNo: settlement.settlementNo, refundNo: refund.refundNo },
-      reason: "development seed data",
-      idempotencyKey: "audit:seed:v1-closed-loop",
-      requestId: "seed-v1-closed-loop",
-      ip: "127.0.0.1"
-    }
-  });
-}
-
-async function seedVirtualCatalog(agentId: string, shopId: string) {
-  await prisma.shopProductGroup.deleteMany({ where: { shopId } });
-  const seeded: Array<{
-    product: Awaited<ReturnType<typeof prisma.platformProduct.upsert>>;
-    agentProduct: Awaited<ReturnType<typeof prisma.agentProduct.upsert>>;
-  }> = [];
 
   for (const item of virtualCatalogProducts) {
-    const fulfillmentRuleJson = {
-      mode: item.fulfillmentMode,
-      imageUrl: item.imageUrl,
-      usageGuide: item.usageGuide,
-      specs: item.specs,
-      detailSections: item.detailSections,
-      stockCount: item.stockCount,
-      soldCount: item.soldCount
-    };
     const fulfillmentType = item.fulfillmentMode === "code_pool" ? "code_pool" : "manual";
     const product = await prisma.platformProduct.upsert({
       where: { productNo: item.productNo },
@@ -524,13 +302,22 @@ async function seedVirtualCatalog(agentId: string, shopId: string) {
         name: item.name,
         categoryName: item.category,
         tagsJson: item.tags,
+        imageUrl: item.imageUrl,
+        specsJson: item.specs,
+        detailSectionsJson: item.detailSections,
+        stockCount: item.stockCount,
+        soldCount: item.soldCount,
         detail: item.description,
         rightsDesc: item.subtitle,
         supplyPriceCents: item.supplyPriceCents,
         minSalePriceCents: item.minSalePriceCents,
         suggestedSalePriceCents: item.suggestedSalePriceCents,
         fulfillmentType,
-        fulfillmentRuleJson,
+        fulfillmentRuleJson: {
+          mode: item.fulfillmentMode,
+          usageGuide: item.usageGuide,
+          ...(item.fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {})
+        },
         afterSaleRuleJson: { refundBeforeFulfillment: true },
         status: "active"
       },
@@ -539,38 +326,43 @@ async function seedVirtualCatalog(agentId: string, shopId: string) {
         name: item.name,
         categoryName: item.category,
         tagsJson: item.tags,
+        imageUrl: item.imageUrl,
+        specsJson: item.specs,
+        detailSectionsJson: item.detailSections,
+        stockCount: item.stockCount,
+        soldCount: item.soldCount,
         detail: item.description,
         rightsDesc: item.subtitle,
         supplyPriceCents: item.supplyPriceCents,
         minSalePriceCents: item.minSalePriceCents,
         suggestedSalePriceCents: item.suggestedSalePriceCents,
         fulfillmentType,
-        fulfillmentRuleJson,
+        fulfillmentRuleJson: {
+          mode: item.fulfillmentMode,
+          usageGuide: item.usageGuide,
+          ...(item.fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {})
+        },
         afterSaleRuleJson: { refundBeforeFulfillment: true },
         status: "active"
       }
     });
 
-    const agentProduct = await prisma.agentProduct.upsert({
-      where: {
-        shopId_productType_platformProductId: {
-          shopId,
-          productType: "platform",
-          platformProductId: product.id
-        }
-      },
+    await prisma.platformShopProduct.upsert({
+      where: { shopId_platformProductId: { shopId: platformShop.id, platformProductId: product.id } },
       update: {
-        salePriceCents: item.agentSalePriceCents,
-        status: "listed"
+        salePriceCents: item.platformSalePriceCents ?? item.suggestedSalePriceCents,
+        fulfillmentCostCents: item.fulfillmentCostCents ?? item.supplyPriceCents,
+        status: "listed",
+        listedAt: now
       },
       create: {
-        agentId,
-        shopId,
-        productType: "platform",
+        shopId: platformShop.id,
         platformProductId: product.id,
-        salePriceCents: item.agentSalePriceCents,
+        salePriceCents: item.platformSalePriceCents ?? item.suggestedSalePriceCents,
+        fulfillmentCostCents: item.fulfillmentCostCents ?? item.supplyPriceCents,
         status: "listed",
-        listedAt: new Date()
+        listedAt: now,
+        idempotencyKey: `seed:platform-listing:${item.productNo}`
       }
     });
 
@@ -579,207 +371,280 @@ async function seedVirtualCatalog(agentId: string, shopId: string) {
         where: {
           productId_codeCiphertext: {
             productId: product.id,
-            codeCiphertext: `dev:${code}`
+            codeCiphertext: `dev:platform:${code}`
           }
         },
         update: { status: "available" },
         create: {
           productId: product.id,
-          codeCiphertext: `dev:${code}`,
-          batchNo: `seed-${item.productNo.toLowerCase()}`,
+          codeCiphertext: `dev:platform:${code}`,
+          batchNo: `seed-platform-${item.productNo.toLowerCase()}`,
+          ownerType: "platform",
+          shopId: platformShop.id,
           status: "available",
           importedById: "seed"
         }
       });
     }
 
-    seeded.push({ product, agentProduct });
+    let upstreamListingId: string | undefined;
+    for (const [index, fixture] of merchantFixtures.entries()) {
+      const salePriceCents = item.merchantSalePriceCents + BigInt(index * 500);
+      const sourceType = upstreamListingId ? "upstream_listing" : "platform_product";
+      const listing = await prisma.merchantProductListing.upsert({
+        where: { shopId_platformProductId: { shopId: fixture.shop.id, platformProductId: product.id } },
+        update: {
+          sourceType,
+          upstreamListingId,
+          salePriceCents,
+          displayName: `${fixture.merchant.name} ${item.name}`,
+          displaySubtitle: item.subtitle,
+          displayDescription: item.description,
+          displayUsageGuide: item.usageGuide,
+          displayImageUrl: item.imageUrl,
+          displayCategory: item.category,
+          displayTagsJson: item.tags,
+          displaySpecsJson: item.specs,
+          displayDetailSectionsJson: item.detailSections,
+          status: "listed",
+          listedAt: now
+        },
+        create: {
+          merchantId: fixture.merchant.id,
+          shopId: fixture.shop.id,
+          sourceType,
+          platformProductId: product.id,
+          upstreamListingId,
+          salePriceCents,
+          displayName: `${fixture.merchant.name} ${item.name}`,
+          displaySubtitle: item.subtitle,
+          displayDescription: item.description,
+          displayUsageGuide: item.usageGuide,
+          displayImageUrl: item.imageUrl,
+          displayCategory: item.category,
+          displayTagsJson: item.tags,
+          displaySpecsJson: item.specs,
+          displayDetailSectionsJson: item.detailSections,
+          status: "listed",
+          listedAt: now,
+          idempotencyKey: `seed:merchant-listing:${fixture.merchant.merchantNo}:${item.productNo}`
+        }
+      });
+      upstreamListingId = listing.id;
+      listingIdsByShop.get(fixture.shop.id)?.push(listing.id);
+
+      for (const code of item.rightsCodes ?? []) {
+        await prisma.rightsCode.upsert({
+          where: {
+            merchantProductListingId_codeCiphertext: {
+              merchantProductListingId: listing.id,
+              codeCiphertext: `dev:${fixture.merchant.merchantNo}:${code}`
+            }
+          },
+          update: { status: "available" },
+          create: {
+            merchantProductListingId: listing.id,
+            codeCiphertext: `dev:${fixture.merchant.merchantNo}:${code}`,
+            batchNo: `seed-${fixture.merchant.merchantNo.toLowerCase()}-${item.productNo.toLowerCase()}`,
+            ownerType: "merchant",
+            ownerMerchantId: fixture.merchant.id,
+            shopId: fixture.shop.id,
+            status: "available",
+            importedById: "seed"
+          }
+        });
+      }
+    }
   }
 
-  for (const [index, group] of virtualShopSeed.productGroups.entries()) {
+  for (const fixture of merchantFixtures) {
+    const review = await prisma.merchantProductReview.upsert({
+      where: { idempotencyKey: `seed:merchant-owned-review:${fixture.merchant.merchantNo}` },
+      update: { status: "approved", reviewedAt: now },
+      create: {
+        merchantId: fixture.merchant.id,
+        shopId: fixture.shop.id,
+        name: `${fixture.merchant.name} 自有虚拟服务`,
+        detailJson: { description: "商户自有商品审核样例" },
+        salePriceCents: 9_900n,
+        afterSaleRuleJson: { refundBeforeFulfillment: true },
+        fulfillmentRuleJson: {
+          mode: fixture.merchant.tier === "second_tier" ? "manual" : "code_pool",
+          ...(fixture.merchant.tier === "second_tier" ? {} : { extractCodeRequired: true })
+        },
+        fulfillmentType: fixture.merchant.tier === "second_tier" ? "manual" : "code_pool",
+        status: "approved",
+        reviewedById: "seed",
+        reviewedAt: now,
+        idempotencyKey: `seed:merchant-owned-review:${fixture.merchant.merchantNo}`
+      }
+    });
+
+    await prisma.merchantProduct.upsert({
+      where: { idempotencyKey: `seed:merchant-owned-product:${fixture.merchant.merchantNo}` },
+      update: {
+        salePriceCents: 9_900n,
+        status: "listed",
+        listedAt: now
+      },
+      create: {
+        merchantId: fixture.merchant.id,
+        shopId: fixture.shop.id,
+        productType: "merchant_owned",
+        ownProductReviewId: review.id,
+        salePriceCents: 9_900n,
+        status: "listed",
+        listedAt: now,
+        idempotencyKey: `seed:merchant-owned-product:${fixture.merchant.merchantNo}`
+      }
+    });
+
+    await prisma.shopProductGroup.deleteMany({ where: { shopId: fixture.shop.id } });
     await prisma.shopProductGroup.create({
       data: {
-        shopId,
-        name: group.name,
-        sortOrder: index + 1,
-        agentProductIds: group.agentProductIds
+        shopId: fixture.shop.id,
+        name: "默认商品",
+        sortOrder: 1,
+        productListingIds: listingIdsByShop.get(fixture.shop.id) ?? []
       }
     });
   }
 
-  return seeded[0];
-}
-
-async function ensureAgentApplication(agentId: string, userId: string) {
-  const existing = await prisma.agentApplication.findFirst({ where: { agentId, userId } });
-  if (existing) return existing;
-  return prisma.agentApplication.create({
-    data: {
-      agentId,
-      userId,
-      identityInfoJson: { type: "individual", name: "测试代理" },
-      contactInfoJson: { phone: "13800000000" },
-      customerServiceWechat: "dev_service_wechat",
-      status: "approved",
-      reviewedById: "seed",
-      reviewedAt: new Date()
+  await prisma.collectionPaymentConfig.upsert({
+    where: { configNo: "PAYCFG_PLATFORM_BALANCE" },
+    update: { status: "active", isDefault: false, enabledAt: now },
+    create: {
+      configNo: "PAYCFG_PLATFORM_BALANCE",
+      ownerType: "platform",
+      shopId: platformShop.id,
+      provider: "balance",
+      confirmMode: "balance_deduct",
+      status: "active",
+      isDefault: false,
+      enabledAt: now,
+      displayName: "余额支付",
+      credentialStatus: "not_configured",
+      idempotencyKey: "seed:paycfg:platform:balance"
     }
   });
-}
 
-async function ensureOrderItem(orderId: string, agentProductId: string) {
-  const existing = await prisma.orderItem.findFirst({ where: { orderId, agentProductId } });
-  if (existing) return existing;
-  return prisma.orderItem.create({
-    data: {
-      orderId,
-      agentProductId,
-      productType: "platform",
-      productIdSnapshot: "P000001",
-      productNameSnapshot: "测试虚拟权益",
-      salePriceCents: 15_000n,
-      quantity: 1,
-      supplyPriceCents: 10_000n,
-      serviceFeeCents: 75n,
-      agentIncomeCents: 4_925n
+  await prisma.collectionPaymentConfig.upsert({
+    where: { configNo: "PAYCFG_PLATFORM_ALIPAY_PERSONAL" },
+    update: { status: "active", isDefault: true, enabledAt: now },
+    create: {
+      configNo: "PAYCFG_PLATFORM_ALIPAY_PERSONAL",
+      ownerType: "platform",
+      shopId: platformShop.id,
+      provider: "alipay_personal",
+      confirmMode: "manual_confirm",
+      status: "active",
+      isDefault: true,
+      enabledAt: now,
+      displayName: "平台个人支付宝",
+      qrUrl: "https://example.test/pay/platform-alipay.png",
+      accountMasked: "plat***pay",
+      credentialStatus: "not_configured",
+      idempotencyKey: "seed:paycfg:platform:alipay-personal"
     }
   });
-}
 
-async function ensureFulfillment(orderId: string, orderItemId: string, agentId: string, successAt: Date) {
-  const existing = await prisma.fulfillmentRecord.findFirst({ where: { orderId, orderItemId } });
-  if (existing) return existing;
-  return prisma.fulfillmentRecord.create({
-    data: {
-      orderId,
-      orderItemId,
-      agentId,
-      fulfillmentType: "manual",
-      status: "success",
-      successAt
-    }
-  });
-}
-
-async function ensureComplaint(orderId: string, agentId: string, userId: string) {
-  const existing = await prisma.complaint.findFirst({
-    where: { orderId, complaintType: "after_sale_service" }
-  });
-  if (existing) return existing;
-  return prisma.complaint.create({
-    data: {
-      orderId,
-      agentId,
-      userId,
-      status: "resolved",
-      complaintType: "after_sale_service",
-      responsibility: "agent",
-      resolutionJson: { result: "partial refund and clawback" }
-    }
-  });
-}
-
-async function seedLedgers(
-  agentId: string,
-  shopId: string,
-  orderId: string,
-  settlementId: string,
-  refundId: string,
-  clawbackId: string,
-  depositTransactionId: string
-) {
-  const entries = [
-    {
-      ledgerNo: "LEDGER000001",
-      accountType: "agent_deposit_available",
-      entryType: "DEPOSIT_PAY",
-      direction: "credit",
-      amountCents: 50_000n,
-      sourceType: "deposit_transaction",
-      sourceId: depositTransactionId,
-      depositTransactionId,
-      idempotencyKey: "ledger:deposit:pay:AGT000001"
+  await prisma.collectionPaymentConfig.upsert({
+    where: { configNo: "PAYCFG_PLATFORM_EPAY" },
+    update: {
+      status: "active",
+      isDefault: false,
+      enabledAt: now,
+      gatewayUrl: "https://xpay.uumua.com/xpay/epay/",
+      apiMode: "submit",
+      merchantNoMasked: "10***83",
+      credentialCiphertext: encryptPaymentCredentialBundle({
+        merchantNo: "10783",
+        signingSecret: "dev-epay-signing-secret"
+      }),
+      credentialStatus: "configured"
     },
-    {
-      ledgerNo: "LEDGER000002",
-      accountType: "agent_pending_income",
-      entryType: "ORDER_AGENT_INCOME_PENDING",
-      direction: "credit",
-      amountCents: 4_925n,
-      sourceType: "order",
-      sourceId: orderId,
-      orderId,
-      idempotencyKey: "ledger:order:income:ORD000001"
-    },
-    {
-      ledgerNo: "LEDGER000003",
-      accountType: "platform_service_fee_income",
-      entryType: "ORDER_SERVICE_FEE_ACCRUAL",
-      direction: "credit",
-      amountCents: 75n,
-      sourceType: "order",
-      sourceId: orderId,
-      orderId,
-      idempotencyKey: "ledger:order:service_fee:ORD000001"
-    },
-    {
-      ledgerNo: "LEDGER000004",
-      accountType: "agent_paid_income",
-      entryType: "SETTLEMENT_PAYOUT",
-      direction: "debit",
-      amountCents: 4_925n,
-      sourceType: "settlement",
-      sourceId: settlementId,
-      settlementId,
-      idempotencyKey: "ledger:settlement:payout:SETTLE000001"
-    },
-    {
-      ledgerNo: "LEDGER000005",
-      accountType: "agent_clawback_receivable",
-      entryType: "CLAWBACK_CREATE",
-      direction: "debit",
-      amountCents: 3_000n,
-      sourceType: "refund",
-      sourceId: refundId,
-      orderId,
-      refundId,
-      clawbackId,
-      idempotencyKey: "ledger:clawback:create:CLAW000001"
+    create: {
+      configNo: "PAYCFG_PLATFORM_EPAY",
+      ownerType: "platform",
+      shopId: platformShop.id,
+      provider: "epay",
+      confirmMode: "callback_query",
+      status: "active",
+      isDefault: false,
+      enabledAt: now,
+      displayName: "平台 e支付",
+      merchantNoMasked: "10***83",
+      gatewayUrl: "https://xpay.uumua.com/xpay/epay/",
+      apiMode: "submit",
+      credentialCiphertext: encryptPaymentCredentialBundle({
+        merchantNo: "10783",
+        signingSecret: "dev-epay-signing-secret"
+      }),
+      credentialStatus: "configured",
+      idempotencyKey: "seed:paycfg:platform:epay"
     }
-  ] as const;
+  });
 
-  for (const entry of entries) {
-    await prisma.ledgerEntry.upsert({
-      where: { ledgerNo: entry.ledgerNo },
-      update: {},
-      create: {
-        ledgerNo: entry.ledgerNo,
-        agentId,
-        shopId,
-        subjectType: "agent",
-        subjectId: agentId,
-        accountType: entry.accountType,
-        entryType: entry.entryType,
-        direction: entry.direction,
-        amountCents: entry.amountCents,
-        currency: "CNY",
-        sourceType: entry.sourceType,
-        sourceId: entry.sourceId,
-        orderId: "orderId" in entry ? entry.orderId : undefined,
-        settlementId: "settlementId" in entry ? entry.settlementId : undefined,
-        refundId: "refundId" in entry ? entry.refundId : undefined,
-        clawbackId: "clawbackId" in entry ? entry.clawbackId : undefined,
-        depositTransactionId: "depositTransactionId" in entry ? entry.depositTransactionId : undefined,
-        idempotencyKey: entry.idempotencyKey,
-        balanceBeforeCents: 0n,
-        balanceAfterCents: entry.amountCents
-      }
-    });
-  }
+  await prisma.platformServiceFeeConfig.upsert({
+    where: { idempotencyKey: "seed:service-fee:default" },
+    update: { enabled: true, feeBps: 50, status: "active" },
+    create: {
+      enabled: true,
+      feeBps: 50,
+      basisType: "final_sale_price",
+      effectiveFrom: new Date("2026-01-01T00:00:00.000Z"),
+      status: "active",
+      idempotencyKey: "seed:service-fee:default"
+    }
+  });
+
+  const coupon = await prisma.couponTemplate.upsert({
+    where: { couponNo: "COUPON_REGISTER_001" },
+    update: { status: "active" },
+    create: {
+      couponNo: "COUPON_REGISTER_001",
+      name: "注册赠送优惠券",
+      discountAmountCents: 500n,
+      platformSubsidyCents: 500n,
+      firstRegistrationOnly: true,
+      status: "active",
+      validFrom: new Date("2026-01-01T00:00:00.000Z"),
+      validTo: new Date("2027-01-01T00:00:00.000Z"),
+      idempotencyKey: "seed:coupon:register"
+    }
+  });
+
+  await prisma.couponScope.upsert({
+    where: { id: "seed_coupon_scope_all" },
+    update: {},
+    create: {
+      id: "seed_coupon_scope_all",
+      couponTemplateId: coupon.id,
+      scopeType: "all_products"
+    }
+  });
+
+  await prisma.auditLog.upsert({
+    where: { idempotencyKey: "audit:seed:merchants-only" },
+    update: {},
+    create: {
+      actorType: "system",
+      actorId: "seed",
+      action: "seed.merchants_only",
+      targetType: "shop",
+      targetId: platformShop.id,
+      beforeJson: {},
+      afterJson: { platformShopNo: platformShop.shopNo, merchantShopNos: merchantFixtures.map((fixture) => fixture.shop.shopNo) },
+      reason: "development seed data",
+      idempotencyKey: "audit:seed:merchants-only",
+      requestId: "seed-merchants-only",
+      ip: "127.0.0.1"
+    }
+  });
 }
 
 main()
-  .finally(async () => {
+  .then(async () => {
     await prisma.$disconnect();
   })
   .catch(async (error) => {

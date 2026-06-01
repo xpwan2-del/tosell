@@ -12,7 +12,7 @@ enum UserStatus {
   disabled
 }
 
-enum AgentStatus {
+enum MerchantStatus {
   draft
   pending_review
   rejected
@@ -56,7 +56,7 @@ enum ProductStatus {
   risk_removed
 }
 
-enum AgentProductStatus {
+enum ProductListingStatus {
   draft
   pending_review
   rejected
@@ -68,7 +68,7 @@ enum AgentProductStatus {
 
 enum ProductType {
   platform
-  agent_owned
+  merchant_owned
 }
 
 enum FulfillmentType {
@@ -104,11 +104,14 @@ enum PaymentProvider {
   wechat_merchant
   epay
   alipay_personal
+  wechat_personal
+  balance
 }
 
 enum PaymentConfirmMode {
   callback_query
   manual_confirm
+  balance_deduct
 }
 
 enum PaymentEnvironment {
@@ -118,7 +121,6 @@ enum PaymentEnvironment {
 
 enum CollectionConfigOwnerType {
   platform
-  agent
   merchant
 }
 
@@ -141,6 +143,38 @@ enum PaymentConfirmSource {
   callback
   query
   manual_confirm
+  balance
+}
+
+enum WalletStatus {
+  active
+  frozen
+  disabled
+}
+
+enum WalletTransactionType {
+  recharge
+  payment_hold
+  payment_capture
+  payment_release
+  refund
+  adjustment
+}
+
+enum WalletRechargeStatus {
+  pending_payment
+  paid
+  failed
+  cancelled
+  expired
+}
+
+enum WalletHoldStatus {
+  active
+  captured
+  released
+  expired
+  cancelled
 }
 
 enum PaymentConfirmationStatus {
@@ -168,7 +202,7 @@ enum RightsCodeStatus {
 
 enum RightsCodeOwnerType {
   platform
-  agent
+  merchant
 }
 
 enum RefundStatus {
@@ -239,9 +273,20 @@ enum PaymentDisputeMaterialStatus {
   ignored
 }
 
+enum ServiceFeeBasisType {
+  final_sale_price
+  paid_amount
+}
+
+enum ServiceFeeConfigStatus {
+  active
+  scheduled
+  disabled
+}
+
 enum AfterSaleStatus {
   pending
-  agent_processing
+  merchant_processing
   platform_intervening
   refund_approved
   refunding
@@ -252,7 +297,7 @@ enum AfterSaleStatus {
 
 enum Responsibility {
   platform
-  agent
+  merchant
   first_tier
   second_tier
   third_tier
@@ -263,12 +308,12 @@ enum Responsibility {
 
 enum ShopOwnerType {
   platform
-  agent
+  merchant
 }
 
 enum SalesChannelType {
   platform_self_operated
-  single_agent
+  single_merchant
   two_tier
   three_tier
 }
@@ -307,7 +352,6 @@ enum MerchantAccountStatus {
 enum AuthSubjectType {
   admin
   merchant
-  agent
   user
 }
 
@@ -323,29 +367,15 @@ enum InitialAccountDeliveryStatus {
   acknowledged
 }
 
-enum ChannelRelationType {
-  two_tier
-  three_tier
-}
-
 enum SaleSourceType {
-  agent_product
+  merchant_product_listing
   merchant_product
   platform_shop_product
 }
 
-enum CollectionChannelType {
-  wechat_qr
-  alipay_qr
-  bank_transfer
-  other
-}
-
-enum CollectionChannelStatus {
-  pending_review
-  active
-  disabled
-  rejected
+enum MerchantProductListingSourceType {
+  platform_product
+  upstream_listing
 }
 
 enum VirtualCodeStatus {
@@ -370,26 +400,6 @@ enum ExtractLogResult {
   locked
   revoked
   expired
-}
-
-enum ClearingRecordStatus {
-  draft
-  confirmed
-  cancelled
-}
-
-enum ClearingItemType {
-  supply_payable
-  service_fee
-  clawback
-  refund_adjustment
-  coupon_subsidy
-}
-
-enum ClearingConfirmationStatus {
-  pending
-  confirmed
-  rejected
 }
 
 enum CouponTemplateStatus {
@@ -417,24 +427,18 @@ enum CouponScopeType {
   shop
 }
 
-enum ChannelStatus {
-  pending_review
-  active
-  frozen
-  closed
-  rejected
-}
-
 enum PaymentChannel {
   wechat_miniprogram
   wechat_h5_jsapi
   wechat_h5
   alipay_wap
+  epay
+  balance
   mock
 }
 
 enum SettlementRole {
-  single_agent
+  single_merchant
   first_tier
   second_tier
   third_tier
@@ -442,7 +446,7 @@ enum SettlementRole {
 
 enum ServiceFeeBearer {
   platform
-  agent
+  merchant
   user
   mixed
   none
@@ -493,25 +497,27 @@ enum LedgerDirection {
 }
 
 enum LedgerSubjectType {
-  agent
+  merchant
   platform
   user
 }
 
 enum LedgerAccountType {
-  agent_pending_income
-  agent_frozen_income
-  agent_payable_income
-  agent_paid_income
-  agent_clawback_receivable
-  agent_deposit_available
-  agent_deposit_frozen
+  merchant_pending_income
+  merchant_frozen_income
+  merchant_payable_income
+  merchant_paid_income
+  merchant_clawback_receivable
+  merchant_deposit_available
+  merchant_deposit_frozen
   platform_service_fee_income
   platform_refund_cost
   platform_self_operated_revenue
   platform_self_operated_fulfillment_cost
   platform_payment_channel_fee
   platform_self_operated_refund_cost
+  user_wallet_available
+  user_wallet_frozen
   first_tier_pending_income
   first_tier_payable_income
   second_tier_pending_income
@@ -521,7 +527,7 @@ enum LedgerAccountType {
 }
 
 enum LedgerEntryType {
-  ORDER_AGENT_INCOME_PENDING
+  ORDER_MERCHANT_INCOME_PENDING
   ORDER_SERVICE_FEE_ACCRUAL
   ORDER_PLATFORM_SELF_REVENUE
   ORDER_PLATFORM_SELF_COST
@@ -529,7 +535,7 @@ enum LedgerEntryType {
   ORDER_FIRST_TIER_INCOME_PENDING
   ORDER_SECOND_TIER_INCOME_PENDING
   ORDER_THIRD_TIER_INCOME_PENDING
-  REFUND_AGENT_BEAR
+  REFUND_MERCHANT_BEAR
   REFUND_PLATFORM_BEAR
   REFUND_FIRST_TIER_BEAR
   REFUND_SECOND_TIER_BEAR
@@ -544,6 +550,12 @@ enum LedgerEntryType {
   DEPOSIT_PAY
   DEPOSIT_DEDUCT
   DEPOSIT_REFUND
+  WALLET_RECHARGE_PAID
+  WALLET_PAYMENT_HOLD
+  WALLET_PAYMENT_CAPTURE
+  WALLET_PAYMENT_RELEASE
+  WALLET_REFUND
+  WALLET_ADJUST
   RISK_FREEZE
   RISK_UNFREEZE
   MANUAL_ADJUST
@@ -565,7 +577,6 @@ enum ComplaintStatus {
 
 enum ActorType {
   user
-  agent
   merchant
   admin
   system
@@ -591,16 +602,13 @@ enum EmailDeliveryStatus {
 }
 
 model User {
-  id        String     @id @default(cuid())
-  openid    String?    @unique
-  unionid   String?    @unique
-  phone     String?
-  status    UserStatus @default(active)
-  createdAt DateTime   @default(now()) @map("created_at")
-  updatedAt DateTime   @updatedAt @map("updated_at")
-
-  agent                Agent?
-  applications         AgentApplication[]
+  id                   String                @id @default(cuid())
+  openid               String?               @unique
+  unionid              String?               @unique
+  phone                String?
+  status               UserStatus            @default(active)
+  createdAt            DateTime              @default(now()) @map("created_at")
+  updatedAt            DateTime              @updatedAt @map("updated_at")
   identities           UserIdentity[]
   sessions             AuthSession[]
   orders               Order[]
@@ -608,6 +616,10 @@ model User {
   merchantAccounts     MerchantAccount[]
   merchantApplications MerchantApplication[]
   userCoupons          UserCoupon[]
+  wallet               UserWallet?
+  walletTransactions   WalletTransaction[]
+  walletRechargeOrders WalletRechargeOrder[]
+  walletPaymentHolds   WalletPaymentHold[]
 
   @@map("users")
 }
@@ -636,7 +648,6 @@ model AuthSession {
   adminUserId       String?           @map("admin_user_id")
   merchantAccountId String?           @map("merchant_account_id")
   merchantId        String?           @map("merchant_id")
-  agentId           String?           @map("agent_id")
   tokenHash         String            @unique @map("token_hash")
   refreshTokenHash  String?           @unique @map("refresh_token_hash")
   status            AuthSessionStatus @default(active)
@@ -645,7 +656,7 @@ model AuthSession {
   revokedAt         DateTime?         @map("revoked_at")
   lastSeenAt        DateTime?         @map("last_seen_at")
   ip                String?
-  userAgent         String?           @map("user_agent")
+  clientInfo        String?           @map("client_info")
   idempotencyKey    String            @unique @map("idempotency_key")
   createdAt         DateTime          @default(now()) @map("created_at")
   updatedAt         DateTime          @updatedAt @map("updated_at")
@@ -654,75 +665,13 @@ model AuthSession {
   adminUser       AdminUser?       @relation(fields: [adminUserId], references: [id])
   merchantAccount MerchantAccount? @relation(fields: [merchantAccountId], references: [id])
   merchant        Merchant?        @relation(fields: [merchantId], references: [id])
-  agent           Agent?           @relation(fields: [agentId], references: [id])
 
   @@index([subjectType, status, expiresAt])
   @@index([userId, status])
   @@index([adminUserId, status])
   @@index([merchantAccountId, status])
   @@index([merchantId, status])
-  @@index([agentId, status])
   @@map("auth_sessions")
-}
-
-model Agent {
-  id            String        @id @default(cuid())
-  userId        String        @unique @map("user_id")
-  agentNo       String        @unique @map("agent_no")
-  name          String
-  contactPhone  String?       @map("contact_phone")
-  status        AgentStatus   @default(draft)
-  riskStatus    RiskStatus    @default(normal) @map("risk_status")
-  depositStatus DepositStatus @default(pending_payment) @map("deposit_status")
-  approvedAt    DateTime?     @map("approved_at")
-  createdAt     DateTime      @default(now()) @map("created_at")
-  updatedAt     DateTime      @updatedAt @map("updated_at")
-
-  user                     User                      @relation(fields: [userId], references: [id])
-  applications             AgentApplication[]
-  shop                     Shop?
-  agentProducts            AgentProduct[]
-  productReviews           AgentProductReview[]
-  depositAccount           DepositAccount?
-  depositTransactions      DepositTransaction[]
-  orders                   Order[]
-  afterSales               AfterSale[]
-  settlementSheets         SettlementSheet[]
-  ledgerEntries            LedgerEntry[]
-  notifications            AgentNotification[]
-  sessions                 AuthSession[]
-  ownedRightsCodes         RightsCode[]
-  collectionPaymentConfigs CollectionPaymentConfig[]
-  firstTierAuthorizations  ChannelAuthorization[]    @relation("FirstTierAuthorization")
-  firstTierRelations       ChannelRelation[]         @relation("FirstTierRelations")
-  secondTierRelations      ChannelRelation[]         @relation("SecondTierRelations")
-  thirdTierRelations       ChannelRelation[]         @relation("ThirdTierRelations")
-
-  @@index([status])
-  @@index([riskStatus])
-  @@map("agents")
-}
-
-model AgentApplication {
-  id                    String       @id @default(cuid())
-  agentId               String?      @map("agent_id")
-  userId                String       @map("user_id")
-  identityInfoJson      Json         @map("identity_info_json")
-  contactInfoJson       Json         @map("contact_info_json")
-  customerServiceWechat String       @map("customer_service_wechat")
-  status                ReviewStatus @default(pending_review)
-  rejectReason          String?      @map("reject_reason")
-  reviewedById          String?      @map("reviewed_by")
-  reviewedAt            DateTime?    @map("reviewed_at")
-  createdAt             DateTime     @default(now()) @map("created_at")
-  updatedAt             DateTime     @updatedAt @map("updated_at")
-
-  agent Agent? @relation(fields: [agentId], references: [id])
-  user  User   @relation(fields: [userId], references: [id])
-
-  @@index([status, createdAt])
-  @@index([agentId])
-  @@map("agent_applications")
 }
 
 model MerchantAccount {
@@ -759,7 +708,7 @@ model Merchant {
   tier                 MerchantTier                 @default(first_tier)
   name                 String
   contactPhone         String?                      @map("contact_phone")
-  status               AgentStatus                  @default(pending_deposit)
+  status               MerchantStatus               @default(pending_deposit)
   riskStatus           RiskStatus                   @default(normal) @map("risk_status")
   depositStatus        DepositStatus                @default(pending_payment) @map("deposit_status")
   creationSource       MerchantCreationSource       @default(self_application) @map("creation_source")
@@ -774,6 +723,7 @@ model Merchant {
   inviteCodes              MerchantInviteCode[]
   shops                    Shop[]
   products                 MerchantProduct[]
+  productListings          MerchantProductListing[]
   productReviews           MerchantProductReview[]
   ownedRightsCodes         RightsCode[]
   depositAccount           DepositAccount?
@@ -781,14 +731,11 @@ model Merchant {
   orders                   Order[]
   afterSales               AfterSale[]
   fulfillmentRecords       FulfillmentRecord[]
-  clearingRecords          ClearingRecord[]
-  clearingItems            ClearingItem[]
   ledgerEntries            LedgerEntry[]
   sessions                 AuthSession[]
+  payments                 Payment[]
   collectionPaymentConfigs CollectionPaymentConfig[]
-  firstTierRelations       ChannelRelation[]         @relation("FirstTierMerchantRelations")
-  secondTierRelations      ChannelRelation[]         @relation("SecondTierMerchantRelations")
-  thirdTierRelations       ChannelRelation[]         @relation("ThirdTierMerchantRelations")
+  settlementSheets         SettlementSheet[]
   createdBy                AdminUser?                @relation("MerchantCreatedBy", fields: [createdByAdminId], references: [id])
 
   @@index([tier, status])
@@ -849,8 +796,7 @@ model MerchantInviteCode {
 
 model Shop {
   id                     String                  @id @default(cuid())
-  ownerType              ShopOwnerType           @default(agent) @map("owner_type")
-  agentId                String?                 @unique @map("agent_id")
+  ownerType              ShopOwnerType           @default(merchant) @map("owner_type")
   merchantId             String?                 @unique @map("merchant_id")
   shopNo                 String                  @unique @map("shop_no")
   name                   String
@@ -875,24 +821,20 @@ model Shop {
   createdAt              DateTime                @default(now()) @map("created_at")
   updatedAt              DateTime                @updatedAt @map("updated_at")
 
-  agent                    Agent?                       @relation(fields: [agentId], references: [id])
   merchant                 Merchant?                    @relation(fields: [merchantId], references: [id])
   createdBy                AdminUser?                   @relation("ShopCreatedBy", fields: [createdByAdminId], references: [id])
   customerServices         ShopCustomerServiceBinding[]
-  collectionChannels       ShopCollectionChannel[]
   collectionPaymentConfigs CollectionPaymentConfig[]
   paymentConfirmations     PaymentConfirmation[]
   productGroups            ShopProductGroup[]
-  agentProducts            AgentProduct[]
+  productListings          MerchantProductListing[]
   merchantProducts         MerchantProduct[]
   merchantProductReviews   MerchantProductReview[]
-  productReviews           AgentProductReview[]
   platformShopProducts     PlatformShopProduct[]
   rightsCodes              RightsCode[]
   orders                   Order[]
   afterSales               AfterSale[]
   fulfillmentRecords       FulfillmentRecord[]
-  clearingRecords          ClearingRecord[]
   couponScopes             CouponScope[]
   settlementItems          SettlementItem[]
   ledgerEntries            LedgerEntry[]
@@ -904,13 +846,13 @@ model Shop {
 }
 
 model ShopProductGroup {
-  id              String   @id @default(cuid())
-  shopId          String   @map("shop_id")
-  name            String
-  sortOrder       Int      @default(0) @map("sort_order")
-  agentProductIds Json     @map("agent_product_ids")
-  createdAt       DateTime @default(now()) @map("created_at")
-  updatedAt       DateTime @updatedAt @map("updated_at")
+  id                String   @id @default(cuid())
+  shopId            String   @map("shop_id")
+  name              String
+  sortOrder         Int      @default(0) @map("sort_order")
+  productListingIds Json     @map("product_listing_ids")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
 
   shop Shop @relation(fields: [shopId], references: [id])
 
@@ -935,95 +877,65 @@ model ShopCustomerServiceBinding {
   @@map("shop_customer_service_bindings")
 }
 
-model ShopCollectionChannel {
-  id               String                  @id @default(cuid())
-  shopId           String                  @map("shop_id")
-  channelType      CollectionChannelType   @map("channel_type")
-  accountName      String                  @map("account_name")
-  qrUrl            String?                 @map("qr_url")
-  note             String?
-  status           CollectionChannelStatus @default(pending_review)
-  reviewStatus     ReviewStatus            @default(pending_review) @map("review_status")
-  isDefault        Boolean                 @default(false) @map("is_default")
-  reviewedById     String?                 @map("reviewed_by")
-  reviewedAt       DateTime?               @map("reviewed_at")
-  idempotencyKey   String                  @unique @map("idempotency_key")
-  createdByAdminId String?                 @map("created_by_admin_id")
-  createdAt        DateTime                @default(now()) @map("created_at")
-  updatedAt        DateTime                @updatedAt @map("updated_at")
-
-  shop                 Shop                  @relation(fields: [shopId], references: [id])
-  createdBy            AdminUser?            @relation("ShopCollectionChannelCreatedBy", fields: [createdByAdminId], references: [id])
-  orders               Order[]
-  payments             Payment[]
-  paymentConfirmations PaymentConfirmation[]
-
-  @@index([shopId, status])
-  @@index([shopId, isDefault])
-  @@map("shop_collection_channels")
-}
-
 model PlatformProduct {
-  id                           String          @id @default(cuid())
-  productNo                    String          @unique @map("product_no")
+  id                           String                   @id @default(cuid())
+  productNo                    String                   @unique @map("product_no")
   name                         String
-  categoryId                   String?         @map("category_id")
-  categoryName                 String?         @map("category_name")
-  tagsJson                     Json?           @map("tags_json")
-  imageUrl                     String?         @map("image_url")
-  specsJson                    Json?           @map("specs_json")
-  detailSectionsJson           Json?           @map("detail_sections_json")
-  stockCount                   Int             @default(0) @map("stock_count")
-  soldCount                    Int             @default(0) @map("sold_count")
-  displayBadge                 String?         @map("display_badge")
-  isRecommended                Boolean         @default(false) @map("is_recommended")
-  displaySort                  Int             @default(0) @map("display_sort")
+  categoryId                   String?                  @map("category_id")
+  categoryName                 String?                  @map("category_name")
+  tagsJson                     Json?                    @map("tags_json")
+  imageUrl                     String?                  @map("image_url")
+  specsJson                    Json?                    @map("specs_json")
+  detailSectionsJson           Json?                    @map("detail_sections_json")
+  stockCount                   Int                      @default(0) @map("stock_count")
+  soldCount                    Int                      @default(0) @map("sold_count")
+  displayBadge                 String?                  @map("display_badge")
+  isRecommended                Boolean                  @default(false) @map("is_recommended")
+  displaySort                  Int                      @default(0) @map("display_sort")
   detail                       String
-  rightsDesc                   String          @map("rights_desc")
-  supplyPriceCents             BigInt          @map("supply_price_cents")
-  minSalePriceCents            BigInt          @map("min_sale_price_cents")
-  suggestedSalePriceCents      BigInt          @map("suggested_sale_price_cents")
-  fulfillmentType              FulfillmentType @default(manual) @map("fulfillment_type")
-  fulfillmentRuleJson          Json            @map("fulfillment_rule_json")
-  manualFulfillmentInstruction String?         @map("manual_fulfillment_instruction")
-  manualFulfillmentWechatQrUrl String?         @map("manual_fulfillment_wechat_qr_url")
-  manualFulfillmentQqQrUrl     String?         @map("manual_fulfillment_qq_qr_url")
-  manualFulfillmentWechatId    String?         @map("manual_fulfillment_wechat_id")
-  manualFulfillmentQqId        String?         @map("manual_fulfillment_qq_id")
-  afterSaleRuleJson            Json            @map("after_sale_rule_json")
-  extractCodeRequired          Boolean         @default(false) @map("extract_code_required")
-  extractCodeTtlMinutes        Int?            @map("extract_code_ttl_minutes")
-  status                       ProductStatus   @default(draft)
-  createdAt                    DateTime        @default(now()) @map("created_at")
-  updatedAt                    DateTime        @updatedAt @map("updated_at")
-
-  agentProducts          AgentProduct[]
-  merchantProducts       MerchantProduct[]
-  merchantProductReviews MerchantProductReview[]
-  rightsCodes            RightsCode[]
-  virtualCodeBatches     VirtualCodeBatch[]
-  virtualCodes           VirtualCode[]
-  platformShopProducts   PlatformShopProduct[]
-  channelOffers          ChannelProductOffer[]
-  couponScopes           CouponScope[]
-  codeAccessLogs         CodePlaintextAccessLog[]
+  rightsDesc                   String                   @map("rights_desc")
+  supplyPriceCents             BigInt                   @map("supply_price_cents")
+  minSalePriceCents            BigInt                   @map("min_sale_price_cents")
+  suggestedSalePriceCents      BigInt                   @map("suggested_sale_price_cents")
+  fulfillmentType              FulfillmentType          @default(manual) @map("fulfillment_type")
+  fulfillmentRuleJson          Json                     @map("fulfillment_rule_json")
+  manualFulfillmentInstruction String?                  @map("manual_fulfillment_instruction")
+  manualFulfillmentWechatQrUrl String?                  @map("manual_fulfillment_wechat_qr_url")
+  manualFulfillmentQqQrUrl     String?                  @map("manual_fulfillment_qq_qr_url")
+  manualFulfillmentWechatId    String?                  @map("manual_fulfillment_wechat_id")
+  manualFulfillmentQqId        String?                  @map("manual_fulfillment_qq_id")
+  afterSaleRuleJson            Json                     @map("after_sale_rule_json")
+  extractCodeRequired          Boolean                  @default(false) @map("extract_code_required")
+  extractCodeTtlMinutes        Int?                     @map("extract_code_ttl_minutes")
+  status                       ProductStatus            @default(draft)
+  createdAt                    DateTime                 @default(now()) @map("created_at")
+  updatedAt                    DateTime                 @updatedAt @map("updated_at")
+  merchantProducts             MerchantProduct[]
+  merchantProductReviews       MerchantProductReview[]
+  rightsCodes                  RightsCode[]
+  virtualCodeBatches           VirtualCodeBatch[]
+  virtualCodes                 VirtualCode[]
+  platformShopProducts         PlatformShopProduct[]
+  merchantProductListings      MerchantProductListing[]
+  couponScopes                 CouponScope[]
+  codeAccessLogs               CodePlaintextAccessLog[]
 
   @@index([status])
   @@map("platform_products")
 }
 
 model PlatformShopProduct {
-  id                   String             @id @default(cuid())
-  shopId               String             @map("shop_id")
-  platformProductId    String             @map("platform_product_id")
-  salePriceCents       BigInt             @map("sale_price_cents")
-  fulfillmentCostCents BigInt             @default(0) @map("fulfillment_cost_cents")
-  status               AgentProductStatus @default(listed)
-  listedAt             DateTime?          @map("listed_at")
-  delistedAt           DateTime?          @map("delisted_at")
-  idempotencyKey       String?            @unique @map("idempotency_key")
-  createdAt            DateTime           @default(now()) @map("created_at")
-  updatedAt            DateTime           @updatedAt @map("updated_at")
+  id                   String               @id @default(cuid())
+  shopId               String               @map("shop_id")
+  platformProductId    String               @map("platform_product_id")
+  salePriceCents       BigInt               @map("sale_price_cents")
+  fulfillmentCostCents BigInt               @default(0) @map("fulfillment_cost_cents")
+  status               ProductListingStatus @default(listed)
+  listedAt             DateTime?            @map("listed_at")
+  delistedAt           DateTime?            @map("delisted_at")
+  idempotencyKey       String?              @unique @map("idempotency_key")
+  createdAt            DateTime             @default(now()) @map("created_at")
+  updatedAt            DateTime             @updatedAt @map("updated_at")
 
   shop            Shop            @relation(fields: [shopId], references: [id])
   platformProduct PlatformProduct @relation(fields: [platformProductId], references: [id])
@@ -1036,41 +948,38 @@ model PlatformShopProduct {
 }
 
 model RightsCode {
-  id              String              @id @default(cuid())
-  productId       String?             @map("product_id")
-  agentProductId  String?             @map("agent_product_id")
-  codeCiphertext  String              @map("code_ciphertext")
-  codeHash        String?             @map("code_hash")
-  secretPreview   String?             @map("secret_preview")
-  ownerType       RightsCodeOwnerType @default(platform) @map("owner_type")
-  ownerAgentId    String?             @map("owner_agent_id")
-  ownerMerchantId String?             @map("owner_merchant_id")
-  shopId          String?             @map("shop_id")
-  batchNo         String              @map("batch_no")
-  status          RightsCodeStatus    @default(available)
-  orderId         String?             @map("order_id")
-  issueKey        String?             @unique @map("issue_key")
-  importedById    String?             @map("imported_by")
-  issuedAt        DateTime?           @map("issued_at")
-  revokedAt       DateTime?           @map("revoked_at")
-  importAuditJson Json?               @map("import_audit_json")
-  createdAt       DateTime            @default(now()) @map("created_at")
-  updatedAt       DateTime            @updatedAt @map("updated_at")
+  id                       String              @id @default(cuid())
+  productId                String?             @map("product_id")
+  merchantProductListingId String?             @map("merchant_product_listing_id")
+  codeCiphertext           String              @map("code_ciphertext")
+  codeHash                 String?             @map("code_hash")
+  secretPreview            String?             @map("secret_preview")
+  ownerType                RightsCodeOwnerType @default(platform) @map("owner_type")
+  ownerMerchantId          String?             @map("owner_merchant_id")
+  shopId                   String?             @map("shop_id")
+  batchNo                  String              @map("batch_no")
+  status                   RightsCodeStatus    @default(available)
+  orderId                  String?             @map("order_id")
+  issueKey                 String?             @unique @map("issue_key")
+  importedById             String?             @map("imported_by")
+  issuedAt                 DateTime?           @map("issued_at")
+  revokedAt                DateTime?           @map("revoked_at")
+  importAuditJson          Json?               @map("import_audit_json")
+  createdAt                DateTime            @default(now()) @map("created_at")
+  updatedAt                DateTime            @updatedAt @map("updated_at")
 
-  product       PlatformProduct?         @relation(fields: [productId], references: [id])
-  agentProduct  AgentProduct?            @relation(fields: [agentProductId], references: [id])
-  ownerAgent    Agent?                   @relation(fields: [ownerAgentId], references: [id])
-  ownerMerchant Merchant?                @relation(fields: [ownerMerchantId], references: [id])
-  shop          Shop?                    @relation(fields: [shopId], references: [id])
-  order         Order?                   @relation(fields: [orderId], references: [id])
-  accessLogs    CodePlaintextAccessLog[]
+  product                PlatformProduct?         @relation(fields: [productId], references: [id])
+  merchantProductListing MerchantProductListing?  @relation(fields: [merchantProductListingId], references: [id])
+  ownerMerchant          Merchant?                @relation(fields: [ownerMerchantId], references: [id])
+  shop                   Shop?                    @relation(fields: [shopId], references: [id])
+  order                  Order?                   @relation(fields: [orderId], references: [id])
+  accessLogs             CodePlaintextAccessLog[]
 
   @@unique([productId, codeCiphertext])
-  @@unique([agentProductId, codeCiphertext])
+  @@unique([merchantProductListingId, codeCiphertext])
   @@index([productId, status])
-  @@index([agentProductId, status])
+  @@index([merchantProductListingId, status])
   @@index([ownerType, status])
-  @@index([ownerAgentId, status])
   @@index([ownerMerchantId, status])
   @@index([shopId, status])
   @@index([codeHash])
@@ -1136,81 +1045,63 @@ model VirtualCode {
   @@map("virtual_codes")
 }
 
-model AgentProduct {
-  id                 String             @id @default(cuid())
-  agentId            String             @map("agent_id")
-  shopId             String             @map("shop_id")
-  productType        ProductType        @map("product_type")
-  platformProductId  String?            @map("platform_product_id")
-  ownProductReviewId String?            @unique @map("own_product_review_id")
-  salePriceCents     BigInt             @map("sale_price_cents")
-  status             AgentProductStatus @default(draft)
-  listedAt           DateTime?          @map("listed_at")
-  delistedAt         DateTime?          @map("delisted_at")
-  createdAt          DateTime           @default(now()) @map("created_at")
-  updatedAt          DateTime           @updatedAt @map("updated_at")
+model MerchantProductListing {
+  id                        String                           @id @default(cuid())
+  merchantId                String                           @map("merchant_id")
+  shopId                    String                           @map("shop_id")
+  sourceType                MerchantProductListingSourceType @default(platform_product) @map("source_type")
+  platformProductId         String                           @map("platform_product_id")
+  upstreamListingId         String?                          @map("upstream_listing_id")
+  salePriceCents            BigInt                           @map("sale_price_cents")
+  displayName               String?                          @map("display_name")
+  displaySubtitle           String?                          @map("display_subtitle")
+  displayDescription        String?                          @map("display_description")
+  displayUsageGuide         String?                          @map("display_usage_guide")
+  displayImageUrl           String?                          @map("display_image_url")
+  displayCategory           String?                          @map("display_category")
+  displayTagsJson           Json?                            @map("display_tags_json")
+  displaySpecsJson          Json?                            @map("display_specs_json")
+  displayDetailSectionsJson Json?                            @map("display_detail_sections_json")
+  status                    ProductListingStatus             @default(draft)
+  listedAt                  DateTime?                        @map("listed_at")
+  delistedAt                DateTime?                        @map("delisted_at")
+  idempotencyKey            String?                          @unique @map("idempotency_key")
+  createdAt                 DateTime                         @default(now()) @map("created_at")
+  updatedAt                 DateTime                         @updatedAt @map("updated_at")
 
-  agent           Agent               @relation(fields: [agentId], references: [id])
-  shop            Shop                @relation(fields: [shopId], references: [id])
-  platformProduct PlatformProduct?    @relation(fields: [platformProductId], references: [id])
-  ownReview       AgentProductReview? @relation(fields: [ownProductReviewId], references: [id])
-  orderItems      OrderItem[]
-  rightsCodes     RightsCode[]
+  merchant           Merchant                 @relation(fields: [merchantId], references: [id])
+  shop               Shop                     @relation(fields: [shopId], references: [id])
+  platformProduct    PlatformProduct          @relation(fields: [platformProductId], references: [id])
+  upstreamListing    MerchantProductListing?  @relation("MerchantProductListingUpstream", fields: [upstreamListingId], references: [id])
+  downstreamListings MerchantProductListing[] @relation("MerchantProductListingUpstream")
+  orderItems         OrderItem[]
+  rightsCodes        RightsCode[]
 
-  @@unique([shopId, productType, platformProductId])
-  @@index([agentId, status])
+  @@unique([shopId, platformProductId])
+  @@index([merchantId, status])
   @@index([shopId, status])
-  @@map("agent_products")
-}
-
-model AgentProductReview {
-  id                           String          @id @default(cuid())
-  agentId                      String          @map("agent_id")
-  shopId                       String          @map("shop_id")
-  name                         String
-  detailJson                   Json            @map("detail_json")
-  salePriceCents               BigInt          @map("sale_price_cents")
-  afterSaleRuleJson            Json            @map("after_sale_rule_json")
-  fulfillmentRuleJson          Json            @map("fulfillment_rule_json")
-  fulfillmentType              FulfillmentType @default(manual) @map("fulfillment_type")
-  manualFulfillmentInstruction String?         @map("manual_fulfillment_instruction")
-  manualFulfillmentWechatQrUrl String?         @map("manual_fulfillment_wechat_qr_url")
-  manualFulfillmentQqQrUrl     String?         @map("manual_fulfillment_qq_qr_url")
-  manualFulfillmentWechatId    String?         @map("manual_fulfillment_wechat_id")
-  manualFulfillmentQqId        String?         @map("manual_fulfillment_qq_id")
-  status                       ReviewStatus    @default(pending_review)
-  rejectReason                 String?         @map("reject_reason")
-  riskReason                   String?         @map("risk_reason")
-  reviewedById                 String?         @map("reviewed_by")
-  reviewedAt                   DateTime?       @map("reviewed_at")
-  createdAt                    DateTime        @default(now()) @map("created_at")
-  updatedAt                    DateTime        @updatedAt @map("updated_at")
-
-  agent        Agent         @relation(fields: [agentId], references: [id])
-  shop         Shop          @relation(fields: [shopId], references: [id])
-  agentProduct AgentProduct?
-
-  @@index([agentId, status])
-  @@index([shopId, status])
-  @@map("agent_product_reviews")
+  @@index([sourceType, status])
+  @@index([platformProductId, status])
+  @@index([upstreamListingId, status])
+  @@map("merchant_product_listings")
 }
 
 model MerchantProduct {
-  id                         String             @id @default(cuid())
-  merchantId                 String             @map("merchant_id")
-  shopId                     String             @map("shop_id")
-  productType                ProductType        @map("product_type")
-  platformProductId          String?            @map("platform_product_id")
-  ownProductReviewId         String?            @unique @map("own_product_review_id")
-  salePriceCents             BigInt             @map("sale_price_cents")
-  firstTierSupplyPriceCents  BigInt?            @map("first_tier_supply_price_cents")
-  secondTierSupplyPriceCents BigInt?            @map("second_tier_supply_price_cents")
-  status                     AgentProductStatus @default(draft)
-  listedAt                   DateTime?          @map("listed_at")
-  delistedAt                 DateTime?          @map("delisted_at")
-  idempotencyKey             String?            @unique @map("idempotency_key")
-  createdAt                  DateTime           @default(now()) @map("created_at")
-  updatedAt                  DateTime           @updatedAt @map("updated_at")
+  id                         String               @id @default(cuid())
+  merchantId                 String               @map("merchant_id")
+  shopId                     String               @map("shop_id")
+  productType                ProductType          @map("product_type")
+  platformProductId          String?              @map("platform_product_id")
+  ownProductReviewId         String?              @unique @map("own_product_review_id")
+  salePriceCents             BigInt               @map("sale_price_cents")
+  firstTierSupplyPriceCents  BigInt?              @map("first_tier_supply_price_cents")
+  secondTierSupplyPriceCents BigInt?              @map("second_tier_supply_price_cents")
+  status                     ProductListingStatus @default(draft)
+  listedAt                   DateTime?            @map("listed_at")
+  delistedAt                 DateTime?            @map("delisted_at")
+  idempotencyKey             String?              @unique @map("idempotency_key")
+  createdAt                  DateTime             @default(now()) @map("created_at")
+  updatedAt                  DateTime             @updatedAt @map("updated_at")
 
   merchant        Merchant               @relation(fields: [merchantId], references: [id])
   shop            Shop                   @relation(fields: [shopId], references: [id])
@@ -1264,21 +1155,17 @@ model Order {
   id                     String            @id @default(cuid())
   orderNo                String            @unique @map("order_no")
   userId                 String            @map("user_id")
-  agentId                String?           @map("agent_id")
   merchantId             String?           @map("merchant_id")
   shopId                 String            @map("shop_id")
   buyerEmail             String?           @map("buyer_email")
-  salesChannelType       SalesChannelType  @default(single_agent) @map("sales_channel_type")
+  buyerPhone             String?           @map("buyer_phone")
+  purchasePasswordHash   String?           @map("purchase_password_hash")
+  salesChannelType       SalesChannelType  @default(single_merchant) @map("sales_channel_type")
   platformShopId         String?           @map("platform_shop_id")
   clientType             String?           @map("client_type")
-  firstTierAgentId       String?           @map("first_tier_agent_id")
-  secondTierAgentId      String?           @map("second_tier_agent_id")
-  thirdTierAgentId       String?           @map("third_tier_agent_id")
   firstTierMerchantId    String?           @map("first_tier_merchant_id")
   secondTierMerchantId   String?           @map("second_tier_merchant_id")
   thirdTierMerchantId    String?           @map("third_tier_merchant_id")
-  channelRelationId      String?           @map("channel_relation_id")
-  collectionChannelId    String?           @map("collection_channel_id")
   collectionSnapshotJson Json?             @map("collection_snapshot_json")
   couponDiscountCents    BigInt            @default(0) @map("coupon_discount_cents")
   couponSnapshotJson     Json?             @map("coupon_snapshot_json")
@@ -1296,10 +1183,8 @@ model Order {
   updatedAt              DateTime          @updatedAt @map("updated_at")
 
   user                      User                       @relation(fields: [userId], references: [id])
-  agent                     Agent?                     @relation(fields: [agentId], references: [id])
   merchant                  Merchant?                  @relation(fields: [merchantId], references: [id])
   shop                      Shop                       @relation(fields: [shopId], references: [id])
-  collectionChannel         ShopCollectionChannel?     @relation(fields: [collectionChannelId], references: [id])
   items                     OrderItem[]
   amountSnapshot            OrderAmountSnapshot?
   payments                  Payment[]
@@ -1308,6 +1193,8 @@ model Order {
   paymentCallbackLogs       PaymentCallbackLog[]
   paymentExceptions         PaymentException[]
   paymentDisputeMaterials   PaymentDisputeMaterial[]
+  walletTransactions        WalletTransaction[]
+  walletPaymentHolds        WalletPaymentHold[]
   fulfillmentRecords        FulfillmentRecord[]
   entitlements              Entitlement[]
   afterSales                AfterSale[]
@@ -1319,23 +1206,15 @@ model Order {
   reservedVirtualCodes      VirtualCode[]              @relation("VirtualCodeReservedOrder")
   extractSecrets            OrderExtractSecret[]
   couponUsages              CouponUsage[]
-  clearingItems             ClearingItem[]
   refundManualConfirmations RefundManualConfirmation[]
   codeAccessLogs            CodePlaintextAccessLog[]
   emailDeliveryRecords      EmailDeliveryRecord[]
-  channelRelation           ChannelRelation?           @relation(fields: [channelRelationId], references: [id])
 
-  @@index([agentId, createdAt])
   @@index([merchantId, createdAt])
   @@index([salesChannelType, createdAt])
-  @@index([firstTierAgentId, createdAt])
-  @@index([secondTierAgentId, createdAt])
-  @@index([thirdTierAgentId, createdAt])
   @@index([firstTierMerchantId, createdAt])
   @@index([secondTierMerchantId, createdAt])
   @@index([thirdTierMerchantId, createdAt])
-  @@index([channelRelationId, createdAt])
-  @@index([collectionChannelId, createdAt])
   @@index([shopId, status])
   @@index([userId, createdAt])
   @@index([fulfilledAt])
@@ -1343,53 +1222,37 @@ model Order {
   @@map("orders")
 }
 
-model AgentNotification {
-  id        String    @id @default(cuid())
-  agentId   String    @map("agent_id")
-  type      String
-  title     String
-  content   String
-  readAt    DateTime? @map("read_at")
-  createdAt DateTime  @default(now()) @map("created_at")
-
-  agent Agent @relation(fields: [agentId], references: [id])
-
-  @@index([agentId, readAt, createdAt])
-  @@map("agent_notifications")
-}
-
 model OrderItem {
-  id                    String         @id @default(cuid())
-  orderId               String         @map("order_id")
-  agentProductId        String?        @map("agent_product_id")
-  merchantProductId     String?        @map("merchant_product_id")
-  platformShopProductId String?        @map("platform_shop_product_id")
-  saleSourceType        SaleSourceType @default(agent_product) @map("sale_source_type")
-  productType           ProductType    @map("product_type")
-  productIdSnapshot     String         @map("product_id_snapshot")
-  productNameSnapshot   String         @map("product_name_snapshot")
-  salePriceCents        BigInt         @map("sale_price_cents")
-  quantity              Int            @default(1)
-  supplyPriceCents      BigInt         @map("supply_price_cents")
-  serviceFeeCents       BigInt         @map("service_fee_cents")
-  agentIncomeCents      BigInt         @map("agent_income_cents")
-  createdAt             DateTime       @default(now()) @map("created_at")
+  id                       String         @id @default(cuid())
+  orderId                  String         @map("order_id")
+  merchantProductListingId String?        @map("merchant_product_listing_id")
+  merchantProductId        String?        @map("merchant_product_id")
+  platformShopProductId    String?        @map("platform_shop_product_id")
+  saleSourceType           SaleSourceType @default(merchant_product_listing) @map("sale_source_type")
+  productType              ProductType    @map("product_type")
+  productIdSnapshot        String         @map("product_id_snapshot")
+  productNameSnapshot      String         @map("product_name_snapshot")
+  salePriceCents           BigInt         @map("sale_price_cents")
+  quantity                 Int            @default(1)
+  supplyPriceCents         BigInt         @map("supply_price_cents")
+  serviceFeeCents          BigInt         @map("service_fee_cents")
+  merchantIncomeCents      BigInt         @map("merchant_income_cents")
+  createdAt                DateTime       @default(now()) @map("created_at")
 
-  order                Order                    @relation(fields: [orderId], references: [id])
-  agentProduct         AgentProduct?            @relation(fields: [agentProductId], references: [id])
-  merchantProduct      MerchantProduct?         @relation(fields: [merchantProductId], references: [id])
-  platformShopProduct  PlatformShopProduct?     @relation(fields: [platformShopProductId], references: [id])
-  fulfillmentRecords   FulfillmentRecord[]
-  entitlements         Entitlement[]
-  virtualCodes         VirtualCode[]
-  reservedVirtualCodes VirtualCode[]            @relation("VirtualCodeReservedOrderItem")
-  extractSecrets       OrderExtractSecret[]
-  codeAccessLogs       CodePlaintextAccessLog[]
-  emailDeliveryRecords EmailDeliveryRecord[]
-  clearingItems        ClearingItem[]
+  order                  Order                    @relation(fields: [orderId], references: [id])
+  merchantProductListing MerchantProductListing?  @relation(fields: [merchantProductListingId], references: [id])
+  merchantProduct        MerchantProduct?         @relation(fields: [merchantProductId], references: [id])
+  platformShopProduct    PlatformShopProduct?     @relation(fields: [platformShopProductId], references: [id])
+  fulfillmentRecords     FulfillmentRecord[]
+  entitlements           Entitlement[]
+  virtualCodes           VirtualCode[]
+  reservedVirtualCodes   VirtualCode[]            @relation("VirtualCodeReservedOrderItem")
+  extractSecrets         OrderExtractSecret[]
+  codeAccessLogs         CodePlaintextAccessLog[]
+  emailDeliveryRecords   EmailDeliveryRecord[]
 
   @@index([orderId])
-  @@index([agentProductId])
+  @@index([merchantProductListingId])
   @@index([merchantProductId])
   @@index([platformShopProductId])
   @@index([saleSourceType, createdAt])
@@ -1397,30 +1260,37 @@ model OrderItem {
 }
 
 model OrderAmountSnapshot {
-  id                          String   @id @default(cuid())
-  orderId                     String   @unique @map("order_id")
-  serviceFeeBps               Int      @default(50) @map("service_fee_bps")
-  paidAmountCents             BigInt   @map("paid_amount_cents")
-  supplyAmountCents           BigInt   @map("supply_amount_cents")
-  serviceFeeCents             BigInt   @map("service_fee_cents")
-  agentExpectedIncomeCents    BigInt   @map("agent_expected_income_cents")
-  platformSupplyPriceCents    BigInt   @default(0) @map("platform_supply_price_cents")
-  resellSupplyPriceCents      BigInt   @default(0) @map("resell_supply_price_cents")
-  firstTierSupplyPriceCents   BigInt   @default(0) @map("first_tier_supply_price_cents")
-  secondTierSupplyPriceCents  BigInt   @default(0) @map("second_tier_supply_price_cents")
-  finalSalePriceCents         BigInt   @default(0) @map("final_sale_price_cents")
-  firstTierIncomeCents        BigInt   @default(0) @map("first_tier_income_cents")
-  secondTierIncomeCents       BigInt   @default(0) @map("second_tier_income_cents")
-  thirdTierIncomeCents        BigInt   @default(0) @map("third_tier_income_cents")
-  fulfillmentCostCents        BigInt   @default(0) @map("fulfillment_cost_cents")
-  paymentChannelFeeCents      BigInt   @default(0) @map("payment_channel_fee_cents")
-  platformGrossProfitCents    BigInt   @default(0) @map("platform_gross_profit_cents")
-  productSnapshotJson         Json     @map("product_snapshot_json")
-  shopSnapshotJson            Json     @map("shop_snapshot_json")
-  pricingSnapshotJson         Json     @map("pricing_snapshot_json")
-  fulfillmentRuleSnapshotJson Json     @map("fulfillment_rule_snapshot_json")
-  afterSaleRuleSnapshotJson   Json     @map("after_sale_rule_snapshot_json")
-  createdAt                   DateTime @default(now()) @map("created_at")
+  id                           String   @id @default(cuid())
+  orderId                      String   @unique @map("order_id")
+  serviceFeeBps                Int      @default(50) @map("service_fee_bps")
+  paidAmountCents              BigInt   @map("paid_amount_cents")
+  supplyAmountCents            BigInt   @map("supply_amount_cents")
+  serviceFeeCents              BigInt   @map("service_fee_cents")
+  merchantExpectedIncomeCents  BigInt   @map("merchant_expected_income_cents")
+  platformSupplyPriceCents     BigInt   @default(0) @map("platform_supply_price_cents")
+  resellSupplyPriceCents       BigInt   @default(0) @map("resell_supply_price_cents")
+  firstTierSupplyPriceCents    BigInt   @default(0) @map("first_tier_supply_price_cents")
+  secondTierSupplyPriceCents   BigInt   @default(0) @map("second_tier_supply_price_cents")
+  finalSalePriceCents          BigInt   @default(0) @map("final_sale_price_cents")
+  firstTierIncomeCents         BigInt   @default(0) @map("first_tier_income_cents")
+  secondTierIncomeCents        BigInt   @default(0) @map("second_tier_income_cents")
+  thirdTierIncomeCents         BigInt   @default(0) @map("third_tier_income_cents")
+  fulfillmentCostCents         BigInt   @default(0) @map("fulfillment_cost_cents")
+  paymentChannelFeeCents       BigInt   @default(0) @map("payment_channel_fee_cents")
+  platformGrossProfitCents     BigInt   @default(0) @map("platform_gross_profit_cents")
+  paymentFeeBps                Int      @default(0) @map("payment_fee_bps")
+  paymentFeeCents              BigInt   @default(0) @map("payment_fee_cents")
+  balancePaidCents             BigInt   @default(0) @map("balance_paid_cents")
+  externalPaidCents            BigInt   @default(0) @map("external_paid_cents")
+  serviceFeeEnabled            Boolean  @default(true) @map("service_fee_enabled")
+  serviceFeeBasisAmountCents   BigInt   @default(0) @map("service_fee_basis_amount_cents")
+  serviceFeeConfigSnapshotJson Json?    @map("service_fee_config_snapshot_json")
+  productSnapshotJson          Json     @map("product_snapshot_json")
+  shopSnapshotJson             Json     @map("shop_snapshot_json")
+  pricingSnapshotJson          Json     @map("pricing_snapshot_json")
+  fulfillmentRuleSnapshotJson  Json     @map("fulfillment_rule_snapshot_json")
+  afterSaleRuleSnapshotJson    Json     @map("after_sale_rule_snapshot_json")
+  createdAt                    DateTime @default(now()) @map("created_at")
 
   order Order @relation(fields: [orderId], references: [id])
 
@@ -1432,7 +1302,7 @@ model Payment {
   paymentNo                 String               @unique @map("payment_no")
   orderId                   String               @map("order_id")
   userId                    String               @map("user_id")
-  collectionChannelId       String?              @map("collection_channel_id")
+  merchantId                String?              @map("merchant_id")
   collectionPaymentConfigId String?              @map("collection_payment_config_id")
   collectionSnapshotJson    Json?                @map("collection_snapshot_json")
   channel                   PaymentChannel
@@ -1442,6 +1312,9 @@ model Payment {
   channelTradeNo            String?              @unique @map("channel_trade_no")
   providerPaymentNo         String?              @map("provider_payment_no")
   providerTradeNo           String?              @map("provider_trade_no")
+  baseAmountCents           BigInt               @default(0) @map("base_amount_cents")
+  feeBps                    Int                  @default(0) @map("fee_bps")
+  feeCents                  BigInt               @default(0) @map("fee_cents")
   amountCents               BigInt               @map("amount_cents")
   channelFeeCents           BigInt               @default(0) @map("channel_fee_cents")
   status                    PaymentStatus        @default(paying)
@@ -1455,7 +1328,7 @@ model Payment {
   updatedAt                 DateTime             @updatedAt @map("updated_at")
 
   order                   Order                    @relation(fields: [orderId], references: [id])
-  collectionChannel       ShopCollectionChannel?   @relation(fields: [collectionChannelId], references: [id])
+  merchant                Merchant?                @relation(fields: [merchantId], references: [id])
   collectionPaymentConfig CollectionPaymentConfig? @relation(fields: [collectionPaymentConfigId], references: [id])
   callbacks               PaymentCallback[]
   callbackLogs            PaymentCallbackLog[]
@@ -1463,10 +1336,13 @@ model Payment {
   disputeMaterials        PaymentDisputeMaterial[]
   exceptions              PaymentException[]
   paymentSnapshots        PaymentSnapshot[]
+  walletTransactions      WalletTransaction[]
+  walletRechargeOrder     WalletRechargeOrder?
+  walletPaymentHold       WalletPaymentHold?
   refunds                 Refund[]
 
   @@index([orderId])
-  @@index([collectionChannelId])
+  @@index([merchantId, status])
   @@index([collectionPaymentConfigId, status])
   @@index([provider, status])
   @@index([providerPaymentNo])
@@ -1495,7 +1371,6 @@ model CollectionPaymentConfig {
   id                    String                    @id @default(cuid())
   configNo              String                    @unique @map("config_no")
   ownerType             CollectionConfigOwnerType @map("owner_type")
-  ownerAgentId          String?                   @map("owner_agent_id")
   ownerMerchantId       String?                   @map("owner_merchant_id")
   shopId                String?                   @map("shop_id")
   provider              PaymentProvider
@@ -1507,6 +1382,8 @@ model CollectionPaymentConfig {
   merchantNoMasked      String?                   @map("merchant_no_masked")
   appIdMasked           String?                   @map("app_id_masked")
   serviceProviderMasked String?                   @map("service_provider_masked")
+  gatewayUrl            String?                   @map("gateway_url")
+  apiMode               String?                   @map("api_mode")
   credentialRef         String?                   @map("credential_ref")
   credentialCiphertext  String?                   @map("credential_ciphertext")
   secretVersion         Int                       @default(1) @map("secret_version")
@@ -1529,17 +1406,14 @@ model CollectionPaymentConfig {
   idempotencyKey        String                    @unique @map("idempotency_key")
   createdAt             DateTime                  @default(now()) @map("created_at")
   updatedAt             DateTime                  @updatedAt @map("updated_at")
-
-  ownerAgent       Agent?               @relation(fields: [ownerAgentId], references: [id])
-  ownerMerchant    Merchant?            @relation(fields: [ownerMerchantId], references: [id])
-  shop             Shop?                @relation(fields: [shopId], references: [id])
-  payments         Payment[]
-  paymentSnapshots PaymentSnapshot[]
-  callbackLogs     PaymentCallbackLog[]
-  exceptions       PaymentException[]
+  ownerMerchant         Merchant?                 @relation(fields: [ownerMerchantId], references: [id])
+  shop                  Shop?                     @relation(fields: [shopId], references: [id])
+  payments              Payment[]
+  paymentSnapshots      PaymentSnapshot[]
+  callbackLogs          PaymentCallbackLog[]
+  exceptions            PaymentException[]
 
   @@index([ownerType, status])
-  @@index([ownerAgentId, status])
   @@index([ownerMerchantId, status])
   @@index([shopId, status])
   @@index([provider, status])
@@ -1560,6 +1434,9 @@ model PaymentSnapshot {
   merchantNoMasked      String?              @map("merchant_no_masked")
   appIdMasked           String?              @map("app_id_masked")
   serviceProviderMasked String?              @map("service_provider_masked")
+  baseAmountCents       BigInt               @default(0) @map("base_amount_cents")
+  feeBps                Int                  @default(0) @map("fee_bps")
+  feeCents              BigInt               @default(0) @map("fee_cents")
   payableAmountCents    BigInt               @map("payable_amount_cents")
   currency              String               @default("CNY")
   paymentNo             String               @unique @map("payment_no")
@@ -1704,32 +1581,29 @@ model PaymentDisputeMaterial {
 }
 
 model PaymentConfirmation {
-  id                  String                    @id @default(cuid())
-  confirmationNo      String                    @unique @map("confirmation_no")
-  orderId             String                    @map("order_id")
-  paymentId           String?                   @map("payment_id")
-  shopId              String                    @map("shop_id")
-  collectionChannelId String?                   @map("collection_channel_id")
-  amountCents         BigInt                    @map("amount_cents")
-  payerName           String?                   @map("payer_name")
-  voucherUrl          String?                   @map("voucher_url")
-  note                String?
-  status              PaymentConfirmationStatus @default(pending)
-  reviewedById        String?                   @map("reviewed_by")
-  reviewedAt          DateTime?                 @map("reviewed_at")
-  rejectReason        String?                   @map("reject_reason")
-  idempotencyKey      String                    @unique @map("idempotency_key")
-  createdAt           DateTime                  @default(now()) @map("created_at")
-  updatedAt           DateTime                  @updatedAt @map("updated_at")
+  id             String                    @id @default(cuid())
+  confirmationNo String                    @unique @map("confirmation_no")
+  orderId        String                    @map("order_id")
+  paymentId      String?                   @map("payment_id")
+  shopId         String                    @map("shop_id")
+  amountCents    BigInt                    @map("amount_cents")
+  payerName      String?                   @map("payer_name")
+  voucherUrl     String?                   @map("voucher_url")
+  note           String?
+  status         PaymentConfirmationStatus @default(pending)
+  reviewedById   String?                   @map("reviewed_by")
+  reviewedAt     DateTime?                 @map("reviewed_at")
+  rejectReason   String?                   @map("reject_reason")
+  idempotencyKey String                    @unique @map("idempotency_key")
+  createdAt      DateTime                  @default(now()) @map("created_at")
+  updatedAt      DateTime                  @updatedAt @map("updated_at")
 
-  order             Order                  @relation(fields: [orderId], references: [id])
-  payment           Payment?               @relation(fields: [paymentId], references: [id])
-  shop              Shop                   @relation(fields: [shopId], references: [id])
-  collectionChannel ShopCollectionChannel? @relation(fields: [collectionChannelId], references: [id])
+  order   Order    @relation(fields: [orderId], references: [id])
+  payment Payment? @relation(fields: [paymentId], references: [id])
+  shop    Shop     @relation(fields: [shopId], references: [id])
 
   @@index([orderId, status])
   @@index([shopId, status, createdAt])
-  @@index([collectionChannelId])
   @@map("payment_confirmations")
 }
 
@@ -1737,7 +1611,6 @@ model FulfillmentRecord {
   id              String            @id @default(cuid())
   orderId         String            @map("order_id")
   orderItemId     String            @map("order_item_id")
-  agentId         String?           @map("agent_id")
   merchantId      String?           @map("merchant_id")
   shopId          String?           @map("shop_id")
   virtualCodeId   String?           @map("virtual_code_id")
@@ -1756,7 +1629,6 @@ model FulfillmentRecord {
   virtualCode VirtualCode?         @relation(fields: [virtualCodeId], references: [id])
   attempts    FulfillmentAttempt[]
 
-  @@index([agentId, status])
   @@index([merchantId, status])
   @@index([orderId])
   @@index([orderItemId])
@@ -1845,7 +1717,7 @@ model OrderExtractLog {
   result          ExtractLogResult
   reasonCode      String?          @map("reason_code")
   ip              String?
-  userAgent       String?          @map("user_agent")
+  clientInfo      String?          @map("client_info")
   idempotencyKey  String?          @unique @map("idempotency_key")
   createdAt       DateTime         @default(now()) @map("created_at")
 
@@ -1873,7 +1745,7 @@ model CodePlaintextAccessLog {
   reason         String?
   requestId      String                  @map("request_id")
   ip             String?
-  userAgent      String?                 @map("user_agent")
+  clientInfo     String?                 @map("client_info")
   idempotencyKey String                  @unique @map("idempotency_key")
   createdAt      DateTime                @default(now()) @map("created_at")
 
@@ -1930,7 +1802,6 @@ model AfterSale {
   afterSaleNo           String           @unique @map("after_sale_no")
   orderId               String           @map("order_id")
   userId                String           @map("user_id")
-  agentId               String?          @map("agent_id")
   merchantId            String?          @map("merchant_id")
   shopId                String           @map("shop_id")
   status                AfterSaleStatus  @default(pending)
@@ -1939,7 +1810,7 @@ model AfterSale {
   requestedRefundCents  BigInt           @map("requested_refund_cents")
   approvedRefundCents   BigInt           @default(0) @map("approved_refund_cents")
   platformBearCents     BigInt           @default(0) @map("platform_bear_cents")
-  agentBearCents        BigInt           @default(0) @map("agent_bear_cents")
+  merchantBearCents     BigInt           @default(0) @map("merchant_bear_cents")
   firstTierBearCents    BigInt           @default(0) @map("first_tier_bear_cents")
   secondTierBearCents   BigInt           @default(0) @map("second_tier_bear_cents")
   thirdTierBearCents    BigInt           @default(0) @map("third_tier_bear_cents")
@@ -1950,12 +1821,10 @@ model AfterSale {
   updatedAt             DateTime         @updatedAt @map("updated_at")
 
   order    Order     @relation(fields: [orderId], references: [id])
-  agent    Agent?    @relation(fields: [agentId], references: [id])
   merchant Merchant? @relation(fields: [merchantId], references: [id])
   shop     Shop      @relation(fields: [shopId], references: [id])
   refunds  Refund[]
 
-  @@index([agentId, status])
   @@index([merchantId, status])
   @@index([shopId, status])
   @@index([orderId])
@@ -2028,48 +1897,48 @@ model RefundCallback {
 }
 
 model SettlementSheet {
-  id                    String                @id @default(cuid())
-  settlementNo          String                @unique @map("settlement_no")
-  agentId               String                @map("agent_id")
-  periodStart           DateTime              @map("period_start")
-  periodEnd             DateTime              @map("period_end")
-  status                SettlementSheetStatus @default(draft)
-  totalOrderCount       Int                   @default(0) @map("total_order_count")
-  totalPaidCents        BigInt                @default(0) @map("total_paid_cents")
-  totalServiceFeeCents  BigInt                @default(0) @map("total_service_fee_cents")
-  totalAgentIncomeCents BigInt                @default(0) @map("total_agent_income_cents")
-  idempotencyKey        String                @unique @map("idempotency_key")
-  createdById           String?               @map("created_by")
-  confirmedById         String?               @map("confirmed_by")
-  createdAt             DateTime              @default(now()) @map("created_at")
-  updatedAt             DateTime              @updatedAt @map("updated_at")
+  id                       String                @id @default(cuid())
+  settlementNo             String                @unique @map("settlement_no")
+  merchantId               String                @map("merchant_id")
+  periodStart              DateTime              @map("period_start")
+  periodEnd                DateTime              @map("period_end")
+  status                   SettlementSheetStatus @default(draft)
+  totalOrderCount          Int                   @default(0) @map("total_order_count")
+  totalPaidCents           BigInt                @default(0) @map("total_paid_cents")
+  totalServiceFeeCents     BigInt                @default(0) @map("total_service_fee_cents")
+  totalMerchantIncomeCents BigInt                @default(0) @map("total_merchant_income_cents")
+  idempotencyKey           String                @unique @map("idempotency_key")
+  createdById              String?               @map("created_by")
+  confirmedById            String?               @map("confirmed_by")
+  createdAt                DateTime              @default(now()) @map("created_at")
+  updatedAt                DateTime              @updatedAt @map("updated_at")
 
-  agent   Agent            @relation(fields: [agentId], references: [id])
-  items   SettlementItem[]
-  payouts ManualPayout[]
-  ledgers LedgerEntry[]
+  merchant Merchant         @relation(fields: [merchantId], references: [id])
+  items    SettlementItem[]
+  payouts  ManualPayout[]
+  ledgers  LedgerEntry[]
 
-  @@unique([agentId, periodStart, periodEnd, idempotencyKey])
-  @@index([agentId, status])
+  @@unique([merchantId, periodStart, periodEnd, idempotencyKey])
+  @@index([merchantId, status])
   @@map("settlement_sheets")
 }
 
 model SettlementItem {
-  id                String         @id @default(cuid())
-  settlementId      String         @map("settlement_id")
-  orderId           String         @map("order_id")
-  settlementRole    SettlementRole @default(single_agent) @map("settlement_role")
-  agentId           String         @map("agent_id")
-  shopId            String         @map("shop_id")
-  paidAmountCents   BigInt         @map("paid_amount_cents")
-  supplyAmountCents BigInt         @map("supply_amount_cents")
-  serviceFeeCents   BigInt         @map("service_fee_cents")
-  agentIncomeCents  BigInt         @map("agent_income_cents")
-  deductedCents     BigInt         @default(0) @map("deducted_cents")
-  settleAmountCents BigInt         @map("settle_amount_cents")
-  fulfilledAt       DateTime       @map("fulfilled_at")
-  settleableAt      DateTime       @map("settleable_at")
-  createdAt         DateTime       @default(now()) @map("created_at")
+  id                  String         @id @default(cuid())
+  settlementId        String         @map("settlement_id")
+  orderId             String         @map("order_id")
+  settlementRole      SettlementRole @default(single_merchant) @map("settlement_role")
+  merchantId          String         @map("merchant_id")
+  shopId              String         @map("shop_id")
+  paidAmountCents     BigInt         @map("paid_amount_cents")
+  supplyAmountCents   BigInt         @map("supply_amount_cents")
+  serviceFeeCents     BigInt         @map("service_fee_cents")
+  merchantIncomeCents BigInt         @map("merchant_income_cents")
+  deductedCents       BigInt         @default(0) @map("deducted_cents")
+  settleAmountCents   BigInt         @map("settle_amount_cents")
+  fulfilledAt         DateTime       @map("fulfilled_at")
+  settleableAt        DateTime       @map("settleable_at")
+  createdAt           DateTime       @default(now()) @map("created_at")
 
   settlement SettlementSheet @relation(fields: [settlementId], references: [id])
   order      Order           @relation(fields: [orderId], references: [id])
@@ -2077,14 +1946,14 @@ model SettlementItem {
 
   @@unique([orderId, settlementRole])
   @@index([settlementId])
-  @@index([agentId, createdAt])
+  @@index([merchantId, createdAt])
   @@map("settlement_items")
 }
 
 model ManualPayout {
   id                    String             @id @default(cuid())
   settlementId          String             @map("settlement_id")
-  agentId               String             @map("agent_id")
+  merchantId            String             @map("merchant_id")
   amountCents           BigInt             @map("amount_cents")
   payeeInfoSnapshotJson Json               @map("payee_info_snapshot_json")
   payoutMethod          String             @map("payout_method")
@@ -2098,83 +1967,8 @@ model ManualPayout {
 
   settlement SettlementSheet @relation(fields: [settlementId], references: [id])
 
-  @@index([agentId, status])
-  @@map("manual_payouts")
-}
-
-model ClearingRecord {
-  id                      String               @id @default(cuid())
-  clearingNo              String               @unique @map("clearing_no")
-  merchantId              String               @map("merchant_id")
-  shopId                  String?              @map("shop_id")
-  periodStart             DateTime             @map("period_start")
-  periodEnd               DateTime             @map("period_end")
-  status                  ClearingRecordStatus @default(draft)
-  totalSupplyPayableCents BigInt               @default(0) @map("total_supply_payable_cents")
-  totalServiceFeeCents    BigInt               @default(0) @map("total_service_fee_cents")
-  totalClawbackCents      BigInt               @default(0) @map("total_clawback_cents")
-  totalCouponSubsidyCents BigInt               @default(0) @map("total_coupon_subsidy_cents")
-  idempotencyKey          String               @unique @map("idempotency_key")
-  createdById             String?              @map("created_by")
-  confirmedById           String?              @map("confirmed_by")
-  confirmedAt             DateTime?            @map("confirmed_at")
-  createdAt               DateTime             @default(now()) @map("created_at")
-  updatedAt               DateTime             @updatedAt @map("updated_at")
-
-  merchant      Merchant               @relation(fields: [merchantId], references: [id])
-  shop          Shop?                  @relation(fields: [shopId], references: [id])
-  items         ClearingItem[]
-  confirmations ClearingConfirmation[]
-  ledgers       LedgerEntry[]
-
-  @@unique([merchantId, periodStart, periodEnd, idempotencyKey])
   @@index([merchantId, status])
-  @@index([status, periodEnd])
-  @@map("clearing_records")
-}
-
-model ClearingItem {
-  id             String           @id @default(cuid())
-  clearingId     String           @map("clearing_id")
-  orderId        String?          @map("order_id")
-  orderItemId    String?          @map("order_item_id")
-  merchantId     String           @map("merchant_id")
-  itemType       ClearingItemType @map("item_type")
-  amountCents    BigInt           @map("amount_cents")
-  sourceType     String           @map("source_type")
-  sourceId       String           @map("source_id")
-  snapshotJson   Json             @map("snapshot_json")
-  idempotencyKey String           @unique @map("idempotency_key")
-  createdAt      DateTime         @default(now()) @map("created_at")
-
-  clearing  ClearingRecord @relation(fields: [clearingId], references: [id])
-  order     Order?         @relation(fields: [orderId], references: [id])
-  orderItem OrderItem?     @relation(fields: [orderItemId], references: [id])
-  merchant  Merchant       @relation(fields: [merchantId], references: [id])
-
-  @@index([clearingId])
-  @@index([merchantId, createdAt])
-  @@index([sourceType, sourceId])
-  @@map("clearing_items")
-}
-
-model ClearingConfirmation {
-  id             String                     @id @default(cuid())
-  clearingId     String                     @map("clearing_id")
-  status         ClearingConfirmationStatus @default(pending)
-  confirmedById  String?                    @map("confirmed_by")
-  confirmedAt    DateTime?                  @map("confirmed_at")
-  voucherUrl     String?                    @map("voucher_url")
-  note           String?
-  idempotencyKey String                     @unique @map("idempotency_key")
-  createdAt      DateTime                   @default(now()) @map("created_at")
-  updatedAt      DateTime                   @updatedAt @map("updated_at")
-
-  clearing    ClearingRecord @relation(fields: [clearingId], references: [id])
-  confirmedBy AdminUser?     @relation("ClearingConfirmationConfirmedBy", fields: [confirmedById], references: [id])
-
-  @@index([clearingId, status])
-  @@map("clearing_confirmations")
+  @@map("manual_payouts")
 }
 
 model CouponTemplate {
@@ -2315,9 +2109,128 @@ model CouponUsage {
   @@map("coupon_usage")
 }
 
+model UserWallet {
+  id                    String       @id @default(cuid())
+  userId                String       @unique @map("user_id")
+  walletNo              String       @unique @map("wallet_no")
+  availableBalanceCents BigInt       @default(0) @map("available_balance_cents")
+  frozenBalanceCents    BigInt       @default(0) @map("frozen_balance_cents")
+  totalRechargeCents    BigInt       @default(0) @map("total_recharge_cents")
+  totalSpendCents       BigInt       @default(0) @map("total_spend_cents")
+  status                WalletStatus @default(active)
+  version               Int          @default(0)
+  createdAt             DateTime     @default(now()) @map("created_at")
+  updatedAt             DateTime     @updatedAt @map("updated_at")
+
+  user           User                  @relation(fields: [userId], references: [id])
+  transactions   WalletTransaction[]
+  rechargeOrders WalletRechargeOrder[]
+  paymentHolds   WalletPaymentHold[]
+
+  @@index([status, updatedAt])
+  @@map("user_wallets")
+}
+
+model WalletRechargeOrder {
+  id             String               @id @default(cuid())
+  rechargeNo     String               @unique @map("recharge_no")
+  userId         String               @map("user_id")
+  walletId       String               @map("wallet_id")
+  paymentId      String?              @unique @map("payment_id")
+  provider       PaymentProvider
+  confirmMode    PaymentConfirmMode   @map("confirm_mode")
+  rechargeCents  BigInt               @map("recharge_cents")
+  feeBps         Int                  @default(0) @map("fee_bps")
+  feeCents       BigInt               @default(0) @map("fee_cents")
+  payableCents   BigInt               @map("payable_cents")
+  status         WalletRechargeStatus @default(pending_payment)
+  paidAt         DateTime?            @map("paid_at")
+  cancelledAt    DateTime?            @map("cancelled_at")
+  expiresAt      DateTime?            @map("expires_at")
+  idempotencyKey String               @unique @map("idempotency_key")
+  createdAt      DateTime             @default(now()) @map("created_at")
+  updatedAt      DateTime             @updatedAt @map("updated_at")
+
+  user         User                @relation(fields: [userId], references: [id])
+  wallet       UserWallet          @relation(fields: [walletId], references: [id])
+  payment      Payment?            @relation(fields: [paymentId], references: [id])
+  transactions WalletTransaction[]
+
+  @@index([userId, status, createdAt])
+  @@index([walletId, status, createdAt])
+  @@index([provider, status])
+  @@map("wallet_recharge_orders")
+}
+
+model WalletPaymentHold {
+  id             String           @id @default(cuid())
+  holdNo         String           @unique @map("hold_no")
+  userId         String           @map("user_id")
+  walletId       String           @map("wallet_id")
+  orderId        String           @map("order_id")
+  paymentId      String?          @unique @map("payment_id")
+  amountCents    BigInt           @map("amount_cents")
+  status         WalletHoldStatus @default(active)
+  expiresAt      DateTime?        @map("expires_at")
+  capturedAt     DateTime?        @map("captured_at")
+  releasedAt     DateTime?        @map("released_at")
+  idempotencyKey String           @unique @map("idempotency_key")
+  createdAt      DateTime         @default(now()) @map("created_at")
+  updatedAt      DateTime         @updatedAt @map("updated_at")
+
+  user         User                @relation(fields: [userId], references: [id])
+  wallet       UserWallet          @relation(fields: [walletId], references: [id])
+  order        Order               @relation(fields: [orderId], references: [id])
+  payment      Payment?            @relation(fields: [paymentId], references: [id])
+  transactions WalletTransaction[]
+
+  @@index([userId, status, createdAt])
+  @@index([walletId, status, createdAt])
+  @@index([orderId, status])
+  @@map("wallet_payment_holds")
+}
+
+model WalletTransaction {
+  id                 String                @id @default(cuid())
+  transactionNo      String                @unique @map("transaction_no")
+  userId             String                @map("user_id")
+  walletId           String                @map("wallet_id")
+  type               WalletTransactionType
+  direction          LedgerDirection
+  amountCents        BigInt                @map("amount_cents")
+  balanceBeforeCents BigInt                @map("balance_before_cents")
+  balanceAfterCents  BigInt                @map("balance_after_cents")
+  frozenBeforeCents  BigInt                @default(0) @map("frozen_before_cents")
+  frozenAfterCents   BigInt                @default(0) @map("frozen_after_cents")
+  orderId            String?               @map("order_id")
+  paymentId          String?               @map("payment_id")
+  rechargeOrderId    String?               @map("recharge_order_id")
+  holdId             String?               @map("hold_id")
+  sourceType         String                @map("source_type")
+  sourceId           String                @map("source_id")
+  note               String?
+  idempotencyKey     String                @unique @map("idempotency_key")
+  createdAt          DateTime              @default(now()) @map("created_at")
+
+  user          User                 @relation(fields: [userId], references: [id])
+  wallet        UserWallet           @relation(fields: [walletId], references: [id])
+  order         Order?               @relation(fields: [orderId], references: [id])
+  payment       Payment?             @relation(fields: [paymentId], references: [id])
+  rechargeOrder WalletRechargeOrder? @relation(fields: [rechargeOrderId], references: [id])
+  hold          WalletPaymentHold?   @relation(fields: [holdId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([walletId, createdAt])
+  @@index([orderId])
+  @@index([paymentId])
+  @@index([rechargeOrderId])
+  @@index([holdId])
+  @@index([sourceType, sourceId])
+  @@map("wallet_transactions")
+}
+
 model DepositAccount {
   id                   String        @id @default(cuid())
-  agentId              String?       @unique @map("agent_id")
   merchantId           String?       @unique @map("merchant_id")
   requiredAmountCents  BigInt        @map("required_amount_cents")
   availableAmountCents BigInt        @default(0) @map("available_amount_cents")
@@ -2327,7 +2240,6 @@ model DepositAccount {
   createdAt            DateTime      @default(now()) @map("created_at")
   updatedAt            DateTime      @updatedAt @map("updated_at")
 
-  agent        Agent?               @relation(fields: [agentId], references: [id])
   merchant     Merchant?            @relation(fields: [merchantId], references: [id])
   transactions DepositTransaction[]
 
@@ -2336,7 +2248,6 @@ model DepositAccount {
 
 model DepositTransaction {
   id                 String                 @id @default(cuid())
-  agentId            String?                @map("agent_id")
   merchantId         String?                @map("merchant_id")
   accountId          String                 @map("account_id")
   type               DepositTransactionType
@@ -2352,12 +2263,10 @@ model DepositTransaction {
   operatorId         String?                @map("operator_id")
   createdAt          DateTime               @default(now()) @map("created_at")
 
-  agent    Agent?         @relation(fields: [agentId], references: [id])
   merchant Merchant?      @relation(fields: [merchantId], references: [id])
   account  DepositAccount @relation(fields: [accountId], references: [id])
   ledgers  LedgerEntry[]
 
-  @@index([agentId, createdAt])
   @@index([merchantId, createdAt])
   @@index([relatedType, relatedId])
   @@map("deposit_transactions")
@@ -2366,7 +2275,7 @@ model DepositTransaction {
 model Clawback {
   id             String              @id @default(cuid())
   clawbackNo     String              @unique @map("clawback_no")
-  agentId        String              @map("agent_id")
+  merchantId     String              @map("merchant_id")
   sourceType     String              @map("source_type")
   sourceId       String              @map("source_id")
   orderId        String?             @map("order_id")
@@ -2381,85 +2290,9 @@ model Clawback {
 
   ledgers LedgerEntry[]
 
-  @@index([agentId, status])
+  @@index([merchantId, status])
   @@index([sourceType, sourceId])
   @@map("clawbacks")
-}
-
-model ChannelAuthorization {
-  id               String        @id @default(cuid())
-  firstTierAgentId String        @unique @map("first_tier_agent_id")
-  status           ChannelStatus @default(pending_review)
-  reviewedById     String?       @map("reviewed_by")
-  reviewedAt       DateTime?     @map("reviewed_at")
-  reason           String?
-  idempotencyKey   String        @unique @map("idempotency_key")
-  createdAt        DateTime      @default(now()) @map("created_at")
-  updatedAt        DateTime      @updatedAt @map("updated_at")
-
-  firstTierAgent Agent @relation("FirstTierAuthorization", fields: [firstTierAgentId], references: [id])
-
-  @@index([status, createdAt])
-  @@map("channel_authorizations")
-}
-
-model ChannelRelation {
-  id                   String              @id @default(cuid())
-  relationType         ChannelRelationType @default(two_tier) @map("relation_type")
-  firstTierAgentId     String?             @map("first_tier_agent_id")
-  secondTierAgentId    String?             @map("second_tier_agent_id")
-  thirdTierAgentId     String?             @map("third_tier_agent_id")
-  firstTierMerchantId  String?             @map("first_tier_merchant_id")
-  secondTierMerchantId String?             @map("second_tier_merchant_id")
-  thirdTierMerchantId  String?             @map("third_tier_merchant_id")
-  status               ChannelStatus       @default(pending_review)
-  reviewedById         String?             @map("reviewed_by")
-  reviewedAt           DateTime?           @map("reviewed_at")
-  reason               String?
-  activeUniqueKey      String?             @unique @map("active_unique_key")
-  idempotencyKey       String              @unique @map("idempotency_key")
-  createdAt            DateTime            @default(now()) @map("created_at")
-  updatedAt            DateTime            @updatedAt @map("updated_at")
-
-  firstTierAgent     Agent?                @relation("FirstTierRelations", fields: [firstTierAgentId], references: [id])
-  secondTierAgent    Agent?                @relation("SecondTierRelations", fields: [secondTierAgentId], references: [id])
-  thirdTierAgent     Agent?                @relation("ThirdTierRelations", fields: [thirdTierAgentId], references: [id])
-  firstTierMerchant  Merchant?             @relation("FirstTierMerchantRelations", fields: [firstTierMerchantId], references: [id])
-  secondTierMerchant Merchant?             @relation("SecondTierMerchantRelations", fields: [secondTierMerchantId], references: [id])
-  thirdTierMerchant  Merchant?             @relation("ThirdTierMerchantRelations", fields: [thirdTierMerchantId], references: [id])
-  offers             ChannelProductOffer[]
-  orders             Order[]
-
-  @@index([firstTierAgentId, status])
-  @@index([secondTierAgentId, status])
-  @@index([thirdTierAgentId, status])
-  @@index([firstTierMerchantId, status])
-  @@index([secondTierMerchantId, status])
-  @@index([thirdTierMerchantId, status])
-  @@map("channel_relations")
-}
-
-model ChannelProductOffer {
-  id                         String             @id @default(cuid())
-  channelRelationId          String             @map("channel_relation_id")
-  platformProductId          String             @map("platform_product_id")
-  resellSupplyPriceCents     BigInt             @map("resell_supply_price_cents")
-  firstTierSupplyPriceCents  BigInt?            @map("first_tier_supply_price_cents")
-  secondTierSupplyPriceCents BigInt?            @map("second_tier_supply_price_cents")
-  terminalMinSalePriceCents  BigInt?            @map("terminal_min_sale_price_cents")
-  status                     AgentProductStatus @default(listed)
-  listedAt                   DateTime?          @map("listed_at")
-  delistedAt                 DateTime?          @map("delisted_at")
-  idempotencyKey             String             @unique @map("idempotency_key")
-  createdAt                  DateTime           @default(now()) @map("created_at")
-  updatedAt                  DateTime           @updatedAt @map("updated_at")
-
-  relation        ChannelRelation @relation(fields: [channelRelationId], references: [id])
-  platformProduct PlatformProduct @relation(fields: [platformProductId], references: [id])
-
-  @@unique([channelRelationId, platformProductId])
-  @@index([platformProductId, status])
-  @@map("channel_product_offers")
 }
 
 model PaymentChannelConfig {
@@ -2477,10 +2310,28 @@ model PaymentChannelConfig {
   @@map("payment_channel_configs")
 }
 
+model PlatformServiceFeeConfig {
+  id             String                 @id @default(cuid())
+  enabled        Boolean                @default(true)
+  feeBps         Int                    @map("fee_bps")
+  basisType      ServiceFeeBasisType    @default(final_sale_price) @map("basis_type")
+  effectiveFrom  DateTime               @map("effective_from")
+  effectiveTo    DateTime?              @map("effective_to")
+  status         ServiceFeeConfigStatus @default(active)
+  createdById    String?                @map("created_by")
+  updatedById    String?                @map("updated_by")
+  idempotencyKey String                 @unique @map("idempotency_key")
+  createdAt      DateTime               @default(now()) @map("created_at")
+  updatedAt      DateTime               @updatedAt @map("updated_at")
+
+  @@index([status, effectiveFrom])
+  @@index([effectiveTo])
+  @@map("platform_service_fee_configs")
+}
+
 model LedgerEntry {
   id                   String            @id @default(cuid())
   ledgerNo             String            @unique @map("ledger_no")
-  agentId              String?           @map("agent_id")
   merchantId           String?           @map("merchant_id")
   shopId               String?           @map("shop_id")
   subjectType          LedgerSubjectType @map("subject_type")
@@ -2494,7 +2345,6 @@ model LedgerEntry {
   sourceId             String            @map("source_id")
   orderId              String?           @map("order_id")
   settlementId         String?           @map("settlement_id")
-  clearingId           String?           @map("clearing_id")
   refundId             String?           @map("refund_id")
   clawbackId           String?           @map("clawback_id")
   depositTransactionId String?           @map("deposit_transaction_id")
@@ -2504,21 +2354,17 @@ model LedgerEntry {
   reversalOfLedgerId   String?           @map("reversal_of_ledger_id")
   createdAt            DateTime          @default(now()) @map("created_at")
 
-  agent              Agent?              @relation(fields: [agentId], references: [id])
   merchant           Merchant?           @relation(fields: [merchantId], references: [id])
   shop               Shop?               @relation(fields: [shopId], references: [id])
   order              Order?              @relation(fields: [orderId], references: [id])
   settlement         SettlementSheet?    @relation(fields: [settlementId], references: [id])
-  clearing           ClearingRecord?     @relation(fields: [clearingId], references: [id])
   refund             Refund?             @relation(fields: [refundId], references: [id])
   clawback           Clawback?           @relation(fields: [clawbackId], references: [id])
   depositTransaction DepositTransaction? @relation(fields: [depositTransactionId], references: [id])
 
-  @@index([agentId, createdAt])
   @@index([merchantId, createdAt])
   @@index([sourceType, sourceId])
   @@index([orderId])
-  @@index([clearingId])
   @@map("ledger_entries")
 }
 
@@ -2540,7 +2386,7 @@ model RiskFreeze {
   id              String           @id @default(cuid())
   targetType      String           @map("target_type")
   targetId        String           @map("target_id")
-  agentId         String?          @map("agent_id")
+  merchantId      String?          @map("merchant_id")
   freezeType      String           @map("freeze_type")
   status          RiskFreezeStatus @default(active)
   reasonCode      String           @map("reason_code")
@@ -2552,7 +2398,7 @@ model RiskFreeze {
   createdAt       DateTime         @default(now()) @map("created_at")
   updatedAt       DateTime         @updatedAt @map("updated_at")
 
-  @@index([agentId, status])
+  @@index([merchantId, status])
   @@index([targetType, targetId, freezeType, status])
   @@map("risk_freezes")
 }
@@ -2560,7 +2406,7 @@ model RiskFreeze {
 model Complaint {
   id             String          @id @default(cuid())
   orderId        String          @map("order_id")
-  agentId        String          @map("agent_id")
+  merchantId     String          @map("merchant_id")
   userId         String          @map("user_id")
   status         ComplaintStatus @default(pending)
   complaintType  String          @map("complaint_type")
@@ -2569,7 +2415,7 @@ model Complaint {
   createdAt      DateTime        @default(now()) @map("created_at")
   updatedAt      DateTime        @updatedAt @map("updated_at")
 
-  @@index([agentId, status])
+  @@index([merchantId, status])
   @@index([orderId])
   @@map("complaints")
 }
@@ -2609,8 +2455,6 @@ model AdminUser {
   createdMerchants           Merchant[]                 @relation("MerchantCreatedBy")
   createdMerchantInviteCodes MerchantInviteCode[]       @relation("MerchantInviteCodeCreatedBy")
   createdShops               Shop[]                     @relation("ShopCreatedBy")
-  createdCollectionChannels  ShopCollectionChannel[]    @relation("ShopCollectionChannelCreatedBy")
-  clearingConfirmations      ClearingConfirmation[]     @relation("ClearingConfirmationConfirmedBy")
   createdCouponTemplates     CouponTemplate[]           @relation("CouponTemplateCreatedBy")
   refundManualConfirmations  RefundManualConfirmation[] @relation("RefundManualConfirmationConfirmedBy")
   sessions                   AuthSession[]

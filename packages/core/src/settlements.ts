@@ -1,6 +1,6 @@
 export type SettlementCandidate = {
   orderId: string;
-  agentId?: string;
+  merchantId?: string;
   shopId?: string;
   paymentStatus: "paid" | string;
   fulfillmentStatus: "success" | string;
@@ -17,17 +17,17 @@ export type SettlementOrderAmount = SettlementCandidate & {
   paidAmountCents: bigint;
   supplyAmountCents: bigint;
   serviceFeeCents: bigint;
-  agentIncomeCents: bigint;
+  merchantIncomeCents: bigint;
 };
 
 export type SettlementItemDraft = {
   orderId: string;
-  agentId: string;
+  merchantId: string;
   shopId: string;
   paidAmountCents: bigint;
   supplyAmountCents: bigint;
   serviceFeeCents: bigint;
-  agentIncomeCents: bigint;
+  merchantIncomeCents: bigint;
   deductedCents: bigint;
   settleAmountCents: bigint;
   fulfilledAt: Date;
@@ -62,7 +62,7 @@ export function selectSettlementCandidates(orders: SettlementCandidate[]): Settl
 export function buildSettlementItems(
   orders: SettlementOrderAmount[],
   alreadySettledOrderIds: Iterable<string> = [],
-  batchAgentId?: string
+  batchMerchantId?: string
 ): SettlementItemDraft[] {
   const settled = new Set(alreadySettledOrderIds);
   const selected = orders.filter((order) => isSettlementCandidate(order) && !settled.has(order.orderId));
@@ -70,22 +70,22 @@ export function buildSettlementItems(
 
   return selected.map((order) => {
     if (!order.fulfilledAt) throw new Error(`settlement order ${order.orderId} has no fulfilledAt`);
-    if (batchAgentId && order.agentId !== batchAgentId) {
-      throw new Error(`settlement order ${order.orderId} does not belong to agent ${batchAgentId}`);
+    if (batchMerchantId && order.merchantId !== batchMerchantId) {
+      throw new Error(`settlement order ${order.orderId} does not belong to merchant ${batchMerchantId}`);
     }
-    if (!order.agentId || !order.shopId) {
-      throw new Error(`settlement order ${order.orderId} requires agent and shop scope`);
+    if (!order.merchantId || !order.shopId) {
+      throw new Error(`settlement order ${order.orderId} requires merchant and shop scope`);
     }
     return {
       orderId: order.orderId,
-      agentId: order.agentId,
+      merchantId: order.merchantId,
       shopId: order.shopId,
       paidAmountCents: order.paidAmountCents,
       supplyAmountCents: order.supplyAmountCents,
       serviceFeeCents: order.serviceFeeCents,
-      agentIncomeCents: order.agentIncomeCents,
+      merchantIncomeCents: order.merchantIncomeCents,
       deductedCents: 0n,
-      settleAmountCents: order.agentIncomeCents,
+      settleAmountCents: order.merchantIncomeCents,
       fulfilledAt: order.fulfilledAt,
       settleableAt: new Date(order.fulfilledAt.getTime() + (order.tPlusOneHours ?? 24) * 60 * 60 * 1000)
     };

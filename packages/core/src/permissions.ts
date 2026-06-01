@@ -1,10 +1,10 @@
 export type Actor =
   | { role: "user"; userId: string }
-  | { role: "agent"; agentId: string; shopId: string }
+  | { role: "merchant"; merchantId: string; shopId: string }
   | { role: "operator" | "finance" | "admin"; adminId: string };
 
 export type AdminPermission =
-  | "agent.review"
+  | "merchant.review"
   | "product.manage"
   | "after_sale.arbitrate"
   | "settlement.generate"
@@ -17,11 +17,11 @@ export type AdminPermission =
   | "rbac.manage"
   | "rights_code.secret.read";
 
-export function assertAgentScope(actor: Actor, resource: { agentId: string; shopId?: string }): void {
-  if (actor.role !== "agent") throw new Error("actor is not an agent");
-  if (actor.agentId !== resource.agentId) throw new Error("agent cannot access another agent resource");
+export function assertMerchantScope(actor: Actor, resource: { merchantId: string; shopId?: string }): void {
+  if (actor.role !== "merchant") throw new Error("actor is not a merchant");
+  if (actor.merchantId !== resource.merchantId) throw new Error("merchant cannot access another merchant resource");
   if (resource.shopId && actor.shopId !== resource.shopId) {
-    throw new Error("agent cannot access another shop resource");
+    throw new Error("merchant cannot access another shop resource");
   }
 }
 
@@ -42,7 +42,7 @@ export function hasAdminPermission(actor: Actor, permission: AdminPermission): b
   if (actor.role === "admin") return true;
   if (actor.role === "operator") {
     return [
-      "agent.review",
+      "merchant.review",
       "product.manage",
       "after_sale.arbitrate",
       "risk.freeze",
