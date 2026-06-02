@@ -424,7 +424,7 @@ function App() {
 
   function showCollection(order: JsonRecord) {
     setSelectedOrder(order);
-    setMessage(`订单 ${text(order.orderNo)} 待收款确认，请使用当前店铺收款方式付款。`);
+    setMessage(`订单 ${text(order.orderNo)} 待收款确认，请按页面金额付款，付款后等待后台确认。`);
   }
 
   async function refreshOrderStatus(order: JsonRecord) {
@@ -1029,18 +1029,18 @@ function App() {
               {text(selectedOrder.paymentStatus) === "unpaid" && !paymentForOrder(selectedOrder) ? (
                 <button type="button" disabled={loading} onClick={() => void createOrderPayment(selectedOrder)}>去支付</button>
               ) : null}
-              <button type="button" className="ghost" onClick={() => openPaymentVoucher(selectedOrder)}>补充异常材料</button>
+              <button type="button" className="ghost" onClick={() => openPaymentVoucher(selectedOrder)}>提交核实材料</button>
             </div>
           </section>
         </div>
       ) : null}
 
       {supportMaterialOrder ? (
-        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="补充异常材料">
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="提交核实材料">
           <section className="checkout">
             <div className="checkout-head">
               <div>
-                <span>异常材料</span>
+                <span>仅用于异常核实</span>
                 <h2>{text(supportMaterialOrder.orderNo)}</h2>
               </div>
               <button type="button" className="icon-button" onClick={() => setSupportMaterialOrder(undefined)}>关闭</button>
@@ -1078,10 +1078,10 @@ function App() {
               <span>备注</span>
               <textarea value={paymentVoucherForm.note} onChange={(event) => setPaymentVoucherForm({ ...paymentVoucherForm, note: event.target.value })} rows={3} placeholder="说明异常情况、客服沟通结果或账号尾号" />
             </label>
-            <p>此入口仅用于异常或争议核实，不作为支付成功依据，也不会触发自动发货。</p>
+            <p>此入口只在订单长时间未确认、客服要求补充信息或发生争议时使用；提交后不会确认付款，也不会触发自动发货。</p>
             <div className="checkout-actions">
               <button type="button" className="ghost" onClick={() => setSupportMaterialOrder(undefined)}>取消</button>
-              <button type="button" disabled={loading || (!paymentVoucherForm.voucherUrl.trim() && !paymentVoucherForm.note.trim())} onClick={() => void submitPaymentVoucher()}>提交材料</button>
+              <button type="button" disabled={loading || (!paymentVoucherForm.voucherUrl.trim() && !paymentVoucherForm.note.trim())} onClick={() => void submitPaymentVoucher()}>提交核实材料</button>
             </div>
           </section>
         </div>
@@ -1575,7 +1575,7 @@ function PaymentMethodPicker(props: {
     return (
       <div className="payment-method-picker unavailable">
         <strong>暂无可用支付方式</strong>
-        <span>当前店铺还没有启用收款方式，请联系店铺客服。</span>
+        <span>当前店铺暂时不能收款，请联系店铺客服。</span>
       </div>
     );
   }
@@ -1631,8 +1631,7 @@ function PaymentBox(props: { channels: JsonRecord[]; orderAmountCents: string; s
       <div className="payment-box unavailable">
       <div>
         <strong>暂无可用收款方式</strong>
-        <span>当前店铺暂时不能收款。</span>
-        <small>请联系店铺客服，或等待商户在后台提交并由平台审核启用。</small>
+        <span>当前店铺暂时不能收款，请联系店铺客服。</span>
       </div>
       </div>
     );
@@ -1690,6 +1689,7 @@ function PersonalPaymentGuide(props: {
   const [copied, setCopied] = useState(false);
   const provider = paymentProviderFrom(props.payment, props.channel);
   const appName = provider.includes("wechat") ? "微信" : "支付宝";
+  const personalSteps = personalPaymentSteps(provider);
   const amountCents = text(props.payment.amountCents, orderPaidAmount(props.order));
   const amount = cents(amountCents);
   const amountForCopy = (Number(amountCents || 0) / 100).toFixed(2);
@@ -1729,7 +1729,7 @@ function PersonalPaymentGuide(props: {
 
         <div className="payment-guide-steps">
           <strong>{isPaid ? "订单已确认收款" : "请截图保存上方付款码"}</strong>
-          <p>打开{appName}扫一扫，选择刚保存的图片或扫码完成付款。</p>
+          {personalSteps.map((step) => <p key={step}>{step}</p>)}
           <p>支付后请回到本页面等待订单刷新，后台确认收款后会自动发放卡密或进入人工交付。</p>
         </div>
 
@@ -1836,6 +1836,21 @@ function PaymentIcon(props: { provider: string }) {
   const kind = props.provider.includes("wechat") ? "wechat" : props.provider.includes("alipay") || props.provider === "personal_alipay" ? "alipay" : props.provider === "balance" ? "balance" : "epay";
   const label = kind === "wechat" ? "微" : kind === "alipay" ? "支" : kind === "balance" ? "余" : "e";
   return <i className={`payment-icon ${kind}`} aria-hidden="true">{label}</i>;
+}
+
+function personalPaymentSteps(provider: string): string[] {
+  if (provider.includes("wechat")) {
+    return [
+      "截屏保存支付码。",
+      "打开微信扫一扫，从相册选择刚才保存的支付码。",
+      "按页面金额付款，付款完成后回到本页面。"
+    ];
+  }
+  return [
+    "截屏保存支付码。",
+    "打开支付宝扫一扫，从相册选择刚才保存的支付码。",
+    "按页面金额付款，付款完成后回到本页面。"
+  ];
 }
 
 function ExtractResult(props: { result: JsonRecord }) {

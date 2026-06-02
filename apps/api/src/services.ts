@@ -1365,6 +1365,7 @@ class BackendServices {
     customerServiceNote?: string;
   }) {
     const shop = this.getMerchantShop(actor);
+    this.assertShopConfigurable(shop, "update shop settings");
     Object.assign(shop, input);
     this.audit("merchant", "shop.update", "shop", shop.id, input);
     return shop;
@@ -1372,6 +1373,7 @@ class BackendServices {
 
   updateMerchantShopCollection(actor: MerchantActor, input: { collectionAccountName?: string; collectionQrUrl?: string; collectionNote?: string }) {
     const shop = this.getMerchantShop(actor);
+    this.assertShopConfigurable(shop, "update shop collection settings");
     shop.collectionAccountName = input.collectionAccountName ?? shop.collectionAccountName;
     shop.collectionQrUrl = input.collectionQrUrl ?? shop.collectionQrUrl;
     shop.collectionNote = input.collectionNote ?? shop.collectionNote;
@@ -1387,6 +1389,7 @@ class BackendServices {
     productGroups?: Array<{ name: string; merchantProductListingIds: string[] }>;
   }) {
     const shop = this.getMerchantShop(actor);
+    this.assertShopConfigurable(shop, "update shop decor");
     if (input.themeColor && !/^#[0-9a-fA-F]{6}$/.test(input.themeColor)) {
       throw new ApiError(400, "SHOP_DECOR_INVALID", "themeColor must be a hex color");
     }
@@ -2196,6 +2199,8 @@ class BackendServices {
   reviewChannelAuthorization(actor: AdminActor, merchantId: string, input: { approved: boolean; reason?: string }) {
     assertAdminPermission(actor, "merchant.review");
     const merchant = requireEntity(this.store.merchants.get(merchantId), "RESOURCE_NOT_FOUND", "merchant not found");
+    this.assertMerchantOperational(merchant, "review downstream supply authorization");
+    this.assertMerchantDepositConfirmed(merchant.id, "review downstream supply authorization");
     const existing = this.store.channelAuthorizations.find((item) => item.firstTierMerchantId === merchant.id);
     const authorization = existing ?? {
       id: nextId(this.store, "channel-auth"),
@@ -2220,11 +2225,14 @@ class BackendServices {
     const firstTier = requireEntity(this.store.merchants.get(input.firstTierMerchantId), "RESOURCE_NOT_FOUND", "first tier merchant not found");
     const secondTier = requireEntity(this.store.merchants.get(input.secondTierMerchantId), "RESOURCE_NOT_FOUND", "second tier merchant not found");
     const thirdTier = input.thirdTierMerchantId ? requireEntity(this.store.merchants.get(input.thirdTierMerchantId), "RESOURCE_NOT_FOUND", "third tier merchant not found") : undefined;
-    const authorization = this.store.channelAuthorizations.find((item) => item.firstTierMerchantId === firstTier.id && item.status === "active");
-    if (!authorization) throw new ApiError(400, "MERCHANT_SUPPLY_RULE_FAILED", "first tier merchant is not authorized for downstream supply");
     if (this.store.channelRelations.some((item) => item.status === "active" && (item.secondTierMerchantId === firstTier.id || item.thirdTierMerchantId === firstTier.id))) {
       throw new ApiError(400, "MERCHANT_SUPPLY_RULE_FAILED", "fourth-tier merchant creation is forbidden");
     }
+    this.assertMerchantOperational(firstTier, "create channel relation");
+    this.assertMerchantOperational(secondTier, "create channel relation");
+    if (thirdTier) this.assertMerchantOperational(thirdTier, "create channel relation");
+    const authorization = this.store.channelAuthorizations.find((item) => item.firstTierMerchantId === firstTier.id && item.status === "active");
+    if (!authorization) throw new ApiError(400, "MERCHANT_SUPPLY_RULE_FAILED", "first tier merchant is not authorized for downstream supply");
     if (firstTier.status !== "active" || secondTier.status !== "active" || (thirdTier && thirdTier.status !== "active")) {
       throw new ApiError(400, "MERCHANT_SUPPLY_RULE_FAILED", "merchant supply participants must be active");
     }
@@ -2264,9 +2272,9 @@ class BackendServices {
     relation: ChannelRelation,
     input: { platformProductId: string; resellSupplyPriceCents: bigint; status?: string }
   ) {
-    this.assertMerchantDepositConfirmed(relation.firstTierMerchantId, "configure channel offer");
-    this.assertMerchantDepositConfirmed(relation.secondTierMerchantId, "configure channel offer");
-    if (relation.thirdTierMerchantId) this.assertMerchantDepositConfirmed(relation.thirdTierMerchantId, "configure channel offer");
+    this.assertMerchantCanOperate(relation.firstTierMerchantId, "configure channel offer");
+    this.assertMerchantCanOperate(relation.secondTierMerchantId, "configure channel offer");
+    if (relation.thirdTierMerchantId) this.assertMerchantCanOperate(relation.thirdTierMerchantId, "configure channel offer");
     const product = requireEntity(this.store.platformProducts.get(input.platformProductId), "RESOURCE_NOT_FOUND", "platform product not found");
     const upstreamSupplyPriceCents = this.upstreamSupplyPriceForRelation(relation, product.id);
     if (input.resellSupplyPriceCents < upstreamSupplyPriceCents) {
@@ -3552,7 +3560,9 @@ class BackendServices {
 
 
   upsertMerchantPaymentMethod(actor: MerchantActor, input: PaymentMethodUpsertInput) {
-    this.getMerchantShop(actor);
+    const shop = this.getMerchantShop(actor);
+    this.assertMerchantCanOperate(actor.merchantId, "configure payment method");
+    this.assertShopConfigurable(shop, "configure payment method");
     const method = this.upsertPaymentMethod("merchant", actor.merchantId, {
       ...input,
       merchantId: actor.merchantId,
@@ -3564,7 +3574,9 @@ class BackendServices {
 
 
   setMerchantPaymentMethodDefault(actor: MerchantActor, methodId: string) {
-    this.getMerchantShop(actor);
+    const shop = this.getMerchantShop(actor);
+    this.assertMerchantCanOperate(actor.merchantId, "set payment method default");
+    this.assertShopConfigurable(shop, "set payment method default");
     const method = requireEntity(this.store.paymentMethods.get(methodId), "RESOURCE_NOT_FOUND", "payment method not found");
     assertMerchantScope(actor, { merchantId: required(method.merchantId, "merchantId"), shopId: method.shopId });
     this.setPaymentMethodDefault(method);
@@ -3586,7 +3598,9 @@ class BackendServices {
 
 
   testMerchantPaymentMethod(actor: MerchantActor, methodId: string) {
-    this.getMerchantShop(actor);
+    const shop = this.getMerchantShop(actor);
+    this.assertMerchantCanOperate(actor.merchantId, "test payment method");
+    this.assertShopConfigurable(shop, "test payment method");
     const method = requireEntity(this.store.paymentMethods.get(methodId), "RESOURCE_NOT_FOUND", "payment method not found");
     assertMerchantScope(actor, { merchantId: required(method.merchantId, "merchantId"), shopId: method.shopId });
     const result = this.testPaymentMethod(method);
@@ -3613,6 +3627,7 @@ class BackendServices {
 
   listPublicPaymentMethods(shopIdentifier: string) {
     const shop = this.getShop(shopIdentifier);
+    if (shop.status !== "open" || shop.riskStatus !== "normal") return [];
     const shopOwnsPaymentMethods = (shop.ownerType ?? "merchant") === "platform";
     const paymentMethods = [...this.store.paymentMethods.values()]
       .filter((method) => method.enabled && method.status === "enabled")
@@ -3818,8 +3833,10 @@ class BackendServices {
 
   private upsertPaymentMethod(ownerType: "platform" | "merchant", operatorId: string, input: PaymentMethodUpsertInput) {
     this.assertPaymentMethodInput(ownerType, input);
+    if (input.shopId) this.assertShopConfigurable(this.getShop(input.shopId), "configure payment method");
     const existing = input.id ? this.store.paymentMethods.get(input.id) : undefined;
     if (existing) {
+      if (existing.shopId) this.assertShopConfigurable(this.getShop(existing.shopId), "configure payment method");
       if (ownerType === "merchant" && (existing.merchantId !== input.merchantId || existing.shopId !== input.shopId)) {
         throw new ApiError(403, "PAYMENT_METHOD_SCOPE_FORBIDDEN", "cannot update another merchant payment method");
       }
@@ -4017,6 +4034,7 @@ class BackendServices {
   }
 
   private setPaymentMethodDefault(method: PaymentMethodConfig) {
+    if (method.shopId) this.assertShopConfigurable(this.getShop(method.shopId), "set payment method default");
     for (const candidate of this.store.paymentMethods.values()) {
       if (candidate.id === method.id) continue;
       if (candidate.ownerType === method.ownerType && candidate.merchantId === method.merchantId && candidate.shopId === method.shopId) candidate.isDefault = false;
@@ -5857,6 +5875,24 @@ class BackendServices {
     const account = requireEntity(this.store.depositAccounts.get(merchantId), "RESOURCE_NOT_FOUND", "deposit account not found");
     if (shouldRestrictForDeposit(account)) {
       throw new ApiError(403, "DEPOSIT_INSUFFICIENT", `merchant deposit is required before ${action}`);
+    }
+  }
+
+  private assertMerchantOperational(merchant: DemoMerchant, action: string) {
+    if (merchant.status !== "active" || merchant.riskStatus !== "normal") {
+      throw new ApiError(403, "MERCHANT_RESTRICTED", `merchant is restricted before ${action}`);
+    }
+  }
+
+  private assertMerchantCanOperate(merchantId: string, action: string) {
+    const merchant = requireEntity(this.store.merchants.get(merchantId), "RESOURCE_NOT_FOUND", "merchant not found");
+    this.assertMerchantOperational(merchant, action);
+    this.assertMerchantDepositConfirmed(merchantId, action);
+  }
+
+  private assertShopConfigurable(shop: DemoShop, action: string) {
+    if (shop.status === "frozen" || shop.status === "disabled" || shop.riskStatus !== "normal") {
+      throw new ApiError(403, "SHOP_RESTRICTED", `shop is restricted before ${action}`);
     }
   }
 }

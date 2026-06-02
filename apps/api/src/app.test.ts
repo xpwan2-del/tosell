@@ -3266,6 +3266,79 @@ describe.sequential("api", () => {
     ]));
   });
 
+  it("blocks configuration and public payment display for frozen shops or restricted merchants", async () => {
+    const app = buildApp();
+    const operatorHeaders = { "x-admin-id": "operator-1", "x-admin-role": "operator" };
+    const merchantHeaders = { "x-merchant-id": "merchant-1", "x-shop-id": "shop-1" };
+
+    const shopFreeze = await app.inject({
+      method: "POST",
+      url: "/api/admin/risk-freezes",
+      headers: operatorHeaders,
+      payload: {
+        targetType: "shop",
+        targetId: "shop-1",
+        freezeType: "shop_frozen",
+        reasonCode: "manual_risk"
+      }
+    });
+    expect(shopFreeze.statusCode).toBe(200);
+
+    const publicMethods = await app.inject({ method: "GET", url: "/api/h5/shops/shop-1/payment-methods" });
+    expect(publicMethods.statusCode).toBe(200);
+    expect(publicMethods.json()).toEqual([]);
+
+    const shopUpdate = await app.inject({
+      method: "PATCH",
+      url: "/api/merchant/shop",
+      headers: merchantHeaders,
+      payload: { announcement: "冻结期间不允许修改" }
+    });
+    expect(shopUpdate.statusCode).toBe(403);
+    expect(shopUpdate.json().code).toBe("SHOP_RESTRICTED");
+
+    const paymentCreate = await app.inject({
+      method: "POST",
+      url: "/api/merchant/payment-methods",
+      headers: merchantHeaders,
+      payload: {
+        provider: "personal_alipay",
+        displayName: "冻结后新增个人支付宝",
+        accountName: "merchant-alipay@example.test",
+        qrUrl: "https://example.test/frozen-pay.png",
+        enabled: true
+      }
+    });
+    expect(paymentCreate.statusCode).toBe(403);
+    expect(paymentCreate.json().code).toBe("SHOP_RESTRICTED");
+
+    const restrictedApp = buildApp();
+    const merchantFreeze = await restrictedApp.inject({
+      method: "POST",
+      url: "/api/admin/risk-freezes",
+      headers: operatorHeaders,
+      payload: {
+        targetType: "merchant",
+        targetId: "merchant-1",
+        freezeType: "settlement_restricted",
+        reasonCode: "manual_risk"
+      }
+    });
+    expect(merchantFreeze.statusCode).toBe(200);
+    const offer = await restrictedApp.inject({
+      method: "POST",
+      url: "/api/merchant/supply/offers",
+      headers: merchantHeaders,
+      payload: {
+        downstreamMerchantId: "merchant-2",
+        platformProductId: "prod-1",
+        resellSupplyPriceCents: "11200"
+      }
+    });
+    expect(offer.statusCode).toBe(403);
+    expect(offer.json().code).toBe("MERCHANT_RESTRICTED");
+  });
+
   it("audits reconciliation exports and supports admin order pagination filters", async () => {
     const app = buildApp();
     const first = await app.inject({

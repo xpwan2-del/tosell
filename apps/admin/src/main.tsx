@@ -2778,7 +2778,7 @@ function PaymentMethodForm(props: {
   }
   return (
     <div className="form-grid wide">
-      <label>收款方式<select value={props.form.provider} onChange={(event) => props.setForm({ ...props.form, provider: event.target.value })}><option value="">请选择</option><option value="alipay_merchant">支付宝商户</option><option value="wechat_merchant">微信/腾讯商户</option><option value="epay">e支付</option><option value="personal_alipay">个人支付宝</option><option value="wechat_personal">个人微信</option></select></label>
+      <label>收款方式<select value={props.form.provider} onChange={(event) => props.setForm({ ...props.form, provider: event.target.value })}><option value="">请选择</option><option value="alipay_merchant">支付宝商户</option><option value="wechat_merchant">微信/腾讯商户</option><option value="epay">e支付 / xpay / 虎皮椒</option><option value="personal_alipay">个人支付宝</option><option value="wechat_personal">个人微信</option></select></label>
       <label>确认方式<input value={confirmMode} readOnly /></label>
       <label>默认方式<select value={props.form.isDefault ? "yes" : "no"} onChange={(event) => props.setForm({ ...props.form, isDefault: event.target.value === "yes" })}><option value="no">否</option><option value="yes">设为默认</option></select></label>
       <label>启用<select value={props.form.enabled ? "yes" : "no"} onChange={(event) => props.setForm({ ...props.form, enabled: event.target.value === "yes" })}><option value="yes">启用</option><option value="no">停用</option></select></label>
@@ -2786,9 +2786,9 @@ function PaymentMethodForm(props: {
       <label>产品类型<input value={props.form.productType} onChange={(event) => props.setForm({ ...props.form, productType: event.target.value })} placeholder={personalPayment ? "可不填" : "H5 / 扫码 / JSAPI"} /></label>
       {!personalPayment ? <label>商户号<input value={props.form.merchantNo} onChange={(event) => props.setForm({ ...props.form, merchantNo: event.target.value })} placeholder="支付平台分配的商户号" /></label> : null}
       {!personalPayment && !epay ? <label>AppID<input value={props.form.appId} onChange={(event) => props.setForm({ ...props.form, appId: event.target.value })} placeholder="支付宝/微信应用 ID" /></label> : null}
-      {epay ? <label>服务商号/渠道 ID<input value={props.form.serviceProviderId} onChange={(event) => props.setForm({ ...props.form, serviceProviderId: event.target.value })} placeholder="e支付要求才填" /></label> : null}
+      {epay ? <label>服务商号/渠道 ID<input value={props.form.serviceProviderId} onChange={(event) => props.setForm({ ...props.form, serviceProviderId: event.target.value })} placeholder="e支付/xpay 要求才填" /></label> : null}
       <label>账户名<input value={props.form.accountName} onChange={(event) => props.setForm({ ...props.form, accountName: event.target.value })} placeholder={personalPayment ? "后台内部核对用，前台不展示" : "内部识别名，可选"} /></label>
-      {epay ? <label>e支付网关<input value={props.form.gatewayUrl} onChange={(event) => props.setForm({ ...props.form, gatewayUrl: event.target.value })} placeholder="https://..." /></label> : null}
+      {epay ? <label>e支付/xpay/虎皮椒网关<input value={props.form.gatewayUrl} onChange={(event) => props.setForm({ ...props.form, gatewayUrl: event.target.value })} placeholder="https://..." /></label> : null}
       {epay ? <label>接口模式<select value={props.form.apiMode || "submit"} onChange={(event) => props.setForm({ ...props.form, apiMode: event.target.value })}><option value="submit">Submit 收银台跳转</option><option value="mapi_first">MApi 优先拉起 App</option><option value="hupijiao_direct">虎皮椒直连</option></select></label> : null}
       {official ? <label>签名密钥<input type="password" value={props.form.signingSecret} onChange={(event) => props.setForm({ ...props.form, signingSecret: event.target.value })} placeholder="只提交，不回显明文" /></label> : null}
       {official ? <label>私钥<input type="password" value={props.form.privateKey} onChange={(event) => props.setForm({ ...props.form, privateKey: event.target.value })} placeholder="只提交，不回显明文" /></label> : null}
@@ -4277,7 +4277,7 @@ function paymentOverviewRows(methodsRows: JsonRecord[], exceptions: JsonRecord[]
   const methods = [
     { key: "alipay_merchant", method: "支付宝商户", confirmMode: "回调/查单自动确认" },
     { key: "wechat_merchant", method: "腾讯/微信商户", confirmMode: "回调/查单自动确认" },
-    { key: "epay", method: "e支付", confirmMode: "回调/查单自动确认" },
+    { key: "epay", method: "e支付/xpay/虎皮椒", confirmMode: "回调/查单自动确认" },
     { key: "personal_alipay", method: "个人支付宝", confirmMode: "人工确认" },
     { key: "wechat_personal", method: "个人微信", confirmMode: "人工确认" },
     { key: "balance", method: "余额支付", confirmMode: "余额扣款自动确认" }
@@ -4443,7 +4443,7 @@ function paymentMethodToForm(method?: JsonRecord) {
 function paymentProviderName(provider: string): string {
   if (provider === "alipay_merchant") return "支付宝商户";
   if (provider === "wechat_merchant") return "腾讯/微信商户";
-  if (provider === "epay") return "e支付";
+  if (provider === "epay") return "e支付/xpay/虎皮椒";
   if (provider === "personal_alipay" || provider === "alipay_personal") return "个人支付宝";
   if (provider === "wechat_personal") return "个人微信";
   if (provider === "balance") return "余额支付";
@@ -4470,7 +4470,7 @@ function paymentKeyStatusText(method?: JsonRecord): string {
 function paymentProviderTypeName(type: string): string {
   if (type.startsWith("alipay_merchant")) return "支付宝商户";
   if (type.startsWith("wechat_merchant")) return "腾讯/微信商户";
-  if (type.startsWith("epay")) return "e支付";
+  if (type.startsWith("epay")) return "e支付/xpay/虎皮椒";
   if (type.startsWith("alipay_personal") || type === "personal_alipay") return "个人支付宝";
   if (type.startsWith("wechat_personal")) return "个人微信";
   if (type === "balance") return "余额支付";
