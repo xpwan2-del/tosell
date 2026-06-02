@@ -354,8 +354,8 @@ function App() {
     if (!await ensureAuth()) return;
     if (loading) return;
     const needsPurchasePassword = requiresProductExtractionCode(checkout.product);
-    if (needsPurchasePassword && !/^\d{4,12}$/.test(extractionCode.trim())) {
-      setMessage("请设置 4-12 位纯数字购买密码。");
+    if (needsPurchasePassword && !isValidPurchasePassword(extractionCode)) {
+      setMessage("请设置 4-32 位购买密码。");
       return;
     }
     if (needsPurchasePassword && !isMainlandChinaMobile(buyerPhone)) {
@@ -372,9 +372,9 @@ function App() {
       const order = await api.createOrder(
         shopId,
         text(checkout.product.id),
-        orderPayableAmount(checkout.quote),
-        {
-          purchasePassword: requiresProductExtractionCode(checkout.product) ? extractionCode : undefined,
+          orderPayableAmount(checkout.quote),
+          {
+          purchasePassword: requiresProductExtractionCode(checkout.product) ? extractionCode.trim() : undefined,
           couponId: checkout.couponId,
           buyerEmail: buyerEmail.trim() || undefined,
           buyerPhone: needsPurchasePassword ? buyerPhone.trim() : undefined,
@@ -398,10 +398,13 @@ function App() {
         setSelectedOrder(undefined);
         setPaymentGuide({ order: orderWithPayment, payment, channel: selectedChannel });
       } else if (payment && isOfficialPayment(payment, selectedChannel)) {
-        const redirectUrl = paymentRedirectUrl(payment);
-        if (redirectUrl) {
+        const openResult = openOfficialPayment(payment);
+        if (openResult === "submitted") {
+          setMessage("支付信息已生成，正在提交到 e支付收银台。");
+          return;
+        }
+        if (openResult === "redirected") {
           setMessage("支付信息已生成，正在打开支付平台。");
-          window.location.assign(redirectUrl);
           return;
         }
         setSelectedOrder(orderWithPayment);
@@ -465,10 +468,13 @@ function App() {
       setSelectedOrder(nextOrder);
       const selectedChannel = selectedPaymentMethod(paymentMethods, selectedPaymentMethodId);
       if (isOfficialPayment(payment, selectedChannel)) {
-        const redirectUrl = paymentRedirectUrl(payment);
-        if (redirectUrl) {
+        const openResult = openOfficialPayment(payment);
+        if (openResult === "submitted") {
+          setMessage("支付信息已生成，正在提交到 e支付收银台。");
+          return;
+        }
+        if (openResult === "redirected") {
           setMessage("支付信息已生成，正在打开支付平台。");
-          window.location.assign(redirectUrl);
           return;
         }
         setMessage("支付方式没有返回可跳转链接，请联系商户检查后台支付配置。");
@@ -671,7 +677,7 @@ function App() {
             <span>店铺公告</span>
             <p>{text(shop.announcement, "购买虚拟账号、卡密或会员权益前，请确认商品说明、发放方式和售后规则。")}</p>
             <ul>
-              <li>自动发码商品购买时设置纯数字购买密码，后台确认收款后可在订单详情查看卡密。</li>
+              <li>自动发码商品购买时设置购买密码，后台确认收款后可在订单详情查看卡密。</li>
               <li>人工交付商品请添加本店客服领取账号或权益。</li>
               <li>遇到发放超时或无法使用，可在订单中心提交售后。</li>
             </ul>
@@ -813,7 +819,7 @@ function App() {
             {Number(checkout.quote.couponDiscountCents ?? 0) > 0 ? (
               <div className="checkout-row"><span>优惠抵扣</span><strong>-{cents(checkout.quote.couponDiscountCents)}</strong></div>
             ) : null}
-            <div className="checkout-row total"><span>应付金额</span><strong>{cents(orderPayableAmount(checkout.quote))}</strong></div>
+            <div className="checkout-row total"><span>应付金额</span><strong>{cents(checkoutPayableAmount(checkout.quote, paymentMethods, selectedPaymentMethodId, wallet))}</strong></div>
             {checkout.coupons.length > 0 ? (
               <CouponPicker
                 coupons={checkout.coupons}
@@ -833,17 +839,19 @@ function App() {
             {requiresProductExtractionCode(checkout.product) ? (
               <>
                 <label className="field">
-                  <span>购买密码</span>
+                  <span>购买密码 <em className="required-mark">必填</em></span>
                   <input
-                    inputMode="numeric"
+                    type="password"
+                    autoComplete="new-password"
                     value={extractionCode}
-                    onChange={(event) => setExtractionCode(event.target.value.replace(/\D/g, "").slice(0, 12))}
-                    placeholder="4-12 位纯数字"
+                    onChange={(event) => setExtractionCode(event.target.value.slice(0, 32))}
+                    placeholder="4-32 位，提交后用于提取卡密"
                     required
                   />
+                  <small className="field-hint">至少输入 4 位，支付成功后用它提取卡密。</small>
                 </label>
                 <label className="field">
-                  <span>联系电话</span>
+                  <span>联系电话 <em className="required-mark">必填</em></span>
                   <input
                     inputMode="tel"
                     value={buyerPhone}
@@ -851,6 +859,7 @@ function App() {
                     placeholder="中国大陆手机号"
                     required
                   />
+                  <small className="field-hint">请输入 11 位中国大陆手机号。</small>
                 </label>
               </>
             ) : null}
@@ -870,7 +879,7 @@ function App() {
             />
             <div className="checkout-actions">
               <button type="button" className="ghost" onClick={() => setCheckout(undefined)}>再看看</button>
-              <button type="button" disabled={loading || paymentMethods.length === 0 || (requiresProductExtractionCode(checkout.product) && (extractionCode.trim().length < 4 || !isMainlandChinaMobile(buyerPhone)))} onClick={() => void submitOrder()}>立即购买</button>
+              <button type="button" disabled={loading || paymentMethods.length === 0 || (requiresProductExtractionCode(checkout.product) && (!isValidPurchasePassword(extractionCode) || !isMainlandChinaMobile(buyerPhone)))} onClick={() => void submitOrder()}>立即购买</button>
             </div>
           </section>
         </div>
@@ -924,13 +933,15 @@ function App() {
         <div className="modal-backdrop notice-backdrop" role="dialog" aria-modal="true" aria-label="购买须知">
           <section className="purchase-notice">
             <span>购买须知</span>
-            <h2>重要提醒，请下单前仔细阅读</h2>
-            <p>为减少虚拟商品售后争议，请在购买前确认商品名称、发放方式、使用说明和客服处理时效。</p>
-            <NoticeItem index="1" title="请认真查看商品详情" text="确认规格、发放方式和使用限制；因未阅读说明造成的问题，按页面规则处理。" />
-            <NoticeItem index="2" title="付款请以订单金额为准" text="当前店铺收款方式由后台配置，付款后由商户或平台后台确认收款。" />
-            <NoticeItem index="3" title="自动发码需设置购买密码" text="购买密码由你购买时自行输入，建议 4-12 位纯数字；人工交付商品请添加店铺客服领取。" />
-            <NoticeItem index="4" title="售后请从订单中心提交" text="订单中心会保留支付、履约、卡密和售后记录，便于平台仲裁和追踪。" />
-            <div className="checkout-actions">
+            <div className="purchase-notice-body">
+              <h2>重要提醒，请下单前仔细阅读</h2>
+              <p>为减少虚拟商品售后争议，请在购买前确认商品名称、发放方式、使用说明和客服处理时效。</p>
+              <NoticeItem index="1" title="请认真查看商品详情" text="确认规格、发放方式和使用限制；因未阅读说明造成的问题，按页面规则处理。" />
+              <NoticeItem index="2" title="付款请以订单金额为准" text="当前店铺收款方式由后台配置，付款后由商户或平台后台确认收款。" />
+              <NoticeItem index="3" title="自动发码需设置购买密码" text="购买密码由你购买时自行输入；人工交付商品请添加店铺客服领取。" />
+              <NoticeItem index="4" title="售后请从订单中心提交" text="订单中心会保留支付、履约、卡密和售后记录，便于平台仲裁和追踪。" />
+            </div>
+            <div className="checkout-actions purchase-notice-actions">
               <button type="button" onClick={acknowledgeNotice}>我已知晓并继续访问</button>
             </div>
           </section>
@@ -989,15 +1000,15 @@ function App() {
                   <PaymentMethodPicker
                     channels={paymentMethods}
                     wallet={wallet}
-                    orderAmountCents={orderPaidAmount(selectedOrder)}
-                    selectedChannelId={effectivePaymentMethodId(paymentMethods, selectedPaymentMethodId, wallet, orderPaidAmount(selectedOrder))}
+                    orderAmountCents={orderBaseAmount(selectedOrder)}
+                    selectedChannelId={effectivePaymentMethodId(paymentMethods, selectedPaymentMethodId, wallet, orderBaseAmount(selectedOrder))}
                     onSelect={setSelectedPaymentMethodId}
                   />
                 ) : null}
                 <PaymentBox
                   channels={paymentMethods}
-                  orderAmountCents={orderPaidAmount(selectedOrder)}
-                  selectedChannelId={effectivePaymentMethodId(paymentMethods, selectedPaymentMethodId, wallet, orderPaidAmount(selectedOrder))}
+                  orderAmountCents={orderBaseAmount(selectedOrder)}
+                  selectedChannelId={effectivePaymentMethodId(paymentMethods, selectedPaymentMethodId, wallet, orderBaseAmount(selectedOrder))}
                   payment={orderPayments[text(selectedOrder.orderNo)] ?? paymentForOrder(selectedOrder)}
                 />
               </>
@@ -1089,11 +1100,13 @@ function App() {
             <label className="field">
               <span>购买密码</span>
               <input
-                inputMode="numeric"
+                type="password"
+                autoComplete="current-password"
                 value={extractInput}
-                onChange={(event) => setExtractInput(event.target.value.replace(/\D/g, "").slice(0, 12))}
+                onChange={(event) => setExtractInput(event.target.value.slice(0, 32))}
                 placeholder="输入购买时设置的购买密码"
               />
+              <small className="field-hint">至少输入 4 位。</small>
             </label>
             {extractResult ? <ExtractResult result={extractResult} /> : null}
             <div className="checkout-actions">
@@ -1279,12 +1292,14 @@ function ExtractionPage() {
         <label className="field">
           <span>购买密码</span>
           <input
-            inputMode="numeric"
+            type="password"
+            autoComplete="current-password"
             value={extractionCode}
-            onChange={(event) => setExtractionCode(event.target.value.replace(/\D/g, "").slice(0, 12))}
-            placeholder="输入购买时设置的纯数字购买密码"
+            onChange={(event) => setExtractionCode(event.target.value.slice(0, 32))}
+            placeholder="输入购买时设置的购买密码"
             autoFocus
           />
+          <small className="field-hint">至少输入 4 位。</small>
         </label>
         {result ? <ExtractResult result={result} /> : null}
         <div className="checkout-actions">
@@ -1481,7 +1496,7 @@ function AccountPanel(props: {
         <div>
           <span>账户余额</span>
           <strong>{registered ? cents(text(props.wallet?.availableBalanceCents, "0")) : "登录后可充值"}</strong>
-          <small>余额支付按商品原价扣款，不加 1% 手续费。</small>
+          <small>余额支付默认不收手续费。</small>
         </div>
         {registered ? (
           <div className="account-recharge">
@@ -1610,6 +1625,7 @@ function PaymentBox(props: { channels: JsonRecord[]; orderAmountCents: string; s
   const baseAmountCents = props.orderAmountCents;
   const feeCents = paymentMethodFeeCents(baseAmountCents, channel);
   const payableCents = String(BigInt(baseAmountCents || "0") + BigInt(feeCents));
+  const epayPayment = paymentProviderFrom(payment, channel) === "epay";
   if (!channel) {
     return (
       <div className="payment-box unavailable">
@@ -1624,14 +1640,16 @@ function PaymentBox(props: { channels: JsonRecord[]; orderAmountCents: string; s
   const personalPayment = isPersonalPaymentProvider(provider) || isPersonalPaymentMethod(channel);
   const interfacePayment = ["alipay_merchant", "wechat_merchant", "epay"].includes(provider) || isInterfacePaymentMethod(channel);
   const balancePayment = provider === "balance";
-  const displayQr = paymentQr || text(channel.qrUrl);
+  const displayQr = epayPayment ? "" : paymentQr || text(channel.qrUrl);
   const publicLabel = text(channel.publicLabel, paymentProviderPublicLabelForH5(provider, channel));
   return (
     <div className="payment-box">
       <div>
         <strong><PaymentIcon provider={provider} /> {publicLabel}</strong>
-        <small>{interfacePayment
-          ? text(payment?.message, "请使用官方二维码或支付链接完成支付，订单以服务端回调或主动查单确认为准。")
+        <small>{epayPayment
+          ? "点击下方按钮进入 e支付收银台，订单以服务端回调确认为准。"
+          : interfacePayment
+            ? text(payment?.message, "请使用官方二维码或支付链接完成支付，订单以服务端回调或主动查单确认为准。")
           : balancePayment
             ? "使用账户余额支付，按商品原价扣款，不加手续费。"
             : personalPayment
@@ -1647,7 +1665,13 @@ function PaymentBox(props: { channels: JsonRecord[]; orderAmountCents: string; s
       ) : (
         <div className="qr-empty">{interfacePayment ? "支付二维码" : "收款码"}</div>
       )}
-      {paymentUrl ? <a href={paymentUrl} target="_blank" rel="noreferrer">{interfacePayment ? "打开官方支付链接" : "打开支付链接"}</a> : null}
+      {epayPayment && payment ? (
+        <button type="button" onClick={() => openOfficialPayment(payment)}>进入 e支付收银台</button>
+      ) : paymentUrl ? (
+        paymentProviderFrom(payment, channel) === "epay" && payment
+          ? <button type="button" onClick={() => openOfficialPayment(payment)}>{interfacePayment ? "进入 e支付收银台" : "打开支付链接"}</button>
+          : <a href={paymentUrl} target="_blank" rel="noreferrer">{interfacePayment ? "打开官方支付链接" : "打开支付链接"}</a>
+      ) : null}
     </div>
   );
 }
@@ -2094,6 +2118,11 @@ function requiresProductExtractionCode(item?: JsonRecord): boolean {
   return isAutomaticProduct(item);
 }
 
+function isValidPurchasePassword(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed.length >= 4 && trimmed.length <= 32;
+}
+
 function isMainlandChinaMobile(value: string): boolean {
   return /^1[3-9]\d{9}$/.test(value.trim());
 }
@@ -2140,8 +2169,21 @@ function orderPaidAmount(order: JsonRecord): string {
   return text(order.buyerPaidAmountCents, text(order.paidAmountCents, text(amountSnapshot?.buyerPaidAmountCents, text(amountSnapshot?.paidAmountCents, text(quote?.buyerPaidAmountCents, text(quote?.paidAmountCents, "0"))))));
 }
 
+function orderBaseAmount(order: JsonRecord): string {
+  const snapshot = order.snapshot as JsonRecord | undefined;
+  const amountSnapshot = snapshot?.amountSnapshot as JsonRecord | undefined;
+  const quote = snapshot?.quote as JsonRecord | undefined;
+  return text(amountSnapshot?.paidAmountCents, text(quote?.paidAmountCents, text(order.paidAmountCents, "0")));
+}
+
 function orderPayableAmount(quote: JsonRecord): string {
   return text(quote.buyerPaidAmountCents, text(quote.paidAmountCents, "0"));
+}
+
+function checkoutPayableAmount(quote: JsonRecord, channels: JsonRecord[], selectedChannelId: string | undefined, wallet?: JsonRecord): string {
+  const baseAmount = orderPayableAmount(quote);
+  const channel = selectedPaymentMethod(channels, effectivePaymentMethodId(channels, selectedChannelId ?? "", wallet, baseAmount));
+  return payableAmountWithPaymentFee(baseAmount, channel);
 }
 
 function quoteOriginalAmount(quote: JsonRecord): string {
@@ -2221,11 +2263,6 @@ function defaultPaymentMethodId(channels: JsonRecord[], wallet?: JsonRecord, bas
   const base = BigInt(baseAmountCents || "0");
   const available = BigInt(text(wallet?.availableBalanceCents, "0"));
   if (balance && base > 0n && available >= base) return text(balance.id);
-  const personalFirst = channels.find((item) => {
-    const provider = text(item.provider);
-    return provider !== "balance" && (isPersonalPaymentProvider(provider) || isPersonalPaymentMethod(item));
-  });
-  if (personalFirst) return text(personalFirst.id);
   const externalDefault = channels.find((item) => text(item.provider) !== "balance" && item.isDefault === true);
   const externalFirst = channels.find((item) => text(item.provider) !== "balance");
   return text((externalDefault ?? externalFirst ?? balance)?.id, "");
@@ -2234,9 +2271,8 @@ function defaultPaymentMethodId(channels: JsonRecord[], wallet?: JsonRecord, bas
 function defaultRechargePaymentMethodId(channels: JsonRecord[], selectedChannelId?: string): string {
   const externalChannels = channels.filter((item) => text(item.id) !== "balance" && text(item.provider) !== "balance");
   if (externalChannels.some((item) => text(item.id) === selectedChannelId)) return selectedChannelId ?? "";
-  const personalFirst = externalChannels.find((item) => isPersonalPaymentProvider(text(item.provider)) || isPersonalPaymentMethod(item));
   const defaultExternal = externalChannels.find((item) => item.isDefault === true);
-  return text((personalFirst ?? defaultExternal ?? externalChannels[0])?.id, "");
+  return text((defaultExternal ?? externalChannels[0])?.id, "");
 }
 
 function isPositiveInteger(value: string): boolean {
@@ -2247,7 +2283,16 @@ function paymentMethodFeeCents(baseAmountCents: string, channel?: JsonRecord): s
   const base = BigInt(baseAmountCents || "0");
   const bps = Number(text(channel?.paymentFeeBps, text(channel?.feeBps, "0")));
   if (!Number.isFinite(bps) || bps <= 0) return "0";
-  return ((base * BigInt(Math.trunc(bps))) / 10000n).toString();
+  return ((base * BigInt(Math.trunc(bps)) + 9999n) / 10000n).toString();
+}
+
+function payableAmountWithPaymentFee(baseAmountCents: string, channel?: JsonRecord): string {
+  return String(BigInt(baseAmountCents || "0") + BigInt(paymentMethodFeeCents(baseAmountCents, channel)));
+}
+
+function paymentFeeRateLabel(channel?: JsonRecord): string {
+  const bps = Number(text(channel?.paymentFeeBps, text(channel?.feeBps, "0")));
+  return Number.isFinite(bps) && bps > 0 ? `手续费 ${(bps / 100).toFixed(0)}%` : "";
 }
 
 function isPersonalPaymentProvider(provider: string): boolean {
@@ -2281,6 +2326,37 @@ function paymentRedirectUrl(payment?: JsonRecord): string {
   if (explicitUrl) return explicitUrl;
   const qrCodeUrl = text(paymentParams?.qrCodeUrl);
   return /^https?:\/\//.test(qrCodeUrl) && !usableImageSrc(qrCodeUrl) ? qrCodeUrl : "";
+}
+
+function openOfficialPayment(payment?: JsonRecord): "submitted" | "redirected" | "missing" {
+  if (submitEpayPaymentForm(payment)) return "submitted";
+  const redirectUrl = paymentRedirectUrl(payment);
+  if (!redirectUrl) return "missing";
+  window.location.assign(redirectUrl);
+  return "redirected";
+}
+
+function submitEpayPaymentForm(payment?: JsonRecord): boolean {
+  const paymentParams = payment?.paymentParams as JsonRecord | undefined;
+  if (text(payment?.provider) !== "epay" && text((payment?.paymentMethod as JsonRecord | undefined)?.provider) !== "epay") return false;
+  const params = paymentParams?.submitParams as JsonRecord | undefined;
+  const action = text(paymentParams?.gatewayUrl, text(paymentParams?.submitPaymentUrl).split("?")[0]);
+  if (!params || !/^https?:\/\//.test(action)) return false;
+  const form = document.createElement("form");
+  form.method = "POST";
+  form.action = action;
+  form.style.display = "none";
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null) continue;
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = key;
+    input.value = String(value);
+    form.appendChild(input);
+  }
+  document.body.appendChild(form);
+  form.submit();
+  return true;
 }
 
 function paymentProviderFrom(payment?: JsonRecord, channel?: JsonRecord): string {
@@ -2342,10 +2418,11 @@ function paymentTileTitle(channel: JsonRecord): string {
 function paymentTileSubtitle(channel: JsonRecord): string {
   const provider = text(channel.provider);
   const type = provider || text(channel.channelType);
+  const feeLabel = paymentFeeRateLabel(channel);
   if (type === "balance" || text(channel.id) === "balance") return "原价扣款";
   if (type === "personal_alipay" || type.startsWith("alipay_personal")) return "保存码后扫码";
   if (type === "wechat_personal" || type.startsWith("wechat_personal")) return "保存码后扫码";
-  if (type.includes("alipay") || type.includes("wechat") || type.includes("epay")) return "跳转官方支付";
+  if (type.includes("alipay") || type.includes("wechat") || type.includes("epay")) return feeLabel ? `跳转官方支付 · ${feeLabel}` : "跳转官方支付";
   return "可用";
 }
 

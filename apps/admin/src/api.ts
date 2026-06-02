@@ -30,7 +30,7 @@ export type PaymentMethodInput = {
   appId?: string;
   serviceProviderId?: string;
   gatewayUrl?: string;
-  apiMode?: "mapi_first" | "submit";
+  apiMode?: "mapi_first" | "submit" | "hupijiao_direct";
   accountName?: string;
   qrUrl?: string;
   paymentUrl?: string;

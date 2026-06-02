@@ -508,7 +508,7 @@ function App() {
     appId: "",
     serviceProviderId: "",
     gatewayUrl: "",
-    apiMode: "mapi_first",
+    apiMode: "submit",
     returnUrl: "",
     note: "",
     signingSecret: "",
@@ -2628,7 +2628,7 @@ function PaymentMethodForm(props: {
       {epay ? <label>服务商号/渠道 ID<input value={props.form.serviceProviderId} onChange={(event) => props.setForm({ ...props.form, serviceProviderId: event.target.value })} placeholder="e支付要求才填" /></label> : null}
       <label>账户名<input value={props.form.accountName} onChange={(event) => props.setForm({ ...props.form, accountName: event.target.value })} placeholder={personalPayment ? "后台内部核对用，前台不展示" : "内部识别名，可选"} /></label>
       {epay ? <label>e支付网关<input value={props.form.gatewayUrl} onChange={(event) => props.setForm({ ...props.form, gatewayUrl: event.target.value })} placeholder="https://..." /></label> : null}
-      {epay ? <label>接口模式<select value={props.form.apiMode || "mapi_first"} onChange={(event) => props.setForm({ ...props.form, apiMode: event.target.value })}><option value="mapi_first">MApi 优先拉起 App</option><option value="submit">Submit 收银台跳转</option></select></label> : null}
+      {epay ? <label>接口模式<select value={props.form.apiMode || "submit"} onChange={(event) => props.setForm({ ...props.form, apiMode: event.target.value })}><option value="submit">Submit 收银台跳转</option><option value="mapi_first">MApi 优先拉起 App</option><option value="hupijiao_direct">虎皮椒直连</option></select></label> : null}
       {official ? <label>签名密钥<input type="password" value={props.form.signingSecret} onChange={(event) => props.setForm({ ...props.form, signingSecret: event.target.value })} placeholder="只提交，不回显明文" /></label> : null}
       {official ? <label>私钥<input type="password" value={props.form.privateKey} onChange={(event) => props.setForm({ ...props.form, privateKey: event.target.value })} placeholder="只提交，不回显明文" /></label> : null}
       {official ? <label>公钥<input type="password" value={props.form.publicKey} onChange={(event) => props.setForm({ ...props.form, publicKey: event.target.value })} placeholder="只提交，不回显明文" /></label> : null}
@@ -3385,7 +3385,7 @@ function paymentMethodPlainHint(method: string, enabled: string, exceptionCount:
   if (method === "个人支付宝" || method === "个人微信") {
     return enabled === "已启用" ? "买家扫码后，后台人工确认真实到账。" : "可作为备用收款方式，需要人工确认。";
   }
-  if (method === "余额支付") return "买家使用账户余额按原价扣款，不增加 1% 手续费。";
+  if (method === "余额支付") return "买家使用账户余额扣款，默认不收手续费。";
   const exceptionText = Number(exceptionCount) > 0 ? `，当前有 ${exceptionCount} 条异常` : "";
   return enabled === "已启用" ? `靠回调或查单确认支付${exceptionText}。` : "填好商户资料并测试通过后再启用。";
 }
@@ -3420,7 +3420,7 @@ function paymentMethodFormInput(form: {
     appId: form.appId || undefined,
     serviceProviderId: form.serviceProviderId || undefined,
     gatewayUrl: form.gatewayUrl || undefined,
-    apiMode: (form.apiMode === "submit" ? "submit" : "mapi_first") as PaymentMethodInput["apiMode"],
+    apiMode: (["mapi_first", "hupijiao_direct"].includes(form.apiMode) ? form.apiMode : "submit") as PaymentMethodInput["apiMode"],
     accountName: form.accountName || undefined,
     qrUrl: form.qrUrl || undefined,
     paymentUrl: form.paymentUrl || undefined,
@@ -3447,7 +3447,7 @@ function paymentMethodToForm(method?: JsonRecord) {
     appId: text(method?.appIdMasked, ""),
     serviceProviderId: text(method?.serviceProviderMasked, ""),
     gatewayUrl: text(method?.gatewayUrl, ""),
-    apiMode: text(method?.apiMode, "mapi_first"),
+    apiMode: text(method?.apiMode, "submit"),
     returnUrl: text(method?.returnUrl, ""),
     note: text(method?.note, ""),
     signingSecret: "",

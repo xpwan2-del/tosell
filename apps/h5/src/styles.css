@@ -760,16 +760,47 @@ code {
 
 .purchase-notice {
   width: min(620px, 100%);
+  max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px);
   display: grid;
-  gap: 14px;
-  padding: 26px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  padding: 0;
   background: #fff;
   border-radius: 8px;
   box-shadow: 0 28px 80px rgba(0, 0, 0, 0.22);
 }
 
+.purchase-notice > span {
+  padding: 24px 26px 0;
+}
+
+.purchase-notice-body {
+  min-height: 0;
+  display: grid;
+  gap: 14px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px 26px 18px;
+}
+
 .purchase-notice h2 {
   font-size: 28px;
+}
+
+.purchase-notice-actions {
+  position: relative;
+  z-index: 2;
+  margin-top: 0;
+  padding: 14px 26px calc(14px + env(safe-area-inset-bottom));
+  background: #fff;
+  border-top: 1px solid #edf2f4;
+  box-shadow: 0 -10px 24px rgba(255, 255, 255, 0.92);
+}
+
+.purchase-notice-actions button {
+  width: 100%;
 }
 
 .notice-item {
@@ -884,6 +915,20 @@ code {
 
 .field textarea {
   resize: vertical;
+}
+
+.required-mark {
+  margin-left: 4px;
+  color: #b12704;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.field-hint {
+  color: #62757b;
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .modal-backdrop {
@@ -2017,7 +2062,26 @@ code {
     width: 100%;
     max-height: calc(100vh - 20px);
     max-height: calc(100dvh - 20px);
+  }
+
+  .checkout {
     padding: 16px;
+  }
+
+  .purchase-notice {
+    padding: 0;
+  }
+
+  .purchase-notice > span {
+    padding: 16px 16px 0;
+  }
+
+  .purchase-notice-body {
+    padding: 10px 16px 14px;
+  }
+
+  .purchase-notice-actions {
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
   }
 
   .checkout-row {
@@ -2279,9 +2343,12 @@ code {
   .hero-copy,
   .merchant-copy,
   .merchant-form,
-  .checkout,
-  .purchase-notice {
+  .checkout {
     padding: 14px;
+  }
+
+  .purchase-notice {
+    padding: 0;
   }
 
   .hero-copy h1 {

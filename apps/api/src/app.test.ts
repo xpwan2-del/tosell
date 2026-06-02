@@ -2650,7 +2650,7 @@ describe.sequential("api", () => {
       method: "POST",
       url: "/api/user/orders",
       headers: { "x-user-id": "pay-user" },
-      payload: { shopId: "shop-1", merchantProductListingId: "mpl-code", clientPaidAmountCents: "4900", buyerPhone: "13800000009", purchasePassword: "246810" }
+      payload: { shopId: "shop-1", merchantProductListingId: "mpl-code", clientPaidAmountCents: "4900", buyerPhone: "13800000009", purchasePassword: "Abcd1234!" }
     });
     expect(order.statusCode).toBe(200);
     const manualPayment = await app.inject({
@@ -2670,7 +2670,7 @@ describe.sequential("api", () => {
       method: "POST",
       url: `/api/merchant/orders/${order.json().orderNo}/confirm-payment`,
       headers: merchantHeaders,
-      payload: { amountCents: "4949", note: "个人支付宝到账" }
+      payload: { amountCents: "4900", note: "个人支付宝到账" }
     });
     expect(manualConfirm.statusCode).toBe(200);
     expect(manualConfirm.json().order).toMatchObject({ paymentStatus: "paid", fulfillmentStatus: "success" });
@@ -2717,7 +2717,7 @@ describe.sequential("api", () => {
       payload: {
         orderNo: autoOrder.json().orderNo,
         providerTradeNo: "ali-trade-1",
-        amountCents: "4949",
+        amountCents: "4900",
         merchantNo: "ali-mch-10001",
         appId: "ali-app-10001",
         tradeStatus: "TRADE_SUCCESS",
@@ -2749,11 +2749,11 @@ describe.sequential("api", () => {
       headers: { "x-admin-id": "finance-1", "x-admin-role": "finance" },
       payload: {
         providerTradeNo: "ali-trade-success",
-        amountCents: "4949",
+        amountCents: "4900",
         merchantNo: "ali-mch-10001",
         appId: "ali-app-10001",
         tradeStatus: "TRADE_SUCCESS",
-        signature: sign("alipay_merchant", autoOrder.json().orderNo, "4949", "ali-trade-success", "ali-mch-10001")
+        signature: sign("alipay_merchant", autoOrder.json().orderNo, "4900", "ali-trade-success", "ali-mch-10001")
       }
     });
     expect(paidByQuery.statusCode).toBe(200);
@@ -2766,11 +2766,11 @@ describe.sequential("api", () => {
       payload: {
         orderNo: autoOrder.json().orderNo,
         providerTradeNo: "ali-trade-success",
-        amountCents: "4949",
+        amountCents: "4900",
         merchantNo: "ali-mch-10001",
         appId: "ali-app-10001",
         tradeStatus: "TRADE_SUCCESS",
-        signature: sign("alipay_merchant", autoOrder.json().orderNo, "4949", "ali-trade-success", "ali-mch-10001")
+        signature: sign("alipay_merchant", autoOrder.json().orderNo, "4900", "ali-trade-success", "ali-mch-10001")
       }
     });
     expect(duplicateCallback.statusCode).toBe(200);
@@ -2802,6 +2802,14 @@ describe.sequential("api", () => {
         })
       })
     });
+    const epayPaymentAgain = await app.inject({
+      method: "POST",
+      url: `/api/user/orders/${epayOrder.json().orderNo}/payments`,
+      headers: { "x-user-id": "epay-user" },
+      payload: { paymentMethodId: merchantEpay.json().id }
+    });
+    expect(epayPaymentAgain.statusCode).toBe(200);
+    expect(epayPaymentAgain.json().paymentParams.submitParams.money).toBe("49.49");
     expect(JSON.stringify(epayPayment.json())).not.toContain("epay-secret");
     const epayCallbackPayload = {
       pid: "merchant-epay-mch-10001",
@@ -2828,12 +2836,102 @@ describe.sequential("api", () => {
     });
     expect(epayCallback.statusCode).toBe(200);
     expect(epayCallback.body).toBe("success");
+    const epayFormCallbackPayload = {
+      ...epayCallbackPayload,
+      trade_no: "epay-trade-success-form"
+    };
+    const epayFormSignPayload = Object.keys(epayFormCallbackPayload)
+      .filter((key) => key !== "sign_type")
+      .sort()
+      .map((key) => `${key}=${String(epayFormCallbackPayload[key as keyof typeof epayFormCallbackPayload])}`)
+      .join("&");
+    const epayFormCallback = await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/epay",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({
+        ...epayFormCallbackPayload,
+        sign: createHash("md5").update(`${epayFormSignPayload}merchant-epay-secret`).digest("hex")
+      }).toString()
+    });
+    expect(epayFormCallback.statusCode).toBe(200);
+    expect(epayFormCallback.body).toBe("success");
     const epayPaidOrder = await app.inject({
       method: "GET",
       url: `/api/user/orders/${epayOrder.json().orderNo}`,
       headers: { "x-user-id": "epay-user" }
     });
     expect(epayPaidOrder.json()).toMatchObject({ paymentStatus: "paid", fulfillmentStatus: "success" });
+
+    const hupijiaoMethod = await app.inject({
+      method: "POST",
+      url: "/api/merchant/payment-methods",
+      headers: merchantHeaders,
+      payload: {
+        provider: "epay",
+        displayName: "商户虎皮椒 e支付",
+        merchantNo: "merchant-hupi-10001",
+        gatewayUrl: "https://epay.example.test/gateway",
+        apiMode: "hupijiao_direct",
+        signingSecret: "merchant-hupi-secret",
+        enabled: true,
+        isDefault: false
+      }
+    });
+    expect(hupijiaoMethod.statusCode).toBe(200);
+    const hupijiaoOrder = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "hupijiao-user" },
+      payload: { shopId: "shop-1", merchantProductListingId: "mpl-1", clientPaidAmountCents: "15000" }
+    });
+    expect(hupijiaoOrder.statusCode).toBe(200);
+    const hupijiaoPayment = await app.inject({
+      method: "POST",
+      url: `/api/user/orders/${hupijiaoOrder.json().orderNo}/payments`,
+      headers: { "x-user-id": "hupijiao-user" },
+      payload: { paymentMethodId: hupijiaoMethod.json().id }
+    });
+    expect(hupijiaoPayment.statusCode).toBe(200);
+    expect(hupijiaoPayment.json()).toMatchObject({
+      status: "created",
+      provider: "epay",
+      paymentParams: expect.objectContaining({
+        method: "HUPIJIAO",
+        apiMode: "hupijiao_direct",
+        paymentUrl: expect.stringContaining(hupijiaoOrder.json().orderNo)
+      })
+    });
+    expect(hupijiaoPayment.json().paymentParams.submitParams).toBeUndefined();
+    const hupijiaoCallbackPayload = {
+      appid: "merchant-hupi-10001",
+      trade_order_id: hupijiaoOrder.json().orderNo,
+      transaction_id: "hupijiao-trade-success",
+      total_fee: "151.50",
+      status: "OD",
+      nonce_str: "hupijiao-callback-nonce",
+      time: "1780359000"
+    };
+    const hupijiaoSignPayload = Object.keys(hupijiaoCallbackPayload)
+      .sort()
+      .map((key) => `${key}=${String(hupijiaoCallbackPayload[key as keyof typeof hupijiaoCallbackPayload])}`)
+      .join("&");
+    const hupijiaoCallback = await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/epay",
+      payload: {
+        ...hupijiaoCallbackPayload,
+        hash: createHash("md5").update(`${hupijiaoSignPayload}merchant-hupi-secret`).digest("hex")
+      }
+    });
+    expect(hupijiaoCallback.statusCode).toBe(200);
+    expect(hupijiaoCallback.body).toBe("success");
+    const hupijiaoPaidOrder = await app.inject({
+      method: "GET",
+      url: `/api/user/orders/${hupijiaoOrder.json().orderNo}`,
+      headers: { "x-user-id": "hupijiao-user" }
+    });
+    expect(hupijiaoPaidOrder.json()).toMatchObject({ paymentStatus: "paid" });
 
     const callbacks = await app.inject({ method: "GET", url: "/api/admin/payment-callbacks", headers: adminHeaders });
     const exceptions = await app.inject({ method: "GET", url: "/api/admin/payment-exceptions", headers: adminHeaders });

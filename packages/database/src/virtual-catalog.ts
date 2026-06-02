@@ -66,7 +66,7 @@ export const virtualCatalogProducts: VirtualCatalogProduct[] = [
     category: "AI 会员",
     tags: ["自动发码", "Claude", "秒级发放"],
     subtitle: "标准卡密库存，支付成功后自动发放。",
-    description: "Claude 类虚拟权益自动发卡商品；购买时设置纯数字购买密码，支付成功后按订单查看卡密。",
+    description: "Claude 类虚拟权益自动发卡商品；购买时设置购买密码，支付成功后按订单查看卡密。",
     usageGuide: "请妥善保存购买时设置的购买密码；错误三次锁定 30 分钟，退款后不可继续查看卡密。",
     imageUrl: "https://images.unsplash.com/photo-1556742502-ec7c0e9f34b1?auto=format&fit=crop&w=900&q=80",
     specs: ["一个月", "自动卡密"],

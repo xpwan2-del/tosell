@@ -70,8 +70,22 @@ function prismaClient() {
   if (!process.env.DATABASE_URL) {
     throw new ApiError(503, "DATABASE_NOT_CONFIGURED", "DATABASE_URL is required in production");
   }
-  productionPrisma ??= new PrismaClient();
+  productionPrisma ??= new PrismaClient({ datasourceUrl: prismaDatasourceUrl() });
   return productionPrisma;
+}
+
+function prismaDatasourceUrl() {
+  const rawUrl = required(process.env.DATABASE_URL, "DATABASE_URL");
+  try {
+    const url = new URL(rawUrl);
+    if (isProductionRuntime()) {
+      if (!url.searchParams.has("connection_limit")) url.searchParams.set("connection_limit", "1");
+      if (!url.searchParams.has("pool_timeout")) url.searchParams.set("pool_timeout", "8");
+    }
+    return url.toString();
+  } catch {
+    return rawUrl;
+  }
 }
 
 function toPrismaApiError(error: unknown): Error {
@@ -110,6 +124,8 @@ function isPrismaConnectionError(error: unknown): boolean {
       candidate.message.includes("Can't reach database server")
       || candidate.message.includes("ECONNREFUSED")
       || candidate.message.includes("Connection refused")
+      || candidate.message.includes("Timed out fetching a new connection")
+      || candidate.message.includes("connection pool")
     ));
 }
 
@@ -425,7 +441,7 @@ function createPrismaProductionServices() {
         try {
           result = await (value as (...methodArgs: unknown[]) => unknown).apply(target, args);
         } catch (error) {
-          if (property === "paymentProviderCallback" || property === "queryPaymentOrder") {
+          if (property === "paymentProviderCallback" || property === "epayProviderCallback" || property === "queryPaymentOrder") {
             try {
               await withPrismaRetry(() => repository.saveForMethod(String(property), service.store));
             } catch (persistError) {
@@ -445,7 +461,7 @@ function createPrismaProductionServices() {
       };
     }
   });
-  if (process.env.PRISMA_PREHYDRATE !== "false") {
+  if (process.env.PRISMA_PREHYDRATE === "true") {
     setTimeout(() => {
       void hydrate().catch(() => {
         hydrationPromise = undefined;
@@ -476,7 +492,7 @@ function createPersistenceDisabledServices(message: string) {
 }
 
 function isMutatingServiceMethod(name: string) {
-  return /^(add|approve|batchSelect|confirm|create|deduct|delete|export|fulfill|generate|grant|handle|mark|paymentCallback|paymentProviderCallback|queryPaymentOrder|refundCallback|register|release|reveal|review|select|set|submit|test|update|upsert)/.test(name);
+  return /^(add|approve|batchSelect|confirm|create|deduct|delete|export|fulfill|generate|grant|handle|mark|paymentCallback|paymentProviderCallback|epayProviderCallback|queryPaymentOrder|refundCallback|register|release|reveal|review|select|set|submit|test|update|upsert)/.test(name);
 }
 
 type BackendServicesOptions = {
@@ -908,7 +924,7 @@ class BackendServices {
   createPaymentIntent(actor: UserActor, orderNo: string, input: { channel: PaymentChannel }) {
     const order = requireEntity(this.store.orders.get(orderNo), "RESOURCE_NOT_FOUND", "order not found");
     assertUserOrderScope(actor, order);
-    if (order.paymentStatus === "paid") {
+    if (order.paymentStatus === "paid" && !order.paymentSnapshot) {
       return { status: "already_paid" as const, orderNo, channel: input.channel };
     }
     if (input.channel === "mock") {
@@ -1045,7 +1061,7 @@ class BackendServices {
     const method = this.resolvePaymentMethodForRecharge(input.paymentMethodId);
     if (!method || method.provider === "balance") throw new ApiError(400, "WALLET_RECHARGE_METHOD_UNAVAILABLE", "wallet recharge needs an external payment method");
     const feeBps = this.paymentFeeBpsForProvider(method.provider);
-    const feeCents = calculateServiceFeeCents(input.amountCents, BigInt(feeBps));
+    const feeCents = calculatePaymentFeeCents(input.amountCents, BigInt(feeBps));
     const recharge: WalletRecharge = {
       rechargeNo: nextId(this.store, "recharge"),
       userId: actor.userId,
@@ -1810,6 +1826,10 @@ class BackendServices {
         relation.status = input.approved ? "pending_deposit" : "closed";
         relation.reason = input.reason ?? relation.reason;
       }
+    }
+    const application = [...this.store.merchantApplications.values()].find((item) => item.merchantId === merchantId);
+    if (application) {
+      application.status = input.approved ? "approved" : "rejected";
     }
     this.audit(actor.role, "merchant.review", "merchant", merchantId, input);
     return credential ? { ...merchant, credential } : merchant;
@@ -3907,16 +3927,16 @@ class BackendServices {
   }
 
   private applyPaymentFeeSnapshot(order: DemoOrder, method: PaymentMethodConfig) {
-    const baseAmountCents = order.buyerPaidAmountCents ?? order.snapshot.amountSnapshot.paidAmountCents;
+    const amount = order.snapshot.amountSnapshot as DemoAmountSnapshot & { buyerPaidAmountCents?: bigint };
+    const baseAmountCents = amount.buyerPaidAmountCents ?? amount.paidAmountCents;
     const feeBps = this.paymentFeeBpsForProvider(method.provider);
-    const feeCents = calculateServiceFeeCents(baseAmountCents, BigInt(feeBps));
-    const amount = order.snapshot.amountSnapshot as DemoAmountSnapshot;
+    const feeCents = calculatePaymentFeeCents(baseAmountCents, BigInt(feeBps));
     amount.paymentFeeBps = BigInt(feeBps);
     amount.paymentFeeCents = feeCents;
     amount.balancePaidCents = method.provider === "balance" ? baseAmountCents : 0n;
     amount.externalPaidCents = method.provider === "balance" ? 0n : baseAmountCents + feeCents;
     order.buyerPaidAmountCents = baseAmountCents + feeCents;
-    return order.buyerPaidAmountCents;
+    return baseAmountCents + feeCents;
   }
 
   private assertPaymentMethodInput(ownerType: "platform" | "merchant", input: PaymentMethodUpsertInput) {
@@ -4153,6 +4173,29 @@ class BackendServices {
       sign_type: "MD5"
     };
     submitParams.sign = signEpayParams(submitParams, signingSecret);
+    if (method.apiMode === "hupijiao_direct") {
+      const hupijiao = await requestHupijiaoPayment(hupijiaoGatewayUrl(gatewayUrl), {
+        merchantNo,
+        signingSecret,
+        orderNo: order.orderNo,
+        amountCents,
+        title: orderProductNameForPayment(order),
+        notifyUrl,
+        returnUrl
+      });
+      return {
+        method: "HUPIJIAO",
+        gatewayUrl: hupijiao.gatewayUrl,
+        paymentUrl: hupijiao.paymentUrl,
+        cashierUrl: hupijiao.paymentUrl,
+        qrCodeUrl: hupijiao.qrCodeUrl ?? hupijiao.paymentUrl,
+        providerOrderId: hupijiao.providerOrderId,
+        apiMode: method.apiMode,
+        mapiStatus: "skipped",
+        notifyUrl,
+        returnUrl
+      };
+    }
     const submitPaymentUrl = appendQuery(endpoints.submitUrl, submitParams);
     const mapi = method.apiMode === "submit" ? undefined : await requestEpayMapi(endpoints.mapiUrl, submitParams);
     const directAppUrl = mapi?.directAppUrl;
@@ -4160,7 +4203,7 @@ class BackendServices {
     const qrCodeUrl = mapi?.qrCodeUrl;
     const paymentUrl = directAppUrl ?? cashierUrl ?? submitPaymentUrl;
     return {
-      method: directAppUrl ? "APP" : mapi?.ok ? "MAPI" : "GET",
+      method: directAppUrl ? "APP" : mapi?.ok ? "MAPI" : "POST",
       gatewayUrl: endpoints.submitUrl,
       mapiUrl: endpoints.mapiUrl,
       paymentUrl,
@@ -4169,7 +4212,7 @@ class BackendServices {
       cashierUrl,
       qrCodeUrl: qrCodeUrl ?? paymentUrl,
       submitParams,
-      apiMode: method.apiMode ?? "mapi_first",
+      apiMode: method.apiMode ?? defaultPaymentApiMode(method.provider) ?? "submit",
       mapiStatus: mapi?.ok ? "resolved" : mapi ? "fallback" : "skipped",
       mapiMessage: mapi?.message,
       notifyUrl,
@@ -4179,8 +4222,9 @@ class BackendServices {
 
   private verifyEpaySignature(method: PaymentMethodConfig, rawPayload: Record<string, unknown>) {
     const signingSecret = method.signingSecret;
-    const signature = stringValue(rawPayload.sign);
+    const signature = stringValue(rawPayload.sign) ?? stringValue(rawPayload.hash);
     if (!signingSecret || !signature) return false;
+    if (isHupijiaoPayload(rawPayload)) return safeEqualHex(signHupijiaoParams(rawPayload, signingSecret), signature);
     return safeEqualHex(signEpayParams(rawPayload, signingSecret), signature);
   }
 
@@ -7293,6 +7337,13 @@ class PrismaStateRepository {
 	         )
        ORDER BY is_default DESC, updated_at DESC
     `;
+    const feeRows = await this.prisma.$queryRaw<Array<{ channel: string; enabled: boolean; fee_bps: number }>>`
+      SELECT channel, enabled, fee_bps
+        FROM payment_channel_configs
+    `;
+    const feeBpsByChannel = new Map(feeRows.map((row) => [row.channel, row.enabled ? row.fee_bps : 0]));
+    const feeBpsForProvider = (provider: PaymentProviderType) => feeBpsByChannel.get(paymentChannelForProvider(provider)) ?? 0;
+
     return [
       {
         id: "balance",
@@ -7318,7 +7369,7 @@ class PrismaStateRepository {
           return Boolean((credential.merchantNo ?? row.merchant_no_masked) && (credential.appId ?? row.app_id_masked) && row.credential_ciphertext?.startsWith("aes256gcm:"));
         }).map((row, index) => {
 	        const provider = mapPaymentProviderFromDb(row.provider);
-	        const feeBps = provider === "balance" ? 0 : 100;
+	        const feeBps = feeBpsForProvider(provider);
 	        return {
 	          id: row.id,
 	          paymentMethodId: row.id,
@@ -7631,11 +7682,13 @@ class PrismaStateRepository {
       fulfillment_status: string;
       refund_status: string;
       paid_amount_cents: bigint;
+      order_base_amount_cents: bigint;
       fulfillment_rule_snapshot_json: unknown;
       product_snapshot_json: unknown;
     }>>`
       SELECT o.id, o.order_no, o.user_id, o.merchant_id, o.shop_id, o.payment_status, o.fulfillment_status,
-             o.refund_status, o.paid_amount_cents, oas.fulfillment_rule_snapshot_json,
+             o.refund_status, o.paid_amount_cents, COALESCE(oas.paid_amount_cents, o.paid_amount_cents) AS order_base_amount_cents,
+             oas.fulfillment_rule_snapshot_json,
              oas.product_snapshot_json
         FROM orders o
         LEFT JOIN order_amount_snapshots oas ON oas.order_id = o.id
@@ -7653,9 +7706,9 @@ class PrismaStateRepository {
     const method = input.paymentMethodId === "balance"
       ? { id: "balance", provider: "balance", confirmMode: "balance_deduct", qrUrl: null as string | null, returnUrl: null as string | null }
       : await this.findDirectPaymentMethod(order.shop_id, input.paymentMethodId);
-    const baseAmountCents = order.paid_amount_cents;
-    const feeBps = method.provider === "balance" ? 0 : 100;
-    const feeCents = calculateServiceFeeCents(baseAmountCents, BigInt(feeBps));
+    const baseAmountCents = order.order_base_amount_cents;
+    const feeBps = await this.directPaymentFeeBpsForProvider(method.provider);
+    const feeCents = calculatePaymentFeeCents(baseAmountCents, BigInt(feeBps));
     const amountCents = baseAmountCents + feeCents;
     const paymentNo = `payment-${orderNo}`;
     const paymentId = stableDbId("payment", paymentNo);
@@ -8836,6 +8889,20 @@ class PrismaStateRepository {
     };
   }
 
+  private async directPaymentFeeBpsForProvider(provider: string) {
+    const normalizedProvider = mapPaymentProviderFromDb(provider);
+    if (normalizedProvider === "balance") return 0;
+    const channel = paymentChannelForProvider(normalizedProvider);
+    const rows = await this.prisma.$queryRaw<Array<{ enabled: boolean; fee_bps: number }>>`
+      SELECT enabled, fee_bps
+        FROM payment_channel_configs
+       WHERE channel = CAST(${channel} AS "PaymentChannel")
+       LIMIT 1
+    `;
+    const config = rows[0];
+    return config?.enabled ? config.fee_bps : 0;
+  }
+
   private async findDirectPaymentMethod(shopId: string, paymentMethodId?: string) {
     const shop = await this.requirePublicShop(shopId);
     const rows = await this.prisma.$queryRaw<Array<{
@@ -8960,11 +9027,34 @@ class PrismaStateRepository {
       sign_type: "MD5"
     };
     submitParams.sign = signEpayParams(submitParams, signingSecret);
+    if (method.apiMode === "hupijiao_direct") {
+      const hupijiao = await requestHupijiaoPayment(hupijiaoGatewayUrl(gatewayUrl), {
+        merchantNo,
+        signingSecret,
+        orderNo,
+        amountCents,
+        title: productNameFromSnapshot(productSnapshot, orderNo),
+        notifyUrl,
+        returnUrl
+      });
+      return {
+        method: "HUPIJIAO",
+        gatewayUrl: hupijiao.gatewayUrl,
+        paymentUrl: hupijiao.paymentUrl,
+        cashierUrl: hupijiao.paymentUrl,
+        qrCodeUrl: hupijiao.qrCodeUrl ?? hupijiao.paymentUrl,
+        providerOrderId: hupijiao.providerOrderId,
+        apiMode: method.apiMode,
+        mapiStatus: "skipped",
+        notifyUrl,
+        returnUrl
+      };
+    }
     const submitPaymentUrl = appendQuery(endpoints.submitUrl, submitParams);
     const mapi = method.apiMode === "submit" ? undefined : await requestEpayMapi(endpoints.mapiUrl, submitParams);
     const paymentUrl = mapi?.directAppUrl ?? mapi?.cashierUrl ?? submitPaymentUrl;
     return {
-      method: mapi?.directAppUrl ? "APP" : mapi?.ok ? "MAPI" : "GET",
+      method: mapi?.directAppUrl ? "APP" : mapi?.ok ? "MAPI" : "POST",
       gatewayUrl: endpoints.submitUrl,
       mapiUrl: endpoints.mapiUrl,
       paymentUrl,
@@ -8973,7 +9063,7 @@ class PrismaStateRepository {
       cashierUrl: mapi?.cashierUrl,
       qrCodeUrl: mapi?.qrCodeUrl ?? paymentUrl,
       submitParams,
-      apiMode: method.apiMode ?? "mapi_first",
+      apiMode: method.apiMode ?? defaultPaymentApiMode("epay") ?? "submit",
       mapiStatus: mapi?.ok ? "resolved" : mapi ? "fallback" : "skipped",
       mapiMessage: mapi?.message,
       notifyUrl,
@@ -9620,6 +9710,7 @@ class PrismaStateRepository {
       "refundCallback",
       "paymentCallback",
       "paymentProviderCallback",
+      "epayProviderCallback",
       "queryPaymentOrder"
     ].includes(method)) {
       await this.persistInShortTransaction((tx) => this.persistLatestPaymentResult(tx, store, method));
@@ -11053,13 +11144,14 @@ class PrismaStateRepository {
         deposit_required_amount_cents, status, expires_at, idempotency_key, created_at, updated_at
       )
       VALUES (
-        ${invite.id}, ${invite.codeHash ?? hashSecret(invite.code)}, NULL,
+        ${invite.id}, ${invite.codeHash ?? hashSecret(invite.code)}, ${invite.issuerMerchantId ?? null},
         CAST(${invite.targetTier} AS "MerchantTier"), ${invite.maxUses ?? 1},
         ${invite.usedCount}, ${invite.depositRequiredAmountCents ?? null},
         CAST(${mapInviteStatus(invite.status)} AS "ReviewStatus"),
         ${invite.expiresAt}, ${`invite:${invite.id}`}, ${invite.createdAt}, now()
       )
       ON CONFLICT (id) DO UPDATE SET
+        issuer_merchant_id = EXCLUDED.issuer_merchant_id,
         used_count = EXCLUDED.used_count,
         deposit_required_amount_cents = EXCLUDED.deposit_required_amount_cents,
         status = EXCLUDED.status,
@@ -11254,6 +11346,7 @@ class PrismaStateRepository {
         ${payableAmount(order)}, ${order.paidAt}, ${order.fulfilledAt}, now(), now()
       )
       ON CONFLICT (order_no) DO UPDATE SET
+        status = EXCLUDED.status,
         payment_status = EXCLUDED.payment_status,
         fulfillment_status = EXCLUDED.fulfillment_status,
         refund_status = EXCLUDED.refund_status,
@@ -11329,7 +11422,7 @@ class PrismaStateRepository {
         service_fee_basis_amount_cents = EXCLUDED.service_fee_basis_amount_cents,
         service_fee_config_snapshot_json = EXCLUDED.service_fee_config_snapshot_json
     `;
-    if (order.paymentStatus === "paid") {
+    if (order.paymentStatus === "paid" && !order.paymentSnapshot) {
       await tx.$executeRaw`
         INSERT INTO payments (
           id, payment_no, order_id, user_id, merchant_id, collection_payment_config_id, channel,
@@ -11339,7 +11432,7 @@ class PrismaStateRepository {
         VALUES (
           ${stableDbId("payment", order.orderNo)}, ${`payment:${order.orderNo}`},
           (SELECT id FROM orders WHERE order_no = ${order.orderNo}), ${order.userId},
-          ${merchantId}, ${order.paymentSnapshot?.paymentMethodId ?? null}, CAST('alipay_wap' AS "PaymentChannel"),
+          ${merchantId}, NULL, CAST('alipay_wap' AS "PaymentChannel"),
           ${payableAmount(order)}, 0, CAST('paid' AS "PaymentStatus"),
           ${`payment:offline:${order.orderNo}`}, ${order.paidAt ?? new Date()}, now(), now()
         )
@@ -11666,6 +11759,29 @@ class PrismaStateRepository {
     const order = log.orderNo ? store.orders.get(log.orderNo) : undefined;
     const method = order ? this.paymentMethodForOrder(store, order) : undefined;
     const paymentNo = order?.paymentSnapshot?.paymentNo ?? (log.orderNo ? `payment:${log.orderNo}` : null);
+    const processedStatus = mapCallbackProcessStatus(log.status);
+    await tx.$executeRaw`
+      INSERT INTO payment_callbacks (
+        id, payment_id, channel, channel_event_id, raw_payload_json,
+        processed_status, idempotency_key, created_at, processed_at
+      )
+      VALUES (
+        ${stableDbId("payment_callback", log.id)},
+        ${paymentNo ? stableDbId("payment", paymentNo) : null},
+        CAST(${mapProviderToLegacyPaymentChannel(log.provider)} AS "PaymentChannel"),
+        ${`callback:${log.provider}:${log.providerTradeNo}:${log.id}`},
+        ${jsonForDb(log.rawPayloadMasked ?? {})}::jsonb,
+        CAST(${processedStatus} AS "CallbackProcessStatus"),
+        ${`payment-callback-legacy:${log.id}`},
+        ${log.receivedAt},
+        ${processedStatus === "processed" || processedStatus === "ignored_duplicate" ? log.receivedAt : null}
+      )
+      ON CONFLICT (channel_event_id) DO UPDATE SET
+        payment_id = EXCLUDED.payment_id,
+        raw_payload_json = EXCLUDED.raw_payload_json,
+        processed_status = EXCLUDED.processed_status,
+        processed_at = EXCLUDED.processed_at
+    `;
     await tx.$executeRaw`
       INSERT INTO payment_callback_logs (
         id, callback_no, payment_id, order_id, payment_snapshot_id, collection_config_id,
@@ -11682,7 +11798,7 @@ class PrismaStateRepository {
         ${method?.id ?? null}, CAST(${mapPaymentProviderToDb(log.provider)} AS "PaymentProvider"),
         'callback', ${log.orderNo ?? null}, ${log.providerTradeNo}, ${log.providerTradeNo},
         ${log.receivedAt}, ${log.verified}, ${log.status !== "exception"}, ${log.status !== "exception"},
-        CAST(${mapCallbackProcessStatus(log.status)} AS "CallbackProcessStatus"),
+        CAST(${processedStatus} AS "CallbackProcessStatus"),
         ${`callback:${log.provider}:${log.providerTradeNo}:${log.id}`},
         ${`payment-callback:${log.id}`}, ${log.status === "accepted" ? null : log.status},
         ${log.exceptionId ?? null}, NULL, ${jsonForDb(log.rawPayloadMasked ?? {})}::jsonb,
@@ -12465,17 +12581,22 @@ class PrismaStateRepository {
     const merchants = await this.prisma.$queryRaw<Array<{
       id: string;
       user_id: string;
+      tier: MerchantTier;
       name: string;
       contact_phone: string | null;
       status: string;
       risk_status: string;
       deposit_status: string;
+      username: string | null;
+      password_hash: string | null;
+      initial_delivery_status: string | null;
     }>>`
-      SELECT m.id, COALESCE(ma.user_id, m.id) AS user_id, m.name, m.contact_phone,
-             m.status, m.risk_status, m.deposit_status
+      SELECT m.id, COALESCE(ma.user_id, m.id) AS user_id, m.tier, m.name, m.contact_phone,
+             m.status, m.risk_status, m.deposit_status,
+             ma.username, ma.password_hash, ma.initial_delivery_status
         FROM merchants m
         LEFT JOIN LATERAL (
-          SELECT user_id
+          SELECT user_id, username, password_hash, initial_delivery_status
             FROM merchant_accounts
            WHERE merchant_id = m.id
            ORDER BY created_at ASC
@@ -12488,9 +12609,13 @@ class PrismaStateRepository {
         userId: row.user_id,
         name: row.name,
         contactPhone: row.contact_phone ?? undefined,
+        tier: row.tier,
         status: row.status,
         riskStatus: row.risk_status,
-        depositStatus: row.deposit_status
+        depositStatus: row.deposit_status,
+        initialPasswordSet: row.initial_delivery_status === "delivered" || Boolean(row.password_hash),
+        merchantUsername: row.username ?? row.id,
+        passwordHash: row.password_hash ?? undefined
       });
     }
 
@@ -13400,6 +13525,7 @@ class PrismaStateRepository {
     const invites = await this.prisma.$queryRaw<Array<{
       id: string;
       code_hash: string;
+      issuer_merchant_id: string | null;
       tier: MerchantTier;
       max_uses: number;
       used_count: number;
@@ -13408,7 +13534,7 @@ class PrismaStateRepository {
       expires_at: Date | null;
       created_at: Date;
     }>>`
-      SELECT id, code_hash, tier, max_uses, used_count, deposit_required_amount_cents, status, expires_at, created_at
+      SELECT id, code_hash, issuer_merchant_id, tier, max_uses, used_count, deposit_required_amount_cents, status, expires_at, created_at
         FROM merchant_invite_codes
     `;
     for (const row of invites) {
@@ -13416,7 +13542,8 @@ class PrismaStateRepository {
         id: row.id,
         code: "",
         codeHash: row.code_hash,
-        issuerType: "platform",
+        issuerType: row.issuer_merchant_id ? "merchant" : "platform",
+        issuerMerchantId: row.issuer_merchant_id ?? undefined,
         targetTier: row.tier,
         status: row.status === "approved" ? "active" : "disabled",
         maxUses: row.max_uses,
@@ -13430,6 +13557,82 @@ class PrismaStateRepository {
 
     store.channelAuthorizations = [];
     store.channelRelations = [];
+    const applicationRows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      merchant_id: string;
+      user_id: string;
+      invite_code_id: string | null;
+      tier: MerchantTier;
+      identity_info_json: unknown;
+      contact_info_json: unknown;
+      customer_service_wechat: string | null;
+      status: string;
+      merchant_status: string;
+      deposit_status: string | null;
+      issuer_merchant_id: string | null;
+    }>>`
+      SELECT ma.id, ma.merchant_id, ma.user_id, ma.invite_code_id, ma.tier,
+             ma.identity_info_json, ma.contact_info_json, ma.customer_service_wechat,
+             ma.status, m.status AS merchant_status, da.status AS deposit_status,
+             mic.issuer_merchant_id
+        FROM merchant_applications ma
+        JOIN merchants m ON m.id = ma.merchant_id
+        LEFT JOIN deposit_accounts da ON da.merchant_id = ma.merchant_id
+        LEFT JOIN merchant_invite_codes mic ON mic.id = ma.invite_code_id
+    `;
+    const parentByMerchant = new Map<string, string>();
+    for (const row of applicationRows) {
+      const identity = isRecord(row.identity_info_json) ? row.identity_info_json : {};
+      const contact = isRecord(row.contact_info_json) ? row.contact_info_json : {};
+      const parentMerchantId = stringValue(identity.parentMerchantId) ?? row.issuer_merchant_id ?? undefined;
+      const application: MerchantApplication = {
+        applicationNo: row.id,
+        merchantId: row.merchant_id,
+        userId: row.user_id,
+        status: row.status,
+        contactPhone: stringValue(contact.phone) ?? "",
+        customerServiceWechat: row.customer_service_wechat ?? "",
+        inviteCode: stringValue(contact.inviteCode),
+        inviteCodeId: row.invite_code_id ?? undefined,
+        targetTier: row.tier,
+        parentMerchantId
+      };
+      store.merchantApplications.set(row.id, application);
+      if (parentMerchantId) parentByMerchant.set(row.merchant_id, parentMerchantId);
+    }
+    const relationStatusFor = (row: { status: string; merchant_status: string; deposit_status: string | null }) => {
+      if (row.status === "rejected") return "closed";
+      if (row.status !== "approved") return "pending_review";
+      return row.merchant_status === "active" && row.deposit_status === "paid" ? "active" : "pending_deposit";
+    };
+    for (const row of applicationRows) {
+      const parentMerchantId = parentByMerchant.get(row.merchant_id);
+      if (!parentMerchantId || row.tier === "first_tier") continue;
+      if (row.tier === "second_tier") {
+        store.channelRelations.push({
+          id: stableDbId("channel_relation", `${parentMerchantId}:${row.merchant_id}`),
+          firstTierMerchantId: parentMerchantId,
+          secondTierMerchantId: row.merchant_id,
+          status: relationStatusFor(row),
+          reason: "invite_registration",
+          reviewedAt: row.status === "approved" ? new Date() : null,
+          activeUniqueKey: `second-tier:${row.merchant_id}`
+        });
+        continue;
+      }
+      const firstTierMerchantId = parentByMerchant.get(parentMerchantId);
+      if (!firstTierMerchantId) continue;
+      store.channelRelations.push({
+        id: stableDbId("channel_relation", `${firstTierMerchantId}:${parentMerchantId}:${row.merchant_id}`),
+        firstTierMerchantId,
+        secondTierMerchantId: parentMerchantId,
+        thirdTierMerchantId: row.merchant_id,
+        status: relationStatusFor(row),
+        reason: "invite_registration",
+        reviewedAt: row.status === "approved" ? new Date() : null,
+        activeUniqueKey: `third-tier:${row.merchant_id}`
+      });
+    }
     store.channelProductOffers = [];
   }
 
@@ -13730,7 +13933,39 @@ function signEpayParams(params: Record<string, unknown>, signingSecret: string) 
   return createHash("md5").update(`${payload}${signingSecret}`).digest("hex").toLowerCase();
 }
 
+function signHupijiaoParams(params: Record<string, unknown>, signingSecret: string) {
+  const payload = Object.keys(params)
+    .filter((key) => key !== "hash")
+    .sort()
+    .map((key) => {
+      const value = params[key];
+      return value === undefined || value === null || value === "" ? undefined : `${key}=${String(value)}`;
+    })
+    .filter((item): item is string => Boolean(item))
+    .join("&");
+  return createHash("md5").update(`${payload}${signingSecret}`).digest("hex").toLowerCase();
+}
+
+function isHupijiaoPayload(rawPayload: Record<string, unknown>) {
+  return Boolean(stringValue(rawPayload.trade_order_id) || stringValue(rawPayload.total_fee) || stringValue(rawPayload.hash));
+}
+
 function normalizeEpayCallbackPayload(rawPayload: Record<string, unknown>) {
+  if (isHupijiaoPayload(rawPayload)) {
+    const orderNo = requiredCallbackString(rawPayload.trade_order_id, "trade_order_id");
+    const status = stringValue(rawPayload.status);
+    return {
+      orderNo,
+      providerTradeNo: stringValue(rawPayload.transaction_id)
+        ?? stringValue(rawPayload.open_order_id)
+        ?? stringValue(rawPayload.order_id)
+        ?? stringValue(rawPayload.oderid)
+        ?? orderNo,
+      amountCents: yuanStringToCents(requiredCallbackString(rawPayload.total_fee, "total_fee")),
+      merchantNo: requiredCallbackString(rawPayload.appid, "appid"),
+      tradeStatus: normalizeHupijiaoTradeStatus(status)
+    };
+  }
   const orderNo = requiredCallbackString(rawPayload.out_trade_no, "out_trade_no");
   return {
     orderNo,
@@ -13739,6 +13974,11 @@ function normalizeEpayCallbackPayload(rawPayload: Record<string, unknown>) {
     merchantNo: requiredCallbackString(rawPayload.pid, "pid"),
     tradeStatus: normalizeEpayTradeStatus(stringValue(rawPayload.trade_status))
   };
+}
+
+function normalizeHupijiaoTradeStatus(status?: string) {
+  if (!status) return "UNKNOWN";
+  return ["OD", "PAID", "SUCCESS", "TRADE_SUCCESS"].includes(status.toUpperCase()) ? "TRADE_SUCCESS" : status;
 }
 
 function normalizeEpayTradeStatus(status?: string) {
@@ -13763,6 +14003,11 @@ function centsString(value: bigint) {
   const yuan = value / 100n;
   const cents = value % 100n;
   return `${yuan.toString()}.${cents.toString().padStart(2, "0")}`;
+}
+
+function calculatePaymentFeeCents(amountCents: bigint, feeBps: bigint) {
+  if (amountCents <= 0n || feeBps <= 0n) return 0n;
+  return (amountCents * feeBps + 9999n) / 10000n;
 }
 
 function appendQuery(url: string, params: Record<string, string>) {
@@ -13792,6 +14037,16 @@ function epayGatewayEndpoints(gatewayUrl: string) {
   };
 }
 
+function hupijiaoGatewayUrl(gatewayUrl: string) {
+  const trimmed = gatewayUrl.trim();
+  if (/\/hupijiao\/payment\/do\.html(?:\?.*)?$/i.test(trimmed)) return trimmed.split("?")[0];
+  if (/\/xpay\/epay(?:\/(?:submit|mapi)\.php)?(?:\?.*)?$/i.test(trimmed)) {
+    return trimmed.replace(/\/xpay\/epay(?:\/(?:submit|mapi)\.php)?(?:\?.*)?$/i, "/xpay/hupijiao/payment/do.html");
+  }
+  const base = trimmed.replace(/\/+$/, "");
+  return `${base}/hupijiao/payment/do.html`;
+}
+
 async function requestEpayMapi(mapiUrl: string, submitParams: Record<string, string>) {
   if (/\.example\.test\b/i.test(mapiUrl)) return { ok: false, message: "mapi skipped for test gateway" };
   try {
@@ -13819,6 +14074,65 @@ async function requestEpayMapi(mapiUrl: string, submitParams: Record<string, str
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : "mapi request failed" };
   }
+}
+
+async function requestHupijiaoPayment(gatewayUrl: string, input: {
+  merchantNo: string;
+  signingSecret: string;
+  orderNo: string;
+  amountCents: bigint;
+  title: string;
+  notifyUrl: string;
+  returnUrl: string;
+}) {
+  const params: Record<string, string> = {
+    version: "1.1",
+    appid: input.merchantNo,
+    trade_order_id: input.orderNo,
+    total_fee: centsString(input.amountCents),
+    title: input.title,
+    time: Math.floor(Date.now() / 1000).toString(),
+    notify_url: input.notifyUrl,
+    return_url: input.returnUrl,
+    nonce_str: randomBytes(8).toString("hex")
+  };
+  params.hash = signHupijiaoParams(params, input.signingSecret);
+  if (/\.example\.test\b/i.test(gatewayUrl)) {
+    return {
+      gatewayUrl,
+      providerOrderId: `hupijiao-${input.orderNo}`,
+      paymentUrl: `${gatewayUrl.replace(/\/+$/, "")}/pay/${encodeURIComponent(input.orderNo)}`,
+      qrCodeUrl: `${gatewayUrl.replace(/\/+$/, "")}/qrcode/${encodeURIComponent(input.orderNo)}`
+    };
+  }
+  const response = await fetch(gatewayUrl, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(params),
+    signal: AbortSignal.timeout(8000)
+  });
+  const rawText = await response.text();
+  const payload = parseJsonObject(rawText);
+  if (!response.ok || !payload) {
+    throw new ApiError(502, "HUPIJIAO_PAYMENT_CREATE_FAILED", `hupijiao payment create failed: http ${response.status}`);
+  }
+  const errcode = stringValue(payload.errcode);
+  if (errcode && errcode !== "0") {
+    throw new ApiError(502, "HUPIJIAO_PAYMENT_CREATE_FAILED", stringValue(payload.errmsg) ?? "hupijiao payment create failed");
+  }
+  const paymentUrl = normalizeHupijiaoBrowserUrl(findUrlInObject(payload, ["url", "payurl", "pay_url", "payment_url"]));
+  if (!paymentUrl) throw new ApiError(502, "HUPIJIAO_PAYMENT_URL_MISSING", "hupijiao payment url is missing");
+  return {
+    gatewayUrl,
+    providerOrderId: stringValue(payload.oderid) ?? stringValue(payload.orderid) ?? stringValue(payload.order_id),
+    paymentUrl,
+    qrCodeUrl: normalizeHupijiaoBrowserUrl(findUrlInObject(payload, ["url_qrcode", "qrcode", "qr_code", "qrurl"]))
+  };
+}
+
+function normalizeHupijiaoBrowserUrl(url?: string) {
+  if (!url) return undefined;
+  return url.replace(/^https?:\/\/xpay\.uumua\.com\//i, `${publicSiteUrl()}/xpay/`);
 }
 
 function parseJsonObject(rawText: string) {
@@ -14177,8 +14491,10 @@ function mapPaymentExceptionReasonCodeFromDb(type: string): string {
   return "MANUAL_REVIEW";
 }
 
-function mapProviderToLegacyPaymentChannel(provider: PaymentProviderType): "wechat_h5" | "alipay_wap" {
+function mapProviderToLegacyPaymentChannel(provider: PaymentProviderType): PaymentChannel {
   if (provider === "wechat_merchant" || provider === "wechat_personal") return "wechat_h5";
+  if (provider === "epay") return "epay";
+  if (provider === "balance") return "balance";
   return "alipay_wap";
 }
 
@@ -14214,11 +14530,11 @@ function isManualPaymentProvider(provider: PaymentProviderType) {
 }
 
 function defaultPaymentApiMode(provider: PaymentProviderType): PaymentApiMode | undefined {
-  return provider === "epay" ? "mapi_first" : undefined;
+  return provider === "epay" ? "submit" : undefined;
 }
 
 function parsePaymentApiMode(value?: string | null): PaymentApiMode | undefined {
-  return value === "submit" || value === "mapi_first" ? value : undefined;
+  return value === "submit" || value === "mapi_first" || value === "hupijiao_direct" ? value : undefined;
 }
 
 function paymentProviderDisplay(provider: PaymentProviderType) {
@@ -14591,11 +14907,11 @@ function createEmptyMemoryStore(): MemoryStore {
     walletHolds: new Map(),
     walletTransactions: [],
     paymentChannelConfigs: [
-      { channel: "mock", enabled: true, feeBps: 100, fixedFeeCents: 0n, statusNote: "dev_only", updatedAt: new Date() },
-      { channel: "wechat_miniprogram", enabled: false, feeBps: 100, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
-      { channel: "wechat_h5_jsapi", enabled: false, feeBps: 100, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
-      { channel: "wechat_h5", enabled: false, feeBps: 100, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
-      { channel: "alipay_wap", enabled: false, feeBps: 100, fixedFeeCents: 0n, statusNote: "alipay_account_required", updatedAt: new Date() },
+      { channel: "mock", enabled: true, feeBps: 0, fixedFeeCents: 0n, statusNote: "dev_only", updatedAt: new Date() },
+      { channel: "wechat_miniprogram", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
+      { channel: "wechat_h5_jsapi", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
+      { channel: "wechat_h5", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
+      { channel: "alipay_wap", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "alipay_account_required", updatedAt: new Date() },
       { channel: "epay", enabled: false, feeBps: 100, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
       { channel: "balance", enabled: true, feeBps: 0, fixedFeeCents: 0n, statusNote: "wallet_balance_ready", updatedAt: new Date() }
     ],
@@ -15024,7 +15340,7 @@ type DemoMerchantProductListing = {
 type SalesChannelType = "platform_self_operated" | "single_merchant" | "two_tier" | "three_tier";
 type PaymentChannel = "wechat_miniprogram" | "wechat_h5_jsapi" | "wechat_h5" | "alipay_wap" | "epay" | "balance" | "mock";
 type PaymentProviderType = "alipay_merchant" | "wechat_merchant" | "epay" | "personal_alipay" | "wechat_personal" | "balance";
-type PaymentApiMode = "mapi_first" | "submit";
+type PaymentApiMode = "mapi_first" | "submit" | "hupijiao_direct";
 type PaymentDisplayType =
   | "alipay_personal_qr"
   | "alipay_merchant_qr"

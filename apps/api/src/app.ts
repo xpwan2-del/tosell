@@ -24,7 +24,7 @@ const paymentMethodBodySchema = z.object({
   appId: z.string().optional(),
   serviceProviderId: z.string().optional(),
   gatewayUrl: z.string().url().optional(),
-  apiMode: z.enum(["mapi_first", "submit"]).optional(),
+  apiMode: z.enum(["mapi_first", "submit", "hupijiao_direct"]).optional(),
   accountName: z.string().optional(),
   qrUrl: z.string().min(1).max(900_000).refine((value) => /^https?:\/\//.test(value) || /^data:image\/(png|jpeg|webp);base64,/.test(value), "qrUrl must be an image upload or http url").optional(),
   paymentUrl: z.string().url().optional(),
@@ -51,6 +51,7 @@ const paymentResultBodySchema = z.object({
 });
 const emailSchema = z.string().email().max(160);
 const extractionCodeSchema = z.string().regex(/^\d{4,12}$/).max(12);
+const purchasePasswordSchema = z.string().trim().min(4).max(32);
 const mainlandPhoneSchema = z.string().regex(/^1[3-9]\d{9}$/);
 const merchantTierSchema = z.enum(["first_tier", "second_tier", "third_tier"]);
 const fulfillmentModeSchema = z.enum(["manual", "code_pool"]);
@@ -117,6 +118,10 @@ export function buildApp() {
     return reply.status(500).send({ code: "INTERNAL_ERROR", message: error.message });
   });
   app.register(cors, { origin: true });
+  app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_request, body, done) => {
+    const params = new URLSearchParams(String(body));
+    done(null, Object.fromEntries(params.entries()));
+  });
 
   app.get("/health", async () => services.health());
   app.get("/api/health", async () => services.health());
@@ -274,7 +279,7 @@ export function buildApp() {
       buyerEmail: emailSchema.optional(),
       buyerPhone: mainlandPhoneSchema.optional(),
       extractionCode: extractionCodeSchema.optional(),
-      purchasePassword: extractionCodeSchema.optional(),
+      purchasePassword: purchasePasswordSchema.optional(),
       couponId: z.string().optional(),
       paymentMethodId: z.string().optional(),
       clientPaidAmountCents: bigintString.optional()
@@ -334,7 +339,7 @@ export function buildApp() {
     const { orderNo } = z.object({ orderNo: z.string() }).parse(request.params);
     const body = z.object({
       extractionCode: extractionCodeSchema.optional(),
-      purchasePassword: extractionCodeSchema.optional()
+      purchasePassword: purchasePasswordSchema.optional()
     }).parse(request.body);
     return serializeBigInt(services.extractOrderCodes(getUserActor(request), orderNo, body.purchasePassword ?? body.extractionCode ?? ""));
   });
@@ -343,7 +348,7 @@ export function buildApp() {
     const { token } = z.object({ token: z.string().min(20) }).parse(request.params);
     const body = z.object({
       extractionCode: extractionCodeSchema.optional(),
-      purchasePassword: extractionCodeSchema.optional()
+      purchasePassword: purchasePasswordSchema.optional()
     }).parse(request.body);
     return serializeBigInt(services.extractOrderCodesByToken(getUserActor(request), token, body.purchasePassword ?? body.extractionCode ?? ""));
   });
@@ -1120,13 +1125,13 @@ export function buildApp() {
     return serializeBigInt(services.paymentCallback(body));
   });
   app.get("/api/callbacks/payments/epay", async (request) => {
-    const result = services.epayProviderCallback(recordPayload(request.query));
+    const result = await services.epayProviderCallback(recordPayload(request.query));
     return result.status === "processed" || result.status === "duplicate" ? "success" : serializeBigInt(result);
   });
   app.post("/api/callbacks/payments/:provider", async (request) => {
     const { provider } = z.object({ provider: paymentProvider }).parse(request.params);
     if (provider === "epay") {
-      const result = services.epayProviderCallback(recordPayload(request.body));
+      const result = await services.epayProviderCallback(recordPayload(request.body));
       return result.status === "processed" || result.status === "duplicate" ? "success" : serializeBigInt(result);
     }
     const body = paymentResultBodySchema.parse(request.body);
