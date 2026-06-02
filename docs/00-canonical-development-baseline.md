@@ -104,6 +104,15 @@
 9. 个人支付宝、个人微信只展示二维码和金额，不展示收款人真实姓名、账号或后台备注。
 10. 服务端回调地址和前台返回地址必须分开：`notify_url` 指向 API 公网地址，`return_url` 指向 H5 前台地址，不能把支付回调拼到后台或 H5 页面地址上。
 
+e支付接口模式：
+
+1. `submit`：按易支付 `submit.php` 协议生成表单收银台。
+2. `mapi_first`：先尝试易支付 `mapi.php`，拿不到可用链接再回退到 `submit.php`。
+3. `hupijiao_direct`：按虎皮椒协议由服务端 POST 创建三方支付单，服务端只把收银台地址返回给 H5，H5 不直接 POST 虎皮椒 JSON 接口。
+4. `hupijiao_direct` 回调仍统一进入 `/api/callbacks/payments/epay`，服务端按虎皮椒字段 `appid`、`trade_order_id`、`total_fee`、`status`、`hash` 归一化并验签。
+5. 如果三方支付域名在移动网络上不可直连，生产环境允许使用同域代理支付页，例如 `https://888tech.club/xpay/pay/{provider_order_id}`。同域代理只代理支付页、支付页静态资源和三方订单二维码/状态接口，不代理或暴露商户密钥。
+6. 可提交到仓库的数据库配置只包括 `provider`、`gateway_url`、`api_mode`、手续费比例、回调 URL 等非密钥配置；商户号、签名密钥、证书和 token 只能保存在生产数据库密文字段或服务器环境变量中，不得写入文档、seed 明文或 Git。
+
 ## 6. 支付和费用
 
 支付手续费和平台服务费必须分开。
