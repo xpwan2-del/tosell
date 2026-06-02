@@ -1,8 +1,10 @@
 import cors from "@fastify/cors";
 import Fastify, { type FastifyRequest } from "fastify";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { extname, join, resolve } from "node:path";
 import { z } from "zod";
-import { isSettlementCandidate } from "../../../packages/core/src/index.js";
+import { assertAdminPermission, isSettlementCandidate } from "../../../packages/core/src/index.js";
 import {
   ApiError,
   type AdminActor,
@@ -55,6 +57,12 @@ const purchasePasswordSchema = z.string().trim().min(4).max(32);
 const mainlandPhoneSchema = z.string().regex(/^1[3-9]\d{9}$/);
 const merchantTierSchema = z.enum(["first_tier", "second_tier", "third_tier"]);
 const fulfillmentModeSchema = z.enum(["manual", "code_pool"]);
+const credentialTypeSchema = z.enum(["code", "account_password"]);
+const productImageUploadSchema = z.object({
+  filename: z.string().min(1).max(180).optional(),
+  contentType: z.enum(["image/jpeg", "image/png", "image/webp"]),
+  dataBase64: z.string().min(1).max(1_700_000)
+});
 const productDetailSectionSchema = z.object({
   title: z.string().min(1).max(60),
   items: z.array(z.string().min(1).max(240)).max(12)
@@ -72,6 +80,7 @@ const productDetailUpdateSchema = z.object({
   stockCount: z.number().int().nonnegative().optional(),
   soldCount: z.number().int().nonnegative().optional(),
   fulfillmentMode: fulfillmentModeSchema.optional(),
+  credentialType: credentialTypeSchema.optional(),
   manualFulfillmentInstruction: z.string().max(1000).optional(),
   afterSaleRule: z.unknown().optional(),
   status: z.string().optional()
@@ -89,8 +98,9 @@ const merchantProductListingDisplayOverrideSchema = z.object({
 });
 
 export function buildApp() {
-  const app = Fastify({ logger: false });
+  const app = Fastify({ logger: false, bodyLimit: 2_500_000 });
   const services = createBackendServices();
+  const productImageDir = resolve(process.cwd(), "apps/api/uploads/product-images");
 
   app.setErrorHandler((error: Error, _request, reply) => {
     if (error instanceof ApiError) {
@@ -117,7 +127,10 @@ export function buildApp() {
     }
     return reply.status(500).send({ code: "INTERNAL_ERROR", message: error.message });
   });
-  app.register(cors, { origin: true });
+  app.register(cors, {
+    origin: true,
+    methods: ["GET", "HEAD", "POST", "PATCH", "DELETE", "OPTIONS"]
+  });
   app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_request, body, done) => {
     const params = new URLSearchParams(String(body));
     done(null, Object.fromEntries(params.entries()));
@@ -125,6 +138,17 @@ export function buildApp() {
 
   app.get("/health", async () => services.health());
   app.get("/api/health", async () => services.health());
+  app.get("/uploads/product-images/:filename", async (request, reply) => {
+    const { filename } = z.object({ filename: z.string().regex(/^[a-zA-Z0-9._-]+$/) }).parse(request.params);
+    const contentType = productImageContentType(filename);
+    if (!contentType) throw new ApiError(404, "PRODUCT_IMAGE_NOT_FOUND", "product image not found");
+    try {
+      const bytes = await readFile(join(productImageDir, filename));
+      return reply.type(contentType).send(bytes);
+    } catch {
+      throw new ApiError(404, "PRODUCT_IMAGE_NOT_FOUND", "product image not found");
+    }
+  });
 
   app.post("/api/auth/h5/guest", async () => {
     const userId = `h5-guest-${cryptoRandomId()}`;
@@ -461,13 +485,14 @@ export function buildApp() {
       salePriceCents: bigintString,
       minSalePriceCents: bigintString.optional(),
       fulfillmentMode: fulfillmentModeSchema.optional(),
+      credentialType: credentialTypeSchema.optional(),
       manualFulfillmentInstruction: z.string().max(1000).optional()
     }).parse(request.body);
     return serializeBigInt(services.submitOwnProduct(getMerchantActor(request), {
       ...body,
       fulfillmentRule: {
         mode: body.fulfillmentMode ?? "manual",
-        ...(body.fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {}),
+        ...(body.fulfillmentMode === "code_pool" ? { extractCodeRequired: true, credentialType: body.credentialType ?? "code" } : {}),
         ...(body.manualFulfillmentInstruction ? { manualFulfillmentInstruction: body.manualFulfillmentInstruction } : {})
       }
     }));
@@ -478,13 +503,13 @@ export function buildApp() {
       salePriceCents: bigintString.optional(),
       minSalePriceCents: bigintString.optional()
     }).parse(request.body);
-    const { fulfillmentMode, manualFulfillmentInstruction, ...rest } = body;
+    const { fulfillmentMode, credentialType, manualFulfillmentInstruction, ...rest } = body;
     return serializeBigInt(services.updateOwnProductDetail(getMerchantActor(request), ownProductId, {
       ...rest,
       fulfillmentRule: fulfillmentMode || manualFulfillmentInstruction
         ? {
             mode: fulfillmentMode ?? "manual",
-            ...(fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {}),
+            ...(fulfillmentMode === "code_pool" ? { extractCodeRequired: true, credentialType: credentialType ?? "code" } : {}),
             ...(manualFulfillmentInstruction ? { manualFulfillmentInstruction } : {})
           }
         : undefined
@@ -506,26 +531,30 @@ export function buildApp() {
     const body = z.object({
       merchantProductListingId: z.string().optional(),
       codes: z.array(z.string()),
-      batchNo: z.string().optional()
+      batchNo: z.string().optional(),
+      credentialType: credentialTypeSchema.optional()
     }).parse(request.body);
     const listingId = body.merchantProductListingId;
     if (!listingId) throw new ApiError(400, "PRODUCT_REQUIRED", "product required");
     return serializeBigInt(services.addMerchantRightsCodes(getMerchantActor(request), {
       ...internalProductRef(listingId),
       codes: body.codes,
-      batchNo: body.batchNo
+      batchNo: body.batchNo,
+      credentialType: body.credentialType
     } as Parameters<typeof services.addMerchantRightsCodes>[1]));
   });
   app.post("/api/merchant/rights-codes/precheck", async (request) => {
     const body = z.object({
       merchantProductListingId: z.string().optional(),
-      codes: z.array(z.string())
+      codes: z.array(z.string()),
+      credentialType: credentialTypeSchema.optional()
     }).parse(request.body);
     const listingId = body.merchantProductListingId;
     if (!listingId) throw new ApiError(400, "PRODUCT_REQUIRED", "product required");
     return serializeBigInt(services.precheckMerchantRightsCodes(getMerchantActor(request), {
       ...internalProductRef(listingId),
-      codes: body.codes
+      codes: body.codes,
+      credentialType: body.credentialType
     } as Parameters<typeof services.precheckMerchantRightsCodes>[1]));
   });
 
@@ -711,13 +740,14 @@ export function buildApp() {
       minSalePriceCents: bigintString,
       suggestedSalePriceCents: bigintString,
       fulfillmentMode: fulfillmentModeSchema.optional(),
+      credentialType: credentialTypeSchema.optional(),
       manualFulfillmentInstruction: z.string().max(1000).optional()
     }).parse(request.body);
     return serializeBigInt(services.createPlatformProduct(getAdminActor(request), {
       ...body,
       fulfillmentRule: {
         mode: body.fulfillmentMode ?? "manual",
-        ...(body.fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {}),
+        ...(body.fulfillmentMode === "code_pool" ? { extractCodeRequired: true, credentialType: body.credentialType ?? "code" } : {}),
         ...(body.fulfillmentMode === "manual" && body.manualFulfillmentInstruction ? { manualFulfillmentInstruction: body.manualFulfillmentInstruction } : {})
       }
     }));
@@ -727,6 +757,28 @@ export function buildApp() {
     const { productId } = z.object({ productId: z.string() }).parse(request.params);
     return serializeBigInt(services.getAdminPlatformProductDetail(getAdminActor(request), productId));
   });
+  app.post("/api/admin/product-images", async (request) => {
+    assertAdminPermission(getAdminActor(request), "product.manage");
+    const body = productImageUploadSchema.parse(request.body);
+    const bytes = Buffer.from(body.dataBase64, "base64");
+    if (!bytes.length || bytes.length > 1_200_000) {
+      throw new ApiError(400, "PRODUCT_IMAGE_TOO_LARGE", "product image must be 1.2MB or smaller");
+    }
+    const extension = productImageExtension(body.contentType);
+    const stem = (body.filename ?? "product-image")
+      .replace(/\.[^.]+$/, "")
+      .replace(/[^a-zA-Z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 40) || "product-image";
+    const filename = `${stem}-${cryptoRandomId()}.${extension}`;
+    await mkdir(productImageDir, { recursive: true });
+    await writeFile(join(productImageDir, filename), bytes);
+    return {
+      imageUrl: `/uploads/product-images/${filename}`,
+      contentType: body.contentType,
+      byteLength: bytes.length
+    };
+  });
   app.patch("/api/admin/products/:productId", async (request) => {
     const { productId } = z.object({ productId: z.string() }).parse(request.params);
     const body = productDetailUpdateSchema.extend({
@@ -734,13 +786,13 @@ export function buildApp() {
       minSalePriceCents: bigintString.optional(),
       suggestedSalePriceCents: bigintString.optional()
     }).parse(request.body);
-    const { fulfillmentMode, manualFulfillmentInstruction, ...rest } = body;
+    const { fulfillmentMode, credentialType, manualFulfillmentInstruction, ...rest } = body;
     return serializeBigInt(services.updatePlatformProduct(getAdminActor(request), productId, {
       ...rest,
       fulfillmentRule: fulfillmentMode || manualFulfillmentInstruction
         ? {
             mode: fulfillmentMode ?? "manual",
-            ...(fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {}),
+            ...(fulfillmentMode === "code_pool" ? { extractCodeRequired: true, credentialType: credentialType ?? "code" } : {}),
             ...(manualFulfillmentInstruction ? { manualFulfillmentInstruction } : {})
           }
         : undefined
@@ -830,14 +882,16 @@ export function buildApp() {
     const body = z.object({
       productId: z.string(),
       codes: z.array(z.string()),
-      batchNo: z.string().optional()
+      batchNo: z.string().optional(),
+      credentialType: credentialTypeSchema.optional()
     }).parse(request.body);
     return serializeBigInt(services.addRightsCodes(getAdminActor(request), body));
   });
   app.post("/api/admin/rights-codes/precheck", async (request) => {
     const body = z.object({
       productId: z.string(),
-      codes: z.array(z.string())
+      codes: z.array(z.string()),
+      credentialType: credentialTypeSchema.optional()
     }).parse(request.body);
     return serializeBigInt(services.precheckRightsCodes(getAdminActor(request), body));
   });
@@ -1400,6 +1454,20 @@ function authTokenSecret(): string {
 
 function cryptoRandomId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function productImageExtension(contentType: "image/jpeg" | "image/png" | "image/webp"): "jpg" | "png" | "webp" {
+  if (contentType === "image/png") return "png";
+  if (contentType === "image/webp") return "webp";
+  return "jpg";
+}
+
+function productImageContentType(filename: string): "image/jpeg" | "image/png" | "image/webp" | undefined {
+  const extension = extname(filename).toLowerCase();
+  if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
+  if (extension === ".png") return "image/png";
+  if (extension === ".webp") return "image/webp";
+  return undefined;
 }
 
 function safeEqual(a: string, b: string): boolean {

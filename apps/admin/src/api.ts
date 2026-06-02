@@ -68,6 +68,12 @@ export type MerchantListingDisplayInput = {
   displayDetailSections?: string;
 };
 
+export type ProductImageUploadInput = {
+  filename?: string;
+  contentType: "image/jpeg" | "image/png" | "image/webp";
+  dataBase64: string;
+};
+
 export class ApiClientError extends Error {
   status: number;
   code: string;
@@ -98,6 +104,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
       throw new ApiClientError(408, "REQUEST_TIMEOUT", "请求超时，请检查网络或稍后重试");
+    }
+    if (error instanceof TypeError) {
+      throw new ApiClientError(0, "NETWORK_ERROR", "无法连接 API，或本次保存内容过大。请刷新页面后重试；如果刚保存过图片，请确认 API 服务已重启。");
     }
     throw error;
   } finally {
@@ -201,6 +210,12 @@ function unmaskedOrUndefined(value?: string): string | undefined {
 
 export const api = {
   baseUrl: API_BASE_URL || "同源 /api",
+  assetUrl: (value: unknown) => {
+    const raw = text(value, "");
+    if (!raw) return "";
+    if (raw.startsWith("/uploads/") && API_BASE_URL) return `${API_BASE_URL}${raw}`;
+    return raw;
+  },
   currentAdminSession,
   saveAdminSession,
   clearAdminSession,
@@ -399,10 +414,15 @@ export const api = {
   adminChannels: () => request<JsonRecord>("/api/admin/merchant-supply", {
     headers: adminHeaders()
   }),
-  createChannelRelation: (firstTierMerchantId: string, secondTierMerchantId: string) => request<JsonRecord>("/api/admin/merchant-supply/relations", {
+  createChannelRelation: (input: { firstTierMerchantId: string; secondTierMerchantId: string; thirdTierMerchantId?: string }) => request<JsonRecord>("/api/admin/merchant-supply/relations", {
     method: "POST",
     headers: adminHeaders(),
-    body: { firstTierMerchantId, secondTierMerchantId, reason: "受控二级供货关系" }
+    body: {
+      firstTierMerchantId: requireText(input.firstTierMerchantId, "一级商户ID"),
+      secondTierMerchantId: requireText(input.secondTierMerchantId, "二级商户ID"),
+      thirdTierMerchantId: input.thirdTierMerchantId?.trim() || undefined,
+      reason: input.thirdTierMerchantId?.trim() ? "受控三级供货关系" : "受控二级供货关系"
+    }
   }),
   upsertChannelOffer: (channelRelationId: string, platformProductId: string, resellSupplyPriceCents: string) => request<JsonRecord>("/api/admin/merchant-supply/offers", {
     method: "POST",
@@ -440,7 +460,7 @@ export const api = {
       voucherUrl: `manual://deposit/${merchantId}/${Date.now()}`
     }
   }),
-  createPlatformProduct: (input: { name: string; category?: string; tags?: string; subtitle?: string; description?: string; usageGuide?: string; imageUrl?: string; specs?: string; detailSections?: string; stockCount: string; soldCount?: string; fulfillmentMode: string; supplyPriceCents: string; minSalePriceCents: string; suggestedSalePriceCents: string }) => {
+  createPlatformProduct: (input: { name: string; category?: string; tags?: string; subtitle?: string; description?: string; usageGuide?: string; imageUrl?: string; specs?: string; detailSections?: string; stockCount: string; soldCount?: string; fulfillmentMode: string; credentialType?: string; supplyPriceCents: string; minSalePriceCents: string; suggestedSalePriceCents: string }) => {
     const stockCount = requireNonNegativeInteger(input.stockCount, "库存");
     const soldCount = input.soldCount ? requireNonNegativeInteger(input.soldCount, "销量") : undefined;
     const supplyPriceCents = requirePositiveCents(input.supplyPriceCents, "供货价");
@@ -462,6 +482,7 @@ export const api = {
         stockCount,
         soldCount,
         fulfillmentMode: input.fulfillmentMode,
+        credentialType: input.fulfillmentMode === "code_pool" ? input.credentialType || "code" : undefined,
         supplyPriceCents,
         minSalePriceCents,
         suggestedSalePriceCents
@@ -615,29 +636,36 @@ export const api = {
   adminPlatformProducts: () => request<JsonRecord[]>("/api/admin/products", {
     headers: adminHeaders()
   }),
-  updatePlatformProduct: (productId: string, input: { name: string; category?: string; tags?: string; subtitle?: string; description?: string; usageGuide?: string; imageUrl?: string; specs?: string; detailSections?: string; stockCount: string; soldCount?: string; fulfillmentMode: string; supplyPriceCents: string; minSalePriceCents: string; suggestedSalePriceCents: string; status: string }) => {
-    const stockCount = input.stockCount ? requireNonNegativeInteger(input.stockCount, "库存") : undefined;
+  uploadProductImage: (input: ProductImageUploadInput) => request<JsonRecord>("/api/admin/product-images", {
+    method: "POST",
+    headers: adminHeaders(),
+    body: input,
+    timeoutMs: 45_000
+  }),
+  updatePlatformProduct: (productId: string, input: Partial<{ name: string; category: string; tags: string; subtitle: string; description: string; usageGuide: string; imageUrl: string; specs: string; detailSections: string; stockCount: string; soldCount: string; fulfillmentMode: string; credentialType: string; supplyPriceCents: string; minSalePriceCents: string; suggestedSalePriceCents: string; status: string }>) => {
+    const stockCount = input.stockCount !== undefined ? requireNonNegativeInteger(input.stockCount, "库存") : undefined;
     const soldCount = input.soldCount ? requireNonNegativeInteger(input.soldCount, "销量") : undefined;
     return request<JsonRecord>(`/api/admin/products/${encodeURIComponent(requireText(productId, "商品ID"))}`, {
       method: "PATCH",
       headers: adminHeaders(),
       body: {
-        name: requireText(input.name, "商品名称"),
-        category: input.category || undefined,
-        tags: input.tags ? input.tags.split(/,|，/).map((item) => item.trim()).filter(Boolean) : undefined,
-        subtitle: input.subtitle || undefined,
-        description: input.description || undefined,
-        usageGuide: input.usageGuide || undefined,
-        imageUrl: input.imageUrl || undefined,
-        specs: splitLines(input.specs),
-        detailSections: parseDetailSections(input.detailSections),
+        name: input.name !== undefined ? requireText(input.name, "商品名称") : undefined,
+        category: input.category !== undefined ? input.category || undefined : undefined,
+        tags: input.tags !== undefined ? input.tags.split(/,|，/).map((item) => item.trim()).filter(Boolean) : undefined,
+        subtitle: input.subtitle !== undefined ? input.subtitle || undefined : undefined,
+        description: input.description !== undefined ? input.description || undefined : undefined,
+        usageGuide: input.usageGuide !== undefined ? input.usageGuide || undefined : undefined,
+        imageUrl: input.imageUrl !== undefined ? input.imageUrl || undefined : undefined,
+        specs: input.specs !== undefined ? splitLines(input.specs) : undefined,
+        detailSections: input.detailSections !== undefined ? parseDetailSections(input.detailSections) : undefined,
         stockCount,
         soldCount,
-        fulfillmentMode: requireText(input.fulfillmentMode, "履约方式"),
-        supplyPriceCents: requirePositiveCents(input.supplyPriceCents, "供货价"),
-        minSalePriceCents: requirePositiveCents(input.minSalePriceCents, "最低售价"),
-        suggestedSalePriceCents: requirePositiveCents(input.suggestedSalePriceCents, "建议售价"),
-        status: requireText(input.status, "商品状态")
+        fulfillmentMode: input.fulfillmentMode !== undefined ? requireText(input.fulfillmentMode, "履约方式") : undefined,
+        credentialType: input.fulfillmentMode === "code_pool" ? input.credentialType || "code" : undefined,
+        supplyPriceCents: input.supplyPriceCents !== undefined ? requirePositiveCents(input.supplyPriceCents, "供货价") : undefined,
+        minSalePriceCents: input.minSalePriceCents !== undefined ? requirePositiveCents(input.minSalePriceCents, "最低售价") : undefined,
+        suggestedSalePriceCents: input.suggestedSalePriceCents !== undefined ? requirePositiveCents(input.suggestedSalePriceCents, "建议售价") : undefined,
+        status: input.status !== undefined ? requireText(input.status, "商品状态") : undefined
       }
     });
   },
@@ -736,22 +764,24 @@ export const api = {
     headers: adminHeaders()
     });
   },
-  importRightsCodes: (input: { productId: string; batchNo: string; codes: string[] }) => request<JsonRecord>("/api/admin/rights-codes/import", {
+  importRightsCodes: (input: { productId: string; batchNo: string; codes: string[]; credentialType?: string }) => request<JsonRecord>("/api/admin/rights-codes/import", {
     method: "POST",
     headers: adminHeaders(),
     body: {
       productId: input.productId,
       batchNo: input.batchNo,
-      codes: input.codes
+      codes: input.codes,
+      credentialType: input.credentialType || undefined
     }
   }),
-  importMerchantRightsCodes: (input: { merchantProductListingId: string; batchNo: string; codes: string[] }) => request<JsonRecord>("/api/merchant/rights-codes/import", {
+  importMerchantRightsCodes: (input: { merchantProductListingId: string; batchNo: string; codes: string[]; credentialType?: string }) => request<JsonRecord>("/api/merchant/rights-codes/import", {
     method: "POST",
     headers: merchantHeaders(),
     body: {
       merchantProductListingId: input.merchantProductListingId,
       batchNo: input.batchNo,
-      codes: input.codes
+      codes: input.codes,
+      credentialType: input.credentialType || undefined
     }
   }),
   notifications: () => request<JsonRecord[]>("/api/merchant/notifications", {
@@ -766,7 +796,7 @@ export const api = {
   adminOwnProductReviews: () => request<JsonRecord[]>("/api/admin/merchant-products/reviews", {
     headers: adminHeaders()
   }),
-  submitOwnProduct: (input: { name: string; category?: string; tags?: string; subtitle?: string; description?: string; usageGuide?: string; imageUrl?: string; specs?: string; detailSections?: string; salePriceCents: string; minSalePriceCents: string; fulfillmentMode: string }) => request<JsonRecord>("/api/merchant/products/own", {
+  submitOwnProduct: (input: { name: string; category?: string; tags?: string; subtitle?: string; description?: string; usageGuide?: string; imageUrl?: string; specs?: string; detailSections?: string; salePriceCents: string; minSalePriceCents: string; fulfillmentMode: string; credentialType?: string }) => request<JsonRecord>("/api/merchant/products/own", {
     method: "POST",
     headers: merchantHeaders(),
     body: {
@@ -781,7 +811,8 @@ export const api = {
       detailSections: parseDetailSections(input.detailSections),
       salePriceCents: requirePositiveCents(input.salePriceCents, "售价"),
       minSalePriceCents: input.minSalePriceCents ? requirePositiveCents(input.minSalePriceCents, "最低价") : undefined,
-      fulfillmentMode: requireText(input.fulfillmentMode, "交付方式")
+      fulfillmentMode: requireText(input.fulfillmentMode, "交付方式"),
+      credentialType: input.fulfillmentMode === "code_pool" ? input.credentialType || "code" : undefined
     }
   }),
   reviewOwnProduct: (ownProductId: string, approved = true) => request<JsonRecord>(`/api/admin/merchant-products/reviews/${ownProductId}/review`, {

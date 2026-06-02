@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createHash, createHmac } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
 import { buildApp } from "./app.ts";
 
 describe.sequential("api", () => {
@@ -439,6 +441,14 @@ describe.sequential("api", () => {
       headers: { "x-merchant-id": "merchant-1", "x-shop-id": "shop-1" },
       payload: {
         name: "代理自有课程权益",
+        category: "账号成品",
+        tags: ["自有商品", "课程"],
+        subtitle: "人工交付课程",
+        description: "平台审核时需要看到完整商品说明",
+        usageGuide: "付款后联系店铺客服开通课程权益",
+        imageUrl: "https://example.com/course.png",
+        specs: ["月卡", "人工开通"],
+        detailSections: [{ title: "审核要点", items: ["核对说明", "核对交付方式"] }],
         salePriceCents: "19900",
         minSalePriceCents: "9900",
         fulfillmentMode: "manual",
@@ -495,6 +505,14 @@ describe.sequential("api", () => {
         ownProductId: submitted.json().id,
         shopId: "shop-1",
         name: "代理自有课程权益",
+        category: "账号成品",
+        tags: ["自有商品", "课程"],
+        subtitle: "人工交付课程",
+        description: "平台审核时需要看到完整商品说明",
+        usageGuide: "付款后联系店铺客服开通课程权益",
+        imageUrl: "https://example.com/course.png",
+        specs: ["月卡", "人工开通"],
+        detailSections: [{ title: "审核要点", items: ["核对说明", "核对交付方式"] }],
         salePriceCents: "19900",
         minSalePriceCents: "9900",
         fulfillmentMode: "manual",
@@ -513,6 +531,12 @@ describe.sequential("api", () => {
     });
     expect(reviewed.statusCode).toBe(200);
     expect(reviewed.json().merchantProductListing.productType).toBe("merchant_owned");
+    expect(reviewed.json().ownProduct).toMatchObject({
+      reviewStatus: "approved",
+      status: "listed",
+      reviewedBy: "operator-1",
+      reviewedAt: expect.any(String)
+    });
 
     const reviewDetail = await app.inject({
       method: "GET",
@@ -524,6 +548,8 @@ describe.sequential("api", () => {
       ownProductId: submitted.json().id,
       reviewStatus: "approved",
       status: "listed",
+      category: "账号成品",
+      imageUrl: "https://example.com/course.png",
       merchant: expect.objectContaining({ id: "merchant-1" }),
       shop: expect.objectContaining({ id: "shop-1" })
     });
@@ -539,7 +565,9 @@ describe.sequential("api", () => {
         id: submitted.json().id,
         ownProductId: submitted.json().id,
         reviewStatus: "approved",
-        status: "listed"
+        status: "listed",
+        reviewedBy: "operator-1",
+        reviewedAt: expect.any(String)
       })
     ]));
 
@@ -1464,6 +1492,107 @@ describe.sequential("api", () => {
     expect(thirdTierSettlement.json().items[0]).toMatchObject({ settlementRole: "third_tier", merchantIncomeCents: "1925" });
   });
 
+  it("lets M3 sell upstream-opened code-pool platform products from the platform master pool", async () => {
+    const app = buildApp();
+    const operatorHeaders = { "x-admin-id": "operator-1", "x-admin-role": "operator" };
+    const secondHeaders = { "x-merchant-id": "merchant-2", "x-shop-id": "shop-2" };
+    const thirdHeaders = { "x-merchant-id": "merchant-3", "x-shop-id": "shop-3" };
+
+    await app.inject({
+      method: "POST",
+      url: "/api/admin/rights-codes/import",
+      headers: operatorHeaders,
+      payload: { productId: "prod-code", batchNo: "m3-code-pool", codes: ["M3-CODE-POOL-001"] }
+    });
+    const firstToSecondOffer = await app.inject({
+      method: "POST",
+      url: "/api/admin/merchant-supply/offers",
+      headers: operatorHeaders,
+      payload: { channelRelationId: "channel-rel-1", platformProductId: "prod-code", resellSupplyPriceCents: "2500" }
+    });
+    expect(firstToSecondOffer.statusCode).toBe(200);
+
+    const secondListing = await app.inject({
+      method: "POST",
+      url: "/api/merchant/products/platform",
+      headers: secondHeaders,
+      payload: {
+        platformProductId: "prod-code",
+        salePriceCents: "3900",
+        displayName: "M2 Claude 自动发码",
+        status: "listed"
+      }
+    });
+    expect(secondListing.statusCode).toBe(200);
+    expect(secondListing.json()).toMatchObject({ platformProductId: "prod-code", productType: "platform" });
+
+    const secondToThirdOffer = await app.inject({
+      method: "POST",
+      url: "/api/admin/merchant-supply/offers",
+      headers: operatorHeaders,
+      payload: { channelRelationId: "channel-rel-2", platformProductId: "prod-code", resellSupplyPriceCents: "4200" }
+    });
+    expect(secondToThirdOffer.statusCode).toBe(200);
+
+    const thirdListing = await app.inject({
+      method: "POST",
+      url: "/api/merchant/products/platform",
+      headers: thirdHeaders,
+      payload: {
+        platformProductId: "prod-code",
+        salePriceCents: "5900",
+        displayName: "M3 Claude 自动发码",
+        status: "listed"
+      }
+    });
+    expect(thirdListing.statusCode).toBe(200);
+
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "m3-code-pool-user" },
+      payload: {
+        shopId: "shop-3",
+        merchantProductListingId: thirdListing.json().id,
+        clientPaidAmountCents: "5900",
+        buyerPhone: "13800000009",
+        purchasePassword: "654321"
+      }
+    });
+    expect(order.statusCode).toBe(200);
+    expect(order.json()).toMatchObject({ salesChannelType: "three_tier", paidAmountCents: "5900" });
+
+    const lockedCodes = await app.inject({
+      method: "GET",
+      url: `/api/admin/rights-codes?productId=prod-code&orderNo=${order.json().orderNo}&status=locked`,
+      headers: operatorHeaders
+    });
+    expect(lockedCodes.statusCode).toBe(200);
+    expect(lockedCodes.json()).toHaveLength(1);
+    expect(lockedCodes.json()[0]).toMatchObject({ productId: "prod-code", status: "locked" });
+
+    const payment = await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: {
+        channel: "mock",
+        channelTradeNo: "trade-m3-code-pool",
+        orderNo: order.json().orderNo,
+        amountCents: "5900"
+      }
+    });
+    expect(payment.statusCode).toBe(200);
+
+    const issuedCodes = await app.inject({
+      method: "GET",
+      url: `/api/admin/rights-codes?productId=prod-code&orderNo=${order.json().orderNo}&status=issued`,
+      headers: operatorHeaders
+    });
+    expect(issuedCodes.statusCode).toBe(200);
+    expect(issuedCodes.json()).toHaveLength(1);
+    expect(issuedCodes.json()[0]).toMatchObject({ productId: "prod-code", status: "issued" });
+  });
+
   it("enforces tiered price visibility on merchant product and order APIs", async () => {
     const app = buildApp();
     const secondProducts = await app.inject({
@@ -1843,6 +1972,55 @@ describe.sequential("api", () => {
     });
   });
 
+  it("uploads product images as local file urls instead of data urls", async () => {
+    const app = buildApp();
+    const headers = { "x-admin-id": "operator-1", "x-admin-role": "operator" };
+    const pngBytes = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      0x00, 0x00, 0x00, 0x0d
+    ]);
+
+    const uploaded = await app.inject({
+      method: "POST",
+      url: "/api/admin/product-images",
+      headers,
+      payload: {
+        filename: "test-product.png",
+        contentType: "image/png",
+        dataBase64: pngBytes.toString("base64")
+      }
+    });
+
+    expect(uploaded.statusCode).toBe(200);
+    const imageUrl = uploaded.json().imageUrl as string;
+    expect(imageUrl).toMatch(/^\/uploads\/product-images\/test-product-/);
+    expect(imageUrl).not.toMatch(/^data:image\//);
+
+    const fetched = await app.inject({ method: "GET", url: imageUrl });
+    expect(fetched.statusCode).toBe(200);
+    expect(fetched.headers["content-type"]).toContain("image/png");
+    expect(Buffer.from(fetched.rawPayload).length).toBe(pngBytes.length);
+
+    await rm(join(process.cwd(), "apps/api", imageUrl.replace(/^\//, "")), { force: true });
+  });
+
+  it("allows browser preflight for admin product updates", async () => {
+    const app = buildApp();
+    const response = await app.inject({
+      method: "OPTIONS",
+      url: "/api/admin/products/prod-design",
+      headers: {
+        origin: "http://localhost:5173",
+        "access-control-request-method": "PATCH",
+        "access-control-request-headers": "content-type,x-admin-id,x-admin-role"
+      }
+    });
+
+    expect(response.statusCode).toBe(204);
+    expect(response.headers["access-control-allow-methods"]).toContain("PATCH");
+    expect(response.headers["access-control-allow-headers"]).toContain("x-admin-role");
+  });
+
   it("does not partially apply failed batch product selection", async () => {
     const app = buildApp();
     const before = await app.inject({
@@ -1976,6 +2154,150 @@ describe.sequential("api", () => {
     });
     expect(risk.statusCode).toBe(200);
     expect(risk.json()).toHaveProperty("lowStockProducts");
+  });
+
+  it("imports account-password credentials and only reveals them after paid order extraction", async () => {
+    const app = buildApp();
+    const operatorHeaders = { "x-admin-id": "operator-1", "x-admin-role": "operator" };
+    const merchantHeaders = { "x-merchant-id": "merchant-1", "x-shop-id": "shop-1" };
+
+    const product = await app.inject({
+      method: "POST",
+      url: "/api/admin/products",
+      headers: operatorHeaders,
+      payload: {
+        name: "账号密码自动发货测试商品",
+        category: "AI 会员",
+        tags: ["账号密码"],
+        stockCount: 1,
+        soldCount: 0,
+        supplyPriceCents: "2000",
+        minSalePriceCents: "3000",
+        suggestedSalePriceCents: "4900",
+        fulfillmentMode: "code_pool",
+        credentialType: "account_password"
+      }
+    });
+    expect(product.statusCode).toBe(200);
+    expect(product.json().fulfillmentRule).toMatchObject({ mode: "code_pool", credentialType: "account_password" });
+
+    const listing = await app.inject({
+      method: "POST",
+      url: "/api/merchant/products/platform",
+      headers: merchantHeaders,
+      payload: {
+        platformProductId: product.json().id,
+        salePriceCents: "4900",
+        displayName: "账号密码自动发货测试上架",
+        status: "listed"
+      }
+    });
+    expect(listing.statusCode).toBe(200);
+
+    const precheck = await app.inject({
+      method: "POST",
+      url: "/api/admin/rights-codes/precheck",
+      headers: operatorHeaders,
+      payload: {
+        productId: product.json().id,
+        credentialType: "account_password",
+        codes: ["account-user@example.com,Passw0rd!,Claude 月卡"]
+      }
+    });
+    expect(precheck.statusCode).toBe(200);
+    expect(precheck.json().summary).toMatchObject({ create: 1, failed: 0 });
+    expect(JSON.stringify(precheck.json())).not.toContain("Passw0rd!");
+
+    const imported = await app.inject({
+      method: "POST",
+      url: "/api/admin/rights-codes/import",
+      headers: operatorHeaders,
+      payload: {
+        productId: product.json().id,
+        batchNo: "account-password-batch",
+        credentialType: "account_password",
+        codes: ["account-user@example.com,Passw0rd!,Claude 月卡"]
+      }
+    });
+    expect(imported.statusCode).toBe(200);
+    expect(imported.json()).toMatchObject({ count: 1 });
+    expect(JSON.stringify(imported.json())).not.toContain("Passw0rd!");
+
+    const inventory = await app.inject({
+      method: "GET",
+      url: `/api/admin/rights-codes?productId=${product.json().id}`,
+      headers: operatorHeaders
+    });
+    expect(inventory.statusCode).toBe(200);
+    expect(inventory.json()[0]).toMatchObject({
+      productId: product.json().id,
+      credentialType: "account_password",
+      codePreview: expect.stringContaining("密码已隐藏")
+    });
+    expect(JSON.stringify(inventory.json())).not.toContain("Passw0rd!");
+
+    const plaintext = await app.inject({
+      method: "GET",
+      url: `/api/admin/rights-codes/plaintext?productId=${product.json().id}`,
+      headers: { "x-admin-id": "admin-1", "x-admin-role": "admin" }
+    });
+    expect(plaintext.statusCode).toBe(200);
+    expect(plaintext.json()[0]).toMatchObject({
+      credentialType: "account_password",
+      account: "account-user@example.com",
+      password: "Passw0rd!",
+      note: "Claude 月卡"
+    });
+
+    const order = await app.inject({
+      method: "POST",
+      url: "/api/user/orders",
+      headers: { "x-user-id": "account-password-user" },
+      payload: {
+        shopId: "shop-1",
+        merchantProductListingId: listing.json().id,
+        clientPaidAmountCents: "4900",
+        buyerPhone: "13800000014",
+        extractionCode: "654321"
+      }
+    });
+    expect(order.statusCode).toBe(200);
+
+    const payment = await app.inject({
+      method: "POST",
+      url: "/api/callbacks/payments/mock",
+      payload: {
+        channel: "mock",
+        channelTradeNo: "trade-account-password",
+        orderNo: order.json().orderNo,
+        amountCents: "4900"
+      }
+    });
+    expect(payment.statusCode).toBe(200);
+
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/user/orders/${order.json().orderNo}`,
+      headers: { "x-user-id": "account-password-user" }
+    });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().delivery.codes).toEqual([]);
+    expect(JSON.stringify(detail.json())).not.toContain("Passw0rd!");
+
+    const extracted = await app.inject({
+      method: "POST",
+      url: `/api/user/extractions/${detail.json().delivery.extractionToken}`,
+      headers: { "x-user-id": "account-password-user" },
+      payload: { extractionCode: "654321" }
+    });
+    expect(extracted.statusCode).toBe(200);
+    expect(extracted.json().codes[0]).toMatchObject({
+      credentialType: "account_password",
+      credentialLabel: "账号密码",
+      account: "account-user@example.com",
+      password: "Passw0rd!",
+      note: "Claude 月卡"
+    });
   });
 
   it("locks one platform code-pool item at order creation and issues it only after payment confirmation", async () => {

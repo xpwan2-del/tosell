@@ -81,7 +81,7 @@ const initialState: LoadState = {
 const navItems = [
   { id: "dashboard", label: "首页", group: "总览" },
   { id: "products", label: "商品", group: "经营" },
-  { id: "inventory", label: "库存卡密", group: "经营" },
+  { id: "inventory", label: "自动发货库存", group: "经营" },
   { id: "coupons", label: "优惠券", group: "经营" },
   { id: "orders", label: "订单", group: "经营" },
   { id: "fulfillment", label: "发货", group: "经营" },
@@ -108,6 +108,7 @@ type ConfirmRow = {
   label: string;
   before?: string;
   value: string;
+  kind?: "text" | "image";
 };
 type ConfirmAction = {
   title: string;
@@ -130,6 +131,7 @@ type ProductFormState = {
   stockCount: string;
   soldCount: string;
   fulfillmentMode: string;
+  credentialType: string;
   supplyPriceCents: string;
   minSalePriceCents: string;
   suggestedSalePriceCents: string;
@@ -178,12 +180,12 @@ const mvpCoverageLabels = [
 
 const moduleHelp: Record<string, string[]> = {
   首页: ["这里是工作台，只放今天要处理的事。", "先处理待办，再看最近订单；经营数据请去销售统计。"],
-  商品: ["商品列表点击“选择”会带出商品详情进行修改。", "自动发码商品去卡密池导入库存；人工交付商品只维护交付说明和客服信息。"],
-  库存卡密: ["一行一个卡密，先预检再导入。", "默认只看脱敏卡密，平台查看明文会写入审计。"],
+  商品: ["商品列表点击“选择”会带出商品详情进行修改。", "自动发货商品去自动发货库存导入兑换码、卡密或账号密码；人工交付商品只维护交付说明和客服信息。"],
+  自动发货库存: ["先选择自动发货商品，再按商品的凭证类型导入兑换码/卡密或账号密码。", "默认只看内容预览，平台查看完整库存内容会写入审计。"],
   优惠券: ["平台统一创建、启用、停用优惠券。", "注册赠券和退款后作废规则由后端处理，前台不能绕过。"],
   订单管理: ["先看待办，再处理订单；列表里的按钮会直接告诉你下一步该做什么。", "官方支付订单等回调或查单；只有个人支付宝订单才人工确认到账。"],
-  发货管理: ["自动发码订单在确认收款后自动发货。", "人工交付订单由商户按客服/交付说明处理后确认发货。"],
-  售后退款: ["先选择订单或售后单，再做拆账、审批和人工退款确认。", "退款完成后客户不能再查看卡密。"],
+  发货管理: ["自动发货订单在确认收款后自动发出库存凭证。", "人工交付订单由商户按客服/交付说明处理后确认发货。"],
+  售后退款: ["先选择订单或售后单，再做拆账、审批和人工退款确认。", "退款完成后客户不能再查看已发出的库存凭证。"],
   销售统计: ["这里单独看经营数据，不处理订单。", "金额以已支付订单和 ledger 为准。"],
   店铺设置: ["维护买家能看到的店铺名称、公告、客服微信/QQ 和收款信息。", "平台不做在线客服，只展示联系方式和二维码。"],
   商户管理: ["平台创建或审核商户，确认保证金后商户才可以经营。", "上游商户只能看下游经营汇总，不能操作下游商户数据。"],
@@ -195,13 +197,14 @@ const moduleHelp: Record<string, string[]> = {
 
 const fieldLabels: Record<string, string> = {
   id: "编号",
-  codeId: "卡密编号",
+  codeId: "库存编号",
   productId: "商品编号",
   platformProductId: "平台商品",
   merchantProductListingId: "店铺商品",
   ownProductId: "自有商品",
   shopId: "店铺",
   merchantId: "商户",
+  merchantTier: "商户等级",
   firstTierMerchantId: "一级商户",
   secondTierMerchantId: "二级商户",
   thirdTierMerchantId: "三级商户",
@@ -222,6 +225,7 @@ const fieldLabels: Record<string, string> = {
   applicationNo: "申请单号",
   name: "名称",
   productName: "商品名称",
+  shopName: "店铺名称",
   category: "类目",
   tags: "标签",
   subtitle: "副标题",
@@ -238,6 +242,7 @@ const fieldLabels: Record<string, string> = {
   stockCount: "库存",
   soldCount: "销量",
   salePriceCents: "售价",
+  fulfillmentCostCents: "履约成本",
   supplyPriceCents: "供货价",
   platformSupplyPriceCents: "平台供货价",
   visibleUpstreamSupplyPriceCents: "上游供货价",
@@ -291,11 +296,15 @@ const fieldLabels: Record<string, string> = {
   maxUses: "最多使用",
   usedCount: "已使用",
   expiresAt: "过期时间",
+  reviewedAt: "审核时间",
   createdAt: "创建时间",
   updatedAt: "更新时间",
   batchNo: "批次",
-  codePreview: "卡密预览",
-  code: "卡密/邀请码",
+  productCode: "商品编号",
+  credentialLabel: "凭证类型",
+  credentialType: "凭证类型",
+  codePreview: "内容预览",
+  code: "完整内容",
   envVar: "配置项"
 };
 
@@ -321,7 +330,7 @@ const valueLabels: Record<string, string> = {
   refunding: "退款中",
   none: "无",
   manual: "人工交付",
-  code_pool: "自动发码",
+  code_pool: "自动发库存凭证",
   platform: "平台",
   merchant: "商户",
   user: "买家",
@@ -389,6 +398,13 @@ function App() {
   const [depositConfirmCents, setDepositConfirmCents] = useState("");
   const [depositDeductCents, setDepositDeductCents] = useState("");
   const [adminMerchantId, setAdminMerchantId] = useState("");
+  const [channelRelationForm, setChannelRelationForm] = useState({
+    firstTierMerchantId: "",
+    secondTierMerchantId: "",
+    thirdTierMerchantId: ""
+  });
+  const [selectedChannelRelationId, setSelectedChannelRelationId] = useState("");
+  const [selectedChannelProductId, setSelectedChannelProductId] = useState("");
   const [downstreamMerchantId, setDownstreamMerchantId] = useState("");
   const [afterSaleAssistNote, setAfterSaleAssistNote] = useState("");
   const [attemptNo, setAttemptNo] = useState(1);
@@ -412,6 +428,7 @@ function App() {
     stockCount: "",
     soldCount: "",
     fulfillmentMode: "",
+    credentialType: "code",
     supplyPriceCents: "",
     minSalePriceCents: "",
     suggestedSalePriceCents: "",
@@ -495,7 +512,8 @@ function App() {
     detailSections: "",
     salePriceCents: "",
     minSalePriceCents: "",
-    fulfillmentMode: ""
+    fulfillmentMode: "",
+    credentialType: "code"
   });
   const [paymentMethodForm, setPaymentMethodForm] = useState({
     provider: "",
@@ -576,8 +594,8 @@ function App() {
   const canConfigureDownstreamOffer = merchantSessionActive && ["first_tier", "second_tier"].includes(currentMerchantTier);
   const merchantInviteTargetTier = currentMerchantTier === "first_tier" ? "second_tier" : currentMerchantTier === "second_tier" ? "third_tier" : "";
   const peerMerchantId = text(data.merchantApplications.find((item) => text(item.merchantId) !== currentMerchantId)?.merchantId, "");
-  const currentPlatformProductId = text(data.platformProducts[0]?.id, "");
-  const currentChannelRelationId = text(channelRows(data.channels, "relations")[0]?.id, "");
+  const currentPlatformProductId = selectedChannelProductId || text(selectedPlatformProduct?.id, text(data.platformProducts[0]?.id, ""));
+  const currentChannelRelationId = selectedChannelRelationId || text(channelRows(data.channels, "relations")[0]?.id, "");
   const currentDeposit = data.adminDeposits.find((item) => text(item.merchantId) === currentMerchantId);
   const currentDepositStatus = text(currentDeposit?.status, text(activeMerchantSession?.merchant.depositStatus, ""));
   const merchantBlockedReason = currentMerchantId && currentDepositStatus !== "paid"
@@ -619,7 +637,7 @@ function App() {
       { label: "成交额", value: cents(reconciliation.totalPaidCents), tone: "strong" },
       { label: "订单数", value: text(data.salesDashboard?.orderCount, "0") },
       { label: "已收款", value: text(data.salesDashboard?.paidOrderCount, "0") },
-      { label: "可用卡密", value: String(data.rightsCodes.filter((item) => text(item.status) === "available").length) },
+      { label: "可发库存", value: String(data.rightsCodes.filter((item) => text(item.status) === "available").length) },
       { label: "售后中", value: String(data.adminAfterSales.filter((item) => text(item.status) !== "closed").length) },
       { label: "待结算", value: String(data.settlements.filter((item) => text(item.status) !== "paid").length) }
     ];
@@ -855,9 +873,9 @@ function App() {
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
 
-  async function runAction(label: string, action: () => Promise<unknown>, refresh = true) {
+  async function runAction(label: string, action: () => Promise<unknown>, refresh = true, options: { skipConfirm?: boolean } = {}) {
     if (loading) return false;
-    if (requiresActionConfirmation(label) && !window.confirm(`${label}会写入后台数据并记录审计，确认继续？`)) {
+    if (!options.skipConfirm && requiresActionConfirmation(label) && !window.confirm(`${label}会写入后台数据并记录审计，确认继续？`)) {
       setMessage(`${label}已取消`);
       return false;
     }
@@ -981,6 +999,7 @@ function App() {
       stockCount: text(row.stockCount, ""),
       soldCount: text(row.soldCount, ""),
       fulfillmentMode: text(rule?.mode, "manual"),
+      credentialType: text(rule?.credentialType, "code"),
       supplyPriceCents: text(row.supplyPriceCents, ""),
       minSalePriceCents: text(row.minSalePriceCents, ""),
       suggestedSalePriceCents: text(row.suggestedSalePriceCents, ""),
@@ -1104,8 +1123,27 @@ function App() {
       setMessage(error);
       return;
     }
-    if (!window.confirm("确认保存平台商品详情？本次变更会写入审计，并只影响后续展示和新订单快照。")) return;
-    void runAction("保存平台商品详情", () => api.updatePlatformProduct(text(selectedPlatformProduct.id, ""), productForm));
+    const productId = text(selectedPlatformProduct.id, "");
+    setConfirmAction({
+      title: "确认保存平台商品详情",
+      description: "请先核对本次修改。确认后才会写入平台商品库，并影响后续展示、新订单快照和自动发货库存关联。",
+      confirmText: "确认修改",
+      actionLabel: "保存平台商品详情",
+      run: () => api.updatePlatformProduct(productId, platformProductUpdatePayload(selectedPlatformProduct, productForm)),
+      rows: platformProductChangeRows(selectedPlatformProduct, productForm, { changedOnly: true })
+    });
+  }
+
+  function uploadSelectedProductImage(file: File) {
+    void runAction("上传商品图片", async () => {
+      const result = await api.uploadProductImage({
+        filename: file.name,
+        contentType: file.type as "image/jpeg" | "image/png" | "image/webp",
+        dataBase64: await readFileAsBase64(file)
+      });
+      setProductForm((form) => ({ ...form, imageUrl: text(result.imageUrl, form.imageUrl) }));
+      return result;
+    }, false, { skipConfirm: true });
   }
 
   function submitPlatformShopProduct() {
@@ -1142,7 +1180,11 @@ function App() {
   }
 
   function submitRightsCodes() {
-    const precheck = precheckRightsCodes(inventoryForm.codes);
+    const selectedInventoryProduct = merchantSessionActive
+      ? selectedOwnMerchantProduct
+      : data.platformProducts.find((item) => text(item.id) === inventoryForm.productId) ?? data.platformProducts.find((item) => productFulfillmentMode(item) === "code_pool");
+    const credentialType = productCredentialType(selectedInventoryProduct);
+    const precheck = precheckRightsCodes(inventoryForm.codes, credentialType);
     setRightsPrecheck(precheck);
     const codes = precheck.validCodes;
     const targetProductId = merchantSessionActive ? text(selectedOwnMerchantProduct?.id, inventoryForm.productId.trim()) : inventoryForm.productId.trim();
@@ -1152,25 +1194,28 @@ function App() {
       return;
     }
     if (precheck.invalidRows.length > 0 || precheck.blankLines.length > 0 || precheck.duplicateCodes.length > 0) {
-      setMessage("卡密导入预检未通过：请先处理空行、重复或非法行。");
+      setMessage("库存导入预检未通过：请先处理空行、重复或格式错误的行。");
       return;
     }
-    void runAction("导入卡密", () => merchantSessionActive
+    void runAction("导入自动发货库存", () => merchantSessionActive
       ? api.importMerchantRightsCodes({
         merchantProductListingId: targetProductId,
         batchNo: inventoryForm.batchNo.trim(),
-        codes
+        codes,
+        credentialType
       })
       : api.importRightsCodes({
         productId: targetProductId,
         batchNo: inventoryForm.batchNo.trim(),
-        codes
+        codes,
+        credentialType
       }));
   }
 
   function submitSelectedPlatformRightsCodes() {
     const productId = text(selectedPlatformProduct?.id, "");
-    const precheck = precheckRightsCodes(inventoryForm.codes);
+    const credentialType = productCredentialType(selectedPlatformProduct);
+    const precheck = precheckRightsCodes(inventoryForm.codes, credentialType);
     setRightsPrecheck(precheck);
     const error = validateRightsCodeForm(productId, inventoryForm.batchNo, precheck.validCodes);
     if (error) {
@@ -1178,19 +1223,20 @@ function App() {
       return;
     }
     if (precheck.invalidRows.length > 0 || precheck.blankLines.length > 0 || precheck.duplicateCodes.length > 0) {
-      setMessage("卡密导入预检未通过：请先处理空行、重复或非法行。");
+      setMessage("库存导入预检未通过：请先处理空行、重复或格式错误的行。");
       return;
     }
-    void runAction("商品详情卡密导入", () => api.importRightsCodes({
+    void runAction("商品详情库存导入", () => api.importRightsCodes({
       productId,
       batchNo: inventoryForm.batchNo.trim(),
-      codes: precheck.validCodes
+      codes: precheck.validCodes,
+      credentialType
     }));
   }
 
-  async function revealRightsCodes(label = "查看明文", filters: { productId?: string; orderNo?: string; status?: string } = {}) {
+  async function revealRightsCodes(label = "查看完整库存内容", filters: { productId?: string; orderNo?: string; status?: string } = {}) {
     if (loading) return;
-    if (!window.confirm(`${label}会读取敏感卡密并写入审计，请确认当前账号有权限且业务需要。`)) {
+    if (!window.confirm(`${label}会读取完整兑换码、卡密或账号密码，并写入审计。请确认当前账号有权限且业务需要。`)) {
       setMessage(`${label}已取消`);
       return;
     }
@@ -1201,8 +1247,8 @@ function App() {
       const rows = await api.rightsCodesPlaintext(filters);
       setSensitiveRightsCodes(rows);
       setShowSensitiveCodes(true);
-      if (label === "导出明文") downloadCsv("rights-codes-plaintext.csv", rows, ["codeId", "productId", "batchNo", "status", "orderNo", "code"]);
-      setMessage(`${label}已触发；生产环境需确认当前账号具备卡密明文权限，并在后端审计中保留查看/导出原因。`);
+      if (label === "下载完整库存表") downloadCsv("rights-codes-full.csv", rows, ["codeId", "productId", "credentialType", "batchNo", "status", "orderNo", "code", "account", "password", "note"]);
+      setMessage(`${label}已完成；完整库存内容属于敏感数据，本次查看/下载会在后端审计中留痕。`);
     } catch (error) {
       setMessage(`${label}失败：${error instanceof Error ? error.message : "未知错误"}`);
     } finally {
@@ -1213,21 +1259,38 @@ function App() {
 
   function exportMaskedRightsCodes(filename: string, rows: JsonRecord[], columns: string[]) {
     if (loading) return;
-    if (!window.confirm("确认导出脱敏卡密列表？导出文件只能用于库存核对。")) {
-      setMessage("导出脱敏已取消");
+    if (!window.confirm("确认导出库存核对表？文件只包含内容预览，不包含完整兑换码、卡密或账号密码。")) {
+      setMessage("导出库存核对表已取消");
       return;
     }
     setLoading(true);
-    setActionLabel("导出脱敏");
+    setActionLabel("导出库存核对表");
     try {
       downloadCsv(filename, rows, columns);
-      setMessage("导出脱敏成功");
+      setMessage("导出库存核对表成功");
     } catch (error) {
-      setMessage(`导出脱敏失败：${error instanceof Error ? error.message : "未知错误"}`);
+      setMessage(`导出库存核对表失败：${error instanceof Error ? error.message : "未知错误"}`);
     } finally {
       setLoading(false);
       setActionLabel("");
     }
+  }
+
+  function downloadRightsCodeTemplate(productId = inventoryForm.productId || text(selectedPlatformProduct?.id, ""), credentialType = "code") {
+    const common = { productId: productId || "从商品详情或下拉选择商品后自动带入", batchNo: "batch-20260602-001" };
+    if (credentialType === "account_password") {
+      downloadCsv("account-password-import-template.csv", [
+        { ...common, account: "user1@example.com", password: "pass123456", note: "月卡" },
+        { ...common, account: "user2@example.com", password: "pass654321", note: "备用账号" }
+      ], ["productId", "batchNo", "account", "password", "note"]);
+      setMessage("已下载账号密码导入模板：每行一组账号和密码，导入前请先预检。");
+      return;
+    }
+    downloadCsv("credential-code-import-template.csv", [
+      { ...common, credential: "CARD-EXAMPLE-001" },
+      { ...common, credential: "CARD-EXAMPLE-002" }
+    ], ["productId", "batchNo", "credential"]);
+      setMessage("已下载兑换码/卡密导入模板：一行一个兑换码或卡密，导入前请先预检。");
   }
 
   function submitOwnProductReviewDecision(approved: boolean) {
@@ -1471,6 +1534,15 @@ function App() {
     void runAction("扣减保证金", () => api.deductDeposit(currentMerchantId, depositDeductCents));
   }
 
+  function submitChannelRelation() {
+    if (!channelRelationForm.firstTierMerchantId.trim() || !channelRelationForm.secondTierMerchantId.trim()) {
+      setMessage("请填写一级商户ID和二级商户ID。三级商户ID可选。");
+      return;
+    }
+    const label = channelRelationForm.thirdTierMerchantId.trim() ? "创建三级供货关系" : "创建二级供货关系";
+    void runAction(label, () => api.createChannelRelation(channelRelationForm));
+  }
+
   function submitChannelOffer(label: string) {
     const error = validatePositiveCents(channelOfferCents, "转供价");
     if (error) {
@@ -1480,6 +1552,10 @@ function App() {
     if (merchantSessionActive) {
       void runAction(label, () => api.upsertMerchantChannelOffer(downstreamMerchantId, currentPlatformProductId, channelOfferCents));
     } else {
+      if (!currentChannelRelationId || !currentPlatformProductId) {
+        setMessage("请先选择供货关系和平台商品。");
+        return;
+      }
       void runAction(label, () => api.upsertChannelOffer(currentChannelRelationId, currentPlatformProductId, channelOfferCents));
     }
   }
@@ -1532,7 +1608,7 @@ function App() {
               <section className="quick-grid">
                 <button type="button" onClick={() => switchModule("orders")}>处理订单</button>
                 <button type="button" onClick={() => switchModule("shops")}>配置收款码</button>
-                <button type="button" onClick={() => switchModule("inventory")}>导入卡密</button>
+                <button type="button" onClick={() => switchModule("inventory")}>添加自动发货库存</button>
                 <button type="button" onClick={() => switchModule("products")}>新增商品</button>
                 <button className="secondary" type="button" onClick={() => switchModule("sales")}>查看经营数据</button>
               </section>
@@ -1592,7 +1668,8 @@ function App() {
                   <label>商品说明<textarea value={productForm.description} onChange={(event) => setProductForm({ ...productForm, description: event.target.value })} rows={3} /></label>
                   <label>使用说明<textarea value={productForm.usageGuide} onChange={(event) => setProductForm({ ...productForm, usageGuide: event.target.value })} rows={3} /></label>
                   <label>详情模块<textarea value={productForm.detailSections} onChange={(event) => setProductForm({ ...productForm, detailSections: event.target.value })} rows={5} placeholder="标题：内容一；内容二" /></label>
-                  <label>发货方式<select value={productForm.fulfillmentMode} onChange={(event) => setProductForm({ ...productForm, fulfillmentMode: event.target.value })}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发码</option></select></label>
+                  <label>发货方式<select value={productForm.fulfillmentMode} onChange={(event) => setProductForm({ ...productForm, fulfillmentMode: event.target.value })}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发库存凭证</option></select></label>
+                  {productForm.fulfillmentMode === "code_pool" ? <label>凭证类型<select value={productForm.credentialType} onChange={(event) => setProductForm({ ...productForm, credentialType: event.target.value })}><option value="code">兑换码/卡密</option><option value="account_password">账号密码</option></select></label> : null}
                   <label>商品状态<select value={productForm.status} onChange={(event) => setProductForm({ ...productForm, status: event.target.value })}><option value="active">上架</option><option value="listed">上架中</option><option value="disabled">下架</option><option value="frozen">冻结</option></select></label>
                   <label>库存<input inputMode="numeric" value={productForm.stockCount} onChange={(event) => setProductForm({ ...productForm, stockCount: event.target.value })} placeholder="必填，非负整数" /></label>
                   <label>销量<input inputMode="numeric" value={productForm.soldCount} onChange={(event) => setProductForm({ ...productForm, soldCount: event.target.value })} placeholder="选填，非负整数" /></label>
@@ -1601,12 +1678,12 @@ function App() {
                   <label>建议售价(分)<input inputMode="numeric" value={productForm.suggestedSalePriceCents} onChange={(event) => setProductForm({ ...productForm, suggestedSalePriceCents: event.target.value })} placeholder="必填，不低于最低售价" /></label>
                 </div>
                 <div className="actions">
-                  <button onClick={selectedPlatformProduct ? submitPlatformProductUpdate : submitPlatformProduct}>{selectedPlatformProduct ? "确认保存详情" : "保存并入库"}</button>
-                  {selectedPlatformProduct ? <button className="secondary" type="button" onClick={() => { setSelectedPlatformProduct(undefined); setMessage("已退出商品详情编辑"); }}>退出详情</button> : null}
-                  {productForm.fulfillmentMode === "code_pool" && selectedPlatformProduct ? <button className="secondary" type="button" onClick={() => { setInventoryForm((current) => ({ ...current, productId: text(selectedPlatformProduct.id, current.productId) })); switchModule("inventory"); }}>进入卡密池</button> : null}
+                  <button disabled={loading} onClick={selectedPlatformProduct ? submitPlatformProductUpdate : submitPlatformProduct}>{loading ? "处理中..." : selectedPlatformProduct ? "确认保存详情" : "保存并入库"}</button>
+                  {selectedPlatformProduct ? <button className="secondary" type="button" disabled={loading} onClick={() => { setSelectedPlatformProduct(undefined); setMessage("已退出商品详情编辑"); }}>退出详情</button> : null}
+                  {productForm.fulfillmentMode === "code_pool" && selectedPlatformProduct ? <button className="secondary" type="button" disabled={loading} onClick={() => { setInventoryForm((current) => ({ ...current, productId: text(selectedPlatformProduct.id, current.productId) })); switchModule("inventory"); }}>进入自动发货库存</button> : null}
                   {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
                 </div>
-                {productForm.fulfillmentMode === "manual" ? <p className="hint">人工交付商品不显示卡密池入口；请维护商品说明、使用说明和店铺客服信息。</p> : null}
+                {productForm.fulfillmentMode === "manual" ? <p className="hint">人工交付商品不能导入自动发货库存；请维护商品说明、使用说明和店铺客服信息。</p> : null}
               </Panel>
             )}
               {!merchantSessionActive ? (
@@ -1631,49 +1708,49 @@ function App() {
             <Panel title="平台商品库" kicker={`${data.platformProducts.length} 个商品`}>
               {merchantSessionActive
                 ? <MerchantListingTable products={data.platformProducts} merchantProducts={data.merchantProducts} onPick={pickListingPlatformProduct} blocked={merchantBlocked || loading} tier={currentMerchantTier} loading={loading && actionLabel.includes("店铺商品")} />
-                : <Table rows={data.platformProducts} columns={platformProductColumns} moneyColumns={["supplyPriceCents", "visibleUpstreamSupplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents"]} onPick={pickPlatformProduct} />}
+                : <ProductCatalogList products={data.platformProducts} rightsCodes={data.rightsCodes} merchantProducts={data.merchantProducts} channels={data.channels} onPick={pickPlatformProduct} />}
             </Panel>
             {!merchantSessionActive ? (
               <Panel title="平台自营已上架" kicker={`${data.platformShopProducts.length} 个商品`}>
-                <Table rows={platformShopProductRows(data.platformShopProducts)} columns={["id", "productName", "shopName", "salePriceCents", "fulfillmentCostCents", "status"]} moneyColumns={["salePriceCents", "fulfillmentCostCents"]} onPick={(row) => {
-                  const source = data.platformShopProducts.find((item) => text(item.id) === text(row.id)) ?? row;
-                  pickPlatformShopProduct(source);
-                }} />
+                <PlatformShopProductTable
+                  rows={platformShopProductRows(data.platformShopProducts)}
+                  onPick={(row) => {
+                    const source = data.platformShopProducts.find((item) => text(item.id) === text(row.id)) ?? row;
+                    pickPlatformShopProduct(source);
+                  }}
+                />
               </Panel>
             ) : null}
             <Panel title="店铺已上架商品" kicker={`${data.merchantProducts.length} 个商品`}>
             <Table rows={merchantProductRows(data.merchantProducts)} columns={merchantProductColumns} moneyColumns={["salePriceCents", "supplyPriceCents", "platformSupplyPriceCents", "visibleUpstreamSupplyPriceCents", "minSalePriceCents"]} onPick={merchantSessionActive ? pickListedMerchantProduct : (row) => setSelectedMerchantProductOverride(data.merchantProducts.find((item) => text(item.id) === text(row.id)) ?? row)} />
           </Panel>
-          <Panel title={merchantSessionActive ? "新增自有商品" : "商户自有商品审核"} kicker={merchantSessionActive ? "提交平台审核" : "平台审核"}>
-            {merchantSessionActive ? (
+          {merchantSessionActive ? (
+            <Panel title="新增自有商品" kicker="提交平台审核">
               <p className="hint">这里发布你自己供货的商品，提交后等平台审核；平台供货商品请在上方“平台商品库”选择。</p>
-            ) : (
-              <p className="hint">这里处理商户自己提交的商品审核；平台店铺商品不走这个入口。</p>
-            )}
-            <div className="actions">
-              {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
-              <div className="form-grid wide">
-                <label>商品名称<input value={ownProductForm.name} onChange={(event) => setOwnProductForm({ ...ownProductForm, name: event.target.value })} /></label>
-                <label>类目<input value={ownProductForm.category} onChange={(event) => setOwnProductForm({ ...ownProductForm, category: event.target.value })} /></label>
-                <label>标签<input value={ownProductForm.tags} onChange={(event) => setOwnProductForm({ ...ownProductForm, tags: event.target.value })} placeholder="逗号分隔" /></label>
-                <label>商品图<input value={ownProductForm.imageUrl} onChange={(event) => setOwnProductForm({ ...ownProductForm, imageUrl: event.target.value })} placeholder="https://..." /></label>
-                <label className="span-2">商品说明<textarea rows={3} value={ownProductForm.description} onChange={(event) => setOwnProductForm({ ...ownProductForm, description: event.target.value })} /></label>
-                <label className="span-2">使用/人工交付说明<textarea rows={3} value={ownProductForm.usageGuide} onChange={(event) => setOwnProductForm({ ...ownProductForm, usageGuide: event.target.value })} placeholder="manual 商品请填写人工交付说明，不得填写批量卡密明文" /></label>
-                <label>售价(分)<input value={ownProductForm.salePriceCents} onChange={(event) => setOwnProductForm({ ...ownProductForm, salePriceCents: event.target.value })} /></label>
-                <label>最低价(分)<input value={ownProductForm.minSalePriceCents} onChange={(event) => setOwnProductForm({ ...ownProductForm, minSalePriceCents: event.target.value })} /></label>
-                <label>交付方式<select value={ownProductForm.fulfillmentMode} onChange={(event) => setOwnProductForm({ ...ownProductForm, fulfillmentMode: event.target.value })}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发码</option></select></label>
+              <div className="actions">
+                {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
+                <div className="form-grid wide">
+                  <label>商品名称<input value={ownProductForm.name} onChange={(event) => setOwnProductForm({ ...ownProductForm, name: event.target.value })} /></label>
+                  <label>类目<input value={ownProductForm.category} onChange={(event) => setOwnProductForm({ ...ownProductForm, category: event.target.value })} /></label>
+                  <label>标签<input value={ownProductForm.tags} onChange={(event) => setOwnProductForm({ ...ownProductForm, tags: event.target.value })} placeholder="逗号分隔" /></label>
+                  <label>商品图<input value={ownProductForm.imageUrl} onChange={(event) => setOwnProductForm({ ...ownProductForm, imageUrl: event.target.value })} placeholder="https://..." /></label>
+                  <label className="span-2">商品说明<textarea rows={3} value={ownProductForm.description} onChange={(event) => setOwnProductForm({ ...ownProductForm, description: event.target.value })} /></label>
+                  <label className="span-2">使用/人工交付说明<textarea rows={3} value={ownProductForm.usageGuide} onChange={(event) => setOwnProductForm({ ...ownProductForm, usageGuide: event.target.value })} placeholder="人工交付商品请填写交付说明，不要在这里填写完整兑换码、卡密或账号密码" /></label>
+                  <label>售价(分)<input value={ownProductForm.salePriceCents} onChange={(event) => setOwnProductForm({ ...ownProductForm, salePriceCents: event.target.value })} /></label>
+                  <label>最低价(分)<input value={ownProductForm.minSalePriceCents} onChange={(event) => setOwnProductForm({ ...ownProductForm, minSalePriceCents: event.target.value })} /></label>
+                  <label>交付方式<select value={ownProductForm.fulfillmentMode} onChange={(event) => setOwnProductForm({ ...ownProductForm, fulfillmentMode: event.target.value })}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发库存凭证</option></select></label>
+                  {ownProductForm.fulfillmentMode === "code_pool" ? <label>凭证类型<select value={ownProductForm.credentialType} onChange={(event) => setOwnProductForm({ ...ownProductForm, credentialType: event.target.value })}><option value="code">兑换码/卡密</option><option value="account_password">账号密码</option></select></label> : null}
+                </div>
+                <button disabled={merchantBlocked || !ownProductForm.name || !ownProductForm.salePriceCents || !ownProductForm.fulfillmentMode} onClick={() => void runAction("提交自有商品审核", () => api.submitOwnProduct(ownProductForm))}>提交审核</button>
               </div>
-              <button disabled={merchantBlocked || !ownProductForm.name || !ownProductForm.salePriceCents || !ownProductForm.fulfillmentMode} onClick={() => void runAction("提交自有商品审核", () => api.submitOwnProduct(ownProductForm))}>提交审核</button>
-              {merchantSessionActive ? null : (
-                <>
-                  <button disabled={!selectedOwnProduct?.id} onClick={() => setSelectedOwnProductReview(selectedOwnProduct)}>打开审核详情</button>
-                  <button className="secondary" disabled={!selectedOwnProduct?.id} onClick={() => submitOwnProductReviewDecision(false)}>拒绝当前详情</button>
-                </>
-              )}
-            </div>
-            <Table rows={data.ownProducts} columns={["id", "name", "salePriceCents", "minSalePriceCents", "fulfillmentMode", "reviewStatus", "status"]} moneyColumns={["salePriceCents", "minSalePriceCents"]} onPick={merchantSessionActive ? undefined : pickOwnProductReview} />
-            {!merchantSessionActive ? <p className="hint">平台后台通过商户自有商品审核接口拉取审核队列，审核动作由后端 RBAC 校验 product.manage 并写入审计。</p> : null}
-          </Panel>
+              <Table rows={data.ownProducts} columns={["id", "name", "salePriceCents", "minSalePriceCents", "fulfillmentMode", "reviewStatus", "status"]} moneyColumns={["salePriceCents", "minSalePriceCents"]} />
+            </Panel>
+          ) : (
+            <Panel title="商品审核" kicker={`${data.ownProducts.length} 条`}>
+              <p className="hint">这里审核各级商户提交的自有商品。平台自营商品和平台供货商品不走这个入口。</p>
+              <OwnProductReviewTable rows={data.ownProducts} onPick={pickOwnProductReview} />
+            </Panel>
+          )}
           {!merchantSessionActive && selectedPlatformProduct ? (
             <PlatformProductDrawer
               product={selectedPlatformProduct}
@@ -1682,16 +1759,22 @@ function App() {
               tab={productDetailTab}
               setTab={setProductDetailTab}
               rightsCodes={data.rightsCodes.filter((item) => text(item.productId) === text(selectedPlatformProduct.id) || text(item.platformProductId) === text(selectedPlatformProduct.id))}
+              relatedMerchantProducts={data.merchantProducts.filter((item) => text(item.platformProductId) === text(selectedPlatformProduct.id))}
+              channelRelations={channelRows(data.channels, "relations")}
+              channelOffers={channelRows(data.channels, "offers").filter((item) => text(item.platformProductId) === text(selectedPlatformProduct.id))}
               inventoryForm={inventoryForm}
               setInventoryForm={setInventoryForm}
               precheck={rightsPrecheck}
-              onPrecheck={() => setRightsPrecheck(precheckRightsCodes(inventoryForm.codes))}
+              onPrecheck={() => setRightsPrecheck(precheckRightsCodes(inventoryForm.codes, productCredentialType(selectedPlatformProduct)))}
               onImport={submitSelectedPlatformRightsCodes}
+              onDownloadTemplate={() => downloadRightsCodeTemplate(text(selectedPlatformProduct.id), productCredentialType(selectedPlatformProduct))}
+              onUploadImage={uploadSelectedProductImage}
               onSave={submitPlatformProductUpdate}
+              busy={loading}
               onClose={() => setSelectedPlatformProduct(undefined)}
-              onReveal={() => void revealRightsCodes("查看明文", { productId: text(selectedPlatformProduct.id) })}
-              onExportPlain={() => void revealRightsCodes("导出明文", { productId: text(selectedPlatformProduct.id) })}
-              onExportMasked={() => exportMaskedRightsCodes("rights-codes-masked.csv", data.rightsCodes.filter((item) => text(item.productId) === text(selectedPlatformProduct.id) || text(item.platformProductId) === text(selectedPlatformProduct.id)), ["codeId", "productId", "batchNo", "status", "orderNo", "codePreview"])}
+              onReveal={() => void revealRightsCodes("查看完整库存内容", { productId: text(selectedPlatformProduct.id) })}
+              onExportPlain={() => void revealRightsCodes("下载完整库存表", { productId: text(selectedPlatformProduct.id) })}
+              onExportMasked={() => exportMaskedRightsCodes("rights-codes-masked.csv", data.rightsCodes.filter((item) => text(item.productId) === text(selectedPlatformProduct.id) || text(item.platformProductId) === text(selectedPlatformProduct.id)), ["codeId", "productId", "credentialType", "batchNo", "status", "orderNo", "codePreview"])}
             />
           ) : null}
           {!merchantSessionActive && selectedOwnProductReview ? (
@@ -1708,61 +1791,92 @@ function App() {
 
     if (active === "inventory") {
       if (merchantSessionActive) {
+        const credentialType = productCredentialType(selectedOwnMerchantProduct);
         return (
-          <Module title="库存卡密" subtitle="商户自有自动发码商品的库存管理">
+          <Module title="自动发货库存" subtitle="管理付款后自动发给客户的兑换码、卡密或账号密码">
             <section className="split">
-              <Panel title="导入自有商品卡密" kicker="商户库存">
-                <p className="hint">只能给本商户已审核通过、且交付方式为自动发码的自有商品导入；列表默认脱敏，不提供商户明文查看。</p>
-                <div className="form-grid wide">
-                  <label>自有上架商品
-                    <select value={text(selectedOwnMerchantProduct?.id, "")} onChange={(event) => setInventoryForm({ ...inventoryForm, productId: event.target.value })}>
+                <Panel title="添加自有商品库存" kicker="商户库存">
+                  <p className="hint">只能给本商户已审核通过、且发货方式为自动发库存凭证的自有商品添加；列表默认只显示内容预览，商户不能查看完整库存内容。</p>
+                  <ProductInventorySummary product={selectedOwnMerchantProduct} rightsCodes={data.rightsCodes.filter((item) => text(item.productId) === text(selectedOwnMerchantProduct?.id) || text(item.merchantProductId) === text(selectedOwnMerchantProduct?.id))} />
+                  <p className="hint">当前商品按“{credentialTypeText(credentialType)}”导入。要改成账号密码自动发货，请到商品管理打开这个商品，在发货方式里选择“自动发库存凭证”，再把凭证类型改成“账号密码”。</p>
+                  <div className="form-grid wide">
+                    <label>自有上架商品
+                      <select value={text(selectedOwnMerchantProduct?.id, "")} onChange={(event) => setInventoryForm({ ...inventoryForm, productId: event.target.value })}>
                       {data.merchantProducts.filter((item) => text(item.productType) === "merchant_owned").map((item) => (
                         <option key={text(item.id)} value={text(item.id)}>{text((item.product as JsonRecord | undefined)?.name, text(item.id))}</option>
                       ))}
                     </select>
                   </label>
                   <label>批次号<input value={inventoryForm.batchNo} onChange={(event) => setInventoryForm({ ...inventoryForm, batchNo: event.target.value })} /></label>
-                  <label className="span-2">卡密/账号<textarea value={inventoryForm.codes} onChange={(event) => setInventoryForm({ ...inventoryForm, codes: event.target.value })} rows={6} placeholder="一行一个卡密/账号" /></label>
-                </div>
-                <button disabled={!selectedOwnMerchantProduct?.id || merchantBlocked} onClick={submitRightsCodes}>导入库存</button>
-              </Panel>
-              <Panel title="库存概况" kicker="脱敏">
-                <KeyValue label="卡密总数" value={String(data.rightsCodes.length)} />
-                <KeyValue label="可用" value={String(data.rightsCodes.filter((item) => text(item.status) === "available").length)} />
-                <KeyValue label="已发放" value={String(data.rightsCodes.filter((item) => text(item.status) === "issued").length)} />
+                    <label className="span-2">{credentialInputLabel(credentialType)}<textarea value={inventoryForm.codes} onChange={(event) => setInventoryForm({ ...inventoryForm, codes: event.target.value })} rows={6} placeholder={credentialInputPlaceholder(credentialType)} /></label>
+                  </div>
+                  <div className="actions">
+                    <button className="secondary" type="button" disabled={loading} onClick={() => switchModule("products")}>去商品管理设置凭证类型</button>
+                    <button className="secondary" type="button" disabled={loading} onClick={() => downloadRightsCodeTemplate(text(selectedOwnMerchantProduct?.id, inventoryForm.productId), credentialType)}>下载导入模板</button>
+                    <button disabled={loading || !selectedOwnMerchantProduct?.id || merchantBlocked} onClick={submitRightsCodes}>{loading ? "导入中..." : "添加库存"}</button>
+                  </div>
+                </Panel>
+              <Panel title="当前库存" kicker="实时">
+                <KeyValue label="库存总数" value={String(data.rightsCodes.length)} />
+                <KeyValue label="可发给客户" value={String(data.rightsCodes.filter((item) => text(item.status) === "available").length)} />
+                <KeyValue label="已发给客户" value={String(data.rightsCodes.filter((item) => text(item.status) === "issued").length)} />
               </Panel>
             </section>
-            <Panel title="自有卡密明细" kicker="默认脱敏">
-              <Table rows={data.rightsCodes.slice(0, 12)} columns={["codeId", "productId", "codePreview", "batchNo", "status", "orderNo"]} />
+            <Panel title="自有库存明细" kicker="默认保护完整内容">
+              <RightsCodeTable
+                rows={data.rightsCodes}
+                showSensitiveCodes={false}
+                sensitiveRows={[]}
+                canReveal={false}
+                hideActions
+              />
             </Panel>
           </Module>
         );
       }
+      const selectedInventoryProduct = data.platformProducts.find((item) => text(item.id) === inventoryForm.productId) ?? data.platformProducts.find((item) => productFulfillmentMode(item) === "code_pool");
+      const credentialType = productCredentialType(selectedInventoryProduct);
       return (
-        <Module title="库存卡密" subtitle="自动发码商品的卡密导入、库存和发放状态">
-          <section className="split">
-            <Panel title="导入卡密" kicker="库存">
-              <div className="form-grid wide">
-                <label>商品ID<input value={inventoryForm.productId} onChange={(event) => setInventoryForm({ ...inventoryForm, productId: event.target.value })} /></label>
-                <label>批次号<input value={inventoryForm.batchNo} onChange={(event) => setInventoryForm({ ...inventoryForm, batchNo: event.target.value })} /></label>
-                <label className="span-2">卡密/账号<textarea value={inventoryForm.codes} onChange={(event) => setInventoryForm({ ...inventoryForm, codes: event.target.value })} rows={6} placeholder="一行一个卡密/账号，必填" /></label>
-              </div>
-              <button onClick={submitRightsCodes}>导入库存</button>
-            </Panel>
-            <Panel title="库存概况" kicker="实时">
-              <KeyValue label="卡密总数" value={String(data.rightsCodes.length)} />
-              <KeyValue label="可用" value={String(data.rightsCodes.filter((item) => text(item.status) === "available").length)} />
-              <KeyValue label="已发放" value={String(data.rightsCodes.filter((item) => text(item.status) === "issued").length)} />
+          <Module title="自动发货库存" subtitle="管理付款后自动发给客户的兑换码、卡密或账号密码">
+            <section className="split">
+              <Panel title="添加自动发货库存" kicker="库存">
+                <ProductInventorySummary product={selectedInventoryProduct} rightsCodes={data.rightsCodes.filter((item) => text(item.productId) === inventoryForm.productId || text(item.platformProductId) === inventoryForm.productId)} />
+                <p className="hint">当前商品按“{credentialTypeText(credentialType)}”导入。要改成账号密码自动发货，请到商品管理打开这个商品，在“基础与价格”里选择发货方式“自动发库存凭证”，再把凭证类型改成“账号密码”。</p>
+                <div className="form-grid wide">
+                  <label>选择商品
+                    <select value={inventoryForm.productId || text(data.platformProducts.find((item) => productFulfillmentMode(item) === "code_pool")?.id, "")} onChange={(event) => setInventoryForm({ ...inventoryForm, productId: event.target.value })}>
+                      {data.platformProducts.filter((item) => productFulfillmentMode(item) === "code_pool").map((item) => (
+                        <option key={text(item.id)} value={text(item.id)}>{text(item.name, text(item.id))} · {credentialTypeText(productCredentialType(item))}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>批次号<input value={inventoryForm.batchNo} onChange={(event) => setInventoryForm({ ...inventoryForm, batchNo: event.target.value })} /></label>
+                  <label className="span-2">{credentialInputLabel(credentialType)}<textarea value={inventoryForm.codes} onChange={(event) => setInventoryForm({ ...inventoryForm, codes: event.target.value })} rows={6} placeholder={credentialInputPlaceholder(credentialType)} /></label>
+                </div>
+                <div className="actions">
+                  <button className="secondary" type="button" disabled={loading} onClick={() => switchModule("products")}>去商品管理设置凭证类型</button>
+                  <button className="secondary" type="button" disabled={loading} onClick={() => downloadRightsCodeTemplate(inventoryForm.productId, credentialType)}>下载导入模板</button>
+                  <button disabled={loading || !inventoryForm.batchNo.trim() || !inventoryForm.codes.trim()} onClick={submitRightsCodes}>{loading ? "导入中..." : "添加库存"}</button>
+                </div>
+              </Panel>
+            <Panel title="当前库存" kicker="实时">
+              <KeyValue label="库存总数" value={String(data.rightsCodes.length)} />
+              <KeyValue label="可发给客户" value={String(data.rightsCodes.filter((item) => text(item.status) === "available").length)} />
+              <KeyValue label="已发给客户" value={String(data.rightsCodes.filter((item) => text(item.status) === "issued").length)} />
             </Panel>
           </section>
-          <Panel title="卡密明细" kicker="默认脱敏">
-            <p className="hint">默认只展示批次、状态、商品和订单归属；查看或导出明文需单独操作并按审计要求留痕。</p>
-            <div className="actions">
-              <button className="secondary" disabled={loading} onClick={() => exportMaskedRightsCodes("rights-codes-masked.csv", data.rightsCodes, ["codeId", "productId", "batchNo", "status", "orderNo", "codePreview"])}>导出脱敏</button>
-              <button className="secondary" onClick={() => void revealRightsCodes()}>查看明文</button>
-              <button className="secondary" onClick={() => void revealRightsCodes("导出明文")}>导出明文</button>
-            </div>
-            <Table rows={(showSensitiveCodes ? sensitiveRightsCodes : data.rightsCodes).slice(0, 12)} columns={showSensitiveCodes ? ["codeId", "productId", "batchNo", "status", "orderNo", "code"] : ["codeId", "productId", "batchNo", "status", "orderNo"]} />
+          <Panel title="库存明细" kicker="默认保护完整内容">
+            <p className="hint">默认只展示内容预览。库存核对表不包含完整兑换码、卡密或账号密码；查看或下载完整库存内容会写入审计。</p>
+            <RightsCodeTable
+              rows={data.rightsCodes}
+              showSensitiveCodes={showSensitiveCodes}
+              sensitiveRows={sensitiveRightsCodes}
+              canReveal
+              loading={loading}
+              onExportMasked={(rows) => exportMaskedRightsCodes("rights-codes-inventory-check.csv", rows, ["codeId", "productId", "credentialType", "batchNo", "status", "orderNo", "codePreview"])}
+              onReveal={(filters) => void revealRightsCodes("查看完整库存内容", filters)}
+              onExportPlain={(filters) => void revealRightsCodes("下载完整库存表", filters)}
+            />
           </Panel>
         </Module>
       );
@@ -1871,7 +1985,7 @@ function App() {
 
     if (active === "fulfillment") {
       return (
-        <Module title="发货管理" subtitle="自动发码和人工交付都在这里处理">
+        <Module title="发货管理" subtitle="自动发货和人工交付都在这里处理">
           <section className="split">
             <Panel title="发货操作" kicker="履约">
               <KeyValue label="订单" value={selectedOrderNo || "暂无订单"} />
@@ -2088,11 +2202,24 @@ function App() {
             <div className="actions">
               {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
               <button disabled={merchantBlocked || !currentMerchantId} onClick={() => void runAction("开通下级供货能力", () => api.reviewChannel(currentMerchantId))}>开通能力</button>
-              <button className="secondary" disabled={merchantBlocked || !currentMerchantId || !peerMerchantId} onClick={() => void runAction("创建二级关系", () => api.createChannelRelation(currentMerchantId, peerMerchantId))}>绑定一级/二级</button>
-              <label>转供价(分)<input inputMode="numeric" value={channelOfferCents} onChange={(event) => setChannelOfferCents(event.target.value)} placeholder="必填" /></label>
-              <button className="secondary" disabled={merchantBlocked || !currentChannelRelationId || !currentPlatformProductId} onClick={() => submitChannelOffer("配置转供价")}>配置转供价</button>
+              <label>一级商户ID<input value={channelRelationForm.firstTierMerchantId} onChange={(event) => setChannelRelationForm({ ...channelRelationForm, firstTierMerchantId: event.target.value })} placeholder={currentMerchantId || "M1 merchantId"} /></label>
+              <label>二级商户ID<input value={channelRelationForm.secondTierMerchantId} onChange={(event) => setChannelRelationForm({ ...channelRelationForm, secondTierMerchantId: event.target.value })} placeholder={peerMerchantId || "M2 merchantId"} /></label>
+              <label>三级商户ID<input value={channelRelationForm.thirdTierMerchantId} onChange={(event) => setChannelRelationForm({ ...channelRelationForm, thirdTierMerchantId: event.target.value })} placeholder="选填，M3 merchantId" /></label>
+              <button className="secondary" disabled={merchantBlocked || !channelRelationForm.firstTierMerchantId.trim() || !channelRelationForm.secondTierMerchantId.trim()} onClick={submitChannelRelation}>绑定供货关系</button>
             </div>
-            <Table rows={channelRows(data.channels, "relations")} columns={["id", "firstTierMerchantId", "secondTierMerchantId", "status"]} />
+            <ChannelOfferEditor
+              relations={channelRows(data.channels, "relations")}
+              products={data.platformProducts}
+              selectedRelationId={currentChannelRelationId}
+              selectedProductId={currentPlatformProductId}
+              priceCents={channelOfferCents}
+              setSelectedRelationId={setSelectedChannelRelationId}
+              setSelectedProductId={setSelectedChannelProductId}
+              setPriceCents={setChannelOfferCents}
+              disabled={merchantBlocked}
+              onSubmit={() => submitChannelOffer("配置转供价")}
+            />
+            <Table rows={channelRows(data.channels, "relations")} columns={["id", "firstTierMerchantId", "secondTierMerchantId", "thirdTierMerchantId", "status"]} />
             <Table rows={channelRows(data.channels, "offers")} columns={["id", "channelRelationId", "platformProductId", "resellSupplyPriceCents", "status"]} moneyColumns={["resellSupplyPriceCents"]} />
           </Panel>
         </Module>
@@ -2132,6 +2259,13 @@ function App() {
                 {canConfigureDownstreamOffer ? (
                   <div className="inline-form">
                     <label>下游商户ID<input value={downstreamMerchantId} onChange={(event) => setDownstreamMerchantId(event.target.value)} placeholder={currentMerchantTier === "first_tier" ? "二级商户ID" : "三级商户ID"} /></label>
+                    <label>平台商品
+                      <select value={currentPlatformProductId} onChange={(event) => setSelectedChannelProductId(event.target.value)}>
+                        {data.platformProducts.map((product) => (
+                          <option key={text(product.id)} value={text(product.id)}>{text(product.name, text(product.id))}</option>
+                        ))}
+                      </select>
+                    </label>
                     <label>转供价(分)<input inputMode="numeric" value={channelOfferCents} onChange={(event) => setChannelOfferCents(event.target.value)} placeholder="必填" /></label>
                     <button className="secondary" disabled={merchantBlocked || !downstreamMerchantId.trim() || !currentPlatformProductId} onClick={() => submitChannelOffer("配置商户转供价")}>配置转供价</button>
                   </div>
@@ -2153,11 +2287,24 @@ function App() {
               <div className="actions">
                 {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
                 <button disabled={merchantBlocked || !currentMerchantId} onClick={() => void runAction("开通下级供货能力", () => api.reviewChannel(currentMerchantId))}>开通二级供货能力</button>
-                <button className="secondary" disabled={merchantBlocked || !currentMerchantId || !peerMerchantId} onClick={() => void runAction("创建二级供货关系", () => api.createChannelRelation(currentMerchantId, peerMerchantId))}>绑定一级/二级商户</button>
-                <label>转供价(分)<input inputMode="numeric" value={channelOfferCents} onChange={(event) => setChannelOfferCents(event.target.value)} placeholder="必填" /></label>
-                <button className="secondary" disabled={merchantBlocked || !currentChannelRelationId || !currentPlatformProductId} onClick={() => submitChannelOffer("配置二级转供价")}>配置二级转供价</button>
+                <label>一级商户ID<input value={channelRelationForm.firstTierMerchantId} onChange={(event) => setChannelRelationForm({ ...channelRelationForm, firstTierMerchantId: event.target.value })} placeholder={currentMerchantId || "M1 merchantId"} /></label>
+                <label>二级商户ID<input value={channelRelationForm.secondTierMerchantId} onChange={(event) => setChannelRelationForm({ ...channelRelationForm, secondTierMerchantId: event.target.value })} placeholder={peerMerchantId || "M2 merchantId"} /></label>
+                <label>三级商户ID<input value={channelRelationForm.thirdTierMerchantId} onChange={(event) => setChannelRelationForm({ ...channelRelationForm, thirdTierMerchantId: event.target.value })} placeholder="选填，M3 merchantId" /></label>
+                <button className="secondary" disabled={merchantBlocked || !channelRelationForm.firstTierMerchantId.trim() || !channelRelationForm.secondTierMerchantId.trim()} onClick={submitChannelRelation}>绑定供货关系</button>
               </div>
-              <Table rows={channelRows(data.channels, "relations")} columns={["id", "firstTierMerchantId", "secondTierMerchantId", "status"]} />
+              <ChannelOfferEditor
+                relations={channelRows(data.channels, "relations")}
+                products={data.platformProducts}
+                selectedRelationId={currentChannelRelationId}
+                selectedProductId={currentPlatformProductId}
+                priceCents={channelOfferCents}
+                setSelectedRelationId={setSelectedChannelRelationId}
+                setSelectedProductId={setSelectedChannelProductId}
+                setPriceCents={setChannelOfferCents}
+                disabled={merchantBlocked}
+                onSubmit={() => submitChannelOffer("配置转供价")}
+              />
+              <Table rows={channelRows(data.channels, "relations")} columns={["id", "firstTierMerchantId", "secondTierMerchantId", "thirdTierMerchantId", "status"]} />
             </Panel>
             <Panel title="商户授权商品" kicker="商户后台">
               <KeyValue label="保证金状态" value={text(currentDeposit?.status, "未知")} />
@@ -2458,13 +2605,14 @@ function App() {
           <ConfirmModal
             action={confirmAction}
             busy={loading && actionLabel === confirmAction.actionLabel}
+            message={actionLabel === confirmAction.actionLabel || message.includes(confirmAction.actionLabel) ? message : undefined}
             onCancel={() => {
               if (loading) return;
               setConfirmAction(undefined);
               setMessage("已取消保存");
             }}
             onConfirm={async () => {
-              const succeeded = await runAction(confirmAction.actionLabel, confirmAction.run, false);
+              const succeeded = await runAction(confirmAction.actionLabel, confirmAction.run, false, { skipConfirm: true });
               if (succeeded) {
                 setConfirmAction(undefined);
                 void loadAll(`${confirmAction.actionLabel}成功，数据已刷新`);
@@ -2481,6 +2629,7 @@ function App() {
 function ConfirmModal(props: {
   action: ConfirmAction;
   busy: boolean;
+  message?: string;
   onCancel: () => void;
   onConfirm: () => void | Promise<void>;
 }) {
@@ -2495,15 +2644,16 @@ function ConfirmModal(props: {
           <button className="secondary small" type="button" disabled={props.busy} onClick={props.onCancel}>关闭</button>
         </div>
         <p>{props.action.description}</p>
+        {props.message ? <p className={props.busy ? "modal-status loading" : "modal-status"}>{props.message}</p> : null}
         <div className="change-list">
-          {props.action.rows.map((row) => (
-            <div className="change-row" key={`${row.label}-${row.value}`}>
+          {props.action.rows.length ? props.action.rows.map((row) => (
+            <div className={row.kind === "image" ? "change-row image-change-row" : "change-row"} key={`${row.label}-${row.value}`}>
               <span>{row.label}</span>
-              {row.before !== undefined ? <em>{row.before}</em> : null}
+              {row.before !== undefined ? <ChangeValue row={row} value={row.before} previous /> : null}
               {row.before !== undefined ? <strong aria-hidden="true">→</strong> : null}
-              <b>{row.value}</b>
+              <ChangeValue row={row} value={row.value} />
             </div>
-          ))}
+          )) : <p className="empty">没有检测到字段变化。</p>}
         </div>
         <div className="modal-actions">
           <button className="secondary" type="button" disabled={props.busy} onClick={props.onCancel}>取消</button>
@@ -2515,6 +2665,17 @@ function ConfirmModal(props: {
       </section>
     </div>
   );
+}
+
+function ChangeValue(props: { row: ConfirmRow; value: string; previous?: boolean }) {
+  if (props.row.kind === "image") {
+    return (
+      <div className={props.previous ? "confirm-image previous" : "confirm-image"}>
+        <ProductImage product={{ name: props.previous ? "修改前商品图片" : "修改后商品图片", imageUrl: props.value }} size="list" />
+      </div>
+    );
+  }
+  return props.previous ? <em>{props.value}</em> : <b>{props.value}</b>;
 }
 
 function Module(props: { title: string; subtitle: string; children: React.ReactNode }) {
@@ -2662,82 +2823,141 @@ function PlatformProductDrawer(props: {
   tab: "base" | "codes" | "audit";
   setTab: (tab: "base" | "codes" | "audit") => void;
   rightsCodes: JsonRecord[];
+  relatedMerchantProducts: JsonRecord[];
+  channelRelations: JsonRecord[];
+  channelOffers: JsonRecord[];
   inventoryForm: { productId: string; batchNo: string; codes: string };
   setInventoryForm: React.Dispatch<React.SetStateAction<{ productId: string; batchNo: string; codes: string }>>;
   precheck?: RightsCodePrecheckResult;
   onPrecheck: () => void;
   onImport: () => void;
+  onDownloadTemplate: () => void;
+  onUploadImage: (file: File) => void;
   onSave: () => void;
+  busy: boolean;
   onClose: () => void;
   onReveal: () => void;
   onExportPlain: () => void;
   onExportMasked: () => void;
 }) {
   const isCodePool = props.form.fulfillmentMode === "code_pool";
-  const availableCount = props.rightsCodes.filter((item) => text(item.status) === "available").length;
-  const issuedCount = props.rightsCodes.filter((item) => text(item.status) === "issued").length;
-  const lowStock = isCodePool && availableCount <= 3;
+  const credentialType: CredentialType = props.form.credentialType === "account_password" ? "account_password" : productCredentialType(props.product);
+  const stats = rightsCodeStats(props.rightsCodes);
+  const lowStock = isCodePool && stats.available <= 3;
+
+  function handleImageFileChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      window.alert("商品图片只支持 JPG、PNG 或 WebP。");
+      return;
+    }
+    if (file.size > 1_200_000) {
+      window.alert("商品图片不能超过 1.2MB。");
+      return;
+    }
+    props.onUploadImage(file);
+  }
+
   return (
-    <aside className="drawer" role="dialog" aria-modal="false" aria-label="平台商品详情">
+    <aside className="drawer product-drawer" role="dialog" aria-modal="false" aria-label="平台商品详情">
       <div className="drawer-head">
         <div>
           <span>平台商品详情</span>
           <h3>{text(props.product.name, text(props.product.id))}</h3>
         </div>
-        <button className="secondary" type="button" onClick={props.onClose}>关闭</button>
+        <button className="secondary" type="button" disabled={props.busy} onClick={props.onClose}>关闭</button>
       </div>
       <div className="tabs">
         <button className={props.tab === "base" ? "active" : ""} type="button" onClick={() => props.setTab("base")}>基础与价格</button>
-        <button className={props.tab === "codes" ? "active" : ""} type="button" disabled={!isCodePool} onClick={() => props.setTab("codes")}>卡密池</button>
+        <button className={props.tab === "codes" ? "active" : ""} type="button" disabled={!isCodePool} onClick={() => props.setTab("codes")}>自动发货库存</button>
         <button className={props.tab === "audit" ? "active" : ""} type="button" onClick={() => props.setTab("audit")}>确认与审计</button>
       </div>
       {props.tab === "base" ? (
-        <>
-          <div className="form-grid wide">
-            <label>商品名称<input value={props.form.name} onChange={(event) => props.setForm((form) => ({ ...form, name: event.target.value }))} /></label>
-            <label>状态<select value={props.form.status} onChange={(event) => props.setForm((form) => ({ ...form, status: event.target.value }))}><option value="active">上架</option><option value="listed">上架中</option><option value="disabled">下架</option><option value="frozen">冻结</option></select></label>
-            <label>类目<input value={props.form.category} onChange={(event) => props.setForm((form) => ({ ...form, category: event.target.value }))} /></label>
-            <label>标签<input value={props.form.tags} onChange={(event) => props.setForm((form) => ({ ...form, tags: event.target.value }))} /></label>
-            <label className="span-2">商品图<input value={props.form.imageUrl} onChange={(event) => props.setForm((form) => ({ ...form, imageUrl: event.target.value }))} /></label>
-            <label>发货方式<select value={props.form.fulfillmentMode} onChange={(event) => props.setForm((form) => ({ ...form, fulfillmentMode: event.target.value }))}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发码</option></select></label>
-            <label>库存<input inputMode="numeric" value={props.form.stockCount} onChange={(event) => props.setForm((form) => ({ ...form, stockCount: event.target.value }))} /></label>
-            <label>供货价(分)<input inputMode="numeric" value={props.form.supplyPriceCents} onChange={(event) => props.setForm((form) => ({ ...form, supplyPriceCents: event.target.value }))} /></label>
-            <label>最低售价(分)<input inputMode="numeric" value={props.form.minSalePriceCents} onChange={(event) => props.setForm((form) => ({ ...form, minSalePriceCents: event.target.value }))} /></label>
-            <label>建议售价(分)<input inputMode="numeric" value={props.form.suggestedSalePriceCents} onChange={(event) => props.setForm((form) => ({ ...form, suggestedSalePriceCents: event.target.value }))} /></label>
-            <label>销量<input inputMode="numeric" value={props.form.soldCount} onChange={(event) => props.setForm((form) => ({ ...form, soldCount: event.target.value }))} /></label>
-            <label className="span-2">商品说明<textarea rows={3} value={props.form.description} onChange={(event) => props.setForm((form) => ({ ...form, description: event.target.value }))} /></label>
-            <label className="span-2">使用/人工交付说明<textarea rows={3} value={props.form.usageGuide} onChange={(event) => props.setForm((form) => ({ ...form, usageGuide: event.target.value }))} /></label>
-            <label className="span-2">详情模块<textarea rows={4} value={props.form.detailSections} onChange={(event) => props.setForm((form) => ({ ...form, detailSections: event.target.value }))} placeholder="标题：内容一；内容二" /></label>
+        <section className="product-workbench">
+          <div className="product-media-panel">
+            <label className="product-image-picker">
+              <input type="file" accept="image/jpeg,image/png,image/webp" onChange={handleImageFileChange} />
+              <ProductImage product={{ ...props.product, imageUrl: props.form.imageUrl }} size="detail" />
+              <span>{props.busy ? "正在上传图片..." : "点击图片上传本地图片"}</span>
+            </label>
+            <KeyValue label="商品编号" value={friendlyId(props.product.id, "商品")} />
+            <KeyValue label="发货类型" value={isCodePool ? `自动发库存凭证：${credentialTypeText(credentialType)}` : "人工交付"} />
+            <KeyValue label="代理链路" value="平台商品源 -> M1 -> M2 -> M3" />
+            <KeyValue label="代理状态" value={`${props.relatedMerchantProducts.length} 个店铺已代理`} />
           </div>
-          <div className="actions">
-            <button type="button" onClick={props.onSave}>确认保存详情</button>
+          <div className="product-edit-panel">
+            <div className="form-grid wide">
+              <div className="form-section-title span-2">基础信息</div>
+              <label>商品名称<input value={props.form.name} onChange={(event) => props.setForm((form) => ({ ...form, name: event.target.value }))} /></label>
+              <label>状态<select value={props.form.status} onChange={(event) => props.setForm((form) => ({ ...form, status: event.target.value }))}><option value="active">上架</option><option value="listed">上架中</option><option value="disabled">下架</option><option value="frozen">冻结</option></select></label>
+              <label>类目<input value={props.form.category} onChange={(event) => props.setForm((form) => ({ ...form, category: event.target.value }))} /></label>
+              <label>标签<input value={props.form.tags} onChange={(event) => props.setForm((form) => ({ ...form, tags: event.target.value }))} /></label>
+              <label className="span-2">图片地址<input value={props.form.imageUrl} onChange={(event) => props.setForm((form) => ({ ...form, imageUrl: event.target.value }))} placeholder="上传后自动生成 /uploads/product-images/...；也可以暂时填写 https 图片外链" /></label>
+              <div className="form-section-title span-2">发货与价格</div>
+              <label>发货方式<select value={props.form.fulfillmentMode} onChange={(event) => props.setForm((form) => ({ ...form, fulfillmentMode: event.target.value }))}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发库存凭证</option></select></label>
+              {props.form.fulfillmentMode === "code_pool" ? <label>凭证类型<select value={props.form.credentialType} onChange={(event) => props.setForm((form) => ({ ...form, credentialType: event.target.value }))}><option value="code">兑换码/卡密</option><option value="account_password">账号密码</option></select></label> : null}
+              <label>库存<input inputMode="numeric" value={props.form.stockCount} onChange={(event) => props.setForm((form) => ({ ...form, stockCount: event.target.value }))} /></label>
+              <label>供货价(分)<input inputMode="numeric" value={props.form.supplyPriceCents} onChange={(event) => props.setForm((form) => ({ ...form, supplyPriceCents: event.target.value }))} /></label>
+              <label>最低售价(分)<input inputMode="numeric" value={props.form.minSalePriceCents} onChange={(event) => props.setForm((form) => ({ ...form, minSalePriceCents: event.target.value }))} /></label>
+              <label>建议售价(分)<input inputMode="numeric" value={props.form.suggestedSalePriceCents} onChange={(event) => props.setForm((form) => ({ ...form, suggestedSalePriceCents: event.target.value }))} /></label>
+              <label>销量<input inputMode="numeric" value={props.form.soldCount} onChange={(event) => props.setForm((form) => ({ ...form, soldCount: event.target.value }))} /></label>
+              <div className="form-section-title span-2">商品详情</div>
+              <label className="span-2">商品说明<textarea rows={3} value={props.form.description} onChange={(event) => props.setForm((form) => ({ ...form, description: event.target.value }))} /></label>
+              <label className="span-2">使用/人工交付说明<textarea rows={3} value={props.form.usageGuide} onChange={(event) => props.setForm((form) => ({ ...form, usageGuide: event.target.value }))} /></label>
+              <label className="span-2">详情模块<textarea rows={4} value={props.form.detailSections} onChange={(event) => props.setForm((form) => ({ ...form, detailSections: event.target.value }))} placeholder="标题：内容一；内容二" /></label>
+            </div>
           </div>
-          {!isCodePool ? <p className="hint">人工交付商品不显示卡密导入、自动发放或买家查看卡密入口；请维护人工交付说明和客服信息。</p> : null}
-        </>
+          <div className="product-side-panel">
+            <ProductInventorySummary product={props.product} rightsCodes={props.rightsCodes} />
+            <ProductProxySummary
+              product={props.product}
+              relatedMerchantProducts={props.relatedMerchantProducts}
+              channelRelations={props.channelRelations}
+              channelOffers={props.channelOffers}
+            />
+            <ProductChangeSummary product={props.product} form={props.form} />
+            <div className="actions">
+              {isCodePool ? <button className="secondary" type="button" disabled={props.busy} onClick={() => props.setTab("codes")}>管理自动发货库存</button> : null}
+              <button type="button" disabled={props.busy} onClick={props.onSave}>{props.busy ? "保存中..." : "确认保存详情"}</button>
+            </div>
+            {!isCodePool ? <p className="hint">人工交付商品不能导入自动发货库存；请维护人工交付说明和客服信息。</p> : null}
+          </div>
+        </section>
       ) : null}
       {props.tab === "codes" ? (
         isCodePool ? (
-          <>
-            <section className="mini-metrics">
-              <KeyValue label="可用卡密" value={String(availableCount)} />
-              <KeyValue label="已发放" value={String(issuedCount)} />
-              <KeyValue label="库存预警" value={lowStock ? "低库存，请补充" : "正常"} />
-            </section>
-            <div className="form-grid wide">
-              <label>批次号<input value={props.inventoryForm.batchNo} onChange={(event) => props.setInventoryForm((form) => ({ ...form, productId: text(props.product.id), batchNo: event.target.value }))} /></label>
-              <label className="span-2">待导入卡密<textarea rows={6} value={props.inventoryForm.codes} onChange={(event) => props.setInventoryForm((form) => ({ ...form, productId: text(props.product.id), codes: event.target.value }))} placeholder="一行一个；先预检再导入" /></label>
-            </div>
-            <div className="actions">
-              <button className="secondary" type="button" onClick={props.onPrecheck}>预检</button>
-              <button type="button" onClick={props.onImport}>导入卡密</button>
-              <button className="secondary" type="button" onClick={props.onExportMasked}>导出脱敏</button>
-              <button className="secondary" type="button" onClick={props.onReveal}>查看明文</button>
-              <button className="secondary" type="button" onClick={props.onExportPlain}>导出明文</button>
+            <>
+              <section className="mini-metrics">
+                <KeyValue label="库存总数" value={String(stats.total)} />
+                <KeyValue label="可发给客户" value={String(stats.available)} />
+                <KeyValue label="已发给客户" value={String(stats.issued)} />
+                <KeyValue label="库存预警" value={lowStock ? "低库存，请补充" : "正常"} />
+              </section>
+              <p className="hint">分配规则：确认收款后按导入时间优先分配可用库存；已发放、冻结、失效、退款禁看的库存不会再次分配。</p>
+              <div className="form-grid wide">
+                <label>批次号<input value={props.inventoryForm.batchNo} onChange={(event) => props.setInventoryForm((form) => ({ ...form, productId: text(props.product.id), batchNo: event.target.value }))} /></label>
+                <label className="span-2">{credentialInputLabel(credentialType)}<textarea rows={6} value={props.inventoryForm.codes} onChange={(event) => props.setInventoryForm((form) => ({ ...form, productId: text(props.product.id), codes: event.target.value }))} placeholder={credentialInputPlaceholder(credentialType)} /></label>
+              </div>
+              <div className="actions">
+                <button className="secondary" type="button" disabled={props.busy} onClick={props.onDownloadTemplate}>下载模板</button>
+                <button className="secondary" type="button" disabled={props.busy} onClick={props.onPrecheck}>预检</button>
+              <button type="button" disabled={props.busy || !props.inventoryForm.batchNo.trim() || !props.inventoryForm.codes.trim()} onClick={props.onImport}>{props.busy ? "导入中..." : "添加库存"}</button>
+              <button className="secondary" type="button" disabled={props.busy || stats.total === 0} onClick={props.onExportMasked}>导出库存核对表</button>
+              <button className="secondary" type="button" disabled={props.busy || stats.total === 0} onClick={props.onReveal}>查看完整库存内容</button>
+              <button className="secondary" type="button" disabled={props.busy || stats.total === 0} onClick={props.onExportPlain}>下载完整库存表</button>
             </div>
             <RightsPrecheckPanel result={props.precheck} />
-            <Table rows={props.rightsCodes} columns={["codeId", "productId", "codePreview", "batchNo", "status", "orderNo"]} />
+            <RightsCodeTable
+              rows={props.rightsCodes}
+              showSensitiveCodes={false}
+              sensitiveRows={[]}
+              canReveal={false}
+              hideActions
+            />
           </>
-        ) : <p className="empty">人工交付商品没有卡密池。请在基础信息中维护人工交付说明和客服资料。</p>
+        ) : <p className="empty">人工交付商品不走自动发货库存。请在基础信息中维护人工交付说明和客服资料。</p>
       ) : null}
       {props.tab === "audit" ? (
         <div className="audit-note">
@@ -2761,6 +2981,204 @@ function RightsPrecheckPanel(props: { result?: RightsCodePrecheckResult }) {
       <KeyValue label="重复" value={props.result.duplicateCodes.length ? props.result.duplicateCodes.join("、") : "无"} />
       <KeyValue label="非法行" value={props.result.invalidRows.length ? props.result.invalidRows.map((row) => `${row.line}:${row.reason}`).join("；") : "无"} />
     </div>
+  );
+}
+
+function ChannelOfferEditor(props: {
+  relations: JsonRecord[];
+  products: JsonRecord[];
+  selectedRelationId: string;
+  selectedProductId: string;
+  priceCents: string;
+  disabled?: boolean;
+  setSelectedRelationId: (value: string) => void;
+  setSelectedProductId: (value: string) => void;
+  setPriceCents: (value: string) => void;
+  onSubmit: () => void;
+}) {
+  return (
+    <div className="channel-offer-editor">
+      <label>供货关系
+        <select value={props.selectedRelationId} onChange={(event) => props.setSelectedRelationId(event.target.value)}>
+          {props.relations.map((relation) => (
+            <option key={text(relation.id)} value={text(relation.id)}>
+              {channelRelationLabel(relation)}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>平台商品
+        <select value={props.selectedProductId} onChange={(event) => props.setSelectedProductId(event.target.value)}>
+          {props.products.map((product) => (
+            <option key={text(product.id)} value={text(product.id)}>
+              {text(product.name, text(product.id))}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>转供价(分)
+        <input inputMode="numeric" value={props.priceCents} onChange={(event) => props.setPriceCents(event.target.value)} placeholder="必填，不能低于上游成本" />
+      </label>
+      <button className="secondary" disabled={props.disabled || !props.selectedRelationId || !props.selectedProductId || !props.priceCents.trim()} onClick={props.onSubmit}>配置转供价</button>
+    </div>
+  );
+}
+
+function ProductCatalogList(props: {
+  products: JsonRecord[];
+  rightsCodes: JsonRecord[];
+  merchantProducts: JsonRecord[];
+  channels?: JsonRecord;
+  onPick: (product: JsonRecord) => void;
+}) {
+  const [draft, setDraft] = useState({
+    keyword: "",
+    category: "",
+    fulfillmentMode: "",
+    status: "",
+    downstreamOpen: "",
+    minSupplyYuan: "",
+    maxSupplyYuan: ""
+  });
+  const [filters, setFilters] = useState(draft);
+  const categories = Array.from(new Set(props.products.map((product) => text(product.category)).filter(Boolean))).sort();
+  const offerCountsByProduct = new Map<string, number>();
+  channelRows(props.channels, "offers").forEach((offer) => {
+    const productId = text(offer.platformProductId);
+    offerCountsByProduct.set(productId, (offerCountsByProduct.get(productId) ?? 0) + 1);
+  });
+  const filtered = props.products.filter((product) => {
+    const keyword = filters.keyword.trim().toLowerCase();
+    const productId = text(product.id);
+    if (keyword) {
+      const haystack = [product.name, product.category, product.tags, product.subtitle, productId]
+        .map((item) => cellText(item).toLowerCase())
+        .join(" ");
+      if (!haystack.includes(keyword)) return false;
+    }
+    if (filters.category && text(product.category) !== filters.category) return false;
+    if (filters.fulfillmentMode && productFulfillmentMode(product) !== filters.fulfillmentMode) return false;
+    if (filters.status && text(product.status) !== filters.status) return false;
+    const offerCount = offerCountsByProduct.get(productId) ?? 0;
+    if (filters.downstreamOpen === "open" && offerCount === 0) return false;
+    if (filters.downstreamOpen === "closed" && offerCount > 0) return false;
+    const supplyPriceCents = Number(product.supplyPriceCents ?? 0);
+    const minSupplyCents = yuanInputToCents(filters.minSupplyYuan);
+    const maxSupplyCents = yuanInputToCents(filters.maxSupplyYuan);
+    if (minSupplyCents !== undefined && supplyPriceCents < minSupplyCents) return false;
+    if (maxSupplyCents !== undefined && supplyPriceCents > maxSupplyCents) return false;
+    return true;
+  });
+  function resetSearch() {
+    const empty = {
+      keyword: "",
+      category: "",
+      fulfillmentMode: "",
+      status: "",
+      downstreamOpen: "",
+      minSupplyYuan: "",
+      maxSupplyYuan: ""
+    };
+    setDraft(empty);
+    setFilters(empty);
+  }
+  if (props.products.length === 0) return <p className="empty">暂无平台商品</p>;
+  return (
+    <>
+      <div className="structured-search product-catalog-search" role="search" aria-label="搜索平台商品库">
+        <div className="search-help">可按商品名称、商品编号、标签、类目、发货方式、商品状态、下游开放状态、供货价范围组合搜索。平台商品才进入 M1 到 M2 到 M3 代理链。</div>
+        <label>商品名称/编号
+          <input
+            value={draft.keyword}
+            onChange={(event) => setDraft({ ...draft, keyword: event.target.value })}
+            placeholder="例如 Claude、prod-code、自动发货"
+          />
+        </label>
+        <label>类目
+          <select value={draft.category} onChange={(event) => setDraft({ ...draft, category: event.target.value })}>
+            <option value="">全部类目</option>
+            {categories.map((category) => <option key={category} value={category}>{category}</option>)}
+          </select>
+        </label>
+        <label>发货方式
+          <select value={draft.fulfillmentMode} onChange={(event) => setDraft({ ...draft, fulfillmentMode: event.target.value })}>
+            <option value="">全部方式</option>
+            <option value="manual">人工交付</option>
+            <option value="code_pool">自动发库存凭证</option>
+          </select>
+        </label>
+        <label>商品状态
+          <select value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value })}>
+            <option value="">全部状态</option>
+            <option value="active">上架</option>
+            <option value="listed">上架中</option>
+            <option value="disabled">下架</option>
+            <option value="frozen">冻结</option>
+          </select>
+        </label>
+        <label>下游开放
+          <select value={draft.downstreamOpen} onChange={(event) => setDraft({ ...draft, downstreamOpen: event.target.value })}>
+            <option value="">全部</option>
+            <option value="open">已开放</option>
+            <option value="closed">未开放</option>
+          </select>
+        </label>
+        <label>最低供货价(元)
+          <input
+            inputMode="decimal"
+            value={draft.minSupplyYuan}
+            onChange={(event) => setDraft({ ...draft, minSupplyYuan: event.target.value })}
+            placeholder="例如 20"
+          />
+        </label>
+        <label>最高供货价(元)
+          <input
+            inputMode="decimal"
+            value={draft.maxSupplyYuan}
+            onChange={(event) => setDraft({ ...draft, maxSupplyYuan: event.target.value })}
+            placeholder="例如 100"
+          />
+        </label>
+        <div className="search-actions">
+          <button type="button" onClick={() => setFilters(draft)}>搜索</button>
+          <button className="secondary" type="button" onClick={resetSearch}>重置</button>
+        </div>
+        <span className="search-count">共 {props.products.length} 个平台商品，当前显示 {filtered.length} 个</span>
+      </div>
+      <div className="product-list">
+        {filtered.map((product) => {
+          const productId = text(product.id);
+          const productCodes = props.rightsCodes.filter((item) => text(item.productId) === productId || text(item.platformProductId) === productId);
+          const stats = rightsCodeStats(productCodes);
+          const relatedListings = props.merchantProducts.filter((item) => text(item.platformProductId) === productId);
+          const productOffers = channelRows(props.channels, "offers").filter((item) => text(item.platformProductId) === productId);
+          const isCodePool = productFulfillmentMode(product) === "code_pool";
+          return (
+            <article className="product-row" key={productId}>
+              <ProductImage product={product} size="list" />
+              <div className="product-row-main">
+                <div className="product-row-title">
+                  <h4>{text(product.name, productId)}</h4>
+                  <StatusBadge value={product.status} />
+                </div>
+                <p>{text(product.subtitle, text(product.description, "暂无商品简介"))}</p>
+                <div className="product-row-facts">
+                  <span>{text(product.category, "未分类")}</span>
+                  <span>{isCodePool ? `自动发货库存：${stats.available} 个可用` : "人工交付：不走自动库存"}</span>
+                  <span>供货价 {cents(product.supplyPriceCents)}</span>
+                  <span>最低售价 {cents(product.minSalePriceCents)}</span>
+                  <span>{relatedListings.length} 个店铺已代理</span>
+                  <span>{productOffers.length > 0 ? `下游开放：${productOffers.length} 条` : "下游未开放"}</span>
+                </div>
+              </div>
+              <div className="product-row-actions">
+                <button className="small" type="button" onClick={() => props.onPick(product)}>打开详情</button>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </>
   );
 }
 
@@ -2849,34 +3267,71 @@ function OwnProductReviewDrawer(props: {
   onReject: () => void;
   onClose: () => void;
 }) {
+  const merchant = props.product.merchant as JsonRecord | undefined;
+  const shop = props.product.shop as JsonRecord | undefined;
+  const reviewStatus = text(props.product.reviewStatus, text(props.product.status));
+  const pending = reviewStatus === "pending_review";
+  const tags = Array.isArray(props.product.tags) ? props.product.tags.map((item) => text(item)).filter(Boolean) : [];
+  const specs = Array.isArray(props.product.specs) ? props.product.specs.map((item) => text(item)).filter(Boolean) : [];
+  const detailSections = Array.isArray(props.product.detailSections) ? props.product.detailSections.filter(isRecord) : [];
   return (
     <aside className="drawer" role="dialog" aria-modal="false" aria-label="自有商品审核详情">
       <div className="drawer-head">
         <div>
-          <span>自有商品审核详情</span>
+          <span>{pending ? "待审核自有商品" : "已审核自有商品"}</span>
           <h3>{text(props.product.name, text(props.product.id))}</h3>
         </div>
         <button className="secondary" type="button" onClick={props.onClose}>关闭</button>
       </div>
-      <section className="detail-grid">
-        <KeyValue label="商户" value={`${text((props.product.merchant as JsonRecord | undefined)?.name, text(props.product.merchantId))} / ${text(props.product.shopId)}`} />
-        <KeyValue label="售价" value={cents(props.product.salePriceCents)} />
-        <KeyValue label="最低价" value={cents(props.product.minSalePriceCents)} />
-        <KeyValue label="履约方式" value={fulfillmentModeLabel(props.product.fulfillmentRule)} />
-        <KeyValue label="审核状态" value={text(props.product.reviewStatus)} />
-        <KeyValue label="商品状态" value={text(props.product.status)} />
-      </section>
+      <div className="review-detail-layout">
+        <div className="review-media">
+          <ProductImage product={props.product} size="detail" />
+        </div>
+        <section className="detail-grid">
+          <KeyValue label="商品编号" value={text(props.product.ownProductId, text(props.product.id))} />
+          <KeyValue label="商户" value={text(merchant?.name, text(props.product.merchantId))} />
+          <KeyValue label="商户等级" value={humanValue(text(merchant?.tier, "-"), "-")} />
+          <KeyValue label="店铺" value={text(shop?.name, text(props.product.shopId))} />
+          <KeyValue label="类目" value={text(props.product.category, "未填写")} />
+          <KeyValue label="标签" value={tags.length ? tags.join("、") : "未填写"} />
+          <KeyValue label="售价" value={cents(props.product.salePriceCents)} />
+          <KeyValue label="最低价" value={cents(props.product.minSalePriceCents)} />
+          <KeyValue label="履约方式" value={fulfillmentModeLabel(props.product.fulfillmentRule)} />
+          <KeyValue label="审核状态" value={humanValue(reviewStatus)} />
+          <KeyValue label="商品状态" value={humanValue(props.product.status)} />
+          <KeyValue label="提交时间" value={dateTimeText(props.product.createdAt)} />
+          <KeyValue label="审核时间" value={text(props.product.reviewedAt) ? dateTimeText(props.product.reviewedAt) : "未审核"} />
+          <KeyValue label="审核人" value={text(props.product.reviewedBy, pending ? "未审核" : "-")} />
+        </section>
+      </div>
       <section className="review-copy">
+        <h4>副标题</h4>
+        <p>{text(props.product.subtitle, "未填写")}</p>
         <h4>商品说明</h4>
         <p>{text(props.product.description, "未填写")}</p>
-        <h4>人工交付/使用说明</h4>
+        <h4>使用/人工交付说明</h4>
         <p>{text(props.product.usageGuide, text(props.product.manualFulfillmentInstruction, "未填写"))}</p>
+        <h4>规格</h4>
+        <p>{specs.length ? specs.join("、") : "未填写"}</p>
+        <h4>详情模块</h4>
+        {detailSections.length ? (
+          <div className="detail-section-list">
+            {detailSections.map((section, index) => (
+              <div key={`${text(section.title, "模块")}-${index}`}>
+                <strong>{text(section.title, `模块 ${index + 1}`)}</strong>
+                <p>{Array.isArray(section.items) ? section.items.map((item) => text(item)).filter(Boolean).join("；") : "未填写"}</p>
+              </div>
+            ))}
+          </div>
+        ) : <p>未填写</p>}
       </section>
-      <div className="actions">
-        <button type="button" onClick={props.onApprove}>确认审核通过</button>
-        <button className="secondary" type="button" onClick={props.onReject}>确认审核拒绝</button>
-      </div>
-      <p className="hint">审核动作走平台商户自有商品审核接口，由后端 RBAC 校验并写入审核审计。</p>
+      {pending ? (
+        <div className="actions">
+          <button type="button" onClick={props.onApprove}>通过审核</button>
+          <button className="secondary" type="button" onClick={props.onReject}>拒绝审核</button>
+        </div>
+      ) : null}
+      <p className="hint">{pending ? "未审核商品通过后会生成商户自有上架商品；拒绝后商户需要补充资料再提交。" : "该商品已完成审核，审核时间和审核人已记录在上方。"}</p>
     </aside>
   );
 }
@@ -2928,6 +3383,161 @@ function StatusBadge(props: { value: unknown }) {
   return <span className={`status-badge ${statusTone(raw)}`}>{humanValue(raw)}</span>;
 }
 
+function ProductImage(props: { product?: JsonRecord; size: "list" | "detail" }) {
+  const imageUrl = api.assetUrl(props.product?.imageUrl);
+  const name = text(props.product?.name, "商品图片");
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [imageUrl]);
+  return (
+    <div className={`product-image ${props.size}`}>
+      {imageUrl && !failed ? <img src={imageUrl} alt={name} onError={() => setFailed(true)} /> : <span>{imageUrl ? "图片加载失败，请更换图片" : "暂无图片"}</span>}
+    </div>
+  );
+}
+
+function ProductInventorySummary(props: { product?: JsonRecord; rightsCodes: JsonRecord[] }) {
+  const isCodePool = props.product ? productFulfillmentMode(props.product) === "code_pool" : false;
+  const credentialType = productCredentialType(props.product);
+  const stats = rightsCodeStats(props.rightsCodes);
+  return (
+    <div className="inventory-summary">
+      <h4>当前商品发货方式</h4>
+      <KeyValue label="发货方式" value={isCodePool ? "自动发库存凭证" : "人工交付"} />
+      {isCodePool ? (
+        <>
+          <KeyValue label="凭证类型" value={credentialTypeText(credentialType)} />
+          <KeyValue label="库存总数" value={String(stats.total)} />
+          <KeyValue label="可发给客户" value={String(stats.available)} />
+          <KeyValue label="已发给客户" value={String(stats.issued)} />
+          <KeyValue label="冻结/失效" value={String(stats.unavailable)} />
+          <p className="hint">确认收款后按导入时间优先分配可用库存，并自动发给客户。</p>
+        </>
+      ) : (
+        <p className="hint">人工交付商品不走自动发货库存，管理员只维护交付说明和客服处理方式。</p>
+      )}
+    </div>
+  );
+}
+
+function ProductProxySummary(props: {
+  product: JsonRecord;
+  relatedMerchantProducts: JsonRecord[];
+  channelRelations: JsonRecord[];
+  channelOffers: JsonRecord[];
+}) {
+  const productId = text(props.product.id);
+  const firstTierListings = props.relatedMerchantProducts.filter((item) => {
+    const merchant = item.merchant as JsonRecord | undefined;
+    return text(merchant?.tier) === "first_tier" || !text(merchant?.tier);
+  }).length;
+  const secondTierListings = props.relatedMerchantProducts.filter((item) => text((item.merchant as JsonRecord | undefined)?.tier) === "second_tier").length;
+  const thirdTierListings = props.relatedMerchantProducts.filter((item) => text((item.merchant as JsonRecord | undefined)?.tier) === "third_tier").length;
+  return (
+    <div className="proxy-summary">
+      <h4>代理链与转供</h4>
+      <KeyValue label="M1 可代理" value="平台商品默认可选；M2/M3 必须由上游配置转供价" />
+      <KeyValue label="店铺代理" value={`M1 ${firstTierListings} / M2 ${secondTierListings} / M3 ${thirdTierListings}`} />
+      <KeyValue label="下游开放" value={props.channelOffers.length ? `${props.channelOffers.length} 条转供价` : "未向下游开放"} />
+      <div className="proxy-flow-list">
+        {props.channelOffers.length ? props.channelOffers.map((offer) => {
+          const relation = props.channelRelations.find((item) => text(item.id) === text(offer.channelRelationId));
+          return (
+            <div key={`${productId}-${text(offer.id, text(offer.channelRelationId))}`}>
+              <span>{relation ? channelRelationLabel(relation) : friendlyId(offer.channelRelationId, "关系")}</span>
+              <strong>{cents(offer.resellSupplyPriceCents)}</strong>
+              <StatusBadge value={offer.status} />
+            </div>
+          );
+        }) : <p className="hint">未配置转供价时，M2/M3 不应看到这个商品；M1 仍按平台供货价选品。</p>}
+      </div>
+    </div>
+  );
+}
+
+function platformProductChangeRows(product: JsonRecord, form: ProductFormState, options: { changedOnly?: boolean } = {}): ConfirmRow[] {
+  const rows: ConfirmRow[] = [
+    { label: "商品名称", before: text(product.name, "-"), value: form.name || "-" },
+    { label: "商品图片", before: text(product.imageUrl, ""), value: form.imageUrl || "", kind: "image" },
+    { label: "发货方式", before: productFulfillmentMode(product) === "code_pool" ? "自动发库存凭证" : "人工交付", value: form.fulfillmentMode === "code_pool" ? "自动发库存凭证" : form.fulfillmentMode === "manual" ? "人工交付" : "未选择" },
+    { label: "库存", before: text(product.stockCount, "-"), value: form.stockCount || "-" },
+    { label: "供货价", before: cents(product.supplyPriceCents), value: cents(form.supplyPriceCents) },
+    { label: "最低售价", before: cents(product.minSalePriceCents), value: cents(form.minSalePriceCents) },
+    { label: "建议售价", before: cents(product.suggestedSalePriceCents), value: cents(form.suggestedSalePriceCents) },
+    { label: "状态", before: statusText(product.status), value: statusText(form.status) },
+    { label: "类目", before: text(product.category, "-"), value: form.category || "-" },
+    { label: "副标题", before: text(product.subtitle, "-"), value: form.subtitle || "-" }
+  ];
+  if (productFulfillmentMode(product) === "code_pool" || form.fulfillmentMode === "code_pool") {
+    rows.splice(3, 0, { label: "凭证类型", before: credentialTypeText(productCredentialType(product)), value: credentialTypeText(form.credentialType) });
+  }
+  return options.changedOnly ? rows.filter((row) => normalizeConfirmValue(row.before) !== normalizeConfirmValue(row.value)) : rows;
+}
+
+function normalizeConfirmValue(value: string | undefined): string {
+  return (value ?? "").trim();
+}
+
+function readFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("read file failed"));
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const [, base64 = ""] = result.split(",", 2);
+      if (!base64) reject(new Error("图片读取失败"));
+      else resolve(base64);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function platformProductUpdatePayload(product: JsonRecord, form: ProductFormState): Partial<ProductFormState> {
+  const payload: Partial<ProductFormState> = {};
+  const add = (key: keyof ProductFormState, before: string, value: string) => {
+    if (normalizeConfirmValue(before) !== normalizeConfirmValue(value)) payload[key] = value;
+  };
+  add("name", text(product.name, ""), form.name);
+  add("category", text(product.category, ""), form.category);
+  add("tags", Array.isArray(product.tags) ? product.tags.map((item) => text(item, "")).filter(Boolean).join("，") : "", form.tags);
+  add("subtitle", text(product.subtitle, ""), form.subtitle);
+  add("description", text(product.description, ""), form.description);
+  add("usageGuide", text(product.usageGuide, ""), form.usageGuide);
+  add("imageUrl", text(product.imageUrl, ""), form.imageUrl);
+  add("specs", Array.isArray(product.specs) ? product.specs.map((item) => text(item, "")).filter(Boolean).join("\n") : "", form.specs);
+  add("detailSections", formatDetailSections(product.detailSections), form.detailSections);
+  add("stockCount", text(product.stockCount, ""), form.stockCount);
+  add("soldCount", text(product.soldCount, ""), form.soldCount);
+  add("supplyPriceCents", text(product.supplyPriceCents, ""), form.supplyPriceCents);
+  add("minSalePriceCents", text(product.minSalePriceCents, ""), form.minSalePriceCents);
+  add("suggestedSalePriceCents", text(product.suggestedSalePriceCents, ""), form.suggestedSalePriceCents);
+  add("status", text(product.status, ""), form.status);
+  const beforeMode = productFulfillmentMode(product);
+  if (beforeMode !== form.fulfillmentMode) {
+    payload.fulfillmentMode = form.fulfillmentMode;
+    if (form.fulfillmentMode === "code_pool") payload.credentialType = form.credentialType;
+  } else if (form.fulfillmentMode === "code_pool" && productCredentialType(product) !== form.credentialType) {
+    payload.fulfillmentMode = form.fulfillmentMode;
+    payload.credentialType = form.credentialType;
+  }
+  return payload;
+}
+
+function ProductChangeSummary(props: { product: JsonRecord; form: ProductFormState }) {
+  const rows = platformProductChangeRows(props.product, props.form);
+  return (
+    <div className="change-summary">
+      <h4>保存前核对</h4>
+      {rows.map((row) => (
+        <div key={row.label}>
+          <span>{row.label}</span>
+          <strong>{row.kind === "image" ? shortUrl(row.before || "-") : row.before ?? "-"}</strong>
+          <em>{row.kind === "image" ? shortUrl(row.value || "-") : row.value}</em>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) => void; mode?: "select" | "next-action" }) {
   if (props.rows.length === 0) return <p className="empty">暂无记录</p>;
   return (
@@ -2969,7 +3579,293 @@ function orderActionLabel(order: JsonRecord): string {
   return "查看订单";
 }
 
-function Table(props: { rows: JsonRecord[]; columns: string[]; moneyColumns?: string[]; onPick?: (row: JsonRecord) => void }) {
+function OwnProductReviewTable(props: { rows: JsonRecord[]; onPick: (row: JsonRecord) => void }) {
+  const [draft, setDraft] = useState({
+    keyword: "",
+    category: "",
+    minPriceYuan: "",
+    maxPriceYuan: "",
+    reviewStatus: ""
+  });
+  const [filters, setFilters] = useState(draft);
+  const categories = Array.from(new Set(props.rows.map((row) => text(row.category)).filter(Boolean))).sort();
+  const filteredRows = props.rows.filter((row) => {
+    const keyword = filters.keyword.trim().toLowerCase();
+    if (keyword) {
+      const haystack = [row.name, row.ownProductId, row.id, row.merchantId, row.shopId, row.category]
+        .map((item) => cellText(item).toLowerCase())
+        .join(" ");
+      if (!haystack.includes(keyword)) return false;
+    }
+    if (filters.category && text(row.category) !== filters.category) return false;
+    const salePriceCents = Number(row.salePriceCents ?? 0);
+    const minPriceCents = yuanInputToCents(filters.minPriceYuan);
+    const maxPriceCents = yuanInputToCents(filters.maxPriceYuan);
+    if (minPriceCents !== undefined && salePriceCents < minPriceCents) return false;
+    if (maxPriceCents !== undefined && salePriceCents > maxPriceCents) return false;
+    const reviewStatus = text(row.reviewStatus, text(row.status));
+    if (filters.reviewStatus === "completed" && reviewStatus === "pending_review") return false;
+    if (filters.reviewStatus && filters.reviewStatus !== "completed" && reviewStatus !== filters.reviewStatus) return false;
+    return true;
+  });
+
+  function resetSearch() {
+    const empty = { keyword: "", category: "", minPriceYuan: "", maxPriceYuan: "", reviewStatus: "" };
+    setDraft(empty);
+    setFilters(empty);
+  }
+
+  return (
+    <>
+      <div className="structured-search" role="search" aria-label="搜索商户自有商品审核">
+        <div className="search-help">可按商品名称、商品编号、商户、类目、售价范围和审核状态组合搜索。</div>
+        <label>商品名称/编号
+          <input value={draft.keyword} onChange={(event) => setDraft({ ...draft, keyword: event.target.value })} placeholder="例如 商品名、own-1、merchant-2" />
+        </label>
+        <label>商品类目
+          <select value={draft.category} onChange={(event) => setDraft({ ...draft, category: event.target.value })}>
+            <option value="">全部类目</option>
+            {categories.map((category) => <option key={category} value={category}>{category}</option>)}
+          </select>
+        </label>
+        <label>最低售价(元)
+          <input inputMode="decimal" value={draft.minPriceYuan} onChange={(event) => setDraft({ ...draft, minPriceYuan: event.target.value })} placeholder="例如 30" />
+        </label>
+        <label>最高售价(元)
+          <input inputMode="decimal" value={draft.maxPriceYuan} onChange={(event) => setDraft({ ...draft, maxPriceYuan: event.target.value })} placeholder="例如 100" />
+        </label>
+        <label>审核状态
+          <select value={draft.reviewStatus} onChange={(event) => setDraft({ ...draft, reviewStatus: event.target.value })}>
+            <option value="">全部状态</option>
+            <option value="pending_review">待审核</option>
+            <option value="completed">已审核完成</option>
+            <option value="approved">已通过</option>
+            <option value="rejected">已拒绝</option>
+          </select>
+        </label>
+        <div className="search-actions">
+          <button type="button" onClick={() => setFilters(draft)}>搜索</button>
+          <button className="secondary" type="button" onClick={resetSearch}>重置</button>
+        </div>
+        <span className="search-count">共 {props.rows.length} 条，当前显示 {filteredRows.length} 条</span>
+      </div>
+      <Table
+        rows={ownProductReviewRows(filteredRows)}
+        columns={["id", "name", "category", "merchantTier", "salePriceCents", "minSalePriceCents", "fulfillmentMode", "reviewStatus", "reviewedAt", "reviewedBy"]}
+        moneyColumns={["salePriceCents", "minSalePriceCents"]}
+        onPick={(row) => {
+          const source = props.rows.find((item) => text(item.id) === text(row.id)) ?? row;
+          props.onPick(source);
+        }}
+        hideSearch
+      />
+    </>
+  );
+}
+
+function PlatformShopProductTable(props: { rows: JsonRecord[]; onPick: (row: JsonRecord) => void }) {
+  const [draft, setDraft] = useState({
+    keyword: "",
+    status: "",
+    minSaleYuan: "",
+    maxSaleYuan: ""
+  });
+  const [filters, setFilters] = useState(draft);
+
+  const filteredRows = props.rows.filter((row) => {
+    const keyword = filters.keyword.trim().toLowerCase();
+    if (keyword) {
+      const matched = ["productName", "platformProductId", "id", "shopName"].some((column) =>
+        cellText(row[column]).toLowerCase().includes(keyword)
+      );
+      if (!matched) return false;
+    }
+    if (filters.status && text(row.status) !== filters.status) return false;
+    const salePriceCents = Number(row.salePriceCents ?? 0);
+    const minSaleCents = yuanInputToCents(filters.minSaleYuan);
+    const maxSaleCents = yuanInputToCents(filters.maxSaleYuan);
+    if (minSaleCents !== undefined && salePriceCents < minSaleCents) return false;
+    if (maxSaleCents !== undefined && salePriceCents > maxSaleCents) return false;
+    return true;
+  });
+
+  function resetSearch() {
+    const empty = { keyword: "", status: "", minSaleYuan: "", maxSaleYuan: "" };
+    setDraft(empty);
+    setFilters(empty);
+  }
+
+  return (
+    <>
+      <div className="structured-search" role="search" aria-label="搜索平台自营商品">
+        <div className="search-help">可按商品名称、商品编号、自营编号、店铺名称、销售状态、售价范围组合搜索。</div>
+        <label>商品名称/编号
+          <input
+            value={draft.keyword}
+            onChange={(event) => setDraft({ ...draft, keyword: event.target.value })}
+            placeholder="例如 Claude、psp-code、prod-code"
+          />
+        </label>
+        <label>销售状态
+          <select value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value })}>
+            <option value="">全部状态</option>
+            <option value="listed">上架销售</option>
+            <option value="approved">审核通过未上架</option>
+            <option value="delisted">下架</option>
+            <option value="risk_removed">风控下架</option>
+          </select>
+        </label>
+        <label>最低售价(元)
+          <input
+            inputMode="decimal"
+            value={draft.minSaleYuan}
+            onChange={(event) => setDraft({ ...draft, minSaleYuan: event.target.value })}
+            placeholder="例如 30"
+          />
+        </label>
+        <label>最高售价(元)
+          <input
+            inputMode="decimal"
+            value={draft.maxSaleYuan}
+            onChange={(event) => setDraft({ ...draft, maxSaleYuan: event.target.value })}
+            placeholder="例如 100"
+          />
+        </label>
+        <div className="search-actions">
+          <button type="button" onClick={() => setFilters(draft)}>搜索</button>
+          <button className="secondary" type="button" onClick={resetSearch}>重置</button>
+        </div>
+        <span className="search-count">共 {props.rows.length} 条，当前显示 {filteredRows.length} 条</span>
+      </div>
+      <Table
+        rows={filteredRows}
+        columns={["id", "platformProductId", "productName", "shopName", "salePriceCents", "fulfillmentCostCents", "status"]}
+        moneyColumns={["salePriceCents", "fulfillmentCostCents"]}
+        onPick={props.onPick}
+        hideSearch
+      />
+    </>
+  );
+}
+
+type RightsCodeFilters = { productId?: string; orderNo?: string; status?: string };
+
+function RightsCodeTable(props: {
+  rows: JsonRecord[];
+  showSensitiveCodes: boolean;
+  sensitiveRows: JsonRecord[];
+  canReveal?: boolean;
+  loading?: boolean;
+  hideActions?: boolean;
+  onExportMasked?: (rows: JsonRecord[]) => void;
+  onReveal?: (filters: RightsCodeFilters) => void;
+  onExportPlain?: (filters: RightsCodeFilters) => void;
+}) {
+  const [draft, setDraft] = useState({ query: "", productId: "", status: "", batchNo: "", orderNo: "" });
+  const [filters, setFilters] = useState(draft);
+  const displayRows = props.showSensitiveCodes ? props.sensitiveRows : props.rows;
+  const productOptions = Array.from(new Set(props.rows.map((row) => rightsCodeProductId(row)).filter(Boolean))).sort();
+  const productLabels = new Map<string, string>();
+  for (const row of props.rows) {
+    const productId = rightsCodeProductId(row);
+    if (productId && !productLabels.has(productId)) productLabels.set(productId, relatedName(row, "product", "name") || productId);
+  }
+  const statusOptions = Array.from(new Set(props.rows.map((row) => text(row.status)).filter(Boolean))).sort();
+  const filteredRows = displayRows.filter((row) => {
+    const query = filters.query.trim().toLowerCase();
+    const productId = rightsCodeProductId(row);
+    const haystack = [
+      row.codeId,
+      row.id,
+      row.productId,
+      row.platformProductId,
+      row.merchantProductId,
+      relatedName(row, "product", "name"),
+      row.batchNo,
+      row.status,
+      humanValue(row.status),
+      row.orderNo,
+      credentialTypeText(row.credentialType),
+      row.codePreview,
+      row.code
+    ].map((value) => text(value).toLowerCase()).join(" ");
+    if (query && !haystack.includes(query)) return false;
+    if (filters.productId && productId !== filters.productId) return false;
+    if (filters.status && text(row.status) !== filters.status) return false;
+    if (filters.batchNo.trim() && !text(row.batchNo).toLowerCase().includes(filters.batchNo.trim().toLowerCase())) return false;
+    if (filters.orderNo.trim() && !text(row.orderNo).toLowerCase().includes(filters.orderNo.trim().toLowerCase())) return false;
+    return true;
+  });
+  const apiFilters: RightsCodeFilters = {
+    productId: filters.productId || undefined,
+    status: filters.status || undefined,
+    orderNo: filters.orderNo.trim() || undefined
+  };
+  const columns = props.showSensitiveCodes
+    ? ["codeId", "productCode", "credentialLabel", "batchNo", "status", "orderNo", "code"]
+    : ["codeId", "productCode", "credentialLabel", "codePreview", "batchNo", "status", "orderNo"];
+  const tableRows = filteredRows.map((row) => ({
+    ...row,
+    codeId: text(row.codeId, text(row.id)),
+    productCode: rightsCodeProductId(row),
+    credentialLabel: credentialTypeText(row.credentialType),
+    orderNo: text(row.orderNo, "未绑定订单")
+  }));
+
+  function resetSearch() {
+    const empty = { query: "", productId: "", status: "", batchNo: "", orderNo: "" };
+    setDraft(empty);
+    setFilters(empty);
+  }
+
+  return (
+    <>
+      <div className="structured-search" role="search" aria-label="搜索自动发货库存">
+        <div className="search-help">可按商品编号、库存编号、内容预览、凭证类型、批次号、订单号和库存状态组合搜索。</div>
+        <label>关键词
+          <input
+            value={draft.query}
+            onChange={(event) => setDraft({ ...draft, query: event.target.value })}
+            placeholder="例如 prod-code、CODE-001、订单号、批次号"
+          />
+        </label>
+        <label>所属商品
+          <select value={draft.productId} onChange={(event) => setDraft({ ...draft, productId: event.target.value })}>
+            <option value="">全部商品</option>
+            {productOptions.map((productId) => <option key={productId} value={productId}>{productLabels.get(productId) ?? productId}</option>)}
+          </select>
+        </label>
+        <label>库存状态
+          <select value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value })}>
+            <option value="">全部状态</option>
+            {statusOptions.map((status) => <option key={status} value={status}>{statusText(status)}</option>)}
+          </select>
+        </label>
+        <label>批次号
+          <input value={draft.batchNo} onChange={(event) => setDraft({ ...draft, batchNo: event.target.value })} placeholder="例如 batch-202606" />
+        </label>
+        <label>订单号
+          <input value={draft.orderNo} onChange={(event) => setDraft({ ...draft, orderNo: event.target.value })} placeholder="例如 order-1001" />
+        </label>
+        <div className="search-actions">
+          <button type="button" onClick={() => setFilters(draft)}>搜索</button>
+          <button className="secondary" type="button" onClick={resetSearch}>重置</button>
+        </div>
+        <span className="search-count">共 {displayRows.length} 条，当前显示 {filteredRows.length} 条</span>
+      </div>
+      {props.hideActions ? null : (
+        <div className="actions">
+          <button className="secondary" disabled={props.loading || filteredRows.length === 0} onClick={() => props.onExportMasked?.(filteredRows)}>导出库存核对表</button>
+          <button className="secondary" disabled={props.loading || !props.canReveal || displayRows.length === 0} onClick={() => props.onReveal?.(apiFilters)}>查看完整库存内容</button>
+          <button className="secondary" disabled={props.loading || !props.canReveal || displayRows.length === 0} onClick={() => props.onExportPlain?.(apiFilters)}>下载完整库存表</button>
+        </div>
+      )}
+      <Table rows={tableRows} columns={columns} hideSearch />
+    </>
+  );
+}
+
+function Table(props: { rows: JsonRecord[]; columns: string[]; moneyColumns?: string[]; onPick?: (row: JsonRecord) => void; hideSearch?: boolean }) {
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
   const moneyColumns = new Set(props.moneyColumns ?? []);
@@ -2983,10 +3879,12 @@ function Table(props: { rows: JsonRecord[]; columns: string[]; moneyColumns?: st
   if (props.rows.length === 0) return <p className="empty">暂无记录</p>;
   return (
     <>
-      <div className="table-tools">
-        <input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} placeholder="筛选当前表格" />
-        <span>共 {filteredRows.length} 条</span>
-      </div>
+      {props.hideSearch ? null : (
+        <div className="table-tools">
+          <input value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} placeholder="输入关键词筛选本表格" />
+          <span>共 {filteredRows.length} 条</span>
+        </div>
+      )}
       <div className="table-wrap">
         <table>
           <thead>
@@ -3024,6 +3922,22 @@ function cellText(value: unknown): string {
   if (Array.isArray(value)) return value.map((item) => text(item)).filter(Boolean).join("、");
   if (typeof value === "number" || typeof value === "bigint") return String(value);
   return text(value);
+}
+
+function yuanInputToCents(value: string): number | undefined {
+  const normalized = value.trim();
+  if (!normalized) return undefined;
+  const amount = Number(normalized);
+  if (!Number.isFinite(amount)) return undefined;
+  return Math.round(amount * 100);
+}
+
+function dateTimeText(value: unknown): string {
+  const raw = text(value);
+  if (!raw) return "-";
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return raw;
+  return date.toLocaleString("zh-CN", { hour12: false });
 }
 
 function fieldLabel(column: string): string {
@@ -3256,9 +4170,69 @@ function platformShopProductRows(rows: JsonRecord[]): JsonRecord[] {
   });
 }
 
+function ownProductReviewRows(rows: JsonRecord[]): JsonRecord[] {
+  return rows.map((row) => {
+    const merchant = row.merchant as JsonRecord | undefined;
+    return {
+      ...row,
+      id: text(row.id, text(row.ownProductId)),
+      category: text(row.category, "未填写"),
+      merchantTier: humanValue(text(merchant?.tier, text(row.merchantTier, "-")), "-"),
+      fulfillmentMode: text(row.fulfillmentMode, productFulfillmentMode(row)),
+      reviewStatus: text(row.reviewStatus, text(row.status, "pending_review")),
+      reviewedAt: text(row.reviewedAt) ? dateTimeText(row.reviewedAt) : "-",
+      reviewedBy: text(row.reviewedBy, "-")
+    };
+  });
+}
+
 function fulfillmentModeLabel(rule: unknown): string {
   const record = isRecord(rule) ? rule : {};
-  return text(record.mode) === "code_pool" ? "自动发码" : "人工交付";
+  return text(record.mode) === "code_pool" ? "自动发库存凭证" : "人工交付";
+}
+
+function productFulfillmentMode(product?: JsonRecord): "code_pool" | "manual" {
+  const explicitMode = text(product?.fulfillmentMode);
+  if (explicitMode === "code_pool" || explicitMode === "manual") return explicitMode;
+  const rule = isRecord(product?.fulfillmentRule) ? product?.fulfillmentRule as JsonRecord : {};
+  return text(rule.mode) === "code_pool" ? "code_pool" : "manual";
+}
+
+type CredentialType = "code" | "account_password";
+
+function productCredentialType(product?: JsonRecord): CredentialType {
+  const rule = isRecord(product?.fulfillmentRule) ? product?.fulfillmentRule as JsonRecord : {};
+  const value = text(product?.credentialType, text(rule.credentialType));
+  return value === "account_password" ? "account_password" : "code";
+}
+
+function credentialTypeText(value: unknown): string {
+  return text(value) === "account_password" ? "账号密码" : "兑换码/卡密";
+}
+
+function credentialInputLabel(type: CredentialType): string {
+  return type === "account_password" ? "账号密码清单" : "兑换码/卡密";
+}
+
+function credentialInputPlaceholder(type: CredentialType): string {
+  return type === "account_password"
+    ? "每行一组：账号,密码,备注；备注可选"
+    : "一行一个兑换码或卡密，例如 CARD-EXAMPLE-001";
+}
+
+function rightsCodeStats(rows: JsonRecord[]) {
+  const available = rows.filter((item) => text(item.status) === "available").length;
+  const issued = rows.filter((item) => ["issued", "used"].includes(text(item.status))).length;
+  return {
+    total: rows.length,
+    available,
+    issued,
+    unavailable: Math.max(0, rows.length - available - issued)
+  };
+}
+
+function rightsCodeProductId(row: JsonRecord): string {
+  return text(row.productId, text(row.platformProductId, text(row.merchantProductId, "")));
 }
 
 function arrayRows(value: unknown, key: string): JsonRecord[] {
@@ -3272,6 +4246,13 @@ function arrayValue(value: unknown): JsonRecord[] {
 function channelRows(channels: JsonRecord | undefined, key: string): JsonRecord[] {
   const value = channels?.[key];
   return Array.isArray(value) ? value as JsonRecord[] : [];
+}
+
+function channelRelationLabel(relation: JsonRecord): string {
+  const first = friendlyId(relation.firstTierMerchantId, "M1");
+  const second = friendlyId(relation.secondTierMerchantId, "M2");
+  const third = text(relation.thirdTierMerchantId, "");
+  return third ? `${first} -> ${second} -> ${friendlyId(third, "M3")}` : `${first} -> ${second}`;
 }
 
 function formatDetailSections(value: unknown): string {
@@ -3505,6 +4486,7 @@ function paymentProviderConfirmMode(type: string): string {
 
 function validatePlatformProductForm(form: {
   name: string;
+  imageUrl?: string;
   fulfillmentMode: string;
   stockCount: string;
   soldCount: string;
@@ -3513,6 +4495,7 @@ function validatePlatformProductForm(form: {
   suggestedSalePriceCents: string;
 }): string {
   if (!form.name.trim()) return "请填写商品名称";
+  if (form.imageUrl?.startsWith("data:image/")) return "商品图片不能直接保存 data:image。请点击图片重新上传，系统会生成 /uploads/product-images/... 地址。";
   if (!form.fulfillmentMode) return "请选择发货方式";
   if (!isNonNegativeInteger(form.stockCount)) return "请填写合法库存，库存必须是非负整数";
   if (form.soldCount && !isNonNegativeInteger(form.soldCount)) return "销量必须是非负整数";
@@ -3530,11 +4513,11 @@ function validatePlatformProductForm(form: {
 function validateRightsCodeForm(productId: string, batchNo: string, codes: string[]): string {
   if (!productId.trim()) return "请填写商品ID";
   if (!batchNo.trim()) return "请填写批次号";
-  if (codes.length === 0) return "请填写至少一个卡密/账号";
+  if (codes.length === 0) return "请填写至少一条自动发货库存";
   return "";
 }
 
-function precheckRightsCodes(value: string): RightsCodePrecheckResult {
+function precheckRightsCodes(value: string, credentialType = "code"): RightsCodePrecheckResult {
   const lines = value.split(/\n/);
   const seen = new Set<string>();
   const validCodes: string[] = [];
@@ -3547,6 +4530,13 @@ function precheckRightsCodes(value: string): RightsCodePrecheckResult {
     if (!code) {
       blankLines.push(lineNo);
       continue;
+    }
+    if (credentialType === "account_password") {
+      const [account = "", password = ""] = splitCredentialInputLine(code);
+      if (!account.trim() || !password.trim()) {
+        invalidRows.push({ line: lineNo, value: code, reason: "账号密码每行必须按“账号,密码,备注”填写，备注可选" });
+        continue;
+      }
     }
     if (code.length < 3 || code.length > 500) {
       invalidRows.push({ line: lineNo, value: code, reason: "长度需为 3-500 个字符" });
@@ -3566,6 +4556,32 @@ function precheckRightsCodes(value: string): RightsCodePrecheckResult {
     duplicateCodes,
     invalidRows
   };
+}
+
+function splitCredentialInputLine(line: string): string[] {
+  const values: string[] = [];
+  let current = "";
+  let quoted = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (char === "\"") {
+      if (quoted && line[index + 1] === "\"") {
+        current += "\"";
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if (!quoted && (char === "," || char === "\t")) {
+      values.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  values.push(current);
+  return values;
 }
 
 function validateCouponForm(form: { name: string; discountCents: string; validDays: string; status: string }): string {

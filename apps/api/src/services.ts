@@ -29,6 +29,7 @@ import {
   type PrismaRepositoryRegistry,
   type PrismaTx
 } from "../../../packages/database/src/index.js";
+import { Buffer } from "node:buffer";
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 
 export class ApiError extends Error {
@@ -1254,14 +1255,14 @@ class BackendServices {
     order.extractionLockedUntil = null;
     const codes = this.store.rightsCodes
       .filter((code) => code.orderNo === order.orderNo && code.status === "issued")
-      .map((code) => ({ codeId: code.codeId, code: code.code, issuedAt: code.issuedAt }));
+      .map((code) => serializeCredentialForDelivery(code));
     this.recordExtractLog(order, actor.userId, "success", undefined);
     this.audit("user", "order.extract.success", "order", orderNo, { codeCount: codes.length });
     return {
       orderNo,
       status: "success",
       codes,
-      message: "卡密已提取，请妥善保存。"
+      message: "自动发货内容已提取，请妥善保存。"
     };
   }
 
@@ -1728,6 +1729,8 @@ class BackendServices {
       afterSaleRule: input.afterSaleRule ?? { platformReviewRequired: true },
       reviewStatus: "pending_review",
       status: "pending_review",
+      reviewedAt: null,
+      reviewedBy: null,
       createdAt: now,
       updatedAt: now
     };
@@ -2070,6 +2073,14 @@ class BackendServices {
           merchantId: product.merchantId,
           shopId: product.shopId,
           name: product.name,
+          category: product.category,
+          tags: product.tags,
+          subtitle: product.subtitle,
+          description: product.description,
+          usageGuide: product.usageGuide,
+          imageUrl: product.imageUrl,
+          specs: product.specs,
+          detailSections: product.detailSections,
           salePriceCents: product.salePriceCents,
           minSalePriceCents: product.minSalePriceCents,
           fulfillmentRule: product.fulfillmentRule,
@@ -2077,6 +2088,8 @@ class BackendServices {
           afterSaleRule: product.afterSaleRule,
           reviewStatus: product.reviewStatus,
           status: product.status,
+          reviewedAt: product.reviewedAt,
+          reviewedBy: product.reviewedBy,
           createdAt: product.createdAt,
           updatedAt: product.updatedAt,
           merchant: merchant ? { id: merchant.id, name: merchant.name, tier: merchant.tier, status: merchant.status } : undefined,
@@ -2105,9 +2118,12 @@ class BackendServices {
   reviewOwnProduct(actor: AdminActor, ownProductId: string, input: { approved: boolean; reason?: string }) {
     assertAdminPermission(actor, "product.manage");
     const ownProduct = requireEntity(this.store.ownProducts.get(ownProductId), "RESOURCE_NOT_FOUND", "own product not found");
+    const reviewedAt = new Date();
     ownProduct.reviewStatus = input.approved ? "approved" : "rejected";
     ownProduct.status = ownProduct.reviewStatus;
-    ownProduct.updatedAt = new Date();
+    ownProduct.reviewedAt = reviewedAt;
+    ownProduct.reviewedBy = actor.adminId;
+    ownProduct.updatedAt = reviewedAt;
     let merchantProductListing: DemoMerchantProductListing | undefined;
     if (input.approved) {
       merchantProductListing = {
@@ -2123,7 +2139,7 @@ class BackendServices {
       ownProduct.status = "listed";
       this.store.merchantProductListings.set(merchantProductListing.id, merchantProductListing);
     }
-    this.audit(actor.role, "own_product.review", "own_product", ownProduct.id, input);
+    this.audit(actor.role, "own_product.review", "own_product", ownProduct.id, { ...input, reviewedBy: actor.adminId });
     return { ownProduct, merchantProductListing };
   }
 
@@ -2286,13 +2302,14 @@ class BackendServices {
     return codes;
   }
 
-  precheckRightsCodes(actor: AdminActor, input: { productId: string; codes: string[] }) {
+  precheckRightsCodes(actor: AdminActor, input: { productId: string; codes: string[]; credentialType?: CredentialType }) {
     assertAdminPermission(actor, "product.manage");
     const product = requireEntity(this.store.platformProducts.get(input.productId), "RESOURCE_NOT_FOUND", "platform product not found");
     if (fulfillmentRuleMode(product.fulfillmentRule) !== "code_pool") {
       throw new ApiError(400, "RIGHTS_CODE_PRODUCT_MODE_INVALID", "card-code pool is only available for code_pool products");
     }
-    const precheck = this.analyzeRightsCodeImport(input.codes, (code) =>
+    const credentialType = input.credentialType ?? productCredentialType(product.fulfillmentRule);
+    const precheck = this.analyzeRightsCodeImport(input.codes, credentialType, (code) =>
       this.store.rightsCodes.some((item) => item.productId === product.id && item.code === code)
     );
     return this.redactRightsCodeImportPrecheck(precheck);
@@ -2341,28 +2358,37 @@ class BackendServices {
   }
 
   private redactRightsCode(code: RightsCode) {
-    const preview = code.code.length <= 6 ? "***" : `${code.code.slice(0, 2)}***${code.code.slice(-2)}`;
+    const preview = credentialPreview(code);
     return {
       ...code,
+      credentialType: code.credentialType ?? "code",
       code: undefined,
+      account: undefined,
+      password: undefined,
+      note: undefined,
       codePreview: preview
     };
   }
 
-  private analyzeRightsCodeImport(codes: string[], exists: (code: string) => boolean): RightsCodeImportPrecheck {
+  private analyzeRightsCodeImport(codes: string[], credentialType: CredentialType, exists: (code: string) => boolean): RightsCodeImportPrecheck {
     const seen = new Set<string>();
     const details = codes.map((rawCode, index): RightsCodeImportDetail => {
-      const normalizedCode = rawCode.trim();
+      const parsed = parseCredentialImportLine(rawCode, credentialType);
+      const normalizedCode = parsed.normalizedCode;
       const base = {
         line: index + 1,
-        codePreview: normalizedCode ? previewSecret(normalizedCode) : undefined,
-        normalizedCode: normalizedCode || undefined
+        credentialType,
+        codePreview: normalizedCode ? parsed.codePreview : undefined,
+        normalizedCode: normalizedCode || undefined,
+        account: parsed.account,
+        password: parsed.password,
+        note: parsed.note
       };
       if (!normalizedCode) {
         return { ...base, action: "fail", reasonCode: "EMPTY_LINE", reason: "empty line" };
       }
-      if (normalizedCode.length > 256 || /[\u0000-\u001f\u007f]/.test(normalizedCode)) {
-        return { ...base, action: "fail", reasonCode: "INVALID_FORMAT", reason: "card code contains invalid characters or is too long" };
+      if (parsed.error) {
+        return { ...base, action: "fail", reasonCode: "INVALID_FORMAT", reason: parsed.error };
       }
       if (seen.has(normalizedCode)) {
         return { ...base, action: "skip", reasonCode: "DUPLICATE_IN_REQUEST", reason: "duplicate in current import" };
@@ -2392,17 +2418,18 @@ class BackendServices {
   private redactRightsCodeImportPrecheck(precheck: RightsCodeImportPrecheck) {
     return {
       ...precheck,
-      details: precheck.details.map(({ normalizedCode: _normalizedCode, ...item }) => item)
+      details: precheck.details.map(({ normalizedCode: _normalizedCode, account: _account, password: _password, note: _note, ...item }) => item)
     };
   }
 
-  addRightsCodes(actor: AdminActor, input: { productId: string; codes: string[]; batchNo?: string }) {
+  addRightsCodes(actor: AdminActor, input: { productId: string; codes: string[]; batchNo?: string; credentialType?: CredentialType }) {
     assertAdminPermission(actor, "product.manage");
     const product = requireEntity(this.store.platformProducts.get(input.productId), "RESOURCE_NOT_FOUND", "platform product not found");
     if (fulfillmentRuleMode(product.fulfillmentRule) !== "code_pool") {
       throw new ApiError(400, "RIGHTS_CODE_PRODUCT_MODE_INVALID", "card-code pool is only available for code_pool products");
     }
-    const precheck = this.analyzeRightsCodeImport(input.codes, (code) =>
+    const credentialType = input.credentialType ?? productCredentialType(product.fulfillmentRule);
+    const precheck = this.analyzeRightsCodeImport(input.codes, credentialType, (code) =>
       this.store.rightsCodes.some((item) => item.productId === product.id && item.code === code)
     );
     const importableCodes = precheck.details
@@ -2412,11 +2439,16 @@ class BackendServices {
     if (importableCodes.length === 0) throw new ApiError(400, "RIGHTS_CODE_EMPTY", "no importable card codes");
     const created: RightsCode[] = [];
     for (const code of importableCodes) {
+      const detail = precheck.details.find((item) => item.normalizedCode === code);
       const item: RightsCode = {
         codeId: nextId(this.store, "code"),
         productId: product.id,
         platformProductId: product.id,
         code,
+        credentialType,
+        account: detail?.account,
+        password: detail?.password,
+        note: detail?.note,
         batchNo: input.batchNo ?? "manual",
         status: "available",
         createdAt: new Date()
@@ -2460,7 +2492,7 @@ class BackendServices {
   }
 
 
-  precheckMerchantRightsCodes(actor: MerchantActor, input: { merchantProductListingId: string; codes: string[] }) {
+  precheckMerchantRightsCodes(actor: MerchantActor, input: { merchantProductListingId: string; codes: string[]; credentialType?: CredentialType }) {
     this.assertMerchantDepositConfirmed(actor.merchantId, "import own rights codes");
     const merchantProductListing = requireEntity(this.store.merchantProductListings.get(input.merchantProductListingId), "RESOURCE_NOT_FOUND", "merchant product not found");
     assertMerchantScope(actor, merchantProductListing);
@@ -2471,14 +2503,15 @@ class BackendServices {
     if (fulfillmentRuleMode(ownProduct.fulfillmentRule) !== "code_pool") {
       throw new ApiError(400, "RIGHTS_CODE_PRODUCT_MODE_INVALID", "own product must use automatic card-code fulfillment");
     }
-    const precheck = this.analyzeRightsCodeImport(input.codes, (code) =>
+    const credentialType = input.credentialType ?? productCredentialType(ownProduct.fulfillmentRule);
+    const precheck = this.analyzeRightsCodeImport(input.codes, credentialType, (code) =>
       this.store.rightsCodes.some((item) => (item.merchantProductListingId ?? item.productId) === merchantProductListing.id && item.code === code)
     );
     return this.redactRightsCodeImportPrecheck(precheck);
   }
 
 
-  addMerchantRightsCodes(actor: MerchantActor, input: { merchantProductListingId: string; codes: string[]; batchNo?: string }) {
+  addMerchantRightsCodes(actor: MerchantActor, input: { merchantProductListingId: string; codes: string[]; batchNo?: string; credentialType?: CredentialType }) {
     this.assertMerchantDepositConfirmed(actor.merchantId, "import own rights codes");
     const merchantProductListing = requireEntity(this.store.merchantProductListings.get(input.merchantProductListingId), "RESOURCE_NOT_FOUND", "merchant product not found");
     assertMerchantScope(actor, merchantProductListing);
@@ -2491,7 +2524,8 @@ class BackendServices {
       throw new ApiError(400, "RIGHTS_CODE_PRODUCT_MODE_INVALID", "own product must use automatic card-code fulfillment");
     }
     ownProduct.fulfillmentRule = { ...rule, mode: "code_pool", extractCodeRequired: true };
-    const precheck = this.analyzeRightsCodeImport(input.codes, (code) =>
+    const credentialType = input.credentialType ?? productCredentialType(ownProduct.fulfillmentRule);
+    const precheck = this.analyzeRightsCodeImport(input.codes, credentialType, (code) =>
       this.store.rightsCodes.some((item) => (item.merchantProductListingId ?? item.productId) === merchantProductListing.id && item.code === code)
     );
     const importableCodes = precheck.details
@@ -2501,12 +2535,17 @@ class BackendServices {
     if (importableCodes.length === 0) throw new ApiError(400, "RIGHTS_CODE_EMPTY", "no importable card codes");
     const created: RightsCode[] = [];
     for (const code of importableCodes) {
+      const detail = precheck.details.find((item) => item.normalizedCode === code);
       const item: RightsCode = {
         codeId: nextId(this.store, "code"),
         productId: merchantProductListing.id,
         merchantProductListingId: merchantProductListing.id,
         merchantProductId: merchantProductListing.id,
         code,
+        credentialType,
+        account: detail?.account,
+        password: detail?.password,
+        note: detail?.note,
         batchNo: input.batchNo ?? "merchant",
         status: "available",
         createdAt: new Date()
@@ -5016,11 +5055,7 @@ class BackendServices {
     }
     const codes = this.store.rightsCodes
       .filter((code) => code.orderNo === order.orderNo && code.status === "issued")
-      .map((code) => ({
-        codeId: code.codeId,
-        code: code.code,
-        issuedAt: code.issuedAt
-      }));
+      .map((code) => serializeCredentialForDelivery(code));
     return {
       mode: "automatic",
       status: order.fulfillmentStatus,
@@ -5042,7 +5077,7 @@ class BackendServices {
         codeCount: 0
       } : undefined,
       codes: !order.extractionCodeSet && options.includeBuyerContact && order.paymentStatus === "paid" && order.fulfillmentStatus === "success" && order.refundStatus === "none" ? codes : [],
-      message: codes.length > 0 ? "卡密已自动发放，请使用购买时设置的购买密码查看。" : "付款后系统会自动发放卡密。"
+      message: codes.length > 0 ? "自动发货库存已准备好，请使用购买时设置的购买密码查看。" : "付款后系统会自动发放库存凭证。"
     };
   }
 
@@ -10883,8 +10918,8 @@ class PrismaStateRepository {
         ${jsonForDb(ownProduct)}::jsonb, ${ownProduct.salePriceCents},
         ${jsonForDb(ownProduct.afterSaleRule)}::jsonb, ${jsonForDb(ownProduct.fulfillmentRule)}::jsonb,
         CAST(${fulfillmentModeFromRule(ownProduct.fulfillmentRule)} AS "FulfillmentType"),
-        CAST(${mapReviewStatus(ownProduct.reviewStatus)} AS "ReviewStatus"), NULL, NULL, NULL,
-        ${ownProduct.reviewStatus === "approved" ? ownProduct.updatedAt ?? new Date() : null},
+        CAST(${mapReviewStatus(ownProduct.reviewStatus)} AS "ReviewStatus"), NULL, NULL, ${ownProduct.reviewedBy ?? null},
+        ${ownProduct.reviewedAt ?? (ownProduct.reviewStatus === "pending_review" ? null : ownProduct.updatedAt ?? new Date())},
         ${`merchant-product-review:${ownProduct.id}`},
         ${ownProduct.createdAt ?? new Date()}, ${ownProduct.updatedAt ?? new Date()}
       )
@@ -12777,11 +12812,13 @@ class PrismaStateRepository {
       after_sale_rule_json: unknown;
       fulfillment_rule_json: unknown;
       status: string;
+      reviewed_by: string | null;
+      reviewed_at: Date | null;
       created_at: Date;
       updated_at: Date;
     }>>`
       SELECT id, merchant_id, shop_id, name, detail_json, sale_price_cents,
-             after_sale_rule_json, fulfillment_rule_json, status, created_at, updated_at
+             after_sale_rule_json, fulfillment_rule_json, status, reviewed_by, reviewed_at, created_at, updated_at
         FROM merchant_product_reviews
     `;
     for (const row of rows) {
@@ -12807,6 +12844,8 @@ class PrismaStateRepository {
         afterSaleRule: decodeStoreValue(row.after_sale_rule_json),
         reviewStatus: row.status,
         status: row.status,
+        reviewedAt: row.reviewed_at,
+        reviewedBy: row.reviewed_by,
         createdAt: row.created_at,
         updatedAt: row.updated_at
       });
@@ -13864,6 +13903,99 @@ function previewSecret(value: string) {
   const trimmed = value.trim();
   if (trimmed.length <= 6) return "***";
   return `${trimmed.slice(0, 2)}***${trimmed.slice(-2)}`;
+}
+
+function parseCredentialImportLine(raw: string, credentialType: CredentialType): {
+  normalizedCode: string;
+  codePreview?: string;
+  account?: string;
+  password?: string;
+  note?: string;
+  error?: string;
+} {
+  const trimmed = raw.trim();
+  if (!trimmed) return { normalizedCode: "" };
+  if (credentialType === "account_password") {
+    const [account = "", password = "", ...noteParts] = splitCredentialCsvLine(trimmed);
+    const normalizedAccount = account.trim();
+    const normalizedPassword = password.trim();
+    const note = noteParts.join(",").trim();
+    if (!normalizedAccount || !normalizedPassword) {
+      return { normalizedCode: trimmed, codePreview: "账号密码格式错误", error: "account and password are required" };
+    }
+    if (normalizedAccount.length > 160 || normalizedPassword.length > 256 || /[\u0000-\u001f\u007f]/.test(`${normalizedAccount}${normalizedPassword}${note}`)) {
+      return { normalizedCode: trimmed, codePreview: "账号密码格式错误", error: "account/password contains invalid characters or is too long" };
+    }
+    const code = note ? `账号：${normalizedAccount}\n密码：${normalizedPassword}\n备注：${note}` : `账号：${normalizedAccount}\n密码：${normalizedPassword}`;
+    return {
+      normalizedCode: code,
+      account: normalizedAccount,
+      password: normalizedPassword,
+      note: note || undefined,
+      codePreview: `账号 ${previewSecret(normalizedAccount)}，密码已隐藏`
+    };
+  }
+  if (trimmed.length > 256 || /[\u0000-\u001f\u007f]/.test(trimmed)) {
+    return { normalizedCode: trimmed, codePreview: previewSecret(trimmed), error: "credential contains invalid characters or is too long" };
+  }
+  return { normalizedCode: trimmed, codePreview: previewSecret(trimmed) };
+}
+
+function splitCredentialCsvLine(line: string): string[] {
+  const values: string[] = [];
+  let current = "";
+  let quoted = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (char === "\"") {
+      if (quoted && line[index + 1] === "\"") {
+        current += "\"";
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if (!quoted && (char === "," || char === "\t")) {
+      values.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  values.push(current);
+  return values;
+}
+
+function credentialPreview(code: RightsCode) {
+  const credentialType = code.credentialType ?? "code";
+  if (credentialType === "account_password") {
+    return `账号 ${previewSecret(code.account ?? code.code)}，密码已隐藏`;
+  }
+  return previewSecret(code.code);
+}
+
+function credentialTypeLabel(type: CredentialType) {
+  return type === "account_password" ? "账号密码" : "兑换码/卡密";
+}
+
+function productCredentialType(rule: unknown): CredentialType {
+  if (!isRecord(rule)) return "code";
+  return rule.credentialType === "account_password" ? "account_password" : "code";
+}
+
+function serializeCredentialForDelivery(code: RightsCode) {
+  const credentialType = code.credentialType ?? "code";
+  return {
+    codeId: code.codeId,
+    code: code.code,
+    credentialType,
+    credentialLabel: credentialTypeLabel(credentialType),
+    account: code.account,
+    password: code.password,
+    note: code.note,
+    issuedAt: code.issuedAt
+  };
 }
 
 function maskSecret(value?: string) {
@@ -15285,6 +15417,8 @@ type DemoOwnProduct = {
   afterSaleRule: unknown;
   reviewStatus: string;
   status: string;
+  reviewedAt?: Date | null;
+  reviewedBy?: string | null;
   createdAt?: Date;
   updatedAt?: Date;
 };
@@ -15593,6 +15727,8 @@ type LedgerEntry = {
   createdAt: Date;
 };
 
+type CredentialType = "code" | "account_password";
+
 type RightsCode = {
   codeId: string;
   productId: string;
@@ -15600,6 +15736,10 @@ type RightsCode = {
   merchantProductListingId?: string;
   merchantProductId?: string;
   code: string;
+  credentialType?: CredentialType;
+  account?: string;
+  password?: string;
+  note?: string;
   batchNo: string;
   status: "available" | "locked" | "issued" | "voided";
   orderNo?: string;
@@ -15615,6 +15755,10 @@ type RightsCodeImportDetail = {
   reason: string | null;
   normalizedCode?: string;
   codePreview?: string;
+  credentialType?: CredentialType;
+  account?: string;
+  password?: string;
+  note?: string;
 };
 
 type RightsCodeImportPrecheck = {
