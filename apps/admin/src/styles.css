@@ -1433,6 +1433,7 @@ textarea {
 .product-media-panel,
 .product-edit-panel,
 .product-side-panel,
+.platform-shop-settings,
 .inventory-summary,
 .change-summary {
   min-width: 0;
@@ -1521,6 +1522,7 @@ textarea {
   box-shadow: 0 10px 24px rgb(20 58 70 / 12%);
 }
 
+.platform-shop-settings,
 .inventory-summary,
 .change-summary,
 .proxy-summary {
@@ -1536,6 +1538,7 @@ textarea {
 .product-drawer .mini-metrics,
 .product-drawer .precheck,
 .product-drawer .audit-note,
+.product-drawer .platform-shop-settings,
 .product-drawer .inventory-summary,
 .product-drawer .change-summary,
 .product-drawer .proxy-summary {
@@ -1555,6 +1558,7 @@ textarea {
 
 .inventory-summary h4,
 .change-summary h4,
+.platform-shop-settings h4,
 .proxy-summary h4 {
   margin: 0 0 4px;
   color: var(--admin-text);
@@ -1565,6 +1569,7 @@ textarea {
 
 .product-drawer .inventory-summary h4,
 .product-drawer .change-summary h4,
+.product-drawer .platform-shop-settings h4,
 .product-drawer .proxy-summary h4 {
   margin: 0 0 5px;
   font-size: var(--admin-font-md);

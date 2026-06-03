@@ -315,6 +315,8 @@ const valueLabels: Record<string, string> = {
   rejected: "已拒绝",
   active: "启用",
   listed: "上架",
+  delisted: "下架",
+  risk_removed: "风控下架",
   disabled: "停用",
   frozen: "冻结",
   open: "营业中",
@@ -412,7 +414,6 @@ function App() {
   const [attemptNo, setAttemptNo] = useState(1);
   const [selectedPlatformProduct, setSelectedPlatformProduct] = useState<JsonRecord | undefined>();
   const [selectedListingPlatformProduct, setSelectedListingPlatformProduct] = useState<JsonRecord | undefined>();
-  const [selectedPlatformShopProductOverride, setSelectedPlatformShopProductOverride] = useState<JsonRecord | undefined>();
   const [selectedMerchantProductOverride, setSelectedMerchantProductOverride] = useState<JsonRecord | undefined>();
   const [selectedOwnProductReview, setSelectedOwnProductReview] = useState<JsonRecord | undefined>();
   const [productDetailTab, setProductDetailTab] = useState<"base" | "codes" | "audit">("base");
@@ -562,7 +563,9 @@ function App() {
   const [sensitiveRightsCodes, setSensitiveRightsCodes] = useState<JsonRecord[]>([]);
 
   const selectedPublicProduct = data.publicProducts[0];
-  const selectedPlatformShopProduct = selectedPlatformShopProductOverride ?? data.platformShopProducts[0];
+  const selectedPlatformShopProduct = selectedPlatformProduct
+    ? data.platformShopProducts.find((item) => text(item.platformProductId) === text(selectedPlatformProduct.id))
+    : undefined;
   const selectedMerchantProduct = selectedMerchantProductOverride ?? data.merchantProducts[0];
   const selectedListingExistingProduct = selectedListingPlatformProduct
     ? data.merchantProducts.find((item) => text(item.platformProductId) === text(selectedListingPlatformProduct.id))
@@ -982,14 +985,14 @@ function App() {
     setSelectedPlatformProduct(row);
     setProductDetailTab("base");
     setRightsPrecheck(undefined);
-    setPlatformShopProductForm((current) => ({
-      ...current,
-      shopId: text(data.platformShop?.id, configuredPlatformShopId || current.shopId),
-      platformProductId: text(row.id, current.platformProductId),
-      salePriceCents: text(row.suggestedSalePriceCents, current.salePriceCents),
-      fulfillmentCostCents: text(row.supplyPriceCents, current.fulfillmentCostCents),
-      status: current.status || "listed"
-    }));
+    const existingPlatformShopProduct = data.platformShopProducts.find((item) => text(item.platformProductId) === text(row.id));
+    setPlatformShopProductForm({
+      shopId: text(existingPlatformShopProduct?.shopId, text(data.platformShop?.id, configuredPlatformShopId)),
+      platformProductId: text(row.id, ""),
+      salePriceCents: text(existingPlatformShopProduct?.salePriceCents, text(row.suggestedSalePriceCents, "")),
+      fulfillmentCostCents: text(existingPlatformShopProduct?.fulfillmentCostCents, text(row.supplyPriceCents, "0")),
+      status: text(existingPlatformShopProduct?.status, "listed")
+    });
     const rule = row.fulfillmentRule as JsonRecord | undefined;
     setProductForm({
       name: text(row.name, ""),
@@ -1084,35 +1087,6 @@ function App() {
     });
   }
 
-  function pickPlatformShopProduct(row: JsonRecord) {
-    setSelectedPlatformShopProductOverride(row);
-    setPlatformShopProductForm({
-      shopId: text(row.shopId, text(data.platformShop?.id, configuredPlatformShopId)),
-      platformProductId: text(row.platformProductId, ""),
-      salePriceCents: text(row.salePriceCents, ""),
-      fulfillmentCostCents: text(row.fulfillmentCostCents, ""),
-      status: text(row.status, "listed")
-    });
-    setMessage(`已选择平台自营商品：${text((row.product as JsonRecord | undefined)?.name, text(row.id))}`);
-  }
-
-  function fillPlatformShopProductFromSelectedProduct() {
-    const product = selectedPlatformProduct ?? data.platformProducts[0];
-    if (!product?.id) {
-      setMessage("请先从平台商品库选择一个商品。");
-      return;
-    }
-    setSelectedPlatformShopProductOverride(undefined);
-    setPlatformShopProductForm({
-      shopId: text(data.platformShop?.id, configuredPlatformShopId),
-      platformProductId: text(product.id, ""),
-      salePriceCents: text(product.suggestedSalePriceCents, ""),
-      fulfillmentCostCents: text(product.supplyPriceCents, "0"),
-      status: "listed"
-    });
-    setMessage("已带入平台商品，可填写平台自营对外售价。");
-  }
-
   function pickOwnProductReview(row: JsonRecord) {
     setSelectedOwnProductReview(row);
     setMessage(`已打开自有商品审核详情：${text(row.name, text(row.id))}`);
@@ -1162,7 +1136,7 @@ function App() {
       setMessage("请先选择要在平台自营店销售的平台商品。");
       return;
     }
-    const priceError = validatePositiveCents(platformShopProductForm.salePriceCents, "平台自营售价");
+    const priceError = validatePositiveCents(platformShopProductForm.salePriceCents, "平台主店售价");
     if (priceError) {
       setMessage(priceError);
       return;
@@ -1171,17 +1145,36 @@ function App() {
       setMessage("履约成本必须是非负整数分。");
       return;
     }
-    const selectedId = text(selectedPlatformShopProductOverride?.id, "");
-    const action = selectedId ? "保存平台自营售价" : "上架平台自营商品";
-    void runAction(action, () => selectedId
-      ? api.updatePlatformShopProduct(selectedId, platformShopProductForm)
-      : api.upsertPlatformShopProduct(
-        shopId,
-        platformProductId,
-        platformShopProductForm.salePriceCents,
-        platformShopProductForm.fulfillmentCostCents,
-        platformShopProductForm.status
-      ));
+    const salePrice = Number(platformShopProductForm.salePriceCents);
+    const minSalePrice = Number(text(selectedPlatformProduct?.minSalePriceCents, "0"));
+    if (minSalePrice > 0 && salePrice < minSalePrice) {
+      setMessage(`平台主店售价不能低于最低售价 ${cents(String(minSalePrice))}。`);
+      return;
+    }
+    const selectedId = text(selectedPlatformShopProduct?.id, "");
+    const action = selectedId ? "保存平台主店销售设置" : "上架到平台主店";
+    setConfirmAction({
+      title: selectedId ? "确认保存平台主店销售设置" : "确认上架到平台主店",
+      description: "这里改的是平台主店卖给客户的价格和销售状态，不会修改平台供货价、最低售价、自动发货库存或代理链路。",
+      confirmText: selectedId ? "确认保存" : "确认上架",
+      actionLabel: action,
+      run: () => selectedId
+        ? api.updatePlatformShopProduct(selectedId, platformShopProductForm)
+        : api.upsertPlatformShopProduct(
+          shopId,
+          platformProductId,
+          platformShopProductForm.salePriceCents,
+          platformShopProductForm.fulfillmentCostCents,
+          platformShopProductForm.status
+        ),
+      rows: [
+        { label: "商品", value: text(selectedPlatformProduct?.name, platformProductId) },
+        { label: "平台主店", value: text(data.platformShop?.name, text(data.platformShop?.id, shopId)) },
+        { label: "销售价", before: selectedId ? cents(selectedPlatformShopProduct?.salePriceCents) : "未上架", value: cents(platformShopProductForm.salePriceCents) },
+        { label: "履约成本", before: selectedId ? cents(selectedPlatformShopProduct?.fulfillmentCostCents) : "-", value: cents(platformShopProductForm.fulfillmentCostCents) },
+        { label: "销售状态", before: selectedId ? statusText(selectedPlatformShopProduct?.status) : "未上架", value: statusText(platformShopProductForm.status) }
+      ]
+    });
   }
 
   function submitRightsCodes() {
@@ -1625,17 +1618,6 @@ function App() {
                 ? <MerchantListingTable products={data.platformProducts} merchantProducts={data.merchantProducts} onPick={pickListingPlatformProduct} blocked={merchantBlocked || loading} tier={currentMerchantTier} loading={loading && actionLabel.includes("店铺商品")} />
                 : <ProductCatalogList products={data.platformProducts} rightsCodes={data.rightsCodes} merchantProducts={data.merchantProducts} channels={data.channels} onPick={pickPlatformProduct} />}
             </Panel>
-            {!merchantSessionActive ? (
-              <Panel title="平台自营已上架" kicker={`${data.platformShopProducts.length} 个商品`}>
-                <PlatformShopProductTable
-                  rows={platformShopProductRows(data.platformShopProducts)}
-                  onPick={(row) => {
-                    const source = data.platformShopProducts.find((item) => text(item.id) === text(row.id)) ?? row;
-                    pickPlatformShopProduct(source);
-                  }}
-                />
-              </Panel>
-            ) : null}
             <Panel title="店铺已上架商品" kicker={`${data.merchantProducts.length} 个商品`}>
               <Table rows={merchantProductRows(data.merchantProducts)} columns={merchantProductColumns} moneyColumns={["salePriceCents", "supplyPriceCents", "platformSupplyPriceCents", "visibleUpstreamSupplyPriceCents", "minSalePriceCents"]} onPick={merchantSessionActive ? pickListedMerchantProduct : (row) => setSelectedMerchantProductOverride(data.merchantProducts.find((item) => text(item.id) === text(row.id)) ?? row)} />
             </Panel>
@@ -1711,24 +1693,6 @@ function App() {
                 {productForm.fulfillmentMode === "manual" ? <p className="hint">人工交付商品不能导入自动发货库存；请维护商品说明、使用说明和店铺客服信息。</p> : null}
               </Panel>
             )}
-              {!merchantSessionActive ? (
-                <Panel title="平台自营售价" kicker="平台对外销售">
-                  <p className="hint">这里改的是平台自营店卖给客户的价格，不是供货价、最低售价或建议售价。</p>
-                  <KeyValue label="平台自营店" value={text(data.platformShop?.name, text(data.platformShop?.id, "未配置"))} />
-                  <div className="form-grid">
-                    <label>平台自营店ID<input value={platformShopProductForm.shopId} onChange={(event) => setPlatformShopProductForm({ ...platformShopProductForm, shopId: event.target.value })} placeholder="平台自营店ID" /></label>
-                    <label>平台商品ID<input value={platformShopProductForm.platformProductId} onChange={(event) => setPlatformShopProductForm({ ...platformShopProductForm, platformProductId: event.target.value })} placeholder="从平台商品库选择后自动带入" /></label>
-                    <label>平台自营售价(分)<input inputMode="numeric" value={platformShopProductForm.salePriceCents} onChange={(event) => setPlatformShopProductForm({ ...platformShopProductForm, salePriceCents: event.target.value })} placeholder="客户看到的销售价" /></label>
-                    <label>履约成本(分)<input inputMode="numeric" value={platformShopProductForm.fulfillmentCostCents} onChange={(event) => setPlatformShopProductForm({ ...platformShopProductForm, fulfillmentCostCents: event.target.value })} placeholder="可填0" /></label>
-                    <label>销售状态<select value={platformShopProductForm.status} onChange={(event) => setPlatformShopProductForm({ ...platformShopProductForm, status: event.target.value })}><option value="listed">上架销售</option><option value="approved">审核通过未上架</option><option value="delisted">下架</option><option value="risk_removed">风控下架</option></select></label>
-                  </div>
-                  <div className="actions">
-                    <button type="button" onClick={fillPlatformShopProductFromSelectedProduct}>带入已选平台商品</button>
-                    <button type="button" onClick={submitPlatformShopProduct}>{selectedPlatformShopProductOverride?.id ? "保存自营售价" : "上架到平台自营店"}</button>
-                    {selectedPlatformShopProductOverride?.id ? <button className="secondary" type="button" onClick={() => { setSelectedPlatformShopProductOverride(undefined); setMessage("已退出平台自营商品编辑"); }}>退出自营编辑</button> : null}
-                  </div>
-                </Panel>
-              ) : null}
             </section>
           {merchantSessionActive ? (
             <Panel title="新增自有商品" kicker="提交平台审核">
@@ -1763,8 +1727,13 @@ function App() {
               relatedMerchantProducts={data.merchantProducts.filter((item) => text(item.platformProductId) === text(selectedPlatformProduct.id))}
               channelRelations={channelRows(data.channels, "relations")}
               channelOffers={channelRows(data.channels, "offers").filter((item) => text(item.platformProductId) === text(selectedPlatformProduct.id))}
+              platformShop={data.platformShop}
+              platformShopProduct={selectedPlatformShopProduct}
+              platformShopForm={platformShopProductForm}
+              setPlatformShopForm={setPlatformShopProductForm}
               onUploadImage={uploadSelectedProductImage}
               onSave={submitPlatformProductUpdate}
+              onSavePlatformShop={submitPlatformShopProduct}
               busy={loading}
               onClose={() => setSelectedPlatformProduct(undefined)}
               onOpenInventory={() => openInventoryForPlatformProduct(selectedPlatformProduct)}
@@ -2893,8 +2862,13 @@ function PlatformProductDrawer(props: {
   relatedMerchantProducts: JsonRecord[];
   channelRelations: JsonRecord[];
   channelOffers: JsonRecord[];
+  platformShop?: JsonRecord;
+  platformShopProduct?: JsonRecord;
+  platformShopForm: PlatformShopProductFormState;
+  setPlatformShopForm: React.Dispatch<React.SetStateAction<PlatformShopProductFormState>>;
   onUploadImage: (file: File) => void;
   onSave: () => void;
+  onSavePlatformShop: () => void;
   busy: boolean;
   onClose: () => void;
   onOpenInventory: () => void;
@@ -2969,6 +2943,14 @@ function PlatformProductDrawer(props: {
             </div>
           </div>
           <div className="product-side-panel">
+            <ProductPlatformShopSettings
+              shop={props.platformShop}
+              shopProduct={props.platformShopProduct}
+              form={props.platformShopForm}
+              setForm={props.setPlatformShopForm}
+              busy={props.busy}
+              onSave={props.onSavePlatformShop}
+            />
             <ProductInventorySummary product={props.product} rightsCodes={props.rightsCodes} />
             <ProductProxySummary
               product={props.product}
@@ -3548,6 +3530,57 @@ function ProductImage(props: { product?: JsonRecord; size: "list" | "detail" }) 
   );
 }
 
+function ProductPlatformShopSettings(props: {
+  shop?: JsonRecord;
+  shopProduct?: JsonRecord;
+  form: PlatformShopProductFormState;
+  setForm: React.Dispatch<React.SetStateAction<PlatformShopProductFormState>>;
+  busy: boolean;
+  onSave: () => void;
+}) {
+  const listed = Boolean(props.shopProduct?.id);
+  const shopName = text(props.shop?.name, text(props.shop?.id, "平台主店未配置"));
+  return (
+    <div className="platform-shop-settings">
+      <h4>平台主店销售设置</h4>
+      <KeyValue label="平台主店" value={shopName} />
+      <KeyValue label="当前状态" value={listed ? statusText(props.shopProduct?.status) : "未上架到平台主店"} />
+      <div className="inline-form compact">
+        <label>销售价(分)
+          <input
+            inputMode="numeric"
+            value={props.form.salePriceCents}
+            onChange={(event) => props.setForm((form) => ({ ...form, salePriceCents: event.target.value }))}
+            placeholder="客户看到的售价"
+          />
+        </label>
+        <label>履约成本(分)
+          <input
+            inputMode="numeric"
+            value={props.form.fulfillmentCostCents}
+            onChange={(event) => props.setForm((form) => ({ ...form, fulfillmentCostCents: event.target.value }))}
+            placeholder="可填 0"
+          />
+        </label>
+        <label>销售状态
+          <select value={props.form.status} onChange={(event) => props.setForm((form) => ({ ...form, status: event.target.value }))}>
+            <option value="listed">上架销售</option>
+            <option value="approved">保存但不上架</option>
+            <option value="delisted">下架</option>
+            <option value="risk_removed">风控下架</option>
+          </select>
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" disabled={props.busy || !props.form.shopId || !props.form.platformProductId} onClick={props.onSave}>
+          {props.busy ? "保存中..." : listed ? "保存销售设置" : "上架到平台主店"}
+        </button>
+      </div>
+      <p className="hint">这里只控制平台主店卖给前台客户的价格和状态，不改平台供货价、库存和代理链。</p>
+    </div>
+  );
+}
+
 function ProductInventorySummary(props: { product?: JsonRecord; rightsCodes: JsonRecord[] }) {
   const isCodePool = props.product ? productFulfillmentMode(props.product) === "code_pool" : false;
   const credentialType = productCredentialType(props.product);
@@ -4026,91 +4059,6 @@ function OwnProductReviewTable(props: { rows: JsonRecord[]; onPick: (row: JsonRe
           const source = props.rows.find((item) => text(item.id) === text(row.id)) ?? row;
           props.onPick(source);
         }}
-        hideSearch
-      />
-    </>
-  );
-}
-
-function PlatformShopProductTable(props: { rows: JsonRecord[]; onPick: (row: JsonRecord) => void }) {
-  const [draft, setDraft] = useState({
-    keyword: "",
-    status: "",
-    minSaleYuan: "",
-    maxSaleYuan: ""
-  });
-  const [filters, setFilters] = useState(draft);
-
-  const filteredRows = props.rows.filter((row) => {
-    const keyword = filters.keyword.trim().toLowerCase();
-    if (keyword) {
-      const matched = ["productName", "platformProductId", "id", "shopName"].some((column) =>
-        cellText(row[column]).toLowerCase().includes(keyword)
-      );
-      if (!matched) return false;
-    }
-    if (filters.status && text(row.status) !== filters.status) return false;
-    const salePriceCents = Number(row.salePriceCents ?? 0);
-    const minSaleCents = yuanInputToCents(filters.minSaleYuan);
-    const maxSaleCents = yuanInputToCents(filters.maxSaleYuan);
-    if (minSaleCents !== undefined && salePriceCents < minSaleCents) return false;
-    if (maxSaleCents !== undefined && salePriceCents > maxSaleCents) return false;
-    return true;
-  });
-
-  function resetSearch() {
-    const empty = { keyword: "", status: "", minSaleYuan: "", maxSaleYuan: "" };
-    setDraft(empty);
-    setFilters(empty);
-  }
-
-  return (
-    <>
-      <div className="structured-search" role="search" aria-label="搜索平台自营商品">
-        <div className="search-help">可按商品名称、商品编号、自营编号、店铺名称、销售状态、售价范围组合搜索。</div>
-        <label>商品名称/编号
-          <input
-            value={draft.keyword}
-            onChange={(event) => setDraft({ ...draft, keyword: event.target.value })}
-            placeholder="例如 Claude、psp-code、prod-code"
-          />
-        </label>
-        <label>销售状态
-          <select value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value })}>
-            <option value="">全部状态</option>
-            <option value="listed">上架销售</option>
-            <option value="approved">审核通过未上架</option>
-            <option value="delisted">下架</option>
-            <option value="risk_removed">风控下架</option>
-          </select>
-        </label>
-        <label>最低售价(元)
-          <input
-            inputMode="decimal"
-            value={draft.minSaleYuan}
-            onChange={(event) => setDraft({ ...draft, minSaleYuan: event.target.value })}
-            placeholder="例如 30"
-          />
-        </label>
-        <label>最高售价(元)
-          <input
-            inputMode="decimal"
-            value={draft.maxSaleYuan}
-            onChange={(event) => setDraft({ ...draft, maxSaleYuan: event.target.value })}
-            placeholder="例如 100"
-          />
-        </label>
-        <div className="search-actions">
-          <button type="button" onClick={() => setFilters(draft)}>搜索</button>
-          <button className="secondary" type="button" onClick={resetSearch}>重置</button>
-        </div>
-        <span className="search-count">共 {props.rows.length} 条，当前显示 {filteredRows.length} 条</span>
-      </div>
-      <Table
-        rows={filteredRows}
-        columns={["id", "platformProductId", "productName", "shopName", "salePriceCents", "fulfillmentCostCents", "status"]}
-        moneyColumns={["salePriceCents", "fulfillmentCostCents"]}
-        onPick={props.onPick}
         hideSearch
       />
     </>
@@ -4600,22 +4548,6 @@ function merchantProductRows(rows: JsonRecord[]): JsonRecord[] {
       platformSupplyPriceCents: product?.platformSupplyPriceCents,
       visibleUpstreamSupplyPriceCents: product?.visibleUpstreamSupplyPriceCents,
       minSalePriceCents: product?.minSalePriceCents,
-      status: row.status
-    };
-  });
-}
-
-function platformShopProductRows(rows: JsonRecord[]): JsonRecord[] {
-  return rows.map((row) => {
-    const product = row.product as JsonRecord | undefined;
-    const shop = row.shop as JsonRecord | undefined;
-    return {
-      id: row.id,
-      platformProductId: row.platformProductId,
-      productName: product?.name,
-      shopName: shop?.name,
-      salePriceCents: row.salePriceCents,
-      fulfillmentCostCents: row.fulfillmentCostCents,
       status: row.status
     };
   });
