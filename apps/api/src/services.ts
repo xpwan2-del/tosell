@@ -3989,9 +3989,10 @@ class BackendServices {
 
   private applyPaymentFeeSnapshot(order: DemoOrder, method: PaymentMethodConfig) {
     const amount = order.snapshot.amountSnapshot as DemoAmountSnapshot & { buyerPaidAmountCents?: bigint };
-    const baseAmountCents = amount.buyerPaidAmountCents ?? amount.paidAmountCents;
+    const baseAmountCents = order.buyerPaidAmountCents ?? amount.buyerPaidAmountCents ?? amount.paidAmountCents;
     const feeBps = this.paymentFeeBpsForProvider(method.provider);
     const feeCents = calculatePaymentFeeCents(baseAmountCents, BigInt(feeBps));
+    amount.buyerPaidAmountCents = baseAmountCents;
     amount.paymentFeeBps = BigInt(feeBps);
     amount.paymentFeeCents = feeCents;
     amount.balancePaidCents = method.provider === "balance" ? baseAmountCents : 0n;
@@ -13631,6 +13632,7 @@ class PrismaStateRepository {
         amountSnapshot: {
           serviceFeeBps: BigInt(amount.serviceFeeBps),
           paidAmountCents: amount.paidAmountCents,
+          buyerPaidAmountCents: order.paidAmountCents,
           supplyAmountCents: amount.supplyAmountCents,
           serviceFeeCents: amount.serviceFeeCents,
           merchantExpectedIncomeCents: amount.merchantExpectedIncomeCents,
@@ -13664,6 +13666,7 @@ class PrismaStateRepository {
         complaintStatus: "none",
         fulfilledAt: order.fulfilledAt,
         paidAt: order.paidAt,
+        createdAt: order.createdAt,
         buyerEmail: order.buyerEmail ?? undefined,
         buyerPhone: order.buyerPhone ?? undefined,
         extractionCodeSet: Boolean(order.purchasePasswordHash),
@@ -15739,6 +15742,7 @@ type DemoOrder = {
   complaintStatus: string;
   fulfilledAt: Date | null;
   paidAt: Date | null;
+  createdAt?: Date;
   buyerEmail?: string;
   buyerPhone?: string;
   extractionCodeSet?: boolean;

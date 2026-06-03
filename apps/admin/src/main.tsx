@@ -4429,9 +4429,16 @@ function statusTone(value: string): string {
 }
 
 function amountOf(order?: JsonRecord): string {
+  if (order?.buyerPaidAmountCents) return text(order.buyerPaidAmountCents, "0");
   if (order?.paidAmountCents) return text(order.paidAmountCents, "0");
   const snapshot = order?.snapshot as JsonRecord | undefined;
   const amount = snapshot?.amountSnapshot as JsonRecord | undefined;
+  if (amount?.buyerPaidAmountCents) return text(amount.buyerPaidAmountCents, "0");
+  const couponDiscountCents = BigInt(text(order?.couponDiscountCents, "0") || "0");
+  const snapshotPaidAmountCents = BigInt(text(amount?.paidAmountCents, "0") || "0");
+  if (couponDiscountCents > 0n && snapshotPaidAmountCents > 0n) {
+    return String(snapshotPaidAmountCents > couponDiscountCents ? snapshotPaidAmountCents - couponDiscountCents : 0n);
+  }
   return text(amount?.paidAmountCents, "0");
 }
 
