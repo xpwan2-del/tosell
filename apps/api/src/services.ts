@@ -215,9 +215,128 @@ function createPrismaProductionServices() {
       }
       if (property === "listPlatformProducts") {
         return async (...args: unknown[]) => {
-          await hydrate();
-          return withPrismaRetry(() => repository.listPlatformProducts(args[0] as MerchantActor | undefined, service.store));
+          return withPrismaRetry(() => repository.listPlatformProducts(args[0] as MerchantActor | undefined));
         };
+      }
+      if (property === "listAdminPlatformProducts") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listAdminPlatformProducts(args[0] as AdminActor));
+      }
+      if (property === "getAdminPlatformProductDetail") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.getAdminPlatformProductDetail(
+          args[0] as AdminActor,
+          String(args[1] ?? "")
+        ));
+      }
+      if (property === "listAdminPlatformShopProducts") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listAdminPlatformShopProducts(args[0] as AdminActor));
+      }
+      if (property === "listRightsCodes") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listRightsCodes(
+          args[0] as AdminActor,
+          args[1] as { productId?: string; orderNo?: string; status?: RightsCode["status"]; shopId?: string } | undefined
+        ));
+      }
+      if (property === "listAdminCoupons") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listAdminCoupons(args[0] as AdminActor));
+      }
+      if (property === "listAdminPaymentMethods") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listAdminPaymentMethods(args[0] as AdminActor));
+      }
+      if (property === "listMerchantPaymentMethods") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listMerchantPaymentMethods(args[0] as MerchantActor));
+      }
+      if (property === "paymentConfigStatus") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.paymentConfigStatus(args[0] as AdminActor));
+      }
+      if (property === "checkPaymentConfig") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.checkPaymentConfig(args[0] as AdminActor));
+      }
+      if (property === "listAdminOrders") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listAdminOrders(
+          args[0] as AdminActor,
+          args[1] as { page?: number; pageSize?: number; status?: string; shopId?: string; orderNo?: string } | undefined
+        ));
+      }
+      if (property === "listUserOrders") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listUserOrders(args[0] as UserActor));
+      }
+      if (property === "getUserOrder") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.getUserOrder(args[0] as UserActor, String(args[1] ?? "")));
+      }
+      if (property === "listUserCoupons") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listUserCoupons(
+          args[0] as UserActor,
+          args[1] as { shopId?: string; merchantProductListingId?: string } | undefined
+        ));
+      }
+      if (property === "listAdminOwnProductReviews") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listAdminOwnProductReviews(args[0] as AdminActor, args[1] as Record<string, unknown> | undefined));
+      }
+      if (property === "getAdminOwnProductReviewDetail") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.getAdminOwnProductReviewDetail(args[0] as AdminActor, String(args[1] ?? "")));
+      }
+      if (property === "listMerchantApplications") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listMerchantApplications(args[0] as AdminActor));
+      }
+      if (property === "listAdminChannels") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listAdminChannels(args[0] as AdminActor));
+      }
+      if (property === "listMerchantRightsCodes") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listMerchantRightsCodes(args[0] as MerchantActor, args[1] as { merchantProductListingId?: string; status?: RightsCode["status"] } | undefined));
+      }
+      if (property === "listAdminAfterSales") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listAdminAfterSales(args[0] as AdminActor));
+      }
+      if (property === "listMerchantAfterSales") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listMerchantAfterSales(args[0] as MerchantActor));
+      }
+      if (property === "listAdminRefunds") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listAdminRefunds(args[0] as AdminActor));
+      }
+      if (property === "listAdminSettlements") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listAdminSettlements(args[0] as AdminActor));
+      }
+      if (property === "listAdminDeposits") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listAdminDeposits(args[0] as AdminActor));
+      }
+      if (property === "listPaymentVouchers") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listPaymentVouchers(args[0] as AdminActor));
+      }
+      if (property === "listMerchantPaymentVouchers") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listMerchantPaymentVouchers(args[0] as MerchantActor));
+      }
+      if (property === "listServiceQrCodes") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listServiceQrCodes(args[0] as AdminActor));
+      }
+      if (property === "adminSalesDashboard") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.adminSalesDashboard(args[0] as AdminActor));
+      }
+      if (property === "adminRiskDashboard") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.adminRiskDashboard(args[0] as AdminActor));
+      }
+      if (property === "merchantDashboard") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.merchantDashboard(args[0] as MerchantActor));
+      }
+      if (property === "listAuditLogs") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listAuditLogs(args[0] as AdminActor));
+      }
+      if (property === "listLedgerEntries") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listLedgerEntries(args[0] as AdminActor));
+      }
+      if (property === "listPaymentCallbackLogs") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listPaymentCallbackLogs(args[0] as AdminActor));
+      }
+      if (property === "listPaymentExceptions") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listPaymentExceptions(args[0] as AdminActor));
+      }
+      if (property === "listEmailDeliveries") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listEmailDeliveries(args[0] as AdminActor));
+      }
+      if (property === "listExtractLogs") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.listExtractLogs(args[0] as AdminActor));
+      }
+      if (property === "getPlatformServiceFeeConfig") {
+        return async (...args: unknown[]) => withPrismaRetry(() => repository.getPlatformServiceFeeConfig(args[0] as AdminActor));
       }
       if (property === "listMerchantProducts") {
         return async (...args: unknown[]) => withPrismaRetry(() => repository.listMerchantProducts(args[0] as MerchantActor));
@@ -3395,7 +3514,7 @@ class BackendServices {
     return config;
   }
 
-  checkPaymentConfig(actor: AdminActor) {
+  async checkPaymentConfig(actor: AdminActor) {
     assertAdminPermission(actor, "audit.read");
     const missing = requiredPaymentEnv().filter((name) => !process.env[name]);
     return {
@@ -5933,6 +6052,1184 @@ class PrismaStateRepository {
     return shop;
   }
 
+  async listAdminPlatformProducts(actor: AdminActor) {
+    assertAdminPermission(actor, "product.manage");
+    const rows = await this.findDirectPlatformProductRows();
+    return rows.map((row) => this.serializeDirectPlatformProductRow(row, {
+      canSeePlatformSupplyPrice: true,
+      platformSupplyPriceCents: row.supply_price_cents
+    }));
+  }
+
+  async getAdminPlatformProductDetail(actor: AdminActor, productId: string) {
+    assertAdminPermission(actor, "product.manage");
+    const rows = await this.findDirectPlatformProductRows(productId);
+    const row = rows[0];
+    if (!row) throw new ApiError(404, "RESOURCE_NOT_FOUND", "platform product not found");
+    const product = this.serializeDirectPlatformProductRow(row, {
+      canSeePlatformSupplyPrice: true,
+      platformSupplyPriceCents: row.supply_price_cents
+    });
+    const fulfillmentModeValue = fulfillmentRuleMode(product.fulfillmentRule);
+    return {
+      ...product,
+      fulfillmentMode: fulfillmentModeValue,
+      manualFulfillmentInstruction: manualFulfillmentInstruction(product.fulfillmentRule),
+      rightsCodePool: await this.directRightsCodePoolSummary(product.id, {
+        canImport: hasAdminPermission(actor, "product.manage") && fulfillmentModeValue === "code_pool",
+        canExportMasked: hasAdminPermission(actor, "product.manage"),
+        canViewPlaintext: hasAdminPermission(actor, "rights_code.secret.read"),
+        canExportPlaintext: hasAdminPermission(actor, "rights_code.secret.read")
+      }),
+      fieldPermissions: {
+        editable: ["name", "category", "tags", "subtitle", "description", "usageGuide", "imageUrl", "specs", "detailSections", "supplyPriceCents", "minSalePriceCents", "suggestedSalePriceCents", "fulfillmentMode", "afterSaleRule", "status"],
+        readonly: []
+      },
+      saveConfirmation: {
+        requiresConfirmation: true,
+        message: "保存会影响后续展示和新订单快照，既有订单不回写。"
+      }
+    };
+  }
+
+  async listAdminPlatformShopProducts(actor: AdminActor) {
+    assertAdminPermission(actor, "product.manage");
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      shop_id: string;
+      platform_product_id: string;
+      sale_price_cents: bigint;
+      fulfillment_cost_cents: bigint;
+      status: string;
+      product_name: string | null;
+      category_name: string | null;
+      image_url: string | null;
+      detail: string | null;
+      rights_desc: string | null;
+      tags_json: unknown;
+      fulfillment_rule_json: unknown;
+    }>>`
+      SELECT psp.id, psp.shop_id, psp.platform_product_id, psp.sale_price_cents,
+             psp.fulfillment_cost_cents, psp.status,
+             pp.name AS product_name, pp.category_name, pp.image_url, pp.detail,
+             pp.rights_desc, pp.tags_json, pp.fulfillment_rule_json
+        FROM platform_shop_products psp
+        LEFT JOIN platform_products pp ON pp.id = psp.platform_product_id
+       ORDER BY psp.updated_at DESC, psp.created_at DESC
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      shopId: row.shop_id,
+      platformProductId: row.platform_product_id,
+      salePriceCents: row.sale_price_cents,
+      fulfillmentCostCents: row.fulfillment_cost_cents,
+      status: row.status,
+      product: row.product_name ? {
+        id: row.platform_product_id,
+        name: row.product_name,
+        category: row.category_name ?? undefined,
+        imageUrl: row.image_url ?? undefined,
+        description: row.detail ?? undefined,
+        subtitle: row.rights_desc ?? undefined,
+        tags: Array.isArray(row.tags_json) ? row.tags_json : undefined,
+        fulfillmentRule: row.fulfillment_rule_json
+      } : undefined
+    }));
+  }
+
+  async listRightsCodes(actor: AdminActor, filters: { productId?: string; orderNo?: string; status?: RightsCode["status"]; shopId?: string } = {}) {
+    assertAdminPermission(actor, "product.manage");
+    const productId = filters.productId ?? null;
+    const orderNo = filters.orderNo ?? null;
+    const status = filters.status ?? null;
+    const shopId = filters.shopId ?? null;
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      product_id: string | null;
+      merchant_product_listing_id: string | null;
+      merchant_product_id: string | null;
+      code_ciphertext: string;
+      batch_no: string;
+      status: RightsCode["status"];
+      order_no: string | null;
+      issue_key: string | null;
+      issued_at: Date | null;
+      created_at: Date;
+    }>>`
+      SELECT rc.id, rc.product_id, rc.merchant_product_listing_id, rc.merchant_product_id,
+             rc.code_ciphertext, rc.batch_no, rc.status, o.order_no, rc.issue_key,
+             rc.issued_at, rc.created_at
+        FROM rights_codes rc
+        LEFT JOIN orders o ON o.id = rc.order_id
+       WHERE (${productId}::text IS NULL OR rc.product_id = ${productId} OR rc.merchant_product_listing_id = ${productId} OR rc.merchant_product_id = ${productId})
+         AND (${orderNo}::text IS NULL OR o.order_no = ${orderNo})
+         AND (${status}::text IS NULL OR rc.status = CAST(${status} AS "RightsCodeStatus"))
+         AND (${shopId}::text IS NULL OR o.shop_id = ${shopId})
+       ORDER BY rc.created_at DESC
+       LIMIT 1000
+    `;
+    return rows.map((row) => this.redactDirectRightsCode({
+      codeId: row.id,
+      productId: row.product_id ?? row.merchant_product_listing_id ?? row.merchant_product_id ?? row.id,
+      platformProductId: row.product_id ?? undefined,
+      merchantProductListingId: row.merchant_product_listing_id ?? undefined,
+      merchantProductId: row.merchant_product_id ?? undefined,
+      code: row.code_ciphertext,
+      batchNo: row.batch_no,
+      status: row.status,
+      orderNo: row.order_no ?? undefined,
+      issueKey: row.issue_key ?? undefined,
+      issuedAt: row.issued_at ?? undefined,
+      createdAt: row.created_at
+    }));
+  }
+
+  async listAdminCoupons(actor: AdminActor) {
+    assertAdminPermission(actor, "product.manage");
+    const templates = await this.prisma.$queryRaw<Array<{
+      id: string;
+      name: string;
+      discount_amount_cents: bigint;
+      first_registration_only: boolean;
+      status: string;
+      valid_from: Date;
+      valid_to: Date;
+    }>>`
+      SELECT id, name, discount_amount_cents, first_registration_only, status, valid_from, valid_to
+        FROM coupon_templates
+       ORDER BY created_at DESC
+    `;
+    const scopes = await this.prisma.$queryRaw<Array<{ coupon_template_id: string; platform_product_id: string | null }>>`
+      SELECT coupon_template_id, platform_product_id
+        FROM coupon_scopes
+       WHERE platform_product_id IS NOT NULL
+    `;
+    return templates.map((row) => ({
+      id: row.id,
+      name: row.name,
+      discountCents: row.discount_amount_cents,
+      productIds: scopes.filter((scope) => scope.coupon_template_id === row.id && scope.platform_product_id).map((scope) => scope.platform_product_id as string),
+      validDays: Math.max(1, Math.ceil((row.valid_to.getTime() - row.valid_from.getTime()) / (24 * 60 * 60 * 1000))),
+      grantOnFirstRegister: row.first_registration_only,
+      status: row.status,
+      createdAt: row.valid_from
+    }));
+  }
+
+  async listAdminPaymentMethods(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    const methods = await this.listDirectPaymentMethods({ ownerType: "platform" });
+    return methods.map((method) => this.serializeDirectPaymentMethod(method));
+  }
+
+  async listMerchantPaymentMethods(actor: MerchantActor) {
+    await this.getMerchantShop(actor);
+    const methods = await this.listDirectPaymentMethods({ ownerType: "merchant", merchantId: actor.merchantId, shopId: actor.shopId });
+    return methods.map((method) => this.serializeDirectPaymentMethod(method));
+  }
+
+  async paymentConfigStatus(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    const methods = await this.listDirectPaymentMethods();
+    const methodProviders: PaymentProviderType[] = ["alipay_merchant", "wechat_merchant", "epay", "personal_alipay", "wechat_personal", "balance"];
+    return methodProviders.map((provider) => {
+      const providerMethods = methods.filter((method) => method.provider === provider);
+      const enabled = provider === "balance" || providerMethods.some((method) => method.enabled && method.status === "enabled");
+      return {
+        channel: provider,
+        provider,
+        enabled,
+        feeBps: provider === "epay" ? 100 : 0,
+        fixedFeeCents: 0n,
+        statusNote: enabled ? "configured" : "not_configured",
+        updatedAt: providerMethods[0]?.updatedAt ?? new Date(0),
+        defaultMethod: providerMethods.some((method) => method.isDefault),
+        confirmationMode: provider === "balance" ? "automatic" : isManualPaymentProvider(provider) ? "manual" : "automatic",
+        methodCount: provider === "balance" ? 1 : providerMethods.length,
+        label: paymentProviderDisplay(provider)
+      };
+    });
+  }
+
+  async checkPaymentConfig(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    const missing = requiredPaymentEnv().filter((name) => !process.env[name]);
+    return {
+      mockReady: mockPaymentEnabled(),
+      productionReady: missing.length === 0 && !mockPaymentEnabled() && !allowDemoAuth(),
+      missing,
+      demoAuthEnabled: allowDemoAuth(),
+      channels: []
+    };
+  }
+
+  async listAdminOrders(actor: AdminActor, filters: { page?: number; pageSize?: number; status?: string; shopId?: string; orderNo?: string } = {}) {
+    assertAdminPermission(actor, "audit.read");
+    const page = filters.page ?? 1;
+    const pageSize = filters.pageSize ?? 100;
+    const offset = (page - 1) * pageSize;
+    const status = filters.status ?? null;
+    const shopId = filters.shopId ?? null;
+    const orderNo = filters.orderNo ?? null;
+    const rows = await this.prisma.$queryRaw<Array<{
+      order_no: string;
+      shop_id: string;
+      merchant_id: string | null;
+      sales_channel_type: string;
+      status: string;
+      payment_status: string;
+      fulfillment_status: string;
+      refund_status: string;
+      paid_amount_cents: bigint;
+      coupon_discount_cents: bigint;
+      collection_snapshot_json: unknown;
+      product_name_snapshot: string | null;
+      quantity: number | null;
+      created_at: Date;
+    }>>`
+      SELECT o.order_no, o.shop_id, o.merchant_id, o.sales_channel_type,
+             o.status, o.payment_status, o.fulfillment_status, o.refund_status,
+             o.paid_amount_cents, o.coupon_discount_cents, o.collection_snapshot_json,
+             oi.product_name_snapshot, oi.quantity, o.created_at
+        FROM orders o
+        LEFT JOIN order_items oi ON oi.order_id = o.id
+       WHERE (${status}::text IS NULL OR o.status::text = ${status} OR o.payment_status::text = ${status} OR o.fulfillment_status::text = ${status} OR o.refund_status::text = ${status})
+         AND (${shopId}::text IS NULL OR o.shop_id = ${shopId})
+         AND (${orderNo}::text IS NULL OR o.order_no ILIKE '%' || ${orderNo} || '%')
+       ORDER BY o.created_at DESC
+       LIMIT ${pageSize}
+      OFFSET ${offset}
+    `;
+    const totalRows = await this.prisma.$queryRaw<Array<{ count: bigint }>>`
+      SELECT count(*)::bigint AS count
+        FROM orders o
+       WHERE (${status}::text IS NULL OR o.status::text = ${status} OR o.payment_status::text = ${status} OR o.fulfillment_status::text = ${status} OR o.refund_status::text = ${status})
+         AND (${shopId}::text IS NULL OR o.shop_id = ${shopId})
+         AND (${orderNo}::text IS NULL OR o.order_no ILIKE '%' || ${orderNo} || '%')
+    `;
+    const items = rows.map((row) => {
+      const collectionSnapshot = row.collection_snapshot_json as PaymentMethodPublicSnapshot | null;
+      return {
+        orderNo: row.order_no,
+        shopId: row.shop_id,
+        merchantId: row.merchant_id ?? undefined,
+        salesChannelType: row.sales_channel_type,
+        status: row.status,
+        paymentStatus: row.payment_status,
+        fulfillmentStatus: row.fulfillment_status,
+        refundStatus: row.refund_status,
+        paidAmountCents: row.paid_amount_cents,
+        buyerPaidAmountCents: row.paid_amount_cents,
+        couponDiscountCents: row.coupon_discount_cents,
+        productName: row.product_name_snapshot ?? "商品",
+        quantity: row.quantity ?? 1,
+        createdAt: row.created_at,
+        collectionPaymentMethod: collectionSnapshot ? {
+          id: collectionSnapshot.id,
+          paymentType: collectionSnapshot.channelType,
+          displayName: collectionSnapshot.displayName
+        } : undefined
+      };
+    });
+    if (!filters.page && !filters.pageSize) return items;
+    return {
+      items,
+      total: Number(totalRows[0]?.count ?? 0n),
+      page,
+      pageSize
+    };
+  }
+
+  async listUserOrders(actor: UserActor) {
+    const rows = await this.findDirectUserOrderRows(actor);
+    return rows.map((row) => this.serializeDirectUserOrderRow(row, { includeBuyerContact: false }));
+  }
+
+  async getUserOrder(actor: UserActor, orderNo: string) {
+    const rows = await this.findDirectUserOrderRows(actor, orderNo);
+    const row = rows[0];
+    if (!row) throw new ApiError(404, "RESOURCE_NOT_FOUND", "order not found");
+    return this.serializeDirectUserOrderRow(row, { includeBuyerContact: true });
+  }
+
+  async listUserCoupons(actor: UserActor, input: { shopId?: string; merchantProductListingId?: string } = {}) {
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      coupon_template_id: string;
+      user_id: string;
+      status: string;
+      source_type: string;
+      source_id: string | null;
+      void_reason: string | null;
+      valid_from: Date;
+      valid_to: Date;
+      created_at: Date;
+      updated_at: Date;
+      template_name: string;
+      discount_amount_cents: bigint;
+      first_registration_only: boolean;
+      template_status: string;
+      template_valid_from: Date;
+      template_valid_to: Date;
+    }>>`
+      SELECT uc.id, uc.coupon_template_id, uc.user_id, uc.status, uc.source_type, uc.source_id,
+             uc.void_reason, uc.valid_from, uc.valid_to, uc.created_at, uc.updated_at,
+             ct.name AS template_name, ct.discount_amount_cents, ct.first_registration_only,
+             ct.status AS template_status, ct.valid_from AS template_valid_from, ct.valid_to AS template_valid_to
+        FROM user_coupons uc
+        JOIN coupon_templates ct ON ct.id = uc.coupon_template_id
+       WHERE uc.user_id = ${actor.userId}
+       ORDER BY uc.created_at DESC
+       LIMIT 500
+    `;
+    const templateIds = rows.map((row) => row.coupon_template_id);
+    const scopes = templateIds.length === 0 ? [] : await this.prisma.$queryRaw<Array<{
+      coupon_template_id: string;
+      platform_product_id: string | null;
+      merchant_product_id: string | null;
+      shop_id: string | null;
+    }>>`
+      SELECT coupon_template_id, platform_product_id, merchant_product_id, shop_id
+        FROM coupon_scopes
+       WHERE coupon_template_id = ANY(${templateIds}::text[])
+    `;
+    const now = Date.now();
+    return rows.map((row) => {
+      const status = row.status === "voided" && row.void_reason === "voided_after_refund"
+        ? "voided_after_refund"
+        : row.status === "active" && row.valid_to.getTime() < now
+          ? "expired"
+          : mapUserCouponMemoryStatus(row.status);
+      const templateScopes = scopes.filter((scope) => scope.coupon_template_id === row.coupon_template_id);
+      const productIds = templateScopes
+        .map((scope) => scope.platform_product_id ?? scope.merchant_product_id)
+        .filter((id): id is string => Boolean(id));
+      const shopScoped = input.shopId
+        ? templateScopes.length === 0 || templateScopes.some((scope) => !scope.shop_id || scope.shop_id === input.shopId)
+        : true;
+      const productScoped = input.merchantProductListingId
+        ? productIds.length === 0 || productIds.includes(input.merchantProductListingId)
+        : true;
+      return {
+        id: row.id,
+        templateId: row.coupon_template_id,
+        userId: row.user_id,
+        status,
+        grantReason: row.source_type,
+        grantedAt: row.created_at,
+        usedAt: row.status === "used" ? row.updated_at : null,
+        orderNo: row.source_id,
+        template: {
+          id: row.coupon_template_id,
+          name: row.template_name,
+          discountCents: row.discount_amount_cents,
+          productIds,
+          validDays: Math.max(1, Math.ceil((row.template_valid_to.getTime() - row.template_valid_from.getTime()) / (24 * 60 * 60 * 1000))),
+          grantOnFirstRegister: row.first_registration_only,
+          status: row.template_status,
+          createdAt: row.template_valid_from
+        },
+        visible: status !== "voided" && status !== "voided_after_refund",
+        applicable: shopScoped && productScoped
+      };
+    }).filter((coupon) => coupon.visible);
+  }
+
+  async listMerchantApplications(actor: AdminActor) {
+    assertAdminPermission(actor, "merchant.review");
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      merchant_id: string | null;
+      user_id: string | null;
+      invite_code_id: string | null;
+      tier: MerchantTier;
+      identity_info_json: unknown;
+      contact_info_json: unknown;
+      customer_service_wechat: string | null;
+      status: string;
+      issuer_merchant_id: string | null;
+    }>>`
+      SELECT ma.id, ma.merchant_id, ma.user_id, ma.invite_code_id, ma.tier,
+             ma.identity_info_json, ma.contact_info_json, ma.customer_service_wechat,
+             ma.status, mic.issuer_merchant_id
+        FROM merchant_applications ma
+        LEFT JOIN merchant_invite_codes mic ON mic.id = ma.invite_code_id
+       ORDER BY ma.created_at DESC
+       LIMIT 500
+    `;
+    return rows.map((row) => {
+      const identity = isRecord(row.identity_info_json) ? row.identity_info_json : {};
+      const contact = isRecord(row.contact_info_json) ? row.contact_info_json : {};
+      return {
+        applicationNo: row.id,
+        merchantId: row.merchant_id ?? "",
+        userId: row.user_id ?? "",
+        status: row.status,
+        contactPhone: stringValue(contact.phone) ?? "",
+        customerServiceWechat: row.customer_service_wechat ?? "",
+        inviteCode: stringValue(contact.inviteCode),
+        inviteCodeId: row.invite_code_id ?? undefined,
+        targetTier: row.tier,
+        parentMerchantId: stringValue(identity.parentMerchantId) ?? row.issuer_merchant_id ?? undefined
+      };
+    });
+  }
+
+  async listAdminOwnProductReviews(actor: AdminActor, filters: {
+    reviewStatus?: string;
+    status?: string;
+    merchantId?: string;
+    shopId?: string;
+    page?: number;
+    pageSize?: number;
+    limit?: number;
+    offset?: number;
+  } = {}) {
+    assertAdminPermission(actor, "product.manage");
+    const reviewStatus = filters.reviewStatus ?? null;
+    const status = filters.status ?? null;
+    const merchantId = filters.merchantId ?? null;
+    const shopId = filters.shopId ?? null;
+    const pageSize = filters.pageSize ?? filters.limit ?? 500;
+    const offset = filters.offset ?? ((filters.page ?? 1) - 1) * pageSize;
+    const rows = await this.findDirectOwnProductReviewRows({ reviewStatus, status, merchantId, shopId, limit: pageSize, offset });
+    const items = await Promise.all(rows.map((row) => this.serializeDirectOwnProductReviewRow(row, false)));
+    if (!filters.page && !filters.pageSize && !filters.limit && filters.offset === undefined) return items;
+    const totalRows = await this.prisma.$queryRaw<Array<{ count: bigint }>>`
+      SELECT count(*)::bigint AS count
+        FROM merchant_product_reviews mpr
+       WHERE (${reviewStatus}::text IS NULL OR mpr.status::text = ${reviewStatus})
+         AND (${status}::text IS NULL OR mpr.status::text = ${status})
+         AND (${merchantId}::text IS NULL OR mpr.merchant_id = ${merchantId})
+         AND (${shopId}::text IS NULL OR mpr.shop_id = ${shopId})
+    `;
+    return {
+      items,
+      total: Number(totalRows[0]?.count ?? 0n),
+      page: filters.page ?? Math.floor(offset / pageSize) + 1,
+      pageSize,
+      offset
+    };
+  }
+
+  async getAdminOwnProductReviewDetail(actor: AdminActor, ownProductId: string) {
+    assertAdminPermission(actor, "product.manage");
+    const rows = await this.findDirectOwnProductReviewRows({ id: ownProductId, limit: 1, offset: 0 });
+    const row = rows[0];
+    if (!row) throw new ApiError(404, "RESOURCE_NOT_FOUND", "own product not found");
+    return this.serializeDirectOwnProductReviewRow(row, true);
+  }
+
+  async listAdminChannels(actor: AdminActor) {
+    assertAdminPermission(actor, "merchant.review");
+    const applicationRows = await this.prisma.$queryRaw<Array<{
+      merchant_id: string | null;
+      tier: MerchantTier;
+      status: string;
+      merchant_status: string | null;
+      deposit_status: string | null;
+      identity_info_json: unknown;
+      issuer_merchant_id: string | null;
+    }>>`
+      SELECT ma.merchant_id, ma.tier, ma.status, m.status AS merchant_status, da.status AS deposit_status,
+             ma.identity_info_json, mic.issuer_merchant_id
+        FROM merchant_applications ma
+        LEFT JOIN merchants m ON m.id = ma.merchant_id
+        LEFT JOIN deposit_accounts da ON da.merchant_id = ma.merchant_id
+        LEFT JOIN merchant_invite_codes mic ON mic.id = ma.invite_code_id
+       WHERE ma.merchant_id IS NOT NULL
+       ORDER BY ma.created_at DESC
+       LIMIT 500
+    `;
+    const parentByMerchant = new Map<string, string>();
+    for (const row of applicationRows) {
+      if (!row.merchant_id) continue;
+      const identity = isRecord(row.identity_info_json) ? row.identity_info_json : {};
+      const parentMerchantId = stringValue(identity.parentMerchantId) ?? row.issuer_merchant_id ?? undefined;
+      if (parentMerchantId) parentByMerchant.set(row.merchant_id, parentMerchantId);
+    }
+    const relationStatusFor = (row: { status: string; merchant_status: string | null; deposit_status: string | null }) => {
+      if (row.status === "rejected") return "closed";
+      if (row.status !== "approved") return "pending_review";
+      return row.merchant_status === "active" && row.deposit_status === "paid" ? "active" : "pending_deposit";
+    };
+    const relations: ChannelRelation[] = [];
+    for (const row of applicationRows) {
+      if (!row.merchant_id || row.tier === "first_tier") continue;
+      const parentMerchantId = parentByMerchant.get(row.merchant_id);
+      if (!parentMerchantId) continue;
+      if (row.tier === "second_tier") {
+        relations.push({
+          id: stableDbId("channel_relation", `${parentMerchantId}:${row.merchant_id}`),
+          firstTierMerchantId: parentMerchantId,
+          secondTierMerchantId: row.merchant_id,
+          status: relationStatusFor(row),
+          reason: "invite_registration",
+          reviewedAt: row.status === "approved" ? new Date() : null,
+          activeUniqueKey: `second-tier:${row.merchant_id}`
+        });
+        continue;
+      }
+      const firstTierMerchantId = parentByMerchant.get(parentMerchantId);
+      if (!firstTierMerchantId) continue;
+      relations.push({
+        id: stableDbId("channel_relation", `${firstTierMerchantId}:${parentMerchantId}:${row.merchant_id}`),
+        firstTierMerchantId,
+        secondTierMerchantId: parentMerchantId,
+        thirdTierMerchantId: row.merchant_id,
+        status: relationStatusFor(row),
+        reason: "invite_registration",
+        reviewedAt: row.status === "approved" ? new Date() : null,
+        activeUniqueKey: `third-tier:${row.merchant_id}`
+      });
+    }
+    const firstTierIds = new Set(applicationRows.filter((row) => row.tier === "first_tier" && row.merchant_id).map((row) => row.merchant_id as string));
+    return {
+      authorizations: Array.from(firstTierIds).map((merchantId) => ({
+        id: stableDbId("channel_auth", merchantId),
+        firstTierMerchantId: merchantId,
+        status: "active",
+        reason: null,
+        reviewedAt: null
+      })),
+      relations,
+      offers: [] as ChannelProductOffer[]
+    };
+  }
+
+  async listMerchantRightsCodes(actor: MerchantActor, filters: { merchantProductListingId?: string; status?: RightsCode["status"] } = {}) {
+    await this.getMerchantShop(actor);
+    const listingId = filters.merchantProductListingId ?? null;
+    const status = filters.status ?? null;
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      product_id: string | null;
+      merchant_product_listing_id: string | null;
+      merchant_product_id: string | null;
+      code_ciphertext: string;
+      batch_no: string;
+      status: RightsCode["status"];
+      order_no: string | null;
+      issue_key: string | null;
+      issued_at: Date | null;
+      created_at: Date;
+    }>>`
+      SELECT rc.id, rc.product_id, rc.merchant_product_listing_id, rc.merchant_product_id,
+             rc.code_ciphertext, rc.batch_no, rc.status, o.order_no, rc.issue_key,
+             rc.issued_at, rc.created_at
+        FROM rights_codes rc
+        LEFT JOIN orders o ON o.id = rc.order_id
+       WHERE rc.owner_merchant_id = ${actor.merchantId}
+         AND rc.shop_id = ${actor.shopId}
+         AND (${listingId}::text IS NULL OR rc.merchant_product_listing_id = ${listingId} OR rc.merchant_product_id = ${listingId})
+         AND (${status}::text IS NULL OR rc.status::text = ${status})
+       ORDER BY rc.created_at DESC
+       LIMIT 1000
+    `;
+    return rows.map((row) => this.redactDirectRightsCode({
+      codeId: row.id,
+      productId: row.merchant_product_listing_id ?? row.merchant_product_id ?? row.product_id ?? row.id,
+      platformProductId: row.product_id ?? undefined,
+      merchantProductListingId: row.merchant_product_listing_id ?? undefined,
+      merchantProductId: row.merchant_product_id ?? undefined,
+      code: row.code_ciphertext,
+      batchNo: row.batch_no,
+      status: row.status,
+      orderNo: row.order_no ?? undefined,
+      issueKey: row.issue_key ?? undefined,
+      issuedAt: row.issued_at ?? undefined,
+      createdAt: row.created_at
+    }));
+  }
+
+  async listAdminAfterSales(actor: AdminActor) {
+    assertAdminPermission(actor, "after_sale.arbitrate");
+    return this.findDirectAfterSales();
+  }
+
+  async listMerchantAfterSales(actor: MerchantActor) {
+    await this.getMerchantShop(actor);
+    return this.findDirectAfterSales(actor);
+  }
+
+  async listAdminRefunds(actor: AdminActor) {
+    assertAdminPermission(actor, "after_sale.arbitrate");
+    return this.prisma.$queryRaw<Array<{
+      refundNo: string;
+      afterSaleNo: string;
+      orderNo: string;
+      amountCents: bigint;
+      merchantClawbackCents: bigint;
+      wasSettled: boolean;
+      channelRefundNo: string | null;
+      status: string;
+      createdAt: Date;
+      updatedAt: Date;
+    }>>`
+      SELECT r.refund_no AS "refundNo", a.after_sale_no AS "afterSaleNo", o.order_no AS "orderNo",
+             r.amount_cents AS "amountCents", 0::bigint AS "merchantClawbackCents",
+             (o.settlement_status::text <> 'pending') AS "wasSettled",
+             r.channel_refund_no AS "channelRefundNo", r.status::text AS status,
+             r.created_at AS "createdAt", r.updated_at AS "updatedAt"
+        FROM refunds r
+        JOIN after_sales a ON a.id = r.after_sale_id
+        JOIN orders o ON o.id = r.order_id
+       ORDER BY r.created_at DESC
+       LIMIT 500
+    `;
+  }
+
+  async listAdminSettlements(actor: AdminActor) {
+    assertAdminPermission(actor, "settlement.generate");
+    const rows = await this.prisma.$queryRaw<Array<{
+      settlement_no: string;
+      merchant_id: string;
+      status: string;
+      total_order_count: number;
+      total_paid_cents: bigint;
+      total_service_fee_cents: bigint;
+      total_merchant_income_cents: bigint;
+      idempotency_key: string;
+    }>>`
+      SELECT settlement_no, merchant_id, status, total_order_count, total_paid_cents,
+             total_service_fee_cents, total_merchant_income_cents, idempotency_key
+        FROM settlement_sheets
+       ORDER BY created_at DESC
+       LIMIT 500
+    `;
+    return rows.map((row): SettlementSheet => ({
+      settlementNo: row.settlement_no,
+      merchantId: row.merchant_id,
+      idempotencyKey: row.idempotency_key,
+      status: row.status,
+      items: [],
+      totalOrderCount: row.total_order_count,
+      totalPaidCents: row.total_paid_cents,
+      totalServiceFeeCents: row.total_service_fee_cents,
+      totalMerchantIncomeCents: row.total_merchant_income_cents
+    }));
+  }
+
+  async listAdminDeposits(actor: AdminActor) {
+    assertAdminPermission(actor, "deposit.manage");
+    const accounts = await this.prisma.$queryRaw<Array<{
+      merchant_id: string | null;
+      required_amount_cents: bigint;
+      available_amount_cents: bigint;
+      frozen_amount_cents: bigint;
+      deducted_amount_cents: bigint;
+      status: string;
+    }>>`
+      SELECT merchant_id, required_amount_cents, available_amount_cents,
+             frozen_amount_cents, deducted_amount_cents, status
+        FROM deposit_accounts
+       ORDER BY updated_at DESC
+       LIMIT 500
+    `;
+    const merchantIds = accounts.map((row) => row.merchant_id).filter((id): id is string => Boolean(id));
+    const transactions = merchantIds.length === 0 ? [] : await this.prisma.$queryRaw<Array<{
+      id: string;
+      merchant_id: string | null;
+      type: string;
+      amount_cents: bigint;
+      balance_before_cents: bigint;
+      balance_after_cents: bigint;
+      reason_code: string;
+      related_type: string | null;
+      related_id: string | null;
+      idempotency_key: string;
+      voucher_url: string | null;
+      operator_id: string | null;
+      note: string | null;
+      created_at: Date;
+    }>>`
+      SELECT id, merchant_id, type, amount_cents, balance_before_cents, balance_after_cents,
+             reason_code, related_type, related_id, idempotency_key, voucher_url, operator_id,
+             note, created_at
+        FROM deposit_transactions
+       WHERE merchant_id = ANY(${merchantIds}::text[])
+       ORDER BY created_at DESC
+       LIMIT 1000
+    `;
+    return accounts.map((account) => ({
+      merchantId: account.merchant_id ?? "",
+      requiredAmountCents: account.required_amount_cents,
+      availableAmountCents: account.available_amount_cents,
+      frozenAmountCents: account.frozen_amount_cents,
+      deductedAmountCents: account.deducted_amount_cents,
+      status: account.status,
+      transactions: transactions
+        .filter((transaction) => transaction.merchant_id === account.merchant_id)
+        .map((transaction): DepositTransaction => ({
+          transactionNo: transaction.id,
+          merchantId: transaction.merchant_id ?? "",
+          type: transaction.type,
+          amountCents: transaction.amount_cents,
+          balanceBeforeCents: transaction.balance_before_cents,
+          balanceAfterCents: transaction.balance_after_cents,
+          reasonCode: transaction.reason_code,
+          relatedType: transaction.related_type ?? "deposit",
+          relatedId: transaction.related_id ?? account.merchant_id ?? "",
+          idempotencyKey: transaction.idempotency_key,
+          proofUrl: transaction.voucher_url ?? undefined,
+          operatorId: transaction.operator_id ?? undefined,
+          remark: transaction.note ?? undefined
+        }))
+    }));
+  }
+
+  async listPaymentVouchers(actor: AdminActor) {
+    assertAdminPermission(actor, "settlement.confirm");
+    return this.findDirectPaymentVouchers();
+  }
+
+  async listMerchantPaymentVouchers(actor: MerchantActor) {
+    await this.getMerchantShop(actor);
+    return this.findDirectPaymentVouchers(actor);
+  }
+
+  async listServiceQrCodes(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return this.prisma.$queryRaw<Array<{
+      shopId: string;
+      ownerType: string;
+      merchantId: string | null;
+      name: string;
+      customerServiceWechat: string | null;
+      customerServiceQrUrl: string | null;
+      customerServiceQq: string | null;
+      customerServiceQqQrUrl: string | null;
+      customerServiceNote: string | null;
+      status: string;
+    }>>`
+      SELECT id AS "shopId", owner_type::text AS "ownerType", merchant_id AS "merchantId",
+             name, customer_service_wechat AS "customerServiceWechat",
+             customer_service_qr_url AS "customerServiceQrUrl",
+             customer_service_qq AS "customerServiceQq",
+             customer_service_qq_qr_url AS "customerServiceQqQrUrl",
+             customer_service_note AS "customerServiceNote", status::text AS status
+        FROM shops
+       ORDER BY updated_at DESC
+       LIMIT 500
+    `;
+  }
+
+  async adminSalesDashboard(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    const summary = await this.prisma.$queryRaw<Array<{
+      order_count: bigint;
+      paid_order_count: bigint;
+      fulfilled_order_count: bigint;
+      after_sale_order_count: bigint;
+      total_paid_cents: bigint;
+      total_refunded_cents: bigint;
+      average_order_paid_cents: bigint;
+    }>>`
+      SELECT count(*)::bigint AS order_count,
+             count(*) FILTER (WHERE payment_status = CAST('paid' AS "PaymentStatus"))::bigint AS paid_order_count,
+             count(*) FILTER (WHERE fulfillment_status = CAST('success' AS "FulfillmentStatus"))::bigint AS fulfilled_order_count,
+             count(*) FILTER (WHERE refund_status <> CAST('none' AS "RefundStatus"))::bigint AS after_sale_order_count,
+             coalesce(sum(paid_amount_cents) FILTER (WHERE payment_status = CAST('paid' AS "PaymentStatus")), 0)::bigint AS total_paid_cents,
+             coalesce((SELECT sum(amount_cents) FROM refunds WHERE status = CAST('refunded' AS "RefundStatus")), 0)::bigint AS total_refunded_cents,
+             coalesce(avg(paid_amount_cents) FILTER (WHERE payment_status = CAST('paid' AS "PaymentStatus")), 0)::bigint AS average_order_paid_cents
+        FROM orders
+    `;
+    const productRows = await this.prisma.$queryRaw<Array<{
+      productId: string;
+      name: string;
+      category: string | null;
+      fulfillmentMode: string;
+      stockCount: number;
+      soldCount: number;
+      paidOrderCount: bigint;
+      totalPaidCents: bigint;
+      availableCodeCount: bigint;
+      issuedCodeCount: bigint;
+    }>>`
+      SELECT pp.id AS "productId", pp.name, pp.category_name AS category,
+             CASE WHEN pp.fulfillment_type IN (CAST('code_pool' AS "FulfillmentType"), CAST('automatic' AS "FulfillmentType")) THEN '自动发码' ELSE '人工交付' END AS "fulfillmentMode",
+             pp.stock_count AS "stockCount", pp.sold_count AS "soldCount",
+             count(o.id) FILTER (WHERE o.payment_status = CAST('paid' AS "PaymentStatus"))::bigint AS "paidOrderCount",
+             coalesce(sum(o.paid_amount_cents) FILTER (WHERE o.payment_status = CAST('paid' AS "PaymentStatus")), 0)::bigint AS "totalPaidCents",
+             count(rc.id) FILTER (WHERE rc.status = CAST('available' AS "RightsCodeStatus"))::bigint AS "availableCodeCount",
+             count(rc.id) FILTER (WHERE rc.status = CAST('issued' AS "RightsCodeStatus"))::bigint AS "issuedCodeCount"
+        FROM platform_products pp
+        LEFT JOIN order_items oi ON oi.product_id_snapshot = pp.id
+        LEFT JOIN orders o ON o.id = oi.order_id
+        LEFT JOIN rights_codes rc ON rc.product_id = pp.id
+       GROUP BY pp.id
+       ORDER BY pp.updated_at DESC
+       LIMIT 100
+    `;
+    const shopRows = await this.prisma.$queryRaw<Array<{
+      shopId: string;
+      name: string;
+      ownerType: string;
+      orderCount: bigint;
+      paidOrderCount: bigint;
+      totalPaidCents: bigint;
+      refundOrderCount: bigint;
+    }>>`
+      SELECT s.id AS "shopId", s.name, s.owner_type::text AS "ownerType",
+             count(o.id)::bigint AS "orderCount",
+             count(o.id) FILTER (WHERE o.payment_status = CAST('paid' AS "PaymentStatus"))::bigint AS "paidOrderCount",
+             coalesce(sum(o.paid_amount_cents) FILTER (WHERE o.payment_status = CAST('paid' AS "PaymentStatus")), 0)::bigint AS "totalPaidCents",
+             count(o.id) FILTER (WHERE o.refund_status <> CAST('none' AS "RefundStatus"))::bigint AS "refundOrderCount"
+        FROM shops s
+        LEFT JOIN orders o ON o.shop_id = s.id
+       GROUP BY s.id
+       ORDER BY s.updated_at DESC
+       LIMIT 100
+    `;
+    const row = summary[0];
+    return {
+      orderCount: Number(row?.order_count ?? 0n),
+      paidOrderCount: Number(row?.paid_order_count ?? 0n),
+      fulfilledOrderCount: Number(row?.fulfilled_order_count ?? 0n),
+      afterSaleOrderCount: Number(row?.after_sale_order_count ?? 0n),
+      totalPaidCents: row?.total_paid_cents ?? 0n,
+      totalRefundedCents: row?.total_refunded_cents ?? 0n,
+      averageOrderPaidCents: row?.average_order_paid_cents ?? 0n,
+      productRows: productRows.map((item) => ({
+        ...item,
+        paidOrderCount: Number(item.paidOrderCount),
+        availableCodeCount: Number(item.availableCodeCount),
+        issuedCodeCount: Number(item.issuedCodeCount)
+      })),
+      shopRows: shopRows.map((item) => ({
+        ...item,
+        orderCount: Number(item.orderCount),
+        paidOrderCount: Number(item.paidOrderCount),
+        refundOrderCount: Number(item.refundOrderCount)
+      }))
+    };
+  }
+
+  async adminRiskDashboard(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    const summary = await this.prisma.$queryRaw<Array<{
+      paid_order_count: bigint;
+      refund_order_count: bigint;
+      active_risk_freeze_count: bigint;
+      pending_after_sale_count: bigint;
+    }>>`
+      SELECT count(*) FILTER (WHERE payment_status = CAST('paid' AS "PaymentStatus"))::bigint AS paid_order_count,
+             count(*) FILTER (WHERE refund_status = CAST('refunded' AS "RefundStatus") OR refund_status = CAST('refunding' AS "RefundStatus"))::bigint AS refund_order_count,
+             (SELECT count(*)::bigint FROM risk_freezes WHERE status = CAST('active' AS "RiskFreezeStatus")) AS active_risk_freeze_count,
+             (SELECT count(*)::bigint FROM after_sales WHERE status = CAST('pending' AS "AfterSaleStatus")) AS pending_after_sale_count
+        FROM orders
+    `;
+    const lowDepositMerchants = await this.prisma.$queryRaw<Array<{
+      merchantId: string | null;
+      availableAmountCents: bigint;
+      requiredAmountCents: bigint;
+    }>>`
+      SELECT merchant_id AS "merchantId", available_amount_cents AS "availableAmountCents",
+             required_amount_cents AS "requiredAmountCents"
+        FROM deposit_accounts
+       WHERE available_amount_cents < required_amount_cents / 5
+       ORDER BY updated_at DESC
+       LIMIT 100
+    `;
+    const lowStockProducts = await this.prisma.$queryRaw<Array<{
+      productId: string;
+      name: string;
+      category: string | null;
+      stockCount: number;
+      availableCodeCount: bigint;
+    }>>`
+      SELECT pp.id AS "productId", pp.name, pp.category_name AS category, pp.stock_count AS "stockCount",
+             count(rc.id) FILTER (WHERE rc.status = CAST('available' AS "RightsCodeStatus"))::bigint AS "availableCodeCount"
+        FROM platform_products pp
+        LEFT JOIN rights_codes rc ON rc.product_id = pp.id
+       GROUP BY pp.id
+      HAVING count(rc.id) FILTER (WHERE rc.status = CAST('available' AS "RightsCodeStatus")) BETWEEN 1 AND 4
+       ORDER BY pp.updated_at DESC
+       LIMIT 100
+    `;
+    const row = summary[0];
+    const paid = Number(row?.paid_order_count ?? 0n);
+    const refunds = Number(row?.refund_order_count ?? 0n);
+    return {
+      paidOrderCount: paid,
+      refundOrderCount: refunds,
+      refundRateBps: paid === 0 ? 0 : Math.round((refunds / paid) * 10_000),
+      activeRiskFreezeCount: Number(row?.active_risk_freeze_count ?? 0n),
+      lowDepositMerchants,
+      lowStockProducts: lowStockProducts.map((item) => ({ ...item, availableCodeCount: Number(item.availableCodeCount) })),
+      pendingAfterSaleCount: Number(row?.pending_after_sale_count ?? 0n)
+    };
+  }
+
+  async merchantDashboard(actor: MerchantActor) {
+    await this.getMerchantShop(actor);
+    const rows = await this.prisma.$queryRaw<Array<{
+      order_count: bigint;
+      paid_order_count: bigint;
+      fulfilled_order_count: bigint;
+      refund_order_count: bigint;
+      gmv_cents: bigint;
+      expected_income_cents: bigint;
+    }>>`
+      SELECT count(*)::bigint AS order_count,
+             count(*) FILTER (WHERE payment_status = CAST('paid' AS "PaymentStatus"))::bigint AS paid_order_count,
+             count(*) FILTER (WHERE fulfillment_status = CAST('success' AS "FulfillmentStatus"))::bigint AS fulfilled_order_count,
+             count(*) FILTER (WHERE refund_status = CAST('refunded' AS "RefundStatus"))::bigint AS refund_order_count,
+             coalesce(sum(o.paid_amount_cents) FILTER (WHERE o.payment_status = CAST('paid' AS "PaymentStatus")), 0)::bigint AS gmv_cents,
+             coalesce(sum(oas.merchant_expected_income_cents) FILTER (WHERE o.payment_status = CAST('paid' AS "PaymentStatus")), 0)::bigint AS expected_income_cents
+        FROM orders o
+        LEFT JOIN order_amount_snapshots oas ON oas.order_id = o.id
+       WHERE (o.merchant_id = ${actor.merchantId} AND o.shop_id = ${actor.shopId})
+          OR o.first_tier_merchant_id = ${actor.merchantId}
+          OR o.second_tier_merchant_id = ${actor.merchantId}
+    `;
+    const depositRows = await this.prisma.$queryRaw<Array<{ available_amount_cents: bigint }>>`
+      SELECT available_amount_cents FROM deposit_accounts WHERE merchant_id = ${actor.merchantId} LIMIT 1
+    `;
+    const productRows = await this.prisma.$queryRaw<Array<{ count: bigint }>>`
+      SELECT count(*)::bigint AS count
+        FROM merchant_product_listings
+       WHERE merchant_id = ${actor.merchantId}
+         AND shop_id = ${actor.shopId}
+         AND status = CAST('listed' AS "ProductListingStatus")
+    `;
+    const row = rows[0];
+    const paid = Number(row?.paid_order_count ?? 0n);
+    const refunds = Number(row?.refund_order_count ?? 0n);
+    return {
+      orderCount: Number(row?.order_count ?? 0n),
+      paidOrderCount: paid,
+      fulfilledOrderCount: Number(row?.fulfilled_order_count ?? 0n),
+      refundOrderCount: refunds,
+      gmvCents: row?.gmv_cents ?? 0n,
+      expectedIncomeCents: row?.expected_income_cents ?? 0n,
+      pendingIncomeCents: 0n,
+      payableIncomeCents: 0n,
+      paidIncomeCents: 0n,
+      refundRateBps: paid === 0 ? 0 : Math.round((refunds / paid) * 10_000),
+      depositAvailableCents: depositRows[0]?.available_amount_cents ?? 0n,
+      activeProductCount: Number(productRows[0]?.count ?? 0n),
+      noticeCount: 0
+    };
+  }
+
+  async listAuditLogs(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return this.prisma.$queryRaw<Array<{
+      actorType: string;
+      actorId: string;
+      action: string;
+      targetType: string;
+      targetId: string;
+      afterJson: unknown;
+      idempotencyKey: string;
+      requestId: string;
+      createdAt: Date;
+    }>>`
+      SELECT actor_type::text AS "actorType", actor_id AS "actorId", action,
+             target_type AS "targetType", target_id AS "targetId", after_json AS "afterJson",
+             idempotency_key AS "idempotencyKey", request_id AS "requestId", created_at AS "createdAt"
+        FROM audit_logs
+       ORDER BY created_at DESC
+       LIMIT 500
+    `;
+  }
+
+  async listLedgerEntries(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    const rows = await this.prisma.$queryRaw<Array<{
+      ledger_no: string;
+      entry_type: string;
+      merchant_id: string | null;
+      amount_cents: bigint;
+      source_type: string;
+      source_id: string;
+      created_at: Date;
+    }>>`
+      SELECT ledger_no, entry_type, merchant_id, amount_cents, source_type, source_id, created_at
+        FROM ledger_entries
+       ORDER BY created_at DESC
+       LIMIT 500
+    `;
+    return rows.map((row): LedgerEntry => ({
+      ledgerNo: row.ledger_no,
+      entryType: row.entry_type,
+      merchantId: row.merchant_id ?? undefined,
+      amountCents: row.amount_cents,
+      orderNo: row.source_type === "order" ? row.source_id : undefined,
+      metadata: { sourceType: row.source_type, sourceId: row.source_id },
+      createdAt: row.created_at
+    }));
+  }
+
+  async listPaymentCallbackLogs(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      provider: PaymentProviderType;
+      order_no: string | null;
+      provider_trade_no: string | null;
+      raw_payload_masked_json: unknown;
+      created_at: Date;
+      signature_valid: boolean | null;
+      processed_status: string;
+      exception_id: string | null;
+    }>>`
+      SELECT pcl.id, pcl.provider, pcl.order_no, pcl.provider_trade_no,
+             pcl.raw_payload_masked_json, pcl.created_at, pcl.signature_valid,
+             pcl.processed_status, pe.id AS exception_id
+        FROM payment_callback_logs pcl
+        LEFT JOIN payment_exceptions pe ON pe.callback_log_id = pcl.id
+       ORDER BY pcl.created_at DESC
+       LIMIT 500
+    `;
+    return rows.map((row): PaymentCallbackLog => ({
+      id: row.id,
+      provider: row.provider,
+      orderNo: row.order_no ?? undefined,
+      providerTradeNo: row.provider_trade_no ?? "",
+      amountCents: 0n,
+      rawPayloadMasked: row.raw_payload_masked_json,
+      receivedAt: row.created_at,
+      verified: row.signature_valid ?? false,
+      status: row.exception_id ? "exception" : row.processed_status === "processed" ? "accepted" : "rejected",
+      exceptionId: row.exception_id ?? undefined
+    }));
+  }
+
+  async listPaymentExceptions(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      provider: PaymentProviderType | null;
+      order_no: string | null;
+      provider_trade_no: string | null;
+      exception_type: string;
+      reason: string | null;
+      status: string;
+      handled_by_id: string | null;
+      handled_at: Date | null;
+      resolution_json: unknown;
+      created_at: Date;
+    }>>`
+      SELECT pe.id, pcl.provider, o.order_no, pcl.provider_trade_no,
+             pe.exception_type, pe.reason, pe.status, pe.handled_by_id,
+             pe.handled_at, pe.resolution_json, pe.created_at
+        FROM payment_exceptions pe
+        LEFT JOIN payment_callback_logs pcl ON pcl.id = pe.callback_log_id
+        LEFT JOIN orders o ON o.id = pe.order_id
+       ORDER BY pe.created_at DESC
+       LIMIT 500
+    `;
+    return rows.map((row): PaymentException => ({
+      id: row.id,
+      provider: row.provider ?? "epay",
+      orderNo: row.order_no ?? undefined,
+      providerTradeNo: row.provider_trade_no ?? undefined,
+      reasonCode: row.exception_type,
+      reason: row.reason ?? row.exception_type,
+      handled: row.status === "resolved",
+      receivedAt: row.created_at,
+      handledBy: row.handled_by_id ?? undefined,
+      handledAt: row.handled_at ?? undefined,
+      note: isRecord(row.resolution_json) ? stringValue(row.resolution_json.note) : undefined
+    }));
+  }
+
+  async listEmailDeliveries(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    const rows = await this.prisma.$queryRaw<Array<{
+      delivery_no: string;
+      order_no: string;
+      user_id: string;
+      email: string;
+      code_count: number;
+      source: string;
+      status: EmailDelivery["status"];
+      error_code: string | null;
+      error_message: string | null;
+      created_at: Date;
+    }>>`
+      SELECT ed.delivery_no, o.order_no, o.user_id, ed.email, ed.code_count,
+             ed.source, ed.status, ed.error_code, ed.error_message, ed.created_at
+        FROM email_delivery_records ed
+        JOIN orders o ON o.id = ed.order_id
+       ORDER BY ed.created_at DESC
+       LIMIT 500
+    `;
+    return rows.map((row): EmailDelivery => ({
+      id: row.delivery_no,
+      orderNo: row.order_no,
+      userId: row.user_id,
+      email: row.email,
+      codeCount: row.code_count,
+      source: row.source === "manual_resend" ? "manual_resend" : "auto_fulfillment",
+      status: row.status,
+      reason: row.error_message ?? row.error_code ?? undefined,
+      createdAt: row.created_at
+    }));
+  }
+
+  async listExtractLogs(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    return this.prisma.$queryRaw<Array<{
+      id: string;
+      orderId: string;
+      actorType: string;
+      actorId: string | null;
+      result: string;
+      reasonCode: string | null;
+      ip: string | null;
+      clientInfo: string | null;
+      createdAt: Date;
+    }>>`
+      SELECT id, order_id AS "orderId", actor_type::text AS "actorType", actor_id AS "actorId",
+             result::text AS result, reason_code AS "reasonCode", ip, client_info AS "clientInfo",
+             created_at AS "createdAt"
+        FROM order_extract_logs
+       ORDER BY created_at DESC
+       LIMIT 500
+    `;
+  }
+
+  async getPlatformServiceFeeConfig(actor: AdminActor) {
+    assertAdminPermission(actor, "audit.read");
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string;
+      enabled: boolean;
+      fee_bps: number;
+      basis_type: "final_sale_price" | "paid_amount";
+      status: "active" | "disabled";
+      updated_at: Date;
+      updated_by: string | null;
+    }>>`
+      SELECT id, enabled, fee_bps, basis_type, status, updated_at, updated_by
+        FROM platform_service_fee_configs
+       WHERE status = CAST('active' AS "ServiceFeeConfigStatus")
+         AND effective_from <= now()
+         AND (effective_to IS NULL OR effective_to > now())
+       ORDER BY effective_from DESC, updated_at DESC
+       LIMIT 1
+    `;
+    const row = rows[0];
+    return row ? {
+      id: row.id,
+      enabled: row.enabled,
+      feeBps: row.fee_bps,
+      basisType: row.basis_type,
+      status: row.status,
+      updatedAt: row.updated_at,
+      updatedBy: row.updated_by ?? undefined
+    } satisfies PlatformServiceFeeConfig : {
+      id: "default",
+      enabled: true,
+      feeBps: 50,
+      basisType: "final_sale_price",
+      status: "active",
+      updatedAt: new Date(0)
+    } satisfies PlatformServiceFeeConfig;
+  }
+
   async createMerchantByAdmin(actor: AdminActor, input: Parameters<BackendServices["createMerchantByAdmin"]>[1]) {
     assertAdminPermission(actor, "merchant.review");
     if (input.targetTier && input.targetTier !== "first_tier") {
@@ -6381,7 +7678,16 @@ class PrismaStateRepository {
   }
 
   private async listDirectFirstTierPlatformProducts() {
-    const rows = await this.prisma.$queryRaw<Array<{
+    const rows = await this.findDirectPlatformProductRows(undefined, { activeOnly: true });
+    return rows.map((row) => this.serializeDirectPlatformProductRow(row, {
+      canSeePlatformSupplyPrice: true,
+      platformSupplyPriceCents: row.supply_price_cents
+    }));
+  }
+
+  private async findDirectPlatformProductRows(productId?: string, options: { activeOnly?: boolean } = {}) {
+    const activeOnly = options.activeOnly ?? false;
+    return this.prisma.$queryRaw<Array<{
       id: string;
       name: string;
       category_name: string | null;
@@ -6409,13 +7715,10 @@ class PrismaStateRepository {
              supply_price_cents, min_sale_price_cents, suggested_sale_price_cents,
              fulfillment_rule_json, after_sale_rule_json, status
         FROM platform_products
-       WHERE status = 'active'
-       ORDER BY COALESCE(display_sort, 0) DESC, created_at ASC
+       WHERE (${productId ?? null}::text IS NULL OR id = ${productId ?? null})
+         AND (${activeOnly} = false OR status = 'active')
+       ORDER BY COALESCE(display_sort, 0) DESC, created_at DESC
     `;
-    return rows.map((row) => this.serializeDirectPlatformProductRow(row, {
-      canSeePlatformSupplyPrice: true,
-      platformSupplyPriceCents: row.supply_price_cents
-    }));
   }
 
   private async listDirectUpstreamPlatformProducts(merchantId: string, runtimeStore?: RuntimeState) {
@@ -6643,6 +7946,46 @@ class PrismaStateRepository {
       sourceName: visibility.sourceName,
       upstreamMerchantProductId: visibility.upstreamMerchantProductId,
       visibleUpstreamSupplyPriceCents: visibility.visibleUpstreamSupplyPriceCents
+    };
+  }
+
+  private async directRightsCodePoolSummary(productId: string, permissions: {
+    canImport: boolean;
+    canExportMasked: boolean;
+    canViewPlaintext: boolean;
+    canExportPlaintext: boolean;
+  }) {
+    const rows = await this.prisma.$queryRaw<Array<{ status: string; count: bigint }>>`
+      SELECT status::text, count(*)::bigint AS count
+        FROM rights_codes
+       WHERE product_id = ${productId}
+       GROUP BY status
+    `;
+    const count = (status: string) => Number(rows.find((row) => row.status === status)?.count ?? 0n);
+    const available = count("available");
+    const issued = count("issued");
+    const locked = count("locked");
+    const voided = count("voided") + count("revoked");
+    return {
+      total: available + issued + locked + voided,
+      available,
+      issued,
+      locked,
+      voided,
+      ...permissions
+    };
+  }
+
+  private redactDirectRightsCode(code: RightsCode) {
+    const preview = credentialPreview(code);
+    return {
+      ...code,
+      credentialType: code.credentialType ?? "code",
+      code: undefined,
+      account: undefined,
+      password: undefined,
+      note: undefined,
+      codePreview: preview
     };
   }
 
@@ -6949,6 +8292,176 @@ class PrismaStateRepository {
     };
   }
 
+  private async findDirectUserOrderRows(actor: UserActor, orderNo?: string) {
+    return this.prisma.$queryRaw<Array<{
+      order_no: string;
+      user_id: string;
+      shop_id: string;
+      merchant_id: string | null;
+      buyer_email: string | null;
+      buyer_phone: string | null;
+      purchase_password_hash: string | null;
+      sales_channel_type: string;
+      status: string;
+      payment_status: string;
+      fulfillment_status: string;
+      refund_status: string;
+      paid_amount_cents: bigint;
+      coupon_discount_cents: bigint;
+      collection_snapshot_json: unknown;
+      coupon_snapshot_json: unknown;
+      paid_at: Date | null;
+      fulfilled_at: Date | null;
+      created_at: Date;
+      merchant_product_listing_id: string | null;
+      merchant_product_id: string | null;
+      platform_shop_product_id: string | null;
+      product_type: string | null;
+      product_id_snapshot: string | null;
+      product_name_snapshot: string | null;
+      sale_price_cents: bigint | null;
+      quantity: number | null;
+      snapshot_paid_amount_cents: bigint | null;
+      supply_amount_cents: bigint | null;
+      service_fee_cents: bigint | null;
+      merchant_expected_income_cents: bigint | null;
+      product_snapshot_json: unknown;
+      shop_snapshot_json: unknown;
+      fulfillment_rule_snapshot_json: unknown;
+      payment_payable_amount_cents: bigint | null;
+      latest_email_delivery_id: string | null;
+      latest_email_delivery_status: string | null;
+      latest_email_delivery_source: string | null;
+      latest_email_delivery_code_count: number | null;
+      latest_email_delivery_created_at: Date | null;
+    }>>`
+      SELECT o.order_no, o.user_id, o.shop_id, o.merchant_id, o.buyer_email, o.buyer_phone,
+             o.purchase_password_hash, o.sales_channel_type, o.status, o.payment_status,
+             o.fulfillment_status, o.refund_status, o.paid_amount_cents, o.coupon_discount_cents,
+             o.collection_snapshot_json, o.coupon_snapshot_json, o.paid_at, o.fulfilled_at, o.created_at,
+             oi.merchant_product_listing_id, oi.merchant_product_id, oi.platform_shop_product_id,
+             oi.product_type, oi.product_id_snapshot, oi.product_name_snapshot, oi.sale_price_cents,
+             oi.quantity, oas.paid_amount_cents AS snapshot_paid_amount_cents,
+             oas.supply_amount_cents, oas.service_fee_cents, oas.merchant_expected_income_cents,
+             oas.product_snapshot_json, oas.shop_snapshot_json, oas.fulfillment_rule_snapshot_json,
+             ps.payable_amount_cents AS payment_payable_amount_cents,
+             ed.delivery_no AS latest_email_delivery_id, ed.status AS latest_email_delivery_status,
+             ed.source AS latest_email_delivery_source, ed.code_count AS latest_email_delivery_code_count,
+             ed.created_at AS latest_email_delivery_created_at
+        FROM orders o
+        LEFT JOIN order_items oi ON oi.order_id = o.id
+        LEFT JOIN order_amount_snapshots oas ON oas.order_id = o.id
+        LEFT JOIN LATERAL (
+          SELECT payable_amount_cents
+            FROM payment_snapshots
+           WHERE order_id = o.id
+           ORDER BY created_at DESC
+           LIMIT 1
+        ) ps ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT delivery_no, status, source, code_count, created_at
+            FROM email_delivery_records
+           WHERE order_id = o.id
+           ORDER BY created_at DESC
+           LIMIT 1
+        ) ed ON TRUE
+       WHERE o.user_id = ${actor.userId}
+         AND (${orderNo ?? null}::text IS NULL OR o.order_no = ${orderNo ?? null})
+       ORDER BY o.created_at DESC
+       LIMIT ${orderNo ? 1 : 200}
+    `;
+  }
+
+  private serializeDirectUserOrderRow(
+    row: Awaited<ReturnType<PrismaStateRepository["findDirectUserOrderRows"]>>[number],
+    options: { includeBuyerContact?: boolean } = {}
+  ) {
+    const quantity = row.quantity ?? 1;
+    const settlementBasisAmountCents = row.snapshot_paid_amount_cents ?? row.paid_amount_cents ?? row.payment_payable_amount_cents ?? 0n;
+    const buyerPaidAmountCents = row.payment_payable_amount_cents ?? row.paid_amount_cents ?? settlementBasisAmountCents;
+    const productSnapshot = isRecord(row.product_snapshot_json) ? row.product_snapshot_json : {};
+    const shopSnapshot = isRecord(row.shop_snapshot_json) ? row.shop_snapshot_json : {};
+    const fulfillmentRule = isRecord(row.fulfillment_rule_snapshot_json) ? row.fulfillment_rule_snapshot_json : {};
+    const collectionSnapshot = row.collection_snapshot_json as PaymentMethodPublicSnapshot | null;
+    const mode = fulfillmentRuleMode(fulfillmentRule);
+    const base = {
+      orderNo: row.order_no,
+      userId: row.user_id,
+      shopId: row.shop_id,
+      merchantProductListingId: row.merchant_product_listing_id ?? row.merchant_product_id ?? row.platform_shop_product_id ?? undefined,
+      salesChannelType: row.sales_channel_type,
+      status: row.status,
+      paymentStatus: row.payment_status,
+      fulfillmentStatus: row.fulfillment_status,
+      refundStatus: row.refund_status,
+      buyerEmail: options.includeBuyerContact ? row.buyer_email ?? undefined : undefined,
+      buyerPhone: options.includeBuyerContact ? row.buyer_phone ?? undefined : undefined,
+      purchasePasswordSet: Boolean(row.purchase_password_hash),
+      paidAt: row.paid_at,
+      fulfilledAt: row.fulfilled_at,
+      refundedAmountCents: 0n,
+      paidAmountCents: buyerPaidAmountCents,
+      buyerPaidAmountCents,
+      settlementBasisAmountCents,
+      couponDiscountCents: row.coupon_discount_cents ?? 0n,
+      salePriceCents: row.sale_price_cents ?? (quantity > 0 ? settlementBasisAmountCents / BigInt(quantity) : settlementBasisAmountCents),
+      quantity,
+      productType: row.product_type ?? stringValue(productSnapshot.productType) ?? "platform",
+      productName: row.product_name_snapshot ?? stringValue(productSnapshot.name) ?? "商品",
+      shopName: stringValue(shopSnapshot.name),
+      customerServiceWechat: stringValue(shopSnapshot.customerServiceWechat),
+      customerServiceQrUrl: stringValue(shopSnapshot.customerServiceQrUrl),
+      customerServiceQq: stringValue(shopSnapshot.customerServiceQq),
+      customerServiceQqQrUrl: stringValue(shopSnapshot.customerServiceQqQrUrl),
+      customerServiceNote: stringValue(shopSnapshot.customerServiceNote),
+      fulfillmentMode: mode,
+      collectionPaymentMethod: collectionSnapshot ? {
+        id: collectionSnapshot.id,
+        paymentType: collectionSnapshot.channelType,
+        displayName: collectionSnapshot.displayName
+      } : undefined,
+      paymentSnapshot: undefined,
+      snapshot: {
+        productType: row.product_type ?? stringValue(productSnapshot.productType) ?? "platform"
+      }
+    };
+    const manualInstruction = manualFulfillmentInstruction(fulfillmentRule);
+    return {
+      ...base,
+      delivery: mode === "code_pool" ? {
+        mode: "automatic",
+        status: row.fulfillment_status,
+        buyerEmail: options.includeBuyerContact ? row.buyer_email ?? undefined : undefined,
+        buyerPhone: options.includeBuyerContact ? row.buyer_phone ?? undefined : undefined,
+        purchasePasswordSet: Boolean(row.purchase_password_hash),
+        extractable: Boolean(row.purchase_password_hash) && row.payment_status === "paid" && row.fulfillment_status === "success" && row.refund_status === "none",
+        emailDelivery: options.includeBuyerContact && row.buyer_email ? row.latest_email_delivery_id ? {
+          id: row.latest_email_delivery_id,
+          status: row.latest_email_delivery_status,
+          source: row.latest_email_delivery_source,
+          codeCount: row.latest_email_delivery_code_count ?? 0,
+          createdAt: row.latest_email_delivery_created_at
+        } : {
+          status: "pending",
+          reason: row.payment_status === "paid" ? "EMAIL_DELIVERY_PENDING" : "WAITING_PAYMENT_CONFIRMATION",
+          codeCount: 0
+        } : undefined,
+        codes: [],
+        message: "付款后系统会自动发放库存凭证。"
+      } : {
+        mode: "manual",
+        status: row.fulfillment_status,
+        manualFulfillmentInstruction: manualInstruction,
+        customerServiceWechat: stringValue(shopSnapshot.customerServiceWechat),
+        customerServiceQrUrl: stringValue(shopSnapshot.customerServiceQrUrl),
+        customerServiceQq: stringValue(shopSnapshot.customerServiceQq),
+        customerServiceQqQrUrl: stringValue(shopSnapshot.customerServiceQqQrUrl),
+        customerServiceNote: stringValue(shopSnapshot.customerServiceNote),
+        message: manualInstruction ?? "本商品为人工交付，请添加店铺客服领取账号、服务或权益。"
+      }
+    };
+  }
+
   private async findDirectMerchantOrderRows(actor: MerchantActor, orderNo?: string) {
     return this.prisma.$queryRaw<Array<{
       order_no: string;
@@ -7058,6 +8571,203 @@ class PrismaStateRepository {
     return result;
   }
 
+  private async findDirectOwnProductReviewRows(filters: {
+    id?: string;
+    reviewStatus?: string | null;
+    status?: string | null;
+    merchantId?: string | null;
+    shopId?: string | null;
+    limit: number;
+    offset: number;
+  }) {
+    const id = filters.id ?? null;
+    const reviewStatus = filters.reviewStatus ?? null;
+    const status = filters.status ?? null;
+    const merchantId = filters.merchantId ?? null;
+    const shopId = filters.shopId ?? null;
+    return this.prisma.$queryRaw<Array<{
+      id: string;
+      merchant_id: string;
+      shop_id: string;
+      name: string;
+      detail_json: unknown;
+      sale_price_cents: bigint;
+      after_sale_rule_json: unknown;
+      fulfillment_rule_json: unknown;
+      status: string;
+      reviewed_at: Date | null;
+      reviewed_by: string | null;
+      created_at: Date;
+      updated_at: Date;
+      merchant_name: string | null;
+      merchant_tier: MerchantTier | null;
+      merchant_status: string | null;
+      shop_name: string | null;
+      shop_status: string | null;
+      listing_id: string | null;
+    }>>`
+      SELECT mpr.id, mpr.merchant_id, mpr.shop_id, mpr.name, mpr.detail_json,
+             mpr.sale_price_cents, mpr.after_sale_rule_json, mpr.fulfillment_rule_json,
+             mpr.status, mpr.reviewed_at, mpr.reviewed_by, mpr.created_at, mpr.updated_at,
+             m.name AS merchant_name, m.tier AS merchant_tier, m.status AS merchant_status,
+             s.name AS shop_name, s.status AS shop_status, mp.id AS listing_id
+        FROM merchant_product_reviews mpr
+        LEFT JOIN merchants m ON m.id = mpr.merchant_id
+        LEFT JOIN shops s ON s.id = mpr.shop_id
+        LEFT JOIN merchant_products mp ON mp.own_product_review_id = mpr.id
+       WHERE (${id}::text IS NULL OR mpr.id = ${id})
+         AND (${reviewStatus}::text IS NULL OR mpr.status::text = ${reviewStatus})
+         AND (${status}::text IS NULL OR mpr.status::text = ${status})
+         AND (${merchantId}::text IS NULL OR mpr.merchant_id = ${merchantId})
+         AND (${shopId}::text IS NULL OR mpr.shop_id = ${shopId})
+       ORDER BY CASE WHEN mpr.status::text = 'pending_review' THEN 0 ELSE 1 END, mpr.created_at DESC
+       LIMIT ${filters.limit}
+      OFFSET ${filters.offset}
+    `;
+  }
+
+  private async serializeDirectOwnProductReviewRow(
+    row: Awaited<ReturnType<PrismaStateRepository["findDirectOwnProductReviewRows"]>>[number],
+    includeDetail: boolean
+  ) {
+    const detail = isRecord(row.detail_json) ? row.detail_json : {};
+    const tags = Array.isArray(detail.tags) ? detail.tags.filter((item): item is string => typeof item === "string") : undefined;
+    const specs = Array.isArray(detail.specs) ? detail.specs.filter((item): item is string => typeof item === "string") : undefined;
+    const detailSections = Array.isArray(detail.detailSections) ? detail.detailSections as ProductDetailSection[] : undefined;
+    const product = {
+      id: row.id,
+      ownProductId: row.id,
+      merchantId: row.merchant_id,
+      shopId: row.shop_id,
+      name: row.name,
+      category: stringValue(detail.category),
+      tags,
+      subtitle: stringValue(detail.subtitle),
+      description: stringValue(detail.description) ?? stringValue(detail.detail),
+      usageGuide: stringValue(detail.usageGuide),
+      imageUrl: stringValue(detail.imageUrl),
+      specs,
+      detailSections,
+      salePriceCents: row.sale_price_cents,
+      minSalePriceCents: row.sale_price_cents,
+      fulfillmentRule: row.fulfillment_rule_json,
+      fulfillmentMode: fulfillmentRuleMode(row.fulfillment_rule_json),
+      manualFulfillmentInstruction: manualFulfillmentInstruction(row.fulfillment_rule_json),
+      afterSaleRule: row.after_sale_rule_json,
+      reviewStatus: row.status,
+      status: row.listing_id && row.status === "approved" ? "listed" : row.status,
+      reviewedAt: row.reviewed_at,
+      reviewedBy: row.reviewed_by,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      merchantProductListingId: row.listing_id ?? undefined,
+      merchant: row.merchant_name ? { id: row.merchant_id, name: row.merchant_name, tier: row.merchant_tier, status: row.merchant_status } : undefined,
+      shop: row.shop_name ? { id: row.shop_id, name: row.shop_name, status: row.shop_status } : undefined
+    };
+    if (!includeDetail) return product;
+    return {
+      ...product,
+      rightsCodePool: row.listing_id ? await this.directRightsCodePoolSummary(row.listing_id, {
+        canImport: false,
+        canExportMasked: false,
+        canViewPlaintext: false,
+        canExportPlaintext: false
+      }) : await this.directRightsCodePoolSummary(row.id, {
+        canImport: false,
+        canExportMasked: false,
+        canViewPlaintext: false,
+        canExportPlaintext: false
+      }),
+      fieldPermissions: {
+        editable: ["reviewStatus", "status"],
+        readonly: ["merchant", "shop", "rightsCodePool"]
+      },
+      saveConfirmation: {
+        requiresConfirmation: true,
+        message: "保存后只影响后续展示和新订单，已产生订单保持原快照。"
+      }
+    };
+  }
+
+  private async findDirectAfterSales(actor?: MerchantActor) {
+    const merchantId = actor?.merchantId ?? null;
+    const shopId = actor?.shopId ?? null;
+    return this.prisma.$queryRaw<Array<{
+      afterSaleNo: string;
+      orderNo: string;
+      userId: string;
+      merchantId: string | null;
+      shopId: string;
+      status: string;
+      reasonCode: string;
+      requestedRefundCents: bigint;
+      approvedRefundCents: bigint;
+      responsibility: string;
+      description: string | undefined;
+    }>>`
+      SELECT a.after_sale_no AS "afterSaleNo", o.order_no AS "orderNo", a.user_id AS "userId",
+             a.merchant_id AS "merchantId", a.shop_id AS "shopId", a.status::text AS status,
+             a.reason_code AS "reasonCode", a.requested_refund_cents AS "requestedRefundCents",
+             a.approved_refund_cents AS "approvedRefundCents", a.responsibility::text AS responsibility,
+             a.evidence_json->>'description' AS description
+        FROM after_sales a
+        JOIN orders o ON o.id = a.order_id
+       WHERE (${merchantId}::text IS NULL OR a.merchant_id = ${merchantId})
+         AND (${shopId}::text IS NULL OR a.shop_id = ${shopId})
+       ORDER BY a.created_at DESC
+       LIMIT 500
+    `;
+  }
+
+  private async findDirectPaymentVouchers(actor?: MerchantActor) {
+    const merchantId = actor?.merchantId ?? null;
+    const shopId = actor?.shopId ?? null;
+    const rows = await this.prisma.$queryRaw<Array<{
+      confirmation_no: string;
+      order_no: string;
+      user_id: string;
+      merchant_id: string | null;
+      shop_id: string;
+      amount_cents: bigint;
+      channel: PaymentChannel | null;
+      payer_name: string | null;
+      voucher_url: string | null;
+      note: string | null;
+      status: string;
+      reviewed_at: Date | null;
+      reviewed_by: string | null;
+      reject_reason: string | null;
+      created_at: Date;
+    }>>`
+      SELECT pc.confirmation_no, o.order_no, o.user_id, o.merchant_id, pc.shop_id,
+             pc.amount_cents, p.channel, pc.payer_name, pc.voucher_url, pc.note,
+             pc.status, pc.reviewed_at, pc.reviewed_by, pc.reject_reason, pc.created_at
+        FROM payment_confirmations pc
+        JOIN orders o ON o.id = pc.order_id
+        LEFT JOIN payments p ON p.id = pc.payment_id
+       WHERE (${merchantId}::text IS NULL OR o.merchant_id = ${merchantId})
+         AND (${shopId}::text IS NULL OR pc.shop_id = ${shopId})
+       ORDER BY pc.created_at DESC
+       LIMIT 500
+    `;
+    return rows.map((row): PaymentVoucher => ({
+      id: row.confirmation_no,
+      orderNo: row.order_no,
+      userId: row.user_id,
+      shopId: row.shop_id,
+      amountCents: row.amount_cents,
+      channel: row.channel ?? "alipay_wap",
+      payerName: row.payer_name ?? undefined,
+      voucherUrl: row.voucher_url ?? undefined,
+      note: row.note ?? undefined,
+      status: row.status === "confirmed" ? "approved" : row.status === "rejected" ? "rejected" : "pending_review",
+      reason: row.reject_reason ?? undefined,
+      createdAt: row.created_at,
+      reviewedAt: row.reviewed_at,
+      reviewedBy: row.reviewed_by
+    }));
+  }
+
   private async findDirectPaymentMethodConfig(methodId: string): Promise<PaymentMethodConfig | undefined> {
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
@@ -7127,6 +8837,27 @@ class PrismaStateRepository {
       lastTestResult: row.test_status === "passed" || row.test_status === "failed" ? row.test_status : undefined,
       lastCallbackAt: row.last_callback_at ?? undefined
     };
+  }
+
+  private async listDirectPaymentMethods(filters: { ownerType?: "platform" | "merchant"; merchantId?: string; shopId?: string } = {}): Promise<PaymentMethodConfig[]> {
+    await this.ensureCollectionPaymentConfigRuntimeSchema();
+    const ownerType = filters.ownerType ?? null;
+    const merchantId = filters.merchantId ?? null;
+    const shopId = filters.shopId ?? null;
+    const rows = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      SELECT id
+        FROM collection_payment_configs
+       WHERE (${ownerType}::text IS NULL OR owner_type = ${ownerType})
+         AND (${merchantId}::text IS NULL OR owner_merchant_id = ${merchantId})
+         AND (${shopId}::text IS NULL OR shop_id = ${shopId})
+       ORDER BY is_default DESC, updated_at DESC, created_at DESC
+    `;
+    const methods: PaymentMethodConfig[] = [];
+    for (const row of rows) {
+      const method = await this.findDirectPaymentMethodConfig(row.id);
+      if (method) methods.push(method);
+    }
+    return methods;
   }
 
   private assertDirectPaymentMethodInput(ownerType: "platform" | "merchant", input: PaymentMethodUpsertInput, updatingExisting: boolean) {

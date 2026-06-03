@@ -70,7 +70,7 @@ function App() {
   const [rechargeAmount, setRechargeAmount] = useState("10000");
   const [orderPayments, setOrderPayments] = useState<Record<string, JsonRecord>>({});
   const [userCoupons, setUserCoupons] = useState<JsonRecord[]>([]);
-  const [orders, setOrders] = useState<JsonRecord[]>(() => readCachedOrders(currentShopId()));
+  const [orders, setOrders] = useState<JsonRecord[]>([]);
   const [selectedProduct, setSelectedProduct] = useState<JsonRecord | undefined>();
   const [detailProduct, setDetailProduct] = useState<JsonRecord | undefined>();
   const [detailCoupons, setDetailCoupons] = useState<JsonRecord[]>([]);
@@ -152,9 +152,7 @@ function App() {
           : defaultPaymentMethodId(nextPaymentMethods, wallet)
       );
       setSelectedProduct((current) => current ?? nextProducts[0]);
-      const mergedOrders = readCachedOrders(resolvedShopId).filter((order) => belongsToShop(order, resolvedShopId));
-      setOrders(mergedOrders);
-      writeCachedOrders(resolvedShopId, mergedOrders);
+      setOrders([]);
       setAuth(session);
       if (session) {
         void refreshUserState(resolvedShopId);
@@ -178,9 +176,7 @@ function App() {
       ]);
       setWallet(nextWallet);
       setUserCoupons(nextCoupons);
-      const mergedOrders = mergeOrders(readCachedOrders(resolvedShopId), nextOrders.filter((order) => belongsToShop(order, resolvedShopId)));
-      setOrders(mergedOrders);
-      writeCachedOrders(resolvedShopId, mergedOrders);
+      setOrders(nextOrders.filter((order) => belongsToShop(order, resolvedShopId)));
     } catch {
       // User-specific data must not block browsing the shop catalog.
     }
@@ -271,7 +267,7 @@ function App() {
       setSelectedPaymentMethodId("");
       setExtractOrder(undefined);
       setExtractResult(undefined);
-      setOrders(readCachedOrders(targetShopId).filter((order) => belongsToShop(order, targetShopId)));
+      setOrders([]);
     window.history.replaceState(null, "", shopHref(targetShopId));
     await load(targetShopId);
   }
@@ -632,11 +628,7 @@ function App() {
   }
 
   function updateOrders(updater: (current: JsonRecord[]) => JsonRecord[]) {
-    setOrders((current) => {
-      const next = updater(current);
-      writeCachedOrders(shopId, next);
-      return next;
-    });
+    setOrders(updater);
   }
 
   return (
@@ -2169,10 +2161,6 @@ function upsertOrder(orders: JsonRecord[], order: JsonRecord): JsonRecord[] {
   return [order, ...next];
 }
 
-function mergeOrders(...groups: JsonRecord[][]): JsonRecord[] {
-  return groups.flat().reduce<JsonRecord[]>((current, order) => upsertOrder(current, order), []);
-}
-
 function belongsToShop(order: JsonRecord, shopId: string): boolean {
   return text(order.shopId, shopId) === shopId;
 }
@@ -2500,40 +2488,6 @@ function yuanToCentsInput(value: string): string {
   const centsDigits = centsPart.slice(0, 2).padEnd(2, "0");
   const centsValue = `${yuan || "0"}${centsDigits}`.replace(/^0+(?=\d)/, "");
   return centsValue || "0";
-}
-
-function cacheKey(shopId: string): string {
-  return `tosell_h5_orders_${shopId}`;
-}
-
-function readCachedOrders(shopId: string): JsonRecord[] {
-  try {
-    const raw = localStorage.getItem(cacheKey(shopId));
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed.filter((item): item is JsonRecord => typeof item === "object" && item !== null && !Array.isArray(item)) : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeCachedOrders(shopId: string, orders: JsonRecord[]) {
-  localStorage.setItem(cacheKey(shopId), JSON.stringify(orders.slice(0, 20).map(redactCachedOrder)));
-}
-
-function redactCachedOrder(order: JsonRecord): JsonRecord {
-  const delivery = order.delivery as JsonRecord | undefined;
-  if (!delivery) return order;
-  return {
-    ...order,
-    buyerEmail: undefined,
-    purchasePasswordSet: order.purchasePasswordSet,
-    delivery: {
-      ...delivery,
-      buyerEmail: undefined,
-      purchasePasswordSet: delivery.purchasePasswordSet,
-      codes: []
-    }
-  };
 }
 
 const h5RootElement = document.getElementById("root")!;
