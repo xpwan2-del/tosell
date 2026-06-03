@@ -232,7 +232,10 @@ function createPrismaProductionServices() {
         return async (...args: unknown[]) => withPrismaRetry(() => repository.listPublicPaymentMethods(String(args[0] ?? "default")));
       }
       if (property === "listPlatformProducts") {
-        return async (...args: unknown[]) => withPrismaRetry(() => repository.listPlatformProducts(args[0] as MerchantActor | undefined));
+        return async (...args: unknown[]) => {
+          await hydrate();
+          return withPrismaRetry(() => repository.listPlatformProducts(args[0] as MerchantActor | undefined, service.store));
+        };
       }
       if (property === "listMerchantProducts") {
         return async (...args: unknown[]) => withPrismaRetry(() => repository.listMerchantProducts(args[0] as MerchantActor));
@@ -388,9 +391,11 @@ function createPrismaProductionServices() {
       }
       if (property === "selectPlatformProduct") {
         return async (...args: unknown[]) => {
+          await hydrate();
           const result = await withPrismaRetry(() => repository.selectPlatformProduct(
             args[0] as MerchantActor,
-            args[1] as MerchantProductListingSelectionInput
+            args[1] as MerchantProductListingSelectionInput,
+            service.store
           ));
           hydrated = false;
           hydrationPromise = undefined;
@@ -4084,6 +4089,7 @@ class BackendServices {
 
   private serializePublicPaymentMethodAsChannel(method: PaymentMethodConfig, index: number) {
     const feeBps = this.paymentFeeBpsForProvider(method.provider);
+    const publicLabel = paymentMethodPublicLabel(method.displayName, method.provider, feeBps);
     return {
       id: method.id,
       paymentMethodId: method.id,
@@ -4092,7 +4098,7 @@ class BackendServices {
       provider: method.provider,
       confirmationMode: method.confirmationMode,
       channelType: paymentDisplayTypeForProvider(method.provider),
-      displayName: paymentProviderDisplay(method.provider),
+      displayName: method.displayName || paymentProviderDisplay(method.provider),
       accountName: undefined,
       qrUrl: isManualPaymentProvider(method.provider) ? method.qrUrl : undefined,
       paymentUrl: isManualPaymentProvider(method.provider) ? method.paymentUrl : undefined,
@@ -4100,7 +4106,7 @@ class BackendServices {
       sortOrder: index,
       paymentFeeBps: feeBps,
       paymentFeeLabel: feeBps === 0 ? "0%" : `${(feeBps / 100).toFixed(0)}%`,
-      publicLabel: paymentProviderPublicLabel(method.provider, feeBps),
+      publicLabel,
       note: isManualPaymentProvider(method.provider) ? "个人收款需商户人工确认" : method.provider === "balance" ? "余额支付无手续费" : "官方支付以回调或查单为准"
     };
   }
@@ -6129,7 +6135,7 @@ class PrismaStateRepository {
     };
   }
 
-  async listPlatformProducts(actor?: MerchantActor) {
+  async listPlatformProducts(actor?: MerchantActor, runtimeStore?: MemoryStore) {
     if (!actor) {
       return this.listDirectFirstTierPlatformProducts();
     }
@@ -6141,7 +6147,7 @@ class PrismaStateRepository {
     const tier = tierRows[0]?.tier ?? "first_tier";
     return tier === "first_tier"
       ? this.listDirectFirstTierPlatformProducts()
-      : this.listDirectUpstreamPlatformProducts(actor.merchantId);
+      : this.listDirectUpstreamPlatformProducts(actor.merchantId, runtimeStore);
   }
 
   async listMerchantProducts(actor: MerchantActor) {
@@ -6248,7 +6254,7 @@ class PrismaStateRepository {
     return this.getDirectMerchantProductListing(actor, row.id);
   }
 
-  async selectPlatformProduct(actor: MerchantActor, input: MerchantProductListingSelectionInput) {
+  async selectPlatformProduct(actor: MerchantActor, input: MerchantProductListingSelectionInput, runtimeStore?: MemoryStore) {
     await this.getMerchantShop(actor);
     const rows = await this.prisma.$queryRaw<Array<{
       merchant_status: string;
@@ -6279,7 +6285,7 @@ class PrismaStateRepository {
     if (!row) throw new ApiError(404, "RESOURCE_NOT_FOUND", "merchant shop not found");
     if (!row.product_id) throw new ApiError(404, "RESOURCE_NOT_FOUND", "platform product not found");
     if (row.merchant_status !== "active" || row.deposit_status !== "paid") {
-      throw new ApiError(400, "DEPOSIT_INSUFFICIENT", "merchant deposit is required before select platform product");
+      throw new ApiError(403, "DEPOSIT_INSUFFICIENT", "merchant deposit is required before select platform product");
     }
     if (row.shop_status !== "open") throw new ApiError(400, "SHOP_NOT_OPEN", "merchant shop is not open");
     if (row.merchant_risk_status !== "normal" || row.shop_risk_status !== "normal") {
@@ -6289,7 +6295,7 @@ class PrismaStateRepository {
 
     const upstream = row.merchant_tier === "first_tier"
       ? undefined
-      : await this.findDirectUpstreamProductListing(actor.merchantId, input.platformProductId);
+      : await this.findDirectUpstreamProductListing(actor.merchantId, input.platformProductId, runtimeStore);
     if (row.merchant_tier !== "first_tier" && !upstream) {
       throw new ApiError(404, "RESOURCE_NOT_FOUND", "platform product is not available to current merchant");
     }
@@ -6373,7 +6379,23 @@ class PrismaStateRepository {
     return this.getDirectMerchantProductListing(actor, listingId);
   }
 
-  private async findDirectUpstreamProductListing(merchantId: string, platformProductId: string): Promise<{ id: string; salePriceCents: bigint } | undefined> {
+  private async findDirectUpstreamProductListing(merchantId: string, platformProductId: string, runtimeStore?: MemoryStore): Promise<{ id?: string; salePriceCents: bigint } | undefined> {
+    const runtimeOffer = this.findRuntimeUpstreamOffer(merchantId, platformProductId, runtimeStore);
+    if (runtimeOffer) {
+      const upstreamListingRows = await this.prisma.$queryRaw<Array<{ id: string }>>`
+        SELECT id
+          FROM merchant_product_listings
+         WHERE merchant_id = ${runtimeOffer.upstreamMerchantId}
+           AND platform_product_id = ${platformProductId}
+           AND status = 'listed'
+         ORDER BY updated_at DESC, created_at DESC
+         LIMIT 1
+      `;
+      return {
+        id: upstreamListingRows[0]?.id,
+        salePriceCents: runtimeOffer.offer.resellSupplyPriceCents
+      };
+    }
     const rows = await this.prisma.$queryRaw<Array<{ id: string; sale_price_cents: bigint }>>`
       SELECT mpl.id, mpl.sale_price_cents
         FROM merchant_applications ma
@@ -6389,6 +6411,34 @@ class PrismaStateRepository {
     `;
     const row = rows[0];
     return row ? { id: row.id, salePriceCents: row.sale_price_cents } : undefined;
+  }
+
+  private findRuntimeSellingRelation(merchantId: string, runtimeStore?: MemoryStore) {
+    return runtimeStore?.channelRelations.find((relation) =>
+      relation.status === "active"
+      && (
+        (!relation.thirdTierMerchantId && relation.secondTierMerchantId === merchantId)
+        || relation.thirdTierMerchantId === merchantId
+      )
+    );
+  }
+
+  private findRuntimeUpstreamOffer(merchantId: string, platformProductId: string, runtimeStore?: MemoryStore) {
+    const relation = this.findRuntimeSellingRelation(merchantId, runtimeStore);
+    if (!relation || !runtimeStore) return undefined;
+    const offer = runtimeStore.channelProductOffers.find((item) =>
+      item.channelRelationId === relation.id
+      && item.platformProductId === platformProductId
+      && item.status === "listed"
+    );
+    if (!offer) return undefined;
+    return {
+      relation,
+      offer,
+      upstreamMerchantId: relation.thirdTierMerchantId === merchantId
+        ? relation.secondTierMerchantId
+        : relation.firstTierMerchantId
+    };
   }
 
   private async assertDirectMerchantCanManageProducts(merchantId: string, shopId: string) {
@@ -6458,7 +6508,96 @@ class PrismaStateRepository {
     }));
   }
 
-  private async listDirectUpstreamPlatformProducts(merchantId: string) {
+  private async listDirectUpstreamPlatformProducts(merchantId: string, runtimeStore?: MemoryStore) {
+    const runtimeRelation = this.findRuntimeSellingRelation(merchantId, runtimeStore);
+    const runtimeOffers = runtimeRelation && runtimeStore
+      ? runtimeStore.channelProductOffers.filter((offer) => offer.channelRelationId === runtimeRelation.id && offer.status === "listed")
+      : [];
+    if (runtimeRelation && runtimeOffers.length > 0) {
+      const upstreamMerchantId = runtimeRelation.thirdTierMerchantId === merchantId
+        ? runtimeRelation.secondTierMerchantId
+        : runtimeRelation.firstTierMerchantId;
+      const offerByProductId = new Map(runtimeOffers.map((offer) => [offer.platformProductId, offer]));
+      const rows = await this.prisma.$queryRaw<Array<{
+        id: string;
+        name: string;
+        category_name: string | null;
+        tags_json: unknown;
+        image_url: string | null;
+        specs_json: unknown;
+        detail_sections_json: unknown;
+        stock_count: number | null;
+        public_stock_count: number | null;
+        sold_count: number | null;
+        display_badge: string | null;
+        is_recommended: boolean | null;
+        display_sort: number | null;
+        detail: string | null;
+        rights_desc: string | null;
+        supply_price_cents: bigint;
+        min_sale_price_cents: bigint;
+        suggested_sale_price_cents: bigint;
+        fulfillment_rule_json: unknown;
+        after_sale_rule_json: unknown;
+        status: string;
+        upstream_listing_id: string | null;
+        upstream_display_name: string | null;
+        upstream_display_subtitle: string | null;
+        upstream_display_description: string | null;
+        upstream_display_usage_guide: string | null;
+        upstream_display_image_url: string | null;
+        upstream_display_category: string | null;
+        upstream_display_tags_json: unknown;
+        upstream_display_specs_json: unknown;
+        upstream_display_detail_sections_json: unknown;
+      }>>`
+        SELECT pp.id, pp.name, pp.category_name, pp.tags_json, pp.image_url, pp.specs_json,
+               pp.detail_sections_json, pp.stock_count, pp.sold_count, pp.display_badge,
+               pp.is_recommended, pp.display_sort, pp.detail, pp.rights_desc, pp.supply_price_cents,
+               pp.min_sale_price_cents, pp.suggested_sale_price_cents, pp.fulfillment_rule_json,
+               pp.after_sale_rule_json, pp.status,
+               upstream.id AS upstream_listing_id,
+               upstream.display_name AS upstream_display_name,
+               upstream.display_subtitle AS upstream_display_subtitle,
+               upstream.display_description AS upstream_display_description,
+               upstream.display_usage_guide AS upstream_display_usage_guide,
+               upstream.display_image_url AS upstream_display_image_url,
+               upstream.display_category AS upstream_display_category,
+               upstream.display_tags_json AS upstream_display_tags_json,
+               upstream.display_specs_json AS upstream_display_specs_json,
+               upstream.display_detail_sections_json AS upstream_display_detail_sections_json
+          FROM platform_products pp
+          LEFT JOIN merchant_product_listings upstream
+            ON upstream.platform_product_id = pp.id
+           AND upstream.merchant_id = ${upstreamMerchantId}
+           AND upstream.status = 'listed'
+         WHERE pp.status = 'active'
+         ORDER BY COALESCE(pp.display_sort, 0) DESC, upstream.updated_at DESC NULLS LAST, pp.created_at ASC
+      `;
+      return rows
+        .filter((row) => offerByProductId.has(row.id))
+        .map((row) => {
+          const offer = required(offerByProductId.get(row.id), "runtimeOffer");
+          return this.serializeDirectPlatformProductRow({
+            ...row,
+            name: row.upstream_display_name ?? row.name,
+            category_name: row.upstream_display_category ?? row.category_name,
+            tags_json: Array.isArray(row.upstream_display_tags_json) ? row.upstream_display_tags_json : row.tags_json,
+            image_url: row.upstream_display_image_url ?? row.image_url,
+            specs_json: Array.isArray(row.upstream_display_specs_json) ? row.upstream_display_specs_json : row.specs_json,
+            detail_sections_json: Array.isArray(row.upstream_display_detail_sections_json) ? row.upstream_display_detail_sections_json : row.detail_sections_json,
+            detail: row.upstream_display_description ?? row.detail,
+            rights_desc: row.upstream_display_subtitle ?? row.rights_desc
+          }, {
+            canSeePlatformSupplyPrice: false,
+            sourceName: row.name,
+            upstreamMerchantProductId: row.upstream_listing_id ?? undefined,
+            visibleUpstreamSupplyPriceCents: offer.resellSupplyPriceCents,
+            minSalePriceCents: maxBigInt([row.min_sale_price_cents, offer.resellSupplyPriceCents]),
+            suggestedSalePriceCents: maxBigInt([row.suggested_sale_price_cents, offer.resellSupplyPriceCents])
+          });
+        });
+    }
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
       name: string;
@@ -6657,7 +6796,7 @@ class PrismaStateRepository {
     const row = rows[0];
     if (!row) throw new ApiError(404, "RESOURCE_NOT_FOUND", "merchant product not found");
     assertMerchantScope(actor, { merchantId: row.merchant_id, shopId: row.shop_id });
-    const directPlatformSource = !row.upstream_listing_id;
+    const directPlatformSource = row.source_type === "platform_product";
     const visibleUpstreamSupplyPriceCents = row.upstream_sale_price_cents ?? undefined;
     const minSalePriceCents = maxBigInt([
       row.min_sale_price_cents,
@@ -7441,6 +7580,7 @@ class PrismaStateRepository {
         }).map((row, index) => {
 	        const provider = mapPaymentProviderFromDb(row.provider);
 	        const feeBps = feeBpsForProvider(provider);
+          const publicLabel = paymentMethodPublicLabel(row.display_name, provider, feeBps);
 	        return {
 	          id: row.id,
 	          paymentMethodId: row.id,
@@ -7449,14 +7589,14 @@ class PrismaStateRepository {
 	          provider,
 	          confirmationMode: row.confirm_mode,
 	          channelType: paymentDisplayTypeForProvider(provider),
-	          displayName: paymentProviderDisplay(provider),
+	          displayName: row.display_name || paymentProviderDisplay(provider),
 	          qrUrl: isManualPaymentProvider(provider) ? row.qr_url ?? undefined : undefined,
 	          paymentUrl: isManualPaymentProvider(provider) ? row.return_url ?? undefined : undefined,
 	          isDefault: row.is_default,
 	          sortOrder: index,
 	          paymentFeeBps: feeBps,
 	          paymentFeeLabel: feeBps === 0 ? "0%" : `${(feeBps / 100).toFixed(0)}%`,
-	          publicLabel: paymentProviderPublicLabel(provider, feeBps),
+	          publicLabel,
 	          note: isManualPaymentProvider(provider) ? "个人收款需商户人工确认" : "官方支付以回调或查单为准"
 	        };
       })
@@ -9076,6 +9216,7 @@ class PrismaStateRepository {
   private async buildDirectEpayPaymentParams(method: {
     provider: string;
     merchantNo?: string;
+    serviceProviderId?: string;
     signingSecret?: string;
     gatewayUrl?: string;
     apiMode?: PaymentApiMode;
@@ -9097,6 +9238,7 @@ class PrismaStateRepository {
       money: centsString(amountCents),
       sign_type: "MD5"
     };
+    if (method.serviceProviderId) submitParams.cid = method.serviceProviderId;
     submitParams.sign = signEpayParams(submitParams, signingSecret);
     if (method.apiMode === "hupijiao_direct") {
       const hupijiao = await requestHupijiaoPayment(hupijiaoGatewayUrl(gatewayUrl), {
@@ -12112,7 +12254,12 @@ class PrismaStateRepository {
         ${stableDbId("refund", refund.refundNo)}, ${refund.refundNo},
         (SELECT id FROM after_sales WHERE after_sale_no = ${refund.afterSaleNo}),
         (SELECT id FROM orders WHERE order_no = ${refund.orderNo}),
-        (SELECT id FROM payments WHERE payment_no = ${`payment:${refund.orderNo}`}),
+        (SELECT p.id
+           FROM payments p
+           JOIN orders o ON o.id = p.order_id
+          WHERE o.order_no = ${refund.orderNo}
+          ORDER BY p.created_at DESC
+          LIMIT 1),
         ${refund.amountCents}, CAST(${mapRefundStatus(refund.status)} AS "RefundStatus"),
         ${refund.channelRefundNo ?? null}, ${`refund:${refund.refundNo}`}, now(), now()
       )
@@ -14722,6 +14869,14 @@ function paymentProviderPublicLabel(provider: PaymentProviderType, feeBps: numbe
   if (provider === "alipay_merchant") return `支付宝${suffix}（商家）`;
   if (provider === "personal_alipay") return `支付宝${suffix}（个人）`;
   return `e支付${suffix}（商家）`;
+}
+
+function paymentMethodPublicLabel(displayName: string | undefined | null, provider: PaymentProviderType, feeBps: number) {
+  if (provider === "balance") return "余额支付";
+  const suffix = feeBps === 0 ? "" : ` +${(feeBps / 100).toFixed(0)}%`;
+  const name = displayName?.trim();
+  if (name) return `${name}${suffix}`;
+  return paymentProviderPublicLabel(provider, feeBps);
 }
 
 function paymentProviderSort(provider: PaymentProviderType) {

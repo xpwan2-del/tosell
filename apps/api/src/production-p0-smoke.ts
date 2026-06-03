@@ -673,7 +673,7 @@ async function runSmoke() {
   const secondVisibleProduct = assertArray(secondVisibleProducts, "second-tier price isolation products")
     .find((item) => item.id === platformProduct.id);
   if (!secondVisibleProduct || secondVisibleProduct.visibleUpstreamSupplyPriceCents !== "1100") {
-    throw new Error(`second-tier product visibility was not scoped to first-tier transfer price: ${JSON.stringify(secondVisibleProduct).slice(0, 400)}`);
+    throw new Error(`second-tier product visibility was not scoped to first-tier transfer price: ${JSON.stringify(secondVisibleProduct ?? secondVisibleProducts).slice(0, 400)}`);
   }
   const thirdVisibleProducts = await injectJson(app, "third-tier price isolation products", {
     method: "GET",
@@ -684,7 +684,7 @@ async function runSmoke() {
   const thirdVisibleProduct = assertArray(thirdVisibleProducts, "third-tier price isolation products")
     .find((item) => item.id === platformProduct.id);
   if (!thirdVisibleProduct || thirdVisibleProduct.visibleUpstreamSupplyPriceCents !== "1300") {
-    throw new Error(`third-tier product visibility was not scoped to second-tier transfer price: ${JSON.stringify(thirdVisibleProduct).slice(0, 400)}`);
+    throw new Error(`third-tier product visibility was not scoped to second-tier transfer price: ${JSON.stringify(thirdVisibleProduct ?? thirdVisibleProducts).slice(0, 400)}`);
   }
   await injectErrorCode(app, "third-tier fourth invite rejected", {
     method: "POST",

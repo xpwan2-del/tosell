@@ -2386,6 +2386,8 @@ function paymentQrUrl(payment?: JsonRecord, channel?: JsonRecord): string {
 }
 
 function paymentChannelDisplayName(channel?: JsonRecord): string {
+  const configuredName = text(channel?.displayName);
+  if (configuredName) return configuredName;
   const provider = text(channel?.provider);
   if (provider) return paymentProviderDisplayName(provider);
   const type = text(channel?.channelType);
@@ -2410,6 +2412,11 @@ function paymentProviderDisplayName(provider: string): string {
 function paymentProviderPublicLabelForH5(provider: string, channel?: JsonRecord): string {
   const serverLabel = text(channel?.publicLabel);
   if (serverLabel) return serverLabel;
+  const configuredName = text(channel?.displayName);
+  if (configuredName && provider !== "balance") {
+    const feeBps = Number(text(channel?.paymentFeeBps, text(channel?.feeBps, "0")));
+    return feeBps > 0 ? `${configuredName} +${(feeBps / 100).toFixed(0)}%` : configuredName;
+  }
   if (provider === "balance") return "余额支付";
   const feeBps = Number(text(channel?.paymentFeeBps, text(channel?.feeBps, "0")));
   const suffix = feeBps > 0 ? `+${(feeBps / 100).toFixed(0)}%` : "";

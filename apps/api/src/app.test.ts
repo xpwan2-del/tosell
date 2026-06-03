@@ -2929,6 +2929,22 @@ describe.sequential("api", () => {
     });
     expect(merchantEpay.statusCode).toBe(200);
     expect(JSON.stringify(merchantEpay.json())).not.toContain("merchant-epay-secret");
+    const merchantZpay = await app.inject({
+      method: "POST",
+      url: "/api/merchant/payment-methods",
+      headers: merchantHeaders,
+      payload: {
+        provider: "epay",
+        displayName: "商户 ZPAY 易支付",
+        merchantNo: "merchant-zpay-mch-10001",
+        gatewayUrl: "https://zpay.example.test/submit.php",
+        signingSecret: "merchant-zpay-secret",
+        enabled: true,
+        isDefault: false
+      }
+    });
+    expect(merchantZpay.statusCode).toBe(200);
+    expect(JSON.stringify(merchantZpay.json())).not.toContain("merchant-zpay-secret");
     const merchantEpayTest = await app.inject({
       method: "POST",
       url: `/api/merchant/payment-methods/${merchantEpay.json().id}/test`,
@@ -2942,7 +2958,10 @@ describe.sequential("api", () => {
     const publicProviders = publicMethods.json().map((method: Record<string, unknown>) => method.provider);
     expect(publicProviders.filter((provider: unknown) => provider === "balance")).toHaveLength(1);
     expect(publicProviders.filter((provider: unknown) => provider === "personal_alipay")).toHaveLength(2);
-    expect(publicProviders.filter((provider: unknown) => provider === "epay")).toHaveLength(1);
+    expect(publicProviders.filter((provider: unknown) => provider === "epay")).toHaveLength(2);
+    expect(publicMethods.json().filter((method: Record<string, unknown>) => method.provider === "epay").map((method: Record<string, unknown>) => method.displayName)).toEqual(
+      expect.arrayContaining(["商户 e支付", "商户 ZPAY 易支付"])
+    );
     expect(publicProviders).not.toContain("alipay_merchant");
     expect(publicMethods.json().map((method: Record<string, unknown>) => method.id)).not.toContain(alipay.json().id);
 
