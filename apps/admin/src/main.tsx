@@ -261,6 +261,7 @@ const fieldLabels: Record<string, string> = {
   discountCents: "抵扣金额",
   validDays: "有效天数",
   grantOnFirstRegister: "注册赠送",
+  grantMode: "发放方式",
   productIds: "适用商品",
   channel: "支付渠道",
   provider: "支付类型",
@@ -1290,9 +1291,10 @@ function App() {
   }
 
   function submitCouponGrant() {
-    const couponId = couponGrantForm.couponId || text(data.coupons[0]?.id, "");
+    const manualCoupon = data.coupons.find((coupon) => !dataBool(coupon.grantOnFirstRegister));
+    const couponId = couponGrantForm.couponId || text(manualCoupon?.id, "");
     if (!couponId) {
-      setMessage("请先选择优惠券。");
+      setMessage("请先创建一张不自动注册发放的优惠券，再手动发放。");
       return;
     }
     if (couponGrantForm.target === "single_user" && !couponGrantForm.userId.trim() && !couponGrantForm.phone.trim()) {
@@ -1874,16 +1876,24 @@ function App() {
         );
       }
       const selectedCoupon = data.coupons.find((item) => text(item.id) === couponGrantForm.couponId) ?? data.coupons[0];
+      const manualCoupons = data.coupons.filter((item) => !dataBool(item.grantOnFirstRegister));
+      const selectedManualCoupon = manualCoupons.find((item) => text(item.id) === couponGrantForm.couponId) ?? manualCoupons[0];
+      const couponRows = data.coupons.map((coupon) => ({
+        ...coupon,
+        grantMode: dataBool(coupon.grantOnFirstRegister) ? "注册成功自动发放" : "后台手动发放"
+      }));
       return (
         <Module title="优惠券" subtitle="平台统一金额券，支持发给所有用户或指定用户">
           <section className="split">
             <Panel title="创建优惠券" kicker="平台金额券">
               <div className="form-grid wide">
                 <label>名称<input value={couponForm.name} onChange={(event) => setCouponForm({ ...couponForm, name: event.target.value })} placeholder="必填" /></label>
-                <label>抵扣金额(分)<input inputMode="numeric" value={couponForm.discountCents} onChange={(event) => setCouponForm({ ...couponForm, discountCents: event.target.value })} placeholder="必填，正整数" /></label>
-                <label>有效天数<input value={couponForm.validDays} onChange={(event) => setCouponForm({ ...couponForm, validDays: event.target.value })} /></label>
+                <label>抵扣金额(元)<input inputMode="decimal" value={centsToYuanInput(couponForm.discountCents)} onChange={(event) => setCouponForm({ ...couponForm, discountCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 5.00" /></label>
+                <label>有效天数<input inputMode="numeric" value={couponForm.validDays} onChange={(event) => setCouponForm({ ...couponForm, validDays: event.target.value })} placeholder="例如 7" /></label>
                 <label>状态<select value={couponForm.status} onChange={(event) => setCouponForm({ ...couponForm, status: event.target.value })}><option value="">请选择</option><option value="active">启用</option><option value="inactive">停用</option></select></label>
+                <label className="checkbox-line span-2"><input type="checkbox" checked={couponForm.grantOnFirstRegister} onChange={(event) => setCouponForm({ ...couponForm, grantOnFirstRegister: event.target.checked })} />注册成功自动发放给新用户</label>
               </div>
+              <p className="hint">勾选后，新用户注册成功会自动获得这张券；不勾选的券不会自动发，只能在右侧手动发放。</p>
               <div className="actions">
                 <button onClick={submitCouponTemplate}>保存优惠券</button>
                 <button className="secondary" disabled={!selectedCoupon?.id} onClick={() => void runAction("停用优惠券", () => api.updateCouponTemplateStatus(text(selectedCoupon?.id, ""), "inactive"))}>停用当前</button>
@@ -1893,8 +1903,9 @@ function App() {
             <Panel title="发放优惠券" kicker="平台发券">
               <div className="form-grid wide">
                 <label className="span-2">选择优惠券
-                  <select value={couponGrantForm.couponId || text(selectedCoupon?.id, "")} onChange={(event) => setCouponGrantForm({ ...couponGrantForm, couponId: event.target.value })}>
-                    {data.coupons.map((coupon) => <option key={text(coupon.id)} value={text(coupon.id)}>{text(coupon.name)} {cents(coupon.discountCents)}</option>)}
+                  <select value={couponGrantForm.couponId || text(selectedManualCoupon?.id, "")} onChange={(event) => setCouponGrantForm({ ...couponGrantForm, couponId: event.target.value })}>
+                    {manualCoupons.length === 0 ? <option value="">暂无可手动发放的优惠券</option> : null}
+                    {manualCoupons.map((coupon) => <option key={text(coupon.id)} value={text(coupon.id)}>{text(coupon.name)} {cents(coupon.discountCents)}</option>)}
                   </select>
                 </label>
                 <label>发放对象
@@ -1907,18 +1918,19 @@ function App() {
                 <label className="span-2">用户ID<input value={couponGrantForm.userId} onChange={(event) => setCouponGrantForm({ ...couponGrantForm, userId: event.target.value })} placeholder="可选，例如 h5-phone-手机号" /></label>
               </div>
               <div className="actions">
-                <button disabled={!selectedCoupon?.id} onClick={submitCouponGrant}>发放优惠券</button>
+                <button disabled={!selectedManualCoupon?.id} onClick={submitCouponGrant}>发放优惠券</button>
               </div>
-              <p className="hint">客户下单时只能选择一张优惠券，所有抵扣金额都由后端重新计算。</p>
+              <p className="hint">这里用于手动发放未设置为注册自动发放的优惠券；客户下单时只能选择一张券，抵扣金额由后端重新计算。</p>
             </Panel>
             <Panel title="优惠券规则" kicker="验收">
               <KeyValue label="券模板" value={String(data.coupons.length)} />
               <KeyValue label="金额券" value={String(data.coupons.length)} />
               <KeyValue label="启用中" value={String(data.coupons.filter((item) => text(item.status) === "active").length)} />
+              <KeyValue label="注册自动发放" value={String(data.coupons.filter((item) => dataBool(item.grantOnFirstRegister)).length)} />
             </Panel>
           </section>
           <Panel title="优惠券列表" kicker={`${data.coupons.length} 个模板`}>
-            <Table rows={data.coupons} columns={["id", "name", "discountCents", "validDays", "status", "createdAt"]} moneyColumns={["discountCents"]} />
+            <Table rows={couponRows} columns={["id", "name", "discountCents", "validDays", "grantMode", "status", "createdAt"]} moneyColumns={["discountCents"]} />
           </Panel>
         </Module>
       );
@@ -4985,7 +4997,7 @@ function splitCredentialInputLine(line: string): string[] {
 
 function validateCouponForm(form: { name: string; discountCents: string; validDays: string; status: string }): string {
   if (!form.name.trim()) return "请填写优惠券名称";
-  if (!isPositiveInteger(form.discountCents)) return "请填写合法抵扣金额，金额必须是正整数分";
+  if (!isPositiveInteger(form.discountCents)) return "请填写合法抵扣金额，按元填写且金额必须大于 0";
   if (!isPositiveInteger(form.validDays)) return "有效天数必须是正整数";
   if (!form.status) return "请选择优惠券状态";
   return "";
