@@ -1054,7 +1054,7 @@ function App() {
     const minPrice = Number(text(selectedListingPlatformProduct.visibleUpstreamSupplyPriceCents, text(selectedListingPlatformProduct.minSalePriceCents, "0")));
     const salePrice = Number(merchantListingForm.salePriceCents);
     if (!Number.isInteger(salePrice) || salePrice <= 0) {
-      setMessage("销售价必须填写正整数分。");
+      setMessage("销售价必须填写大于 0 的金额，按元填写，最多两位小数。");
       return;
     }
     if (minPrice > 0 && salePrice < minPrice) {
@@ -1142,7 +1142,7 @@ function App() {
       return;
     }
     if (!isNonNegativeInteger(platformShopProductForm.fulfillmentCostCents)) {
-      setMessage("履约成本必须是非负整数分。");
+      setMessage("履约成本必须是非负金额，按元填写，最多两位小数。");
       return;
     }
     const salePrice = Number(platformShopProductForm.salePriceCents);
@@ -1642,7 +1642,7 @@ function App() {
                     </section>
                     <div className="form-grid wide">
                       <label>店铺商品名称<input value={text(merchantListingForm.displayName)} onChange={(event) => setMerchantListingForm({ ...merchantListingForm, displayName: event.target.value })} /></label>
-                      <label>销售价(分)<input inputMode="numeric" value={merchantListingForm.salePriceCents} onChange={(event) => setMerchantListingForm({ ...merchantListingForm, salePriceCents: event.target.value })} /></label>
+                      <label>销售价(元)<input inputMode="decimal" value={centsToYuanInput(merchantListingForm.salePriceCents)} onChange={(event) => setMerchantListingForm({ ...merchantListingForm, salePriceCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 49.90" /></label>
                       <label>类目<input value={text(merchantListingForm.displayCategory)} onChange={(event) => setMerchantListingForm({ ...merchantListingForm, displayCategory: event.target.value })} /></label>
                       <label>状态<select value={text(merchantListingForm.status, "listed")} onChange={(event) => setMerchantListingForm({ ...merchantListingForm, status: event.target.value })}><option value="listed">上架销售</option><option value="approved">保存但不上架</option><option value="delisted">下架</option></select></label>
                       <label className="span-2">缩略图<input value={text(merchantListingForm.displayImageUrl)} onChange={(event) => setMerchantListingForm({ ...merchantListingForm, displayImageUrl: event.target.value })} /></label>
@@ -1680,9 +1680,9 @@ function App() {
                   <label>商品状态<select value={productForm.status} onChange={(event) => setProductForm({ ...productForm, status: event.target.value })}><option value="active">上架</option><option value="listed">上架中</option><option value="disabled">下架</option><option value="frozen">冻结</option></select></label>
                   <label>库存<input inputMode="numeric" value={productForm.stockCount} onChange={(event) => setProductForm({ ...productForm, stockCount: event.target.value })} placeholder="必填，非负整数" /></label>
                   <label>销量<input inputMode="numeric" value={productForm.soldCount} onChange={(event) => setProductForm({ ...productForm, soldCount: event.target.value })} placeholder="选填，非负整数" /></label>
-                  <label>供货价(分)<input inputMode="numeric" value={productForm.supplyPriceCents} onChange={(event) => setProductForm({ ...productForm, supplyPriceCents: event.target.value })} placeholder="必填，正整数" /></label>
-                  <label>最低售价(分)<input inputMode="numeric" value={productForm.minSalePriceCents} onChange={(event) => setProductForm({ ...productForm, minSalePriceCents: event.target.value })} placeholder="必填，不低于供货价" /></label>
-                  <label>建议售价(分)<input inputMode="numeric" value={productForm.suggestedSalePriceCents} onChange={(event) => setProductForm({ ...productForm, suggestedSalePriceCents: event.target.value })} placeholder="必填，不低于最低售价" /></label>
+                  <label>供货价(元)<input inputMode="decimal" value={centsToYuanInput(productForm.supplyPriceCents)} onChange={(event) => setProductForm({ ...productForm, supplyPriceCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 100.00" /></label>
+                  <label>最低售价(元)<input inputMode="decimal" value={centsToYuanInput(productForm.minSalePriceCents)} onChange={(event) => setProductForm({ ...productForm, minSalePriceCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 120.00" /></label>
+                  <label>建议售价(元)<input inputMode="decimal" value={centsToYuanInput(productForm.suggestedSalePriceCents)} onChange={(event) => setProductForm({ ...productForm, suggestedSalePriceCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 149.00" /></label>
                 </div>
                 <div className="actions">
                   <button disabled={loading} onClick={selectedPlatformProduct ? submitPlatformProductUpdate : submitPlatformProduct}>{loading ? "处理中..." : selectedPlatformProduct ? "确认保存详情" : "保存并入库"}</button>
@@ -1706,8 +1706,8 @@ function App() {
                   <label>商品图<input value={ownProductForm.imageUrl} onChange={(event) => setOwnProductForm({ ...ownProductForm, imageUrl: event.target.value })} placeholder="https://..." /></label>
                   <label className="span-2">商品说明<textarea rows={3} value={ownProductForm.description} onChange={(event) => setOwnProductForm({ ...ownProductForm, description: event.target.value })} /></label>
                   <label className="span-2">使用/人工交付说明<textarea rows={3} value={ownProductForm.usageGuide} onChange={(event) => setOwnProductForm({ ...ownProductForm, usageGuide: event.target.value })} placeholder="人工交付商品请填写交付说明，不要在这里填写完整兑换码、卡密或账号密码" /></label>
-                  <label>售价(分)<input value={ownProductForm.salePriceCents} onChange={(event) => setOwnProductForm({ ...ownProductForm, salePriceCents: event.target.value })} /></label>
-                  <label>最低价(分)<input value={ownProductForm.minSalePriceCents} onChange={(event) => setOwnProductForm({ ...ownProductForm, minSalePriceCents: event.target.value })} /></label>
+                  <label>售价(元)<input inputMode="decimal" value={centsToYuanInput(ownProductForm.salePriceCents)} onChange={(event) => setOwnProductForm({ ...ownProductForm, salePriceCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 49.90" /></label>
+                  <label>最低价(元)<input inputMode="decimal" value={centsToYuanInput(ownProductForm.minSalePriceCents)} onChange={(event) => setOwnProductForm({ ...ownProductForm, minSalePriceCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 39.90" /></label>
                   <label>交付方式<select value={ownProductForm.fulfillmentMode} onChange={(event) => setOwnProductForm({ ...ownProductForm, fulfillmentMode: event.target.value })}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发库存凭证</option></select></label>
                   {ownProductForm.fulfillmentMode === "code_pool" ? <label>凭证类型<select value={ownProductForm.credentialType} onChange={(event) => setOwnProductForm({ ...ownProductForm, credentialType: event.target.value })}><option value="code">兑换码/卡密</option><option value="account_password">账号密码</option></select></label> : null}
                 </div>
@@ -2281,7 +2281,7 @@ function App() {
                         ))}
                       </select>
                     </label>
-                    <label>转供价(分)<input inputMode="numeric" value={channelOfferCents} onChange={(event) => setChannelOfferCents(event.target.value)} placeholder="必填" /></label>
+                    <label>转供价(元)<input inputMode="decimal" value={centsToYuanInput(channelOfferCents)} onChange={(event) => setChannelOfferCents(yuanInputToCentsText(event.target.value))} placeholder="例如 42.00" /></label>
                     <button className="secondary" disabled={merchantBlocked || !downstreamMerchantId.trim() || !currentPlatformProductId} onClick={() => submitChannelOffer("配置商户转供价")}>配置转供价</button>
                   </div>
                 ) : (
@@ -2932,9 +2932,9 @@ function PlatformProductDrawer(props: {
               <label>发货方式<select value={props.form.fulfillmentMode} onChange={(event) => props.setForm((form) => ({ ...form, fulfillmentMode: event.target.value }))}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发库存凭证</option></select></label>
               {props.form.fulfillmentMode === "code_pool" ? <label>凭证类型<select value={props.form.credentialType} onChange={(event) => props.setForm((form) => ({ ...form, credentialType: event.target.value }))}><option value="code">兑换码/卡密</option><option value="account_password">账号密码</option></select></label> : null}
               <label>库存<input inputMode="numeric" value={props.form.stockCount} onChange={(event) => props.setForm((form) => ({ ...form, stockCount: event.target.value }))} /></label>
-              <label>供货价(分)<input inputMode="numeric" value={props.form.supplyPriceCents} onChange={(event) => props.setForm((form) => ({ ...form, supplyPriceCents: event.target.value }))} /></label>
-              <label>最低售价(分)<input inputMode="numeric" value={props.form.minSalePriceCents} onChange={(event) => props.setForm((form) => ({ ...form, minSalePriceCents: event.target.value }))} /></label>
-              <label>建议售价(分)<input inputMode="numeric" value={props.form.suggestedSalePriceCents} onChange={(event) => props.setForm((form) => ({ ...form, suggestedSalePriceCents: event.target.value }))} /></label>
+              <label>供货价(元)<input inputMode="decimal" value={centsToYuanInput(props.form.supplyPriceCents)} onChange={(event) => props.setForm((form) => ({ ...form, supplyPriceCents: yuanInputToCentsText(event.target.value) }))} /></label>
+              <label>最低售价(元)<input inputMode="decimal" value={centsToYuanInput(props.form.minSalePriceCents)} onChange={(event) => props.setForm((form) => ({ ...form, minSalePriceCents: yuanInputToCentsText(event.target.value) }))} /></label>
+              <label>建议售价(元)<input inputMode="decimal" value={centsToYuanInput(props.form.suggestedSalePriceCents)} onChange={(event) => props.setForm((form) => ({ ...form, suggestedSalePriceCents: yuanInputToCentsText(event.target.value) }))} /></label>
               <label>销量<input inputMode="numeric" value={props.form.soldCount} onChange={(event) => props.setForm((form) => ({ ...form, soldCount: event.target.value }))} /></label>
               <div className="form-section-title span-2">商品详情</div>
               <label className="span-2">商品说明<textarea rows={3} value={props.form.description} onChange={(event) => props.setForm((form) => ({ ...form, description: event.target.value }))} /></label>
@@ -3049,8 +3049,8 @@ function ChannelOfferEditor(props: {
           ))}
         </select>
       </label>
-      <label>转供价(分)
-        <input inputMode="numeric" value={props.priceCents} onChange={(event) => props.setPriceCents(event.target.value)} placeholder="必填，不能低于上游成本" />
+      <label>转供价(元)
+        <input inputMode="decimal" value={centsToYuanInput(props.priceCents)} onChange={(event) => props.setPriceCents(yuanInputToCentsText(event.target.value))} placeholder="例如 42.00，不能低于上游成本" />
       </label>
       <button className="secondary" disabled={props.disabled || !props.selectedRelationId || !props.selectedProductId || !props.priceCents.trim()} onClick={props.onSubmit}>配置转供价</button>
     </div>
@@ -3546,20 +3546,20 @@ function ProductPlatformShopSettings(props: {
       <KeyValue label="平台主店" value={shopName} />
       <KeyValue label="当前状态" value={listed ? statusText(props.shopProduct?.status) : "未上架到平台主店"} />
       <div className="inline-form compact">
-        <label>销售价(分)
+        <label>销售价(元)
           <input
-            inputMode="numeric"
-            value={props.form.salePriceCents}
-            onChange={(event) => props.setForm((form) => ({ ...form, salePriceCents: event.target.value }))}
-            placeholder="客户看到的售价"
+            inputMode="decimal"
+            value={centsToYuanInput(props.form.salePriceCents)}
+            onChange={(event) => props.setForm((form) => ({ ...form, salePriceCents: yuanInputToCentsText(event.target.value) }))}
+            placeholder="例如 149.00"
           />
         </label>
-        <label>履约成本(分)
+        <label>履约成本(元)
           <input
-            inputMode="numeric"
-            value={props.form.fulfillmentCostCents}
-            onChange={(event) => props.setForm((form) => ({ ...form, fulfillmentCostCents: event.target.value }))}
-            placeholder="可填 0"
+            inputMode="decimal"
+            value={centsToYuanInput(props.form.fulfillmentCostCents)}
+            onChange={(event) => props.setForm((form) => ({ ...form, fulfillmentCostCents: yuanInputToCentsText(event.target.value) }))}
+            placeholder="例如 100.00，可填 0"
           />
         </label>
         <label>销售状态
@@ -4265,9 +4265,25 @@ function cellText(value: unknown): string {
 function yuanInputToCents(value: string): number | undefined {
   const normalized = value.trim();
   if (!normalized) return undefined;
+  if (!/^\d+(?:\.\d{0,2})?$/.test(normalized)) return undefined;
   const amount = Number(normalized);
   if (!Number.isFinite(amount)) return undefined;
   return Math.round(amount * 100);
+}
+
+function yuanInputToCentsText(value: string): string {
+  const normalized = value.trim();
+  if (!normalized) return "";
+  const cents = yuanInputToCents(normalized);
+  return cents === undefined ? "" : String(cents);
+}
+
+function centsToYuanInput(value: unknown): string {
+  const raw = text(value, "");
+  if (!raw) return "";
+  const numeric = Number(raw);
+  if (!Number.isFinite(numeric)) return "";
+  return (numeric / 100).toFixed(2);
 }
 
 function dateTimeText(value: unknown): string {
@@ -4882,9 +4898,9 @@ function validatePlatformProductForm(form: {
   if (!form.fulfillmentMode) return "请选择发货方式";
   if (!isNonNegativeInteger(form.stockCount)) return "请填写合法库存，库存必须是非负整数";
   if (form.soldCount && !isNonNegativeInteger(form.soldCount)) return "销量必须是非负整数";
-  if (!isPositiveInteger(form.supplyPriceCents)) return "请填写合法供货价，金额必须是正整数分";
-  if (!isPositiveInteger(form.minSalePriceCents)) return "请填写合法最低售价，金额必须是正整数分";
-  if (!isPositiveInteger(form.suggestedSalePriceCents)) return "请填写合法建议售价，金额必须是正整数分";
+  if (!isPositiveInteger(form.supplyPriceCents)) return "请填写合法供货价，按元填写，金额必须大于 0";
+  if (!isPositiveInteger(form.minSalePriceCents)) return "请填写合法最低售价，按元填写，金额必须大于 0";
+  if (!isPositiveInteger(form.suggestedSalePriceCents)) return "请填写合法建议售价，按元填写，金额必须大于 0";
   const supply = Number(form.supplyPriceCents);
   const min = Number(form.minSalePriceCents);
   const suggested = Number(form.suggestedSalePriceCents);
@@ -4976,7 +4992,7 @@ function validateCouponForm(form: { name: string; discountCents: string; validDa
 }
 
 function validatePositiveCents(value: string, label: string): string {
-  return isPositiveInteger(value) ? "" : `请填写合法${label}，金额必须是正整数分`;
+  return isPositiveInteger(value) ? "" : `请填写合法${label}，金额必须大于 0`;
 }
 
 function validateManualMerchantForm(form: {
