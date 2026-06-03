@@ -587,6 +587,10 @@ textarea {
   line-height: 1.25;
 }
 
+.todo-card.strong {
+  border-top: 3px solid var(--admin-primary);
+}
+
 .todo-card em {
   display: block;
   margin-top: 8px;
@@ -608,6 +612,61 @@ textarea {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
+}
+
+.order-todo-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.order-workbench {
+  display: grid;
+  gap: 16px;
+}
+
+.order-current-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+
+.order-current-grid .kv {
+  min-width: 0;
+}
+
+.order-current-grid .kv strong {
+  overflow-wrap: anywhere;
+}
+
+.order-next-box {
+  display: grid;
+  gap: 6px;
+  margin-top: 14px;
+  padding: 12px;
+  background: var(--admin-surface-soft);
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+}
+
+.order-next-box span {
+  color: var(--admin-muted);
+  font-size: var(--admin-font-xs);
+  line-height: var(--admin-line-tight);
+  font-weight: var(--admin-weight-label);
+}
+
+.order-next-box strong {
+  color: var(--admin-text);
+  font-size: var(--admin-font-md);
+  line-height: var(--admin-line-tight);
+}
+
+.order-next-box p {
+  margin: 0;
+  color: var(--admin-muted);
+  font-size: var(--admin-font-sm);
+  line-height: var(--admin-line-normal);
 }
 
 .product-management-stack {
@@ -1050,6 +1109,10 @@ textarea {
 .structured-search.compact {
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   margin-top: 10px;
+}
+
+.structured-search.order-search {
+  grid-template-columns: repeat(auto-fit, minmax(156px, 1fr));
 }
 
 .structured-search label {
@@ -2140,6 +2203,8 @@ th {
   .metric-grid,
   .payment-method-grid,
   .work-grid,
+  .order-todo-grid,
+  .order-current-grid,
   .split,
   .form-grid,
   .form-grid.wide {

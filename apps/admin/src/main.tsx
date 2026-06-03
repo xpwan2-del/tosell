@@ -321,8 +321,10 @@ const valueLabels: Record<string, string> = {
   not_opened: "未开店",
   paid: "已支付",
   unpaid: "待付款",
+  pending_payment: "待付款",
   fulfilled: "已完成",
   fulfilling: "发货中",
+  not_started: "未发货",
   success: "成功",
   failed: "失败",
   processing: "处理中",
@@ -1955,35 +1957,52 @@ function App() {
 
     if (active === "orders") {
       const manualConfirmAllowed = canManuallyConfirmOrder(selectedOrder);
+      const sortedOrders = sortOrdersNewestFirst(visibleOrders);
       return (
-        <Module title="订单管理" subtitle="按收款方式处理订单，不再按截图确认支付">
-          <section className="split sticky-workbench">
-            <Panel title="当前订单" kicker={selectedOrderNo || "未选择"}>
-              <KeyValue label="订单号" value={selectedOrderNo || "暂无订单"} />
-              <KeyValue label="金额" value={cents(selectedOrderAmount)} />
-              <KeyValue label="支付状态" value={humanValue(selectedOrder?.paymentStatus)} />
-              <KeyValue label="履约状态" value={humanValue(selectedOrder?.fulfillmentStatus)} />
-              <KeyValue label="收款方式" value={orderPaymentMethodLabel(selectedOrder)} />
-              <KeyValue label="下一步" value={orderNextStep(selectedOrder)} />
-              <KeyValue label="异常材料" value={selectedOrderPaymentVouchers.length > 0 ? `${selectedOrderPaymentVouchers.length} 条，仅作核实` : "无"} />
-              <div className="actions">
-                <button disabled={!selectedOrderNo || text(selectedOrder?.paymentStatus) === "paid" || !manualConfirmAllowed} onClick={submitConfirmPayment}>确认个人支付宝到账</button>
-                <button className="secondary" disabled={!selectedOrderNo || manualConfirmAllowed || text(selectedOrder?.paymentStatus) === "paid"} onClick={() => switchModule("payment")}>去查单/看回调</button>
-                <button className="secondary" disabled={!selectedOrderNo} onClick={() => switchModule("fulfillment")}>去发货</button>
-              </div>
-              {!manualConfirmAllowed && text(selectedOrder?.paymentStatus) !== "paid" ? <p className="hint">这类订单不能靠截图或人工凭感觉确认，要等官方回调或主动查单。</p> : null}
-            </Panel>
-            <Panel title="处理规则" kicker="订单流转">
-              <ol className="steps">
-                <li>官方支付或 e支付订单：以回调或查单结果为准。</li>
-                <li>个人收款码订单：财务确认账户到账后再点确认。</li>
-                <li>已收款未发货的订单进入发货管理。</li>
-                <li>退款和售后在售后模块处理，避免订单页混着操作。</li>
-              </ol>
+        <Module title="订单管理" subtitle="按订单时间、支付状态、发货状态处理订单">
+          <OrderTodoSummary orders={sortedOrders} />
+          <section className="order-workbench sticky-workbench">
+            <Panel title="当前订单" kicker={selectedOrderNo ? orderTimeLabel(selectedOrder) : "未选择"}>
+              {selectedOrder ? (
+                <>
+                  <div className="order-current-grid">
+                    <KeyValue label="订单号" value={selectedOrderNo} />
+                    <KeyValue label="下单时间" value={orderTimeLabel(selectedOrder)} />
+                    <KeyValue label="店铺" value={orderShopLabel(selectedOrder)} />
+                    <KeyValue label="客户" value={orderCustomerLabel(selectedOrder)} />
+                    <KeyValue label="商品" value={orderProductLabel(selectedOrder)} />
+                    <KeyValue label="金额" value={cents(selectedOrderAmount)} />
+                    <KeyValue label="收款方式" value={orderPaymentMethodLabel(selectedOrder)} />
+                    <div className="kv">
+                      <span>支付状态</span>
+                      <strong><OrderStatusBadge value={selectedOrder.paymentStatus} type="payment" /></strong>
+                    </div>
+                    <div className="kv">
+                      <span>发货状态</span>
+                      <strong><OrderStatusBadge value={selectedOrder.fulfillmentStatus} type="fulfillment" /></strong>
+                    </div>
+                    <div className="kv">
+                      <span>订单状态</span>
+                      <strong><OrderStatusBadge value={selectedOrder.status} type="order" /></strong>
+                    </div>
+                    <KeyValue label="异常材料" value={selectedOrderPaymentVouchers.length > 0 ? `${selectedOrderPaymentVouchers.length} 条，仅作核实` : "无"} />
+                  </div>
+                  <div className="order-next-box">
+                    <span>下一步</span>
+                    <strong>{orderNextStep(selectedOrder)}</strong>
+                    <p>{orderNextStepHint(selectedOrder)}</p>
+                  </div>
+                  <div className="actions">
+                    <button disabled={!selectedOrderNo || text(selectedOrder?.paymentStatus) === "paid" || !manualConfirmAllowed} onClick={submitConfirmPayment}>确认个人支付宝到账</button>
+                    <button className="secondary" disabled={!selectedOrderNo || manualConfirmAllowed || text(selectedOrder?.paymentStatus) === "paid"} onClick={() => switchModule("payment")}>查单/看回调</button>
+                    <button className="secondary" disabled={!selectedOrderNo || text(selectedOrder?.paymentStatus) !== "paid"} onClick={() => switchModule("fulfillment")}>去发货</button>
+                  </div>
+                </>
+              ) : <p className="empty">暂无订单</p>}
             </Panel>
           </section>
-          <Panel title="订单列表" kicker={`${visibleOrders.length} 笔`}>
-            <OrdersTable rows={visibleOrders} onPick={setCurrentOrder} mode="next-action" />
+          <Panel title="订单列表" kicker={`${sortedOrders.length} 笔，最新订单在前`}>
+            <OrdersTable rows={sortedOrders} onPick={setCurrentOrder} mode="next-action" />
           </Panel>
           <Panel title="异常/争议材料" kicker={merchantSessionActive ? "当前店铺" : "全平台"}>
             <p className="hint">这里是买家补充的付款说明或凭证，只能用于人工核对，不能直接当作已收款。</p>
@@ -3672,25 +3691,59 @@ function ProductChangeSummary(props: { product: JsonRecord; form: ProductFormSta
   );
 }
 
+function OrderTodoSummary(props: { orders: JsonRecord[] }) {
+  const cards = [
+    { label: "待确认到账", value: props.orders.filter((order) => text(order.paymentStatus) !== "paid" && canManuallyConfirmOrder(order)).length, tone: "strong" },
+    { label: "待发货", value: props.orders.filter((order) => text(order.paymentStatus) === "paid" && orderFulfillmentStatusKey(order) !== "success").length },
+    { label: "发货失败", value: props.orders.filter((order) => orderFulfillmentStatusKey(order) === "failed").length },
+    { label: "售后中", value: props.orders.filter((order) => text(order.refundStatus, "none") !== "none").length },
+    { label: "今日订单", value: props.orders.filter((order) => isToday(orderCreatedAt(order))).length }
+  ];
+  return (
+    <section className="order-todo-grid" aria-label="订单待办摘要">
+      {cards.map((card) => (
+        <div className={card.tone === "strong" ? "todo-card strong" : "todo-card"} key={card.label}>
+          <span>{card.label}</span>
+          <strong>{String(card.value)}</strong>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function OrderStatusBadge(props: { value: unknown; type: "payment" | "fulfillment" | "order" }) {
+  const raw = text(props.value, "unknown");
+  return <span className={`status-badge ${statusTone(raw)}`}>{orderStatusText(raw, props.type)}</span>;
+}
+
 function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) => void; mode?: "select" | "next-action" }) {
-  const [draft, setDraft] = useState({ keyword: "", paymentStatus: "", fulfillmentStatus: "", refundStatus: "" });
-  const [filters, setFilters] = useState(draft);
-  const filteredRows = props.rows.filter((order) => {
-    const keyword = filters.keyword.trim().toLowerCase();
-    if (keyword) {
-      const haystack = [order.orderNo, order.id, order.shopName, order.shopId, order.merchantId, order.userId, order.status]
-        .map((item) => cellText(item).toLowerCase())
-        .join(" ");
-      if (!haystack.includes(keyword)) return false;
-    }
-    if (filters.paymentStatus && text(order.paymentStatus) !== filters.paymentStatus) return false;
-    if (filters.fulfillmentStatus && text(order.fulfillmentStatus) !== filters.fulfillmentStatus) return false;
-    if (filters.refundStatus && text(order.refundStatus, "none") !== filters.refundStatus) return false;
-    return true;
+  const [draft, setDraft] = useState({
+    orderNo: "",
+    shop: "",
+    product: "",
+    startDate: "",
+    endDate: "",
+    paymentStatus: "",
+    fulfillmentStatus: "",
+    orderStatus: "",
+    paymentProvider: ""
   });
+  const [filters, setFilters] = useState(draft);
+  const paymentProviderOptions = Array.from(new Set(props.rows.map((order) => orderPaymentProvider(order)).filter(Boolean))).sort();
+  const filteredRows = sortOrdersNewestFirst(props.rows).filter((order) => orderMatchesFilters(order, filters));
 
   function resetSearch() {
-    const empty = { keyword: "", paymentStatus: "", fulfillmentStatus: "", refundStatus: "" };
+    const empty = {
+      orderNo: "",
+      shop: "",
+      product: "",
+      startDate: "",
+      endDate: "",
+      paymentStatus: "",
+      fulfillmentStatus: "",
+      orderStatus: "",
+      paymentProvider: ""
+    };
     setDraft(empty);
     setFilters(empty);
   }
@@ -3698,15 +3751,27 @@ function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) =>
   if (props.rows.length === 0) return <p className="empty">暂无记录</p>;
   return (
     <>
-      <div className="structured-search compact" role="search" aria-label="搜索订单">
-        <div className="search-help">可按订单号、店铺、商户、用户、支付状态、发货状态和售后状态组合搜索。</div>
-        <label>订单/店铺/用户
-          <input value={draft.keyword} onChange={(event) => setDraft({ ...draft, keyword: event.target.value })} placeholder="例如 order-1001、店铺名、用户ID" />
+      <div className="structured-search order-search" role="search" aria-label="搜索订单">
+        <div className="search-help">可按订单号、店铺/商户、商品名称、下单时间、支付状态、发货状态、订单状态和收款方式组合搜索。</div>
+        <label>订单号
+          <input value={draft.orderNo} onChange={(event) => setDraft({ ...draft, orderNo: event.target.value })} placeholder="输入订单号" />
+        </label>
+        <label>店铺/商户
+          <input value={draft.shop} onChange={(event) => setDraft({ ...draft, shop: event.target.value })} placeholder="店铺名、店铺ID、商户ID" />
+        </label>
+        <label>商品名称
+          <input value={draft.product} onChange={(event) => setDraft({ ...draft, product: event.target.value })} placeholder="输入商品名称" />
+        </label>
+        <label>开始时间
+          <input type="date" value={draft.startDate} onChange={(event) => setDraft({ ...draft, startDate: event.target.value })} />
+        </label>
+        <label>结束时间
+          <input type="date" value={draft.endDate} onChange={(event) => setDraft({ ...draft, endDate: event.target.value })} />
         </label>
         <label>支付状态
           <select value={draft.paymentStatus} onChange={(event) => setDraft({ ...draft, paymentStatus: event.target.value })}>
             <option value="">全部支付状态</option>
-            <option value="pending">待支付</option>
+            <option value="unpaid">待付款</option>
             <option value="paid">已支付</option>
             <option value="failed">支付失败</option>
           </select>
@@ -3716,16 +3781,23 @@ function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) =>
             <option value="">全部发货状态</option>
             <option value="pending">待发货</option>
             <option value="processing">发货中</option>
-            <option value="success">已发货</option>
+            <option value="success">发货成功</option>
             <option value="failed">发货失败</option>
           </select>
         </label>
-        <label>售后状态
-          <select value={draft.refundStatus} onChange={(event) => setDraft({ ...draft, refundStatus: event.target.value })}>
-            <option value="">全部售后状态</option>
-            <option value="none">无售后</option>
-            <option value="pending">售后中</option>
-            <option value="refunded">已退款</option>
+        <label>订单状态
+          <select value={draft.orderStatus} onChange={(event) => setDraft({ ...draft, orderStatus: event.target.value })}>
+            <option value="">全部订单状态</option>
+            <option value="pending">待处理</option>
+            <option value="completed">已完成</option>
+            <option value="aftersale">售后中</option>
+            <option value="failed">异常/失败</option>
+          </select>
+        </label>
+        <label>收款方式
+          <select value={draft.paymentProvider} onChange={(event) => setDraft({ ...draft, paymentProvider: event.target.value })}>
+            <option value="">全部收款方式</option>
+            {paymentProviderOptions.map((provider) => <option key={provider} value={provider}>{paymentProviderName(provider)}</option>)}
           </select>
         </label>
         <div className="search-actions">
@@ -3740,24 +3812,30 @@ function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) =>
             <table>
               <thead>
                 <tr>
+                  <th>下单时间</th>
                   <th>订单号</th>
                   <th>店铺</th>
-                  <th>状态</th>
-                  <th>支付</th>
-                  <th>发货</th>
+                  <th>商品</th>
                   <th>金额</th>
+                  <th>收款方式</th>
+                  <th>支付状态</th>
+                  <th>发货状态</th>
+                  <th>订单状态</th>
                   <th>操作</th>
                 </tr>
               </thead>
               <tbody>
                 {filteredRows.map((order) => (
                   <tr key={text(order.orderNo)}>
+                    <td>{orderTimeLabel(order)}</td>
                     <td>{text(order.orderNo)}</td>
                     <td>{orderShopLabel(order)}</td>
-                    <td><StatusBadge value={order.status} /></td>
-                    <td><StatusBadge value={order.paymentStatus} /></td>
-                    <td><StatusBadge value={order.fulfillmentStatus} /></td>
+                    <td>{orderProductLabel(order)}</td>
                     <td>{cents(amountOf(order))}</td>
+                    <td>{orderPaymentMethodLabel(order)}</td>
+                    <td><OrderStatusBadge value={order.paymentStatus} type="payment" /></td>
+                    <td><OrderStatusBadge value={order.fulfillmentStatus} type="fulfillment" /></td>
+                    <td><OrderStatusBadge value={order.status} type="order" /></td>
                     <td><button className="small" type="button" onClick={() => props.onPick(order)}>{props.mode === "next-action" ? orderActionLabel(order) : "查看"}</button></td>
                   </tr>
                 ))}
@@ -3769,13 +3847,16 @@ function OrdersTable(props: { rows: JsonRecord[]; onPick: (order: JsonRecord) =>
               <article className="mobile-data-card" key={`mobile-${text(order.orderNo)}`}>
                 <div className="mobile-card-head">
                   <strong>{text(order.orderNo)}</strong>
-                  <StatusBadge value={order.paymentStatus} />
+                  <OrderStatusBadge value={order.paymentStatus} type="payment" />
                 </div>
                 <div className="card-facts">
+                  <span><b>下单时间</b>{orderTimeLabel(order)}</span>
                   <span><b>店铺</b>{orderShopLabel(order)}</span>
-                  <span><b>订单状态</b><StatusBadge value={order.status} /></span>
-                  <span><b>发货</b><StatusBadge value={order.fulfillmentStatus} /></span>
+                  <span><b>商品</b>{orderProductLabel(order)}</span>
                   <span><b>金额</b>{cents(amountOf(order))}</span>
+                  <span><b>收款方式</b>{orderPaymentMethodLabel(order)}</span>
+                  <span><b>发货</b><OrderStatusBadge value={order.fulfillmentStatus} type="fulfillment" /></span>
+                  <span><b>订单状态</b><OrderStatusBadge value={order.status} type="order" /></span>
                 </div>
                 <div className="card-actions">
                   <button className="small" type="button" onClick={() => props.onPick(order)}>{props.mode === "next-action" ? orderActionLabel(order) : "查看"}</button>
@@ -3794,6 +3875,77 @@ function orderActionLabel(order: JsonRecord): string {
   if (text(order.paymentStatus) !== "paid") return canManuallyConfirmOrder(order) ? "确认到账" : "看支付状态";
   if (text(order.fulfillmentStatus) !== "success") return "去发货";
   return "查看订单";
+}
+
+function orderMatchesFilters(order: JsonRecord, filters: {
+  orderNo: string;
+  shop: string;
+  product: string;
+  startDate: string;
+  endDate: string;
+  paymentStatus: string;
+  fulfillmentStatus: string;
+  orderStatus: string;
+  paymentProvider: string;
+}): boolean {
+  if (!includesKeyword([order.orderNo, order.id], filters.orderNo)) return false;
+  if (!includesKeyword([orderShopLabel(order), order.shopId, order.merchantId], filters.shop)) return false;
+  if (!includesKeyword([orderProductLabel(order), orderProductId(order)], filters.product)) return false;
+  const createdAt = orderCreatedAt(order);
+  if (filters.startDate && (!createdAt || createdAt < startOfDay(filters.startDate))) return false;
+  if (filters.endDate && (!createdAt || createdAt > endOfDay(filters.endDate))) return false;
+  if (filters.paymentStatus && orderPaymentStatusKey(order) !== filters.paymentStatus) return false;
+  if (filters.fulfillmentStatus && orderFulfillmentStatusKey(order) !== filters.fulfillmentStatus) return false;
+  if (filters.orderStatus && orderBusinessStatusKey(order) !== filters.orderStatus) return false;
+  if (filters.paymentProvider && orderPaymentProvider(order) !== filters.paymentProvider) return false;
+  return true;
+}
+
+function includesKeyword(values: unknown[], keyword: string): boolean {
+  const normalized = keyword.trim().toLowerCase();
+  if (!normalized) return true;
+  return values.map((item) => cellText(item).toLowerCase()).join(" ").includes(normalized);
+}
+
+function orderPaymentStatusKey(order: JsonRecord): string {
+  const status = text(order.paymentStatus, "");
+  if (status === "paid") return "paid";
+  if (status === "failed") return "failed";
+  return "unpaid";
+}
+
+function orderFulfillmentStatusKey(order: JsonRecord): string {
+  const status = text(order.fulfillmentStatus, "");
+  if (status === "success" || status === "fulfilled") return "success";
+  if (status === "failed") return "failed";
+  if (status === "processing" || status === "fulfilling") return "processing";
+  return "pending";
+}
+
+function orderBusinessStatusKey(order: JsonRecord): string {
+  if (text(order.refundStatus, "none") !== "none") return "aftersale";
+  if (orderPaymentStatusKey(order) === "failed" || orderFulfillmentStatusKey(order) === "failed") return "failed";
+  if (orderPaymentStatusKey(order) === "paid" && orderFulfillmentStatusKey(order) === "success") return "completed";
+  return "pending";
+}
+
+function orderStatusText(value: unknown, type: "payment" | "fulfillment" | "order"): string {
+  const raw = text(value, "");
+  if (type === "payment") {
+    if (raw === "paid") return "已支付";
+    if (raw === "failed") return "支付失败";
+    return "待付款";
+  }
+  if (type === "fulfillment") {
+    if (raw === "success" || raw === "fulfilled") return "发货成功";
+    if (raw === "failed") return "发货失败";
+    if (raw === "processing" || raw === "fulfilling") return "发货中";
+    return "未发货";
+  }
+  if (raw === "success" || raw === "fulfilled" || raw === "completed") return "已完成";
+  if (raw === "failed") return "异常/失败";
+  if (raw === "closed" || raw === "cancelled") return "已关闭";
+  return humanValue(raw, "待处理");
 }
 
 function OwnProductReviewTable(props: { rows: JsonRecord[]; onPick: (row: JsonRecord) => void }) {
@@ -4242,9 +4394,60 @@ function orderShopLabel(order?: JsonRecord): string {
   return text(shopSnapshot?.name, friendlyId(order?.shopId, "店铺"));
 }
 
+function orderProductLabel(order?: JsonRecord): string {
+  const snapshot = order?.snapshot as JsonRecord | undefined;
+  const productSnapshot = snapshot?.productSnapshot as JsonRecord | undefined;
+  return text(productSnapshot?.name, text(snapshot?.productNameSnapshot, friendlyId(orderProductId(order), "商品")));
+}
+
+function orderProductId(order?: JsonRecord): string {
+  const snapshot = order?.snapshot as JsonRecord | undefined;
+  const productSnapshot = snapshot?.productSnapshot as JsonRecord | undefined;
+  return text(productSnapshot?.id, text(order?.productId, text(snapshot?.productId, "")));
+}
+
+function orderCustomerLabel(order?: JsonRecord): string {
+  return friendlyId(order?.userId, "客户");
+}
+
+function orderCreatedAt(order?: JsonRecord): Date | undefined {
+  const snapshot = order?.snapshot as JsonRecord | undefined;
+  const raw = text(order?.createdAt, text(snapshot?.createdAt, ""));
+  if (!raw) return undefined;
+  const date = new Date(raw);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+function orderTimeLabel(order?: JsonRecord): string {
+  return dateTimeText(text(order?.createdAt, text((order?.snapshot as JsonRecord | undefined)?.createdAt, "")));
+}
+
+function sortOrdersNewestFirst(rows: JsonRecord[]): JsonRecord[] {
+  return [...rows].sort((left, right) => {
+    const leftTime = orderCreatedAt(left)?.getTime() ?? 0;
+    const rightTime = orderCreatedAt(right)?.getTime() ?? 0;
+    if (rightTime !== leftTime) return rightTime - leftTime;
+    return text(right.orderNo).localeCompare(text(left.orderNo));
+  });
+}
+
+function startOfDay(value: string): Date {
+  return new Date(`${value}T00:00:00`);
+}
+
+function endOfDay(value: string): Date {
+  return new Date(`${value}T23:59:59.999`);
+}
+
+function isToday(value?: Date): boolean {
+  if (!value) return false;
+  const now = new Date();
+  return value.getFullYear() === now.getFullYear() && value.getMonth() === now.getMonth() && value.getDate() === now.getDate();
+}
+
 function statusTone(value: string): string {
   if (["paid", "success", "fulfilled", "active", "approved", "open", "available", "enabled", "processed"].includes(value)) return "good";
-  if (["pending", "pending_review", "unpaid", "processing", "fulfilling", "refunding", "created", "paying", "pending_manual_confirmation"].includes(value)) return "todo";
+  if (["pending", "pending_review", "pending_payment", "unpaid", "not_started", "processing", "fulfilling", "refunding", "created", "paying", "pending_manual_confirmation"].includes(value)) return "todo";
   if (["rejected", "failed", "disabled", "frozen", "refunded", "voided", "voided_after_refund"].includes(value)) return "warn";
   return "neutral";
 }
@@ -4311,6 +4514,16 @@ function orderNextStep(order?: JsonRecord): string {
   const provider = orderPaymentProvider(order);
   if (isPersonalPaymentProvider(provider) || !provider) return "确认个人收款是否到账";
   return "等待回调，必要时主动查单";
+}
+
+function orderNextStepHint(order?: JsonRecord): string {
+  if (!order) return "从订单列表选择一笔订单后再处理。";
+  if (text(order.refundStatus, "none") !== "none") return "这笔订单已经进入售后流程，请到售后退款模块处理拆账、审批和退款。";
+  if (text(order.paymentStatus) === "paid" && text(order.fulfillmentStatus) !== "success") return "款项已经确认，可以进入发货管理处理自动发货或人工交付。";
+  if (text(order.paymentStatus) === "paid") return "这笔订单已完成收款，后续只需要关注售后和结算状态。";
+  const provider = orderPaymentProvider(order);
+  if (isPersonalPaymentProvider(provider) || !provider) return "个人支付宝订单必须确认真实到账后再点确认。";
+  return "平台 e支付、支付宝商户和微信商户订单以官方回调或主动查单为准。";
 }
 
 function selectedAfterSaleNo(rows: JsonRecord[], current?: JsonRecord): string {
