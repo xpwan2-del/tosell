@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   IdempotencyRegistry,
-  MockPaymentProvider,
   allocateRefund,
   applyClawback,
   applyFulfillmentAttempt,
@@ -289,13 +288,17 @@ describe("order, payment, fulfillment, deposit, and clawback helpers", () => {
     const registry = new IdempotencyRegistry();
     let processed = 0;
     const result = processPaymentCallback({
-      provider: new MockPaymentProvider(),
+      provider: {
+        channel: "signed_provider",
+        verifyPaymentCallback: (payload) => payload.channel === "signed_provider" && payload.signature === "valid"
+      },
       registry,
       payload: {
-        channel: "mock",
+        channel: "signed_provider",
         channelTradeNo: "trade-1",
         orderNo: "order-1",
-        amountCents: 15_000n
+        amountCents: 15_000n,
+        signature: "valid"
       },
       order: {
         orderNo: "order-1",

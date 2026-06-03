@@ -14,4 +14,4 @@ npm run api:dev
 npm run admin:dev
 ```
 
-可通过 `VITE_API_BASE_URL` 指向其他 API 地址。生产部署不要把该变量配置为本地 `localhost`。管理台使用 demo mock header，不包含真实密钥。
+可通过 `VITE_API_BASE_URL` 指向其他 API 地址。生产部署不要把该变量配置为本地 `localhost`。管理台必须通过正式登录接口取得 bearer token；本地功能测试也要连接 Google VM PostgreSQL 真实数据库。

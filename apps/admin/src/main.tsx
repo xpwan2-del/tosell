@@ -81,6 +81,7 @@ const initialState: LoadState = {
 const navItems = [
   { id: "dashboard", label: "首页", group: "总览" },
   { id: "products", label: "商品", group: "经营" },
+  { id: "productReviews", label: "商品审核", group: "经营" },
   { id: "inventory", label: "自动发货库存", group: "经营" },
   { id: "coupons", label: "优惠券", group: "经营" },
   { id: "orders", label: "订单", group: "经营" },
@@ -117,6 +118,7 @@ type ConfirmAction = {
   confirmText: string;
   actionLabel: string;
   run: () => Promise<unknown>;
+  onSuccess?: (result: unknown) => void;
 };
 type ProductFormState = {
   name: string;
@@ -137,6 +139,27 @@ type ProductFormState = {
   suggestedSalePriceCents: string;
   status: string;
 };
+function emptyProductForm(): ProductFormState {
+  return {
+    name: "",
+    category: "",
+    tags: "",
+    subtitle: "",
+    description: "",
+    usageGuide: "",
+    imageUrl: "",
+    specs: "",
+    detailSections: "",
+    stockCount: "",
+    soldCount: "",
+    fulfillmentMode: "",
+    credentialType: "code",
+    supplyPriceCents: "",
+    minSalePriceCents: "",
+    suggestedSalePriceCents: "",
+    status: "active"
+  };
+}
 type MerchantListingFormState = MerchantListingDisplayInput;
 type PlatformShopProductFormState = {
   shopId: string;
@@ -417,27 +440,11 @@ function App() {
   const [selectedListingPlatformProduct, setSelectedListingPlatformProduct] = useState<JsonRecord | undefined>();
   const [selectedMerchantProductOverride, setSelectedMerchantProductOverride] = useState<JsonRecord | undefined>();
   const [selectedOwnProductReview, setSelectedOwnProductReview] = useState<JsonRecord | undefined>();
+  const [showPlatformCreateForm, setShowPlatformCreateForm] = useState(false);
   const [productDetailTab, setProductDetailTab] = useState<"base" | "codes" | "audit">("base");
+  const [productDetailFeedback, setProductDetailFeedback] = useState("");
   const [rightsPrecheck, setRightsPrecheck] = useState<RightsCodePrecheckResult | undefined>();
-  const [productForm, setProductForm] = useState<ProductFormState>({
-    name: "",
-    category: "",
-    tags: "",
-    subtitle: "",
-    description: "",
-    usageGuide: "",
-    imageUrl: "",
-    specs: "",
-    detailSections: "",
-    stockCount: "",
-    soldCount: "",
-    fulfillmentMode: "",
-    credentialType: "code",
-    supplyPriceCents: "",
-    minSalePriceCents: "",
-    suggestedSalePriceCents: "",
-    status: "active"
-  });
+  const [productForm, setProductForm] = useState<ProductFormState>(() => emptyProductForm());
   const [merchantListingForm, setMerchantListingForm] = useState<MerchantListingFormState>({
     salePriceCents: "",
     status: "listed",
@@ -584,6 +591,8 @@ function App() {
   const selectedPaymentMethod = data.paymentMethods.find((item) => text(item.id) === selectedPaymentMethodId)
     ?? data.paymentMethods.find((item) => text(item.status) !== "disabled")
     ?? data.paymentMethods[0];
+  const listedShopProducts = merchantSessionActive ? data.merchantProducts : data.platformShopProducts;
+  const productCategoryOptions = useMemo(() => productCategories(data), [data]);
   const selectedPaymentException = data.paymentExceptions.find((item) => item.handled !== true) ?? data.paymentExceptions[0];
   const selectedPaymentVoucher = data.paymentVouchers.find((item) => text(item.status) === "pending_review") ?? data.paymentVouchers[0];
   const selectedWalletRecharge = data.walletRecharges.find((item) => text(item.status) === "pending_payment") ?? data.walletRecharges[0];
@@ -663,7 +672,7 @@ function App() {
     {
       label: "待审商品",
       value: data.ownProducts.filter((item) => text(item.reviewStatus) === "pending_review").length,
-      target: "products" as ModuleId
+      target: "productReviews" as ModuleId
     },
     {
       label: "待处理售后",
@@ -698,6 +707,13 @@ function App() {
           partialLoadErrors += 1;
           return fallback;
         }
+      };
+      const loadSequential = async <T extends readonly unknown[]>(loaders: { [K in keyof T]: () => Promise<T[K]> }): Promise<T> => {
+        const results: unknown[] = [];
+        for (const loader of loaders as readonly (() => Promise<unknown>)[]) {
+          results.push(await loader());
+        }
+        return results as unknown as T;
       };
       const shop = merchantSessionActive
         ? await optional(api.merchantShop, {} as JsonRecord)
@@ -748,45 +764,45 @@ function App() {
         salesDashboard,
         paymentGuide,
         platformServiceFee
-      ] = await Promise.all([
-        configuredPlatformShopId ? optional(() => api.shop(configuredPlatformShopId), {}) : Promise.resolve({} as JsonRecord),
-        shopIdForPublicData ? optional(() => api.shopProducts(shopIdForPublicData), []) : Promise.resolve([] as JsonRecord[]),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminPlatformShopProducts, []),
-        merchantSessionActive ? optional(api.merchantProducts, []) : Promise.resolve([] as JsonRecord[]),
-        optional(loadPlatformProducts, []),
-        merchantSessionActive ? optional(api.ownProducts, []) : optional(api.adminOwnProductReviews, []),
-        merchantSessionActive ? optional(api.merchantOrders, []) : Promise.resolve([] as JsonRecord[]),
-        merchantSessionActive ? optional(api.merchantSettlements, []) : Promise.resolve([] as JsonRecord[]),
-        merchantSessionActive ? optional(api.merchantClawbacks, []) : Promise.resolve([] as JsonRecord[]),
-        merchantSessionActive ? optional(api.merchantDepositTransactions, []) : Promise.resolve([] as JsonRecord[]),
-        optional(loadOrders, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.merchantApplications, []),
-        optional(loadInviteCodes, []),
-        optional(loadAfterSales, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminRefunds, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminSettlements, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminDeposits, []),
-        merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.adminChannels, {}),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.serviceQrCodes, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.riskFreezes, []),
-        merchantSessionActive ? optional(api.merchantPaymentMethods, []) : optional(api.adminPaymentMethods, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.paymentCallbacks, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.paymentExceptions, []),
-        merchantSessionActive ? optional(api.merchantPaymentVouchers, []) : optional(api.paymentVouchers, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.wallets, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.walletRecharges, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.walletTransactions, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminCoupons, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.auditLogs, []),
-        merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.ledgerEntries, []),
-        merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.reconciliationSummary, {}),
-        merchantSessionActive ? optional(() => api.merchantRightsCodes(), []) : optional(api.rightsCodes, []),
-        merchantSessionActive ? optional(api.notifications, []) : Promise.resolve([] as JsonRecord[]),
-        merchantSessionActive ? optional(api.merchantDashboard, {}) : Promise.resolve({} as JsonRecord),
-        merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.riskDashboard, {}),
-        merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.salesDashboard, {}),
-        merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.paymentGuide, {}),
-        merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.platformServiceFee, {})
+      ] = await loadSequential([
+        () => merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(() => api.shop(configuredPlatformShopId || "platform"), {} as JsonRecord),
+        () => shopIdForPublicData ? optional(() => api.shopProducts(shopIdForPublicData), [] as JsonRecord[]) : Promise.resolve([] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminPlatformShopProducts, [] as JsonRecord[]),
+        () => merchantSessionActive ? optional(api.merchantProducts, [] as JsonRecord[]) : Promise.resolve([] as JsonRecord[]),
+        () => loadPlatformProducts(),
+        () => merchantSessionActive ? optional(api.ownProducts, [] as JsonRecord[]) : optional(api.adminOwnProductReviews, [] as JsonRecord[]),
+        () => merchantSessionActive ? optional(api.merchantOrders, [] as JsonRecord[]) : Promise.resolve([] as JsonRecord[]),
+        () => merchantSessionActive ? optional(api.merchantSettlements, [] as JsonRecord[]) : Promise.resolve([] as JsonRecord[]),
+        () => merchantSessionActive ? optional(api.merchantClawbacks, [] as JsonRecord[]) : Promise.resolve([] as JsonRecord[]),
+        () => merchantSessionActive ? optional(api.merchantDepositTransactions, [] as JsonRecord[]) : Promise.resolve([] as JsonRecord[]),
+        () => optional(loadOrders, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.merchantApplications, [] as JsonRecord[]),
+        () => optional(loadInviteCodes, [] as JsonRecord[]),
+        () => optional(loadAfterSales, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminRefunds, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminSettlements, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminDeposits, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.adminChannels, {} as JsonRecord),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.serviceQrCodes, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.riskFreezes, [] as JsonRecord[]),
+        () => merchantSessionActive ? optional(api.merchantPaymentMethods, [] as JsonRecord[]) : optional(api.adminPaymentMethods, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.paymentCallbacks, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.paymentExceptions, [] as JsonRecord[]),
+        () => merchantSessionActive ? optional(api.merchantPaymentVouchers, [] as JsonRecord[]) : optional(api.paymentVouchers, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.wallets, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.walletRecharges, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.walletTransactions, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.adminCoupons, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.auditLogs, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve([] as JsonRecord[]) : optional(api.ledgerEntries, [] as JsonRecord[]),
+        () => merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.reconciliationSummary, {} as JsonRecord),
+        () => merchantSessionActive ? optional(() => api.merchantRightsCodes(), [] as JsonRecord[]) : optional(api.rightsCodes, [] as JsonRecord[]),
+        () => merchantSessionActive ? optional(api.notifications, [] as JsonRecord[]) : Promise.resolve([] as JsonRecord[]),
+        () => merchantSessionActive ? optional(api.merchantDashboard, {} as JsonRecord) : Promise.resolve({} as JsonRecord),
+        () => merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.riskDashboard, {} as JsonRecord),
+        () => merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.salesDashboard, {} as JsonRecord),
+        () => merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.paymentGuide, {} as JsonRecord),
+        () => merchantSessionActive ? Promise.resolve({} as JsonRecord) : optional(api.platformServiceFee, {} as JsonRecord)
       ]);
       setData({
         shop,
@@ -877,12 +893,24 @@ function App() {
   }, [session?.token]);
 
   useEffect(() => {
+    if (!selectedPlatformProduct?.id) return;
+    const platformProductId = text(selectedPlatformProduct.id, "");
+    const shopId = text(data.platformShop?.id, configuredPlatformShopId);
+    if (!shopId || !platformProductId) return;
+    setPlatformShopProductForm((form) => ({
+      ...form,
+      shopId: form.shopId || shopId,
+      platformProductId: form.platformProductId || platformProductId
+    }));
+  }, [data.platformShop?.id, selectedPlatformProduct?.id]);
+
+  useEffect(() => {
     const onHashChange = () => setActive(moduleFromHash());
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
 
-  async function runAction(label: string, action: () => Promise<unknown>, refresh = true, options: { skipConfirm?: boolean } = {}) {
+  async function runAction(label: string, action: () => Promise<unknown>, refresh = true, options: { skipConfirm?: boolean; onSuccess?: (result: unknown) => void } = {}) {
     if (loading) return false;
     if (!options.skipConfirm && requiresActionConfirmation(label) && !window.confirm(`${label}会写入后台数据并记录审计，确认继续？`)) {
       setMessage(`${label}已取消`);
@@ -899,6 +927,7 @@ function App() {
       if (isRecord(result) && isRecord(result.refund)) setCurrentRefund(result.refund as JsonRecord);
       if (isRecord(result) && isRecord(result.allocation)) setCurrentAllocation(result.allocation as JsonRecord);
       if (isRecord(result) && isRecord(result.credential)) setCreatedCredential(result.credential as JsonRecord);
+      options.onSuccess?.(result);
       setMessage(`${label}成功`);
       if (refresh) await loadAll(`${label}成功，数据已刷新`);
       return true;
@@ -979,11 +1008,25 @@ function App() {
       setMessage(error);
       return;
     }
-    void runAction("创建平台商品", () => api.createPlatformProduct(productForm));
+    void runAction("创建平台商品", () => api.createPlatformProduct(productForm)).then((succeeded) => {
+      if (succeeded) setShowPlatformCreateForm(false);
+    });
+  }
+
+  function openPlatformProductCreate() {
+    setSelectedPlatformProduct(undefined);
+    setProductDetailFeedback("");
+    setProductDetailTab("base");
+    setRightsPrecheck(undefined);
+    setProductForm(emptyProductForm());
+    setShowPlatformCreateForm(true);
+    setMessage("已打开新增平台商品");
   }
 
   function pickPlatformProduct(row: JsonRecord) {
     setSelectedPlatformProduct(row);
+    setProductDetailFeedback("");
+    setShowPlatformCreateForm(false);
     setProductDetailTab("base");
     setRightsPrecheck(undefined);
     const existingPlatformShopProduct = data.platformShopProducts.find((item) => text(item.platformProductId) === text(row.id));
@@ -994,26 +1037,7 @@ function App() {
       fulfillmentCostCents: text(existingPlatformShopProduct?.fulfillmentCostCents, text(row.supplyPriceCents, "0")),
       status: text(existingPlatformShopProduct?.status, "listed")
     });
-    const rule = row.fulfillmentRule as JsonRecord | undefined;
-    setProductForm({
-      name: text(row.name, ""),
-      category: text(row.category, ""),
-      tags: Array.isArray(row.tags) ? row.tags.map((item) => text(item, "")).filter(Boolean).join("，") : "",
-      subtitle: text(row.subtitle, ""),
-      description: text(row.description, ""),
-      usageGuide: text(row.usageGuide, ""),
-      imageUrl: text(row.imageUrl, ""),
-      specs: Array.isArray(row.specs) ? row.specs.map((item) => text(item, "")).filter(Boolean).join("\n") : "",
-      detailSections: formatDetailSections(row.detailSections),
-      stockCount: text(row.stockCount, ""),
-      soldCount: text(row.soldCount, ""),
-      fulfillmentMode: text(rule?.mode, "manual"),
-      credentialType: text(rule?.credentialType, "code"),
-      supplyPriceCents: text(row.supplyPriceCents, ""),
-      minSalePriceCents: text(row.minSalePriceCents, ""),
-      suggestedSalePriceCents: text(row.suggestedSalePriceCents, ""),
-      status: text(row.status, "active")
-    });
+    setProductForm(platformProductToForm(row));
     setMessage(`已选择平台商品：${text(row.name, text(row.id))}`);
   }
 
@@ -1110,11 +1134,19 @@ function App() {
       confirmText: "确认修改",
       actionLabel: "保存平台商品详情",
       run: () => api.updatePlatformProduct(productId, platformProductUpdatePayload(selectedPlatformProduct, productForm)),
+      onSuccess: (result) => {
+        const savedProduct = isRecord(result) ? result : platformProductSnapshot(selectedPlatformProduct, productForm);
+        const nextProduct = platformProductSnapshot(savedProduct, productForm);
+        setSelectedPlatformProduct(nextProduct);
+        setProductForm(platformProductToForm(nextProduct));
+        setProductDetailFeedback(`保存成功，已写入平台商品库。保存时间：${new Date().toLocaleString("zh-CN", { hour12: false })}`);
+      },
       rows: platformProductChangeRows(selectedPlatformProduct, productForm, { changedOnly: true })
     });
   }
 
   function uploadSelectedProductImage(file: File) {
+    setProductDetailFeedback("");
     void runAction("上传商品图片", async () => {
       const result = await api.uploadProductImage({
         filename: file.name,
@@ -1613,22 +1645,25 @@ function App() {
 
     if (active === "products") {
       return (
-        <Module title="商品管理" subtitle={merchantSessionActive ? "平台店铺商品、自有商品上架、库存准备" : "平台供货、自营上架、商户自有商品审核"}>
+        <Module title="商品管理" subtitle={merchantSessionActive ? "平台店铺商品、自有商品上架、库存准备" : "平台供货、平台自营上架和商品基础维护"}>
           <section className="product-management-stack">
             <Panel title="平台商品库" kicker={`${data.platformProducts.length} 个商品`}>
+              {!merchantSessionActive ? (
+                <div className="panel-actions">
+                  <button type="button" disabled={loading} onClick={openPlatformProductCreate}>新增平台商品</button>
+                </div>
+              ) : null}
               {merchantSessionActive
                 ? <MerchantListingTable products={data.platformProducts} merchantProducts={data.merchantProducts} onPick={pickListingPlatformProduct} blocked={merchantBlocked || loading} tier={currentMerchantTier} loading={loading && actionLabel.includes("店铺商品")} />
                 : <ProductCatalogList products={data.platformProducts} rightsCodes={data.rightsCodes} merchantProducts={data.merchantProducts} channels={data.channels} onPick={pickPlatformProduct} />}
             </Panel>
-            <Panel title="店铺已上架商品" kicker={`${data.merchantProducts.length} 个商品`}>
-              <Table rows={merchantProductRows(data.merchantProducts)} columns={merchantProductColumns} moneyColumns={["salePriceCents", "supplyPriceCents", "platformSupplyPriceCents", "visibleUpstreamSupplyPriceCents", "minSalePriceCents"]} onPick={merchantSessionActive ? pickListedMerchantProduct : (row) => setSelectedMerchantProductOverride(data.merchantProducts.find((item) => text(item.id) === text(row.id)) ?? row)} />
+            <Panel title={merchantSessionActive ? "店铺已上架商品" : "平台自营已上架商品"} kicker={`${listedShopProducts.length} 个商品`}>
+              <Table rows={merchantProductRows(listedShopProducts)} columns={merchantProductColumns} moneyColumns={["salePriceCents", "supplyPriceCents", "platformSupplyPriceCents", "visibleUpstreamSupplyPriceCents", "minSalePriceCents"]} onPick={merchantSessionActive ? pickListedMerchantProduct : (row) => {
+                const shopProduct = data.platformShopProducts.find((item) => text(item.id) === text(row.id));
+                const product = data.platformProducts.find((item) => text(item.id) === text(shopProduct?.platformProductId));
+                if (product) pickPlatformProduct(product);
+              }} />
             </Panel>
-            {!merchantSessionActive ? (
-              <Panel title="商品审核" kicker={`${data.ownProducts.length} 条`}>
-                <p className="hint">这里审核各级商户提交的自有商品。平台自营商品和平台供货商品不走这个入口。</p>
-                <OwnProductReviewTable rows={data.ownProducts} onPick={pickOwnProductReview} />
-              </Panel>
-            ) : null}
           </section>
           <section className="split">
             {merchantSessionActive ? (
@@ -1644,8 +1679,8 @@ function App() {
                     </section>
                     <div className="form-grid wide">
                       <label>店铺商品名称<input value={text(merchantListingForm.displayName)} onChange={(event) => setMerchantListingForm({ ...merchantListingForm, displayName: event.target.value })} /></label>
-                      <label>销售价(元)<input inputMode="decimal" value={centsToYuanInput(merchantListingForm.salePriceCents)} onChange={(event) => setMerchantListingForm({ ...merchantListingForm, salePriceCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 49.90" /></label>
-                      <label>类目<input value={text(merchantListingForm.displayCategory)} onChange={(event) => setMerchantListingForm({ ...merchantListingForm, displayCategory: event.target.value })} /></label>
+                      <label>销售价(元)<MoneyInput value={merchantListingForm.salePriceCents} onCentsChange={(value) => setMerchantListingForm({ ...merchantListingForm, salePriceCents: value })} placeholder="例如 49.90" /></label>
+                      <CategorySelect label="类目" value={text(merchantListingForm.displayCategory)} options={productCategoryOptions} onChange={(value) => setMerchantListingForm({ ...merchantListingForm, displayCategory: value })} />
                       <label>状态<select value={text(merchantListingForm.status, "listed")} onChange={(event) => setMerchantListingForm({ ...merchantListingForm, status: event.target.value })}><option value="listed">上架销售</option><option value="approved">保存但不上架</option><option value="delisted">下架</option></select></label>
                       <label className="span-2">缩略图<input value={text(merchantListingForm.displayImageUrl)} onChange={(event) => setMerchantListingForm({ ...merchantListingForm, displayImageUrl: event.target.value })} /></label>
                       <label className="span-2">副标题<input value={text(merchantListingForm.displaySubtitle)} onChange={(event) => setMerchantListingForm({ ...merchantListingForm, displaySubtitle: event.target.value })} /></label>
@@ -1664,37 +1699,7 @@ function App() {
                   </>
                 ) : <p className="empty">先从“可店铺商品列表”选择一个商品。</p>}
               </Panel>
-            ) : (
-              <Panel title={selectedPlatformProduct ? "平台商品详情" : "新增平台供货商品"} kicker={selectedPlatformProduct ? text(selectedPlatformProduct.id) : "平台"}>
-                {selectedPlatformProduct ? <p className="hint">当前正在编辑已选平台商品。保存前请确认价格、履约方式和状态变更；后端会写入审计。</p> : null}
-                <div className="form-grid">
-                  <label>商品名称<input value={productForm.name} onChange={(event) => setProductForm({ ...productForm, name: event.target.value })} placeholder="例如：会员月卡/账号成品号" /></label>
-                  <label>类目<input value={productForm.category} onChange={(event) => setProductForm({ ...productForm, category: event.target.value })} placeholder="例如：AI 会员" /></label>
-                  <label>标签<input value={productForm.tags} onChange={(event) => setProductForm({ ...productForm, tags: event.target.value })} placeholder="逗号分隔" /></label>
-                  <label>副标题<input value={productForm.subtitle} onChange={(event) => setProductForm({ ...productForm, subtitle: event.target.value })} placeholder="一句话说明卖点" /></label>
-                  <label>商品图<input value={productForm.imageUrl} onChange={(event) => setProductForm({ ...productForm, imageUrl: event.target.value })} placeholder="https://..." /></label>
-                  <label>规格<textarea value={productForm.specs} onChange={(event) => setProductForm({ ...productForm, specs: event.target.value })} rows={3} placeholder="一行一个规格" /></label>
-                  <label>商品说明<textarea value={productForm.description} onChange={(event) => setProductForm({ ...productForm, description: event.target.value })} rows={3} /></label>
-                  <label>使用说明<textarea value={productForm.usageGuide} onChange={(event) => setProductForm({ ...productForm, usageGuide: event.target.value })} rows={3} /></label>
-                  <label>详情模块<textarea value={productForm.detailSections} onChange={(event) => setProductForm({ ...productForm, detailSections: event.target.value })} rows={5} placeholder="标题：内容一；内容二" /></label>
-                  <label>发货方式<select value={productForm.fulfillmentMode} onChange={(event) => setProductForm({ ...productForm, fulfillmentMode: event.target.value })}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发库存凭证</option></select></label>
-                  {productForm.fulfillmentMode === "code_pool" ? <label>凭证类型<select value={productForm.credentialType} onChange={(event) => setProductForm({ ...productForm, credentialType: event.target.value })}><option value="code">兑换码/卡密</option><option value="account_password">账号密码</option></select></label> : null}
-                  <label>商品状态<select value={productForm.status} onChange={(event) => setProductForm({ ...productForm, status: event.target.value })}><option value="active">上架</option><option value="listed">上架中</option><option value="disabled">下架</option><option value="frozen">冻结</option></select></label>
-                  <label>库存<input inputMode="numeric" value={productForm.stockCount} onChange={(event) => setProductForm({ ...productForm, stockCount: event.target.value })} placeholder="必填，非负整数" /></label>
-                  <label>销量<input inputMode="numeric" value={productForm.soldCount} onChange={(event) => setProductForm({ ...productForm, soldCount: event.target.value })} placeholder="选填，非负整数" /></label>
-                  <label>供货价(元)<input inputMode="decimal" value={centsToYuanInput(productForm.supplyPriceCents)} onChange={(event) => setProductForm({ ...productForm, supplyPriceCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 100.00" /></label>
-                  <label>最低售价(元)<input inputMode="decimal" value={centsToYuanInput(productForm.minSalePriceCents)} onChange={(event) => setProductForm({ ...productForm, minSalePriceCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 120.00" /></label>
-                  <label>建议售价(元)<input inputMode="decimal" value={centsToYuanInput(productForm.suggestedSalePriceCents)} onChange={(event) => setProductForm({ ...productForm, suggestedSalePriceCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 149.00" /></label>
-                </div>
-                <div className="actions">
-                  <button disabled={loading} onClick={selectedPlatformProduct ? submitPlatformProductUpdate : submitPlatformProduct}>{loading ? "处理中..." : selectedPlatformProduct ? "确认保存详情" : "保存并入库"}</button>
-                  {selectedPlatformProduct ? <button className="secondary" type="button" disabled={loading} onClick={() => { setSelectedPlatformProduct(undefined); setMessage("已退出商品详情编辑"); }}>退出详情</button> : null}
-                  {productForm.fulfillmentMode === "code_pool" && selectedPlatformProduct ? <button className="secondary" type="button" disabled={loading} onClick={() => openInventoryForPlatformProduct(selectedPlatformProduct)}>去库存管理补货</button> : null}
-                  {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
-                </div>
-                {productForm.fulfillmentMode === "manual" ? <p className="hint">人工交付商品不能导入自动发货库存；请维护商品说明、使用说明和店铺客服信息。</p> : null}
-              </Panel>
-            )}
+            ) : null}
             </section>
           {merchantSessionActive ? (
             <Panel title="新增自有商品" kicker="提交平台审核">
@@ -1703,13 +1708,13 @@ function App() {
                 {merchantBlocked ? <p className="warning">{merchantBlockedReason}</p> : null}
                 <div className="form-grid wide">
                   <label>商品名称<input value={ownProductForm.name} onChange={(event) => setOwnProductForm({ ...ownProductForm, name: event.target.value })} /></label>
-                  <label>类目<input value={ownProductForm.category} onChange={(event) => setOwnProductForm({ ...ownProductForm, category: event.target.value })} /></label>
+                  <CategorySelect label="类目" value={ownProductForm.category} options={productCategoryOptions} onChange={(value) => setOwnProductForm({ ...ownProductForm, category: value })} />
                   <label>标签<input value={ownProductForm.tags} onChange={(event) => setOwnProductForm({ ...ownProductForm, tags: event.target.value })} placeholder="逗号分隔" /></label>
                   <label>商品图<input value={ownProductForm.imageUrl} onChange={(event) => setOwnProductForm({ ...ownProductForm, imageUrl: event.target.value })} placeholder="https://..." /></label>
                   <label className="span-2">商品说明<textarea rows={3} value={ownProductForm.description} onChange={(event) => setOwnProductForm({ ...ownProductForm, description: event.target.value })} /></label>
                   <label className="span-2">使用/人工交付说明<textarea rows={3} value={ownProductForm.usageGuide} onChange={(event) => setOwnProductForm({ ...ownProductForm, usageGuide: event.target.value })} placeholder="人工交付商品请填写交付说明，不要在这里填写完整兑换码、卡密或账号密码" /></label>
-                  <label>售价(元)<input inputMode="decimal" value={centsToYuanInput(ownProductForm.salePriceCents)} onChange={(event) => setOwnProductForm({ ...ownProductForm, salePriceCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 49.90" /></label>
-                  <label>最低价(元)<input inputMode="decimal" value={centsToYuanInput(ownProductForm.minSalePriceCents)} onChange={(event) => setOwnProductForm({ ...ownProductForm, minSalePriceCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 39.90" /></label>
+                  <label>售价(元)<MoneyInput value={ownProductForm.salePriceCents} onCentsChange={(value) => setOwnProductForm({ ...ownProductForm, salePriceCents: value })} placeholder="例如 49.90" /></label>
+                  <label>最低价(元)<MoneyInput value={ownProductForm.minSalePriceCents} onCentsChange={(value) => setOwnProductForm({ ...ownProductForm, minSalePriceCents: value })} placeholder="例如 39.90" /></label>
                   <label>交付方式<select value={ownProductForm.fulfillmentMode} onChange={(event) => setOwnProductForm({ ...ownProductForm, fulfillmentMode: event.target.value })}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发库存凭证</option></select></label>
                   {ownProductForm.fulfillmentMode === "code_pool" ? <label>凭证类型<select value={ownProductForm.credentialType} onChange={(event) => setOwnProductForm({ ...ownProductForm, credentialType: event.target.value })}><option value="code">兑换码/卡密</option><option value="account_password">账号密码</option></select></label> : null}
                 </div>
@@ -1722,7 +1727,10 @@ function App() {
             <PlatformProductDrawer
               product={selectedPlatformProduct}
               form={productForm}
-              setForm={setProductForm}
+              setForm={(next) => {
+                setProductDetailFeedback("");
+                setProductForm(next);
+              }}
               tab={productDetailTab}
               setTab={setProductDetailTab}
               rightsCodes={data.rightsCodes.filter((item) => text(item.productId) === text(selectedPlatformProduct.id) || text(item.platformProductId) === text(selectedPlatformProduct.id))}
@@ -1733,14 +1741,38 @@ function App() {
               platformShopProduct={selectedPlatformShopProduct}
               platformShopForm={platformShopProductForm}
               setPlatformShopForm={setPlatformShopProductForm}
+              categoryOptions={productCategoryOptions}
               onUploadImage={uploadSelectedProductImage}
               onSave={submitPlatformProductUpdate}
+              saveFeedback={productDetailFeedback}
               onSavePlatformShop={submitPlatformShopProduct}
               busy={loading}
               onClose={() => setSelectedPlatformProduct(undefined)}
               onOpenInventory={() => openInventoryForPlatformProduct(selectedPlatformProduct)}
             />
           ) : null}
+          {!merchantSessionActive && showPlatformCreateForm ? (
+            <PlatformProductCreateDrawer
+              form={productForm}
+              setForm={setProductForm}
+              categoryOptions={productCategoryOptions}
+              onUploadImage={uploadSelectedProductImage}
+              onSave={submitPlatformProduct}
+              busy={loading}
+              onClose={() => setShowPlatformCreateForm(false)}
+            />
+          ) : null}
+        </Module>
+      );
+    }
+
+    if (active === "productReviews") {
+      return (
+        <Module title="商品审核" subtitle={merchantSessionActive ? "当前店铺提交的自有商品记录" : "审核下级商户提交的自有商品"}>
+          <Panel title={merchantSessionActive ? "自有商品提交记录" : "商户自有商品审核"} kicker={`${data.ownProducts.length} 条`}>
+            <p className="hint">这里处理各级商户提交的自有商品。平台供货商品和平台自营上架商品不走这个入口。</p>
+            <OwnProductReviewTable rows={data.ownProducts} onPick={pickOwnProductReview} />
+          </Panel>
           {!merchantSessionActive && selectedOwnProductReview ? (
             <OwnProductReviewDrawer
               product={selectedOwnProduct}
@@ -1888,7 +1920,7 @@ function App() {
             <Panel title="创建优惠券" kicker="平台金额券">
               <div className="form-grid wide">
                 <label>名称<input value={couponForm.name} onChange={(event) => setCouponForm({ ...couponForm, name: event.target.value })} placeholder="必填" /></label>
-                <label>抵扣金额(元)<input inputMode="decimal" value={centsToYuanInput(couponForm.discountCents)} onChange={(event) => setCouponForm({ ...couponForm, discountCents: yuanInputToCentsText(event.target.value) })} placeholder="例如 5.00" /></label>
+                <label>抵扣金额(元)<MoneyInput value={couponForm.discountCents} onCentsChange={(value) => setCouponForm({ ...couponForm, discountCents: value })} placeholder="例如 5.00" /></label>
                 <label>有效天数<input inputMode="numeric" value={couponForm.validDays} onChange={(event) => setCouponForm({ ...couponForm, validDays: event.target.value })} placeholder="例如 7" /></label>
                 <label>状态<select value={couponForm.status} onChange={(event) => setCouponForm({ ...couponForm, status: event.target.value })}><option value="">请选择</option><option value="active">启用</option><option value="inactive">停用</option></select></label>
                 <label className="checkbox-line span-2"><input type="checkbox" checked={couponForm.grantOnFirstRegister} onChange={(event) => setCouponForm({ ...couponForm, grantOnFirstRegister: event.target.checked })} />注册成功自动发放给新用户</label>
@@ -2293,7 +2325,7 @@ function App() {
                         ))}
                       </select>
                     </label>
-                    <label>转供价(元)<input inputMode="decimal" value={centsToYuanInput(channelOfferCents)} onChange={(event) => setChannelOfferCents(yuanInputToCentsText(event.target.value))} placeholder="例如 42.00" /></label>
+                    <label>转供价(元)<MoneyInput value={channelOfferCents} onCentsChange={setChannelOfferCents} placeholder="例如 42.00" /></label>
                     <button className="secondary" disabled={merchantBlocked || !downstreamMerchantId.trim() || !currentPlatformProductId} onClick={() => submitChannelOffer("配置商户转供价")}>配置转供价</button>
                   </div>
                 ) : (
@@ -2639,7 +2671,7 @@ function App() {
               setMessage("已取消保存");
             }}
             onConfirm={async () => {
-              const succeeded = await runAction(confirmAction.actionLabel, confirmAction.run, false, { skipConfirm: true });
+              const succeeded = await runAction(confirmAction.actionLabel, confirmAction.run, false, { skipConfirm: true, onSuccess: confirmAction.onSuccess });
               if (succeeded) {
                 setConfirmAction(undefined);
                 void loadAll(`${confirmAction.actionLabel}成功，数据已刷新`);
@@ -2878,8 +2910,10 @@ function PlatformProductDrawer(props: {
   platformShopProduct?: JsonRecord;
   platformShopForm: PlatformShopProductFormState;
   setPlatformShopForm: React.Dispatch<React.SetStateAction<PlatformShopProductFormState>>;
+  categoryOptions: string[];
   onUploadImage: (file: File) => void;
   onSave: () => void;
+  saveFeedback?: string;
   onSavePlatformShop: () => void;
   busy: boolean;
   onClose: () => void;
@@ -2904,7 +2938,6 @@ function PlatformProductDrawer(props: {
     }
     props.onUploadImage(file);
   }
-
   return (
     <aside className="drawer product-drawer" role="dialog" aria-modal="false" aria-label="平台商品详情">
       <div className="drawer-head">
@@ -2937,16 +2970,17 @@ function PlatformProductDrawer(props: {
               <div className="form-section-title span-2">基础信息</div>
               <label>商品名称<input value={props.form.name} onChange={(event) => props.setForm((form) => ({ ...form, name: event.target.value }))} /></label>
               <label>状态<select value={props.form.status} onChange={(event) => props.setForm((form) => ({ ...form, status: event.target.value }))}><option value="active">上架</option><option value="listed">上架中</option><option value="disabled">下架</option><option value="frozen">冻结</option></select></label>
-              <label>类目<input value={props.form.category} onChange={(event) => props.setForm((form) => ({ ...form, category: event.target.value }))} /></label>
+              <CategorySelect label="类目" value={props.form.category} options={props.categoryOptions} onChange={(value) => props.setForm((form) => ({ ...form, category: value }))} />
               <label>标签<input value={props.form.tags} onChange={(event) => props.setForm((form) => ({ ...form, tags: event.target.value }))} /></label>
-              <label className="span-2">图片地址<input value={props.form.imageUrl} onChange={(event) => props.setForm((form) => ({ ...form, imageUrl: event.target.value }))} placeholder="上传后自动生成 /uploads/product-images/...；也可以暂时填写 https 图片外链" /></label>
+              <KeyValue label="商品图片" value={props.form.imageUrl ? "已上传" : "未上传"} />
+              <KeyValue label="图片路径" value={text(props.form.imageUrl, "点击左侧图片上传")} />
               <div className="form-section-title span-2">发货与价格</div>
               <label>发货方式<select value={props.form.fulfillmentMode} onChange={(event) => props.setForm((form) => ({ ...form, fulfillmentMode: event.target.value }))}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发库存凭证</option></select></label>
               {props.form.fulfillmentMode === "code_pool" ? <label>凭证类型<select value={props.form.credentialType} onChange={(event) => props.setForm((form) => ({ ...form, credentialType: event.target.value }))}><option value="code">兑换码/卡密</option><option value="account_password">账号密码</option></select></label> : null}
               <label>库存<input inputMode="numeric" value={props.form.stockCount} onChange={(event) => props.setForm((form) => ({ ...form, stockCount: event.target.value }))} /></label>
-              <label>供货价(元)<input inputMode="decimal" value={centsToYuanInput(props.form.supplyPriceCents)} onChange={(event) => props.setForm((form) => ({ ...form, supplyPriceCents: yuanInputToCentsText(event.target.value) }))} /></label>
-              <label>最低售价(元)<input inputMode="decimal" value={centsToYuanInput(props.form.minSalePriceCents)} onChange={(event) => props.setForm((form) => ({ ...form, minSalePriceCents: yuanInputToCentsText(event.target.value) }))} /></label>
-              <label>建议售价(元)<input inputMode="decimal" value={centsToYuanInput(props.form.suggestedSalePriceCents)} onChange={(event) => props.setForm((form) => ({ ...form, suggestedSalePriceCents: yuanInputToCentsText(event.target.value) }))} /></label>
+              <label>供货价(元)<MoneyInput value={props.form.supplyPriceCents} onCentsChange={(value) => props.setForm((form) => ({ ...form, supplyPriceCents: value }))} /></label>
+              <label>最低售价(元)<MoneyInput value={props.form.minSalePriceCents} onCentsChange={(value) => props.setForm((form) => ({ ...form, minSalePriceCents: value }))} /></label>
+              <label>建议售价(元)<MoneyInput value={props.form.suggestedSalePriceCents} onCentsChange={(value) => props.setForm((form) => ({ ...form, suggestedSalePriceCents: value }))} /></label>
               <label>销量<input inputMode="numeric" value={props.form.soldCount} onChange={(event) => props.setForm((form) => ({ ...form, soldCount: event.target.value }))} /></label>
               <div className="form-section-title span-2">商品详情</div>
               <label className="span-2">商品说明<textarea rows={3} value={props.form.description} onChange={(event) => props.setForm((form) => ({ ...form, description: event.target.value }))} /></label>
@@ -2971,6 +3005,7 @@ function PlatformProductDrawer(props: {
               channelOffers={props.channelOffers}
             />
             <ProductChangeSummary product={props.product} form={props.form} />
+            {props.saveFeedback ? <p className="inline-feedback success">{props.saveFeedback}</p> : null}
             <div className="actions">
               {isCodePool ? <button className="secondary" type="button" disabled={props.busy} onClick={props.onOpenInventory}>去库存管理补货</button> : null}
               <button type="button" disabled={props.busy} onClick={props.onSave}>{props.busy ? "保存中..." : "确认保存详情"}</button>
@@ -3062,7 +3097,7 @@ function ChannelOfferEditor(props: {
         </select>
       </label>
       <label>转供价(元)
-        <input inputMode="decimal" value={centsToYuanInput(props.priceCents)} onChange={(event) => props.setPriceCents(yuanInputToCentsText(event.target.value))} placeholder="例如 42.00，不能低于上游成本" />
+        <MoneyInput value={props.priceCents} onCentsChange={props.setPriceCents} placeholder="例如 42.00，不能低于上游成本" />
       </label>
       <button className="secondary" disabled={props.disabled || !props.selectedRelationId || !props.selectedProductId || !props.priceCents.trim()} onClick={props.onSubmit}>配置转供价</button>
     </div>
@@ -3172,16 +3207,22 @@ function ProductCatalogList(props: {
           <input
             inputMode="decimal"
             value={draft.minSupplyYuan}
-            onChange={(event) => setDraft({ ...draft, minSupplyYuan: event.target.value })}
-            placeholder="例如 20"
+            onChange={(event) => {
+              const value = event.target.value.trim();
+              if (isYuanMoneyDraft(value)) setDraft({ ...draft, minSupplyYuan: value });
+            }}
+            placeholder="例如 20.50"
           />
         </label>
         <label>最高供货价(元)
           <input
             inputMode="decimal"
             value={draft.maxSupplyYuan}
-            onChange={(event) => setDraft({ ...draft, maxSupplyYuan: event.target.value })}
-            placeholder="例如 100"
+            onChange={(event) => {
+              const value = event.target.value.trim();
+              if (isYuanMoneyDraft(value)) setDraft({ ...draft, maxSupplyYuan: value });
+            }}
+            placeholder="例如 100.00"
           />
         </label>
         <div className="search-actions">
@@ -3542,6 +3583,103 @@ function ProductImage(props: { product?: JsonRecord; size: "list" | "detail" }) 
   );
 }
 
+function PlatformProductCreateDrawer(props: {
+  form: ProductFormState;
+  setForm: React.Dispatch<React.SetStateAction<ProductFormState>>;
+  categoryOptions: string[];
+  onUploadImage: (file: File) => void;
+  onSave: () => void;
+  busy: boolean;
+  onClose: () => void;
+}) {
+  function handleImageFileChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      window.alert("商品图片只支持 JPG、PNG 或 WebP。");
+      return;
+    }
+    if (file.size > 1_200_000) {
+      window.alert("商品图片不能超过 1.2MB。");
+      return;
+    }
+    props.onUploadImage(file);
+  }
+  const validationIssues = platformProductFormIssues(props.form);
+
+  return (
+    <aside className="drawer product-drawer" role="dialog" aria-modal="false" aria-label="新增平台供货商品">
+      <div className="drawer-head">
+        <div>
+          <span>新增平台供货商品</span>
+          <h3>{text(props.form.name, "新商品")}</h3>
+        </div>
+        <button className="secondary" type="button" disabled={props.busy} onClick={props.onClose}>关闭</button>
+      </div>
+      <section className="product-workbench">
+        <div className="product-media-panel">
+          <label className="product-image-picker">
+            <input type="file" accept="image/jpeg,image/png,image/webp" onChange={handleImageFileChange} />
+            <ProductImage product={{ name: props.form.name || "新增商品图片", imageUrl: props.form.imageUrl }} size="detail" />
+            <span>{props.busy ? "正在上传图片..." : "点击图片上传商品图"}</span>
+          </label>
+          <KeyValue label="图片状态" value={props.form.imageUrl ? "已上传" : "未上传"} />
+          <KeyValue label="保存位置" value={props.form.imageUrl ? text(props.form.imageUrl) : "/uploads/product-images/"} />
+          <p className="hint">不要手填图片 URL。上传后系统会生成图片路径，商品保存时只保存这个路径。</p>
+        </div>
+        <div className="product-edit-panel">
+          <div className="form-grid wide">
+            <div className="form-section-title span-2">基础信息</div>
+            <label>商品名称<input value={props.form.name} onChange={(event) => props.setForm((form) => ({ ...form, name: event.target.value }))} placeholder="例如：会员月卡/账号成品号" /></label>
+            <label>状态<select value={props.form.status} onChange={(event) => props.setForm((form) => ({ ...form, status: event.target.value }))}><option value="active">上架</option><option value="listed">上架中</option><option value="disabled">下架</option><option value="frozen">冻结</option></select></label>
+            <CategorySelect label="类目" value={props.form.category} options={props.categoryOptions} onChange={(value) => props.setForm((form) => ({ ...form, category: value }))} />
+            <label>标签<input value={props.form.tags} onChange={(event) => props.setForm((form) => ({ ...form, tags: event.target.value }))} placeholder="逗号分隔" /></label>
+            <label className="span-2">副标题<input value={props.form.subtitle} onChange={(event) => props.setForm((form) => ({ ...form, subtitle: event.target.value }))} placeholder="一句话说明卖点" /></label>
+            <div className="form-section-title span-2">发货与价格</div>
+            <label>发货方式<select value={props.form.fulfillmentMode} onChange={(event) => props.setForm((form) => ({ ...form, fulfillmentMode: event.target.value }))}><option value="">请选择</option><option value="manual">人工交付</option><option value="code_pool">自动发库存凭证</option></select></label>
+            {props.form.fulfillmentMode === "code_pool" ? <label>凭证类型<select value={props.form.credentialType} onChange={(event) => props.setForm((form) => ({ ...form, credentialType: event.target.value }))}><option value="code">兑换码/卡密</option><option value="account_password">账号密码</option></select></label> : null}
+            <label>库存<input inputMode="numeric" value={props.form.stockCount} onChange={(event) => props.setForm((form) => ({ ...form, stockCount: event.target.value }))} placeholder="必填，非负整数" /></label>
+            <label>销量<input inputMode="numeric" value={props.form.soldCount} onChange={(event) => props.setForm((form) => ({ ...form, soldCount: event.target.value }))} placeholder="选填，非负整数" /></label>
+            <label>供货价(元)<MoneyInput value={props.form.supplyPriceCents} onCentsChange={(value) => props.setForm((form) => ({ ...form, supplyPriceCents: value }))} placeholder="例如 100.00" /></label>
+            <label>最低售价(元)<MoneyInput value={props.form.minSalePriceCents} onCentsChange={(value) => props.setForm((form) => ({ ...form, minSalePriceCents: value }))} placeholder="例如 120.00" /></label>
+            <label>建议售价(元)<MoneyInput value={props.form.suggestedSalePriceCents} onCentsChange={(value) => props.setForm((form) => ({ ...form, suggestedSalePriceCents: value }))} placeholder="例如 149.00" /></label>
+            <label className="span-2">规格<textarea value={props.form.specs} onChange={(event) => props.setForm((form) => ({ ...form, specs: event.target.value }))} rows={3} placeholder="一行一个规格" /></label>
+            <div className="form-section-title span-2">商品详情</div>
+            <label className="span-2">商品说明<textarea value={props.form.description} onChange={(event) => props.setForm((form) => ({ ...form, description: event.target.value }))} rows={3} /></label>
+            <label className="span-2">使用说明<textarea value={props.form.usageGuide} onChange={(event) => props.setForm((form) => ({ ...form, usageGuide: event.target.value }))} rows={3} /></label>
+            <label className="span-2">详情分段（选填）<textarea value={props.form.detailSections} onChange={(event) => props.setForm((form) => ({ ...form, detailSections: event.target.value }))} rows={4} placeholder={"适用场景：可注册 Google、Grok、云服务等应用；适合长期使用\n注意事项：登录后先绑定安全信息；不要频繁切换地区"} /></label>
+            <p className="hint span-2">这里用来把前台商品详情拆成几个小段落。每行一个分段，格式是“标题：内容一；内容二”。不填写也可以，不影响发货和库存。</p>
+          </div>
+        </div>
+        <div className="product-side-panel">
+          <div className="change-summary">
+            <h4>保存前核对</h4>
+            <KeyValue label="商品名称" value={text(props.form.name, "未填写")} />
+            <KeyValue label="商品图片" value={props.form.imageUrl ? "已上传" : "未上传"} />
+            <KeyValue label="类目" value={text(props.form.category, "未选择")} />
+            <KeyValue label="发货方式" value={props.form.fulfillmentMode ? fulfillmentModeLabel({ mode: props.form.fulfillmentMode, credentialType: props.form.credentialType }) : "未选择"} />
+            <KeyValue label="供货价" value={cents(props.form.supplyPriceCents)} />
+            <KeyValue label="最低售价" value={cents(props.form.minSalePriceCents)} />
+            <KeyValue label="建议售价" value={cents(props.form.suggestedSalePriceCents)} />
+          </div>
+          {validationIssues.length ? (
+            <div className="form-issues">
+              <strong>当前还不能保存</strong>
+              {validationIssues.map((issue) => <span key={issue}>{issue}</span>)}
+            </div>
+          ) : null}
+          <div className="actions">
+            <button type="button" disabled={props.busy} onClick={props.onSave}>{props.busy ? "保存中..." : "保存并入库"}</button>
+            <button className="secondary" type="button" disabled={props.busy} onClick={props.onClose}>取消</button>
+          </div>
+          {props.form.fulfillmentMode === "manual" ? <p className="hint">人工交付商品不能导入自动发货库存；请维护商品说明、使用说明和店铺客服信息。</p> : null}
+        </div>
+      </section>
+    </aside>
+  );
+}
+
 function ProductPlatformShopSettings(props: {
   shop?: JsonRecord;
   shopProduct?: JsonRecord;
@@ -3559,18 +3697,16 @@ function ProductPlatformShopSettings(props: {
       <KeyValue label="当前状态" value={listed ? statusText(props.shopProduct?.status) : "未上架到平台主店"} />
       <div className="inline-form compact">
         <label>销售价(元)
-          <input
-            inputMode="decimal"
-            value={centsToYuanInput(props.form.salePriceCents)}
-            onChange={(event) => props.setForm((form) => ({ ...form, salePriceCents: yuanInputToCentsText(event.target.value) }))}
+          <MoneyInput
+            value={props.form.salePriceCents}
+            onCentsChange={(value) => props.setForm((form) => ({ ...form, salePriceCents: value }))}
             placeholder="例如 149.00"
           />
         </label>
         <label>履约成本(元)
-          <input
-            inputMode="decimal"
-            value={centsToYuanInput(props.form.fulfillmentCostCents)}
-            onChange={(event) => props.setForm((form) => ({ ...form, fulfillmentCostCents: yuanInputToCentsText(event.target.value) }))}
+          <MoneyInput
+            value={props.form.fulfillmentCostCents}
+            onCentsChange={(value) => props.setForm((form) => ({ ...form, fulfillmentCostCents: value }))}
             placeholder="例如 100.00，可填 0"
           />
         </label>
@@ -3669,6 +3805,71 @@ function platformProductChangeRows(product: JsonRecord, form: ProductFormState, 
     rows.splice(3, 0, { label: "凭证类型", before: credentialTypeText(productCredentialType(product)), value: credentialTypeText(form.credentialType) });
   }
   return options.changedOnly ? rows.filter((row) => normalizeConfirmValue(row.before) !== normalizeConfirmValue(row.value)) : rows;
+}
+
+function platformProductToForm(product: JsonRecord): ProductFormState {
+  const rule = product.fulfillmentRule as JsonRecord | undefined;
+  return {
+    name: text(product.name, ""),
+    category: text(product.category, ""),
+    tags: Array.isArray(product.tags) ? product.tags.map((item) => text(item, "")).filter(Boolean).join("，") : "",
+    subtitle: text(product.subtitle, ""),
+    description: text(product.description, ""),
+    usageGuide: text(product.usageGuide, ""),
+    imageUrl: text(product.imageUrl, ""),
+    specs: Array.isArray(product.specs) ? product.specs.map((item) => text(item, "")).filter(Boolean).join("\n") : "",
+    detailSections: formatDetailSections(product.detailSections),
+    stockCount: text(product.stockCount, ""),
+    soldCount: text(product.soldCount, ""),
+    fulfillmentMode: text(rule?.mode, "manual"),
+    credentialType: text(rule?.credentialType, "code"),
+    supplyPriceCents: text(product.supplyPriceCents, ""),
+    minSalePriceCents: text(product.minSalePriceCents, ""),
+    suggestedSalePriceCents: text(product.suggestedSalePriceCents, ""),
+    status: text(product.status, "active")
+  };
+}
+
+function platformProductSnapshot(product: JsonRecord, form: ProductFormState): JsonRecord {
+  return {
+    ...product,
+    name: form.name,
+    category: form.category,
+    tags: splitFormList(form.tags, /,|，/),
+    subtitle: form.subtitle,
+    description: form.description,
+    usageGuide: form.usageGuide,
+    imageUrl: form.imageUrl,
+    specs: splitFormList(form.specs, /\n|,|，/),
+    detailSections: detailSectionsFromText(form.detailSections),
+    stockCount: form.stockCount,
+    soldCount: form.soldCount,
+    supplyPriceCents: form.supplyPriceCents,
+    minSalePriceCents: form.minSalePriceCents,
+    suggestedSalePriceCents: form.suggestedSalePriceCents,
+    status: form.status,
+    fulfillmentRule: {
+      mode: form.fulfillmentMode,
+      ...(form.fulfillmentMode === "code_pool" ? { extractCodeRequired: true, credentialType: form.credentialType || "code" } : {})
+    }
+  };
+}
+
+function splitFormList(value: string, separator: RegExp): string[] {
+  return value.split(separator).map((item) => item.trim()).filter(Boolean);
+}
+
+function detailSectionsFromText(value: string): Array<{ title: string; items: string[] }> {
+  return value
+    .split(/\n+/)
+    .map((line) => {
+      const [title, content = ""] = line.split(/:|：/, 2);
+      return {
+        title: title.trim(),
+        items: content.split(/;|；|：/).map((item) => item.trim()).filter(Boolean)
+      };
+    })
+    .filter((section) => section.title && section.items.length > 0);
 }
 
 function normalizeConfirmValue(value: string | undefined): string {
@@ -4043,10 +4244,16 @@ function OwnProductReviewTable(props: { rows: JsonRecord[]; onPick: (row: JsonRe
           </select>
         </label>
         <label>最低售价(元)
-          <input inputMode="decimal" value={draft.minPriceYuan} onChange={(event) => setDraft({ ...draft, minPriceYuan: event.target.value })} placeholder="例如 30" />
+          <input inputMode="decimal" value={draft.minPriceYuan} onChange={(event) => {
+            const value = event.target.value.trim();
+            if (isYuanMoneyDraft(value)) setDraft({ ...draft, minPriceYuan: value });
+          }} placeholder="例如 30.00" />
         </label>
         <label>最高售价(元)
-          <input inputMode="decimal" value={draft.maxPriceYuan} onChange={(event) => setDraft({ ...draft, maxPriceYuan: event.target.value })} placeholder="例如 100" />
+          <input inputMode="decimal" value={draft.maxPriceYuan} onChange={(event) => {
+            const value = event.target.value.trim();
+            if (isYuanMoneyDraft(value)) setDraft({ ...draft, maxPriceYuan: value });
+          }} placeholder="例如 100.00" />
         </label>
         <label>审核状态
           <select value={draft.reviewStatus} onChange={(event) => setDraft({ ...draft, reviewStatus: event.target.value })}>
@@ -4275,8 +4482,8 @@ function cellText(value: unknown): string {
 }
 
 function yuanInputToCents(value: string): number | undefined {
-  const normalized = value.trim();
-  if (!normalized) return undefined;
+  const normalized = value.trim().replace(/^\./, "0.");
+  if (!normalized || normalized === "0.") return undefined;
   if (!/^\d+(?:\.\d{0,2})?$/.test(normalized)) return undefined;
   const amount = Number(normalized);
   if (!Number.isFinite(amount)) return undefined;
@@ -4290,12 +4497,48 @@ function yuanInputToCentsText(value: string): string {
   return cents === undefined ? "" : String(cents);
 }
 
+function isYuanMoneyDraft(value: string): boolean {
+  return value === "" || /^\d*(?:\.\d{0,2})?$/.test(value);
+}
+
 function centsToYuanInput(value: unknown): string {
   const raw = text(value, "");
   if (!raw) return "";
   const numeric = Number(raw);
   if (!Number.isFinite(numeric)) return "";
   return (numeric / 100).toFixed(2);
+}
+
+function MoneyInput(props: {
+  value: string;
+  onCentsChange: (value: string) => void;
+  placeholder?: string;
+}) {
+  const [draft, setDraft] = useState(() => centsToYuanInput(props.value));
+  const [focused, setFocused] = useState(false);
+
+  useEffect(() => {
+    if (!focused) setDraft(centsToYuanInput(props.value));
+  }, [focused, props.value]);
+
+  return (
+    <input
+      inputMode="decimal"
+      value={draft}
+      onFocus={() => setFocused(true)}
+      onBlur={() => {
+        setFocused(false);
+        setDraft(centsToYuanInput(yuanInputToCentsText(draft)));
+      }}
+      onChange={(event) => {
+        const next = event.target.value.trim();
+        if (!isYuanMoneyDraft(next)) return;
+        setDraft(next);
+        props.onCentsChange(yuanInputToCentsText(next));
+      }}
+      placeholder={props.placeholder}
+    />
+  );
 }
 
 function dateTimeText(value: unknown): string {
@@ -4550,6 +4793,32 @@ function isMerchantSession(session: BackendSession | undefined): session is Merc
 function sessionLabel(session: BackendSession): string {
   if (isMerchantSession(session)) return text(session.merchant.displayName, text(session.merchant.username, "商户"));
   return text(session.admin.displayName, text(session.admin.adminRole, "admin"));
+}
+
+function productCategories(data: LoadState): string[] {
+  const defaults = ["AI 会员", "账号成品", "API 额度", "网络服务"];
+  const values = [
+    ...defaults,
+    ...data.platformProducts.map((item) => text(item.category)),
+    ...data.platformShopProducts.map((item) => text((item.product as JsonRecord | undefined)?.category)),
+    ...data.merchantProducts.map((item) => text((item.product as JsonRecord | undefined)?.category, text(item.category))),
+    ...data.ownProducts.map((item) => text(item.category))
+  ].map((item) => item.trim()).filter(Boolean);
+  return Array.from(new Set(values)).sort((left, right) => left.localeCompare(right, "zh-Hans-CN"));
+}
+
+function CategorySelect(props: { label: string; value: string; options: string[]; onChange: (value: string) => void }) {
+  const options = props.value && !props.options.includes(props.value)
+    ? [props.value, ...props.options]
+    : props.options;
+  return (
+    <label>{props.label}
+      <select value={props.value} onChange={(event) => props.onChange(event.target.value)}>
+        <option value="">请选择类目</option>
+        {options.map((category) => <option key={category} value={category}>{category}</option>)}
+      </select>
+    </label>
+  );
 }
 
 function shopShareUrl(shopId: string, shop?: JsonRecord): string {
@@ -4904,6 +5173,7 @@ function paymentProviderConfirmMode(type: string): string {
 
 function validatePlatformProductForm(form: {
   name: string;
+  category?: string;
   imageUrl?: string;
   fulfillmentMode: string;
   stockCount: string;
@@ -4912,20 +5182,40 @@ function validatePlatformProductForm(form: {
   minSalePriceCents: string;
   suggestedSalePriceCents: string;
 }): string {
-  if (!form.name.trim()) return "请填写商品名称";
-  if (form.imageUrl?.startsWith("data:image/")) return "商品图片不能直接保存 data:image。请点击图片重新上传，系统会生成 /uploads/product-images/... 地址。";
-  if (!form.fulfillmentMode) return "请选择发货方式";
-  if (!isNonNegativeInteger(form.stockCount)) return "请填写合法库存，库存必须是非负整数";
-  if (form.soldCount && !isNonNegativeInteger(form.soldCount)) return "销量必须是非负整数";
-  if (!isPositiveInteger(form.supplyPriceCents)) return "请填写合法供货价，按元填写，金额必须大于 0";
-  if (!isPositiveInteger(form.minSalePriceCents)) return "请填写合法最低售价，按元填写，金额必须大于 0";
-  if (!isPositiveInteger(form.suggestedSalePriceCents)) return "请填写合法建议售价，按元填写，金额必须大于 0";
+  return platformProductFormIssues(form)[0] ?? "";
+}
+
+function platformProductFormIssues(form: {
+  name: string;
+  category?: string;
+  imageUrl?: string;
+  fulfillmentMode: string;
+  stockCount: string;
+  soldCount: string;
+  supplyPriceCents: string;
+  minSalePriceCents: string;
+  suggestedSalePriceCents: string;
+}): string[] {
+  const issues: string[] = [];
+  if (!form.name.trim()) issues.push("请填写商品名称");
+  if (!text(form.category).trim()) issues.push("请选择商品类目");
+  if (form.imageUrl?.startsWith("data:image/")) issues.push("商品图片不能直接保存 data:image，请重新上传图片。");
+  if (!form.fulfillmentMode) issues.push("请选择发货方式");
+  if (!isNonNegativeInteger(form.stockCount)) issues.push("请填写合法库存，库存必须是非负整数");
+  if (form.soldCount && !isNonNegativeInteger(form.soldCount)) issues.push("销量必须是非负整数");
+  const hasSupply = isPositiveInteger(form.supplyPriceCents);
+  const hasMin = isPositiveInteger(form.minSalePriceCents);
+  const hasSuggested = isPositiveInteger(form.suggestedSalePriceCents);
+  if (!hasSupply) issues.push("请填写合法供货价，按元填写，金额必须大于 0");
+  if (!hasMin) issues.push("请填写合法最低售价，按元填写，金额必须大于 0");
+  if (!hasSuggested) issues.push("请填写合法建议售价，按元填写，金额必须大于 0");
+  if (!hasSupply || !hasMin || !hasSuggested) return issues;
   const supply = Number(form.supplyPriceCents);
   const min = Number(form.minSalePriceCents);
   const suggested = Number(form.suggestedSalePriceCents);
-  if (min < supply) return "最低售价不能低于供货价";
-  if (suggested < min) return "建议售价不能低于最低售价";
-  return "";
+  if (min < supply) issues.push("最低售价不能低于供货价");
+  if (suggested < min) issues.push("建议售价不能低于最低售价");
+  return issues;
 }
 
 function validateRightsCodeForm(productId: string, batchNo: string, codes: string[]): string {

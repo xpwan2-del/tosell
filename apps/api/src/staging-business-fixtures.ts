@@ -449,10 +449,9 @@ function assertFixtureEnvironment() {
   }
   const usesPrismaApiPath = process.env.APP_ENV === "production"
     || process.env.NODE_ENV === "production"
-    || process.env.VERCEL_ENV === "production"
-    || process.env.PERSISTENCE_PROVIDER === "prisma";
+    || process.env.VERCEL_ENV === "production";
   if (!usesPrismaApiPath) {
-    throw new Error("APP_ENV=production or PERSISTENCE_PROVIDER=prisma is required so fixture APIs write to the database");
+    throw new Error("APP_ENV=production is required so fixture APIs write to the configured PostgreSQL database");
   }
   if (process.env.VERCEL_ENV === "production") {
     throw new Error("business fixtures are blocked when VERCEL_ENV=production");

@@ -328,11 +328,17 @@ textarea {
 
 .top-actions,
 .actions,
+.panel-actions,
 .quick-grid {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
   align-items: center;
+}
+
+.panel-actions {
+  justify-content: flex-end;
+  margin-bottom: 12px;
 }
 
 .top-actions a {
@@ -375,6 +381,29 @@ textarea {
   font-size: var(--admin-font-sm);
   line-height: var(--admin-line-normal);
   font-weight: var(--admin-weight-strong);
+}
+
+.inline-feedback.success {
+  color: #18533a;
+  background: #ecf8f1;
+  border-color: #bfe4cc;
+}
+
+.form-issues {
+  display: grid;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid #f0c6bc;
+  border-radius: var(--admin-radius);
+  background: #fff3ef;
+  color: #7a2918;
+  font-size: var(--admin-font-sm);
+  line-height: var(--admin-line-normal);
+}
+
+.form-issues strong {
+  font-size: var(--admin-font-sm);
+  line-height: var(--admin-line-normal);
 }
 
 .module {
@@ -1481,6 +1510,8 @@ textarea {
 
 .product-side-panel .actions,
 .product-side-panel > .hint,
+.product-side-panel .form-issues,
+.product-side-panel .inline-feedback,
 .product-side-panel .change-summary {
   grid-column: 1 / -1;
 }

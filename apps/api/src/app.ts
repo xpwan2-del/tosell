@@ -15,7 +15,7 @@ import {
 
 const bigintString = z.union([z.string(), z.number(), z.bigint()]).transform((value) => BigInt(value));
 const adminRole = z.enum(["operator", "finance", "admin"]);
-const paymentChannel = z.enum(["wechat_miniprogram", "wechat_h5_jsapi", "wechat_h5", "alipay_wap", "epay", "balance", "mock"]);
+const paymentChannel = z.enum(["wechat_miniprogram", "wechat_h5_jsapi", "wechat_h5", "alipay_wap", "epay", "balance"]);
 const paymentProvider = z.enum(["alipay_merchant", "wechat_merchant", "epay", "personal_alipay", "wechat_personal", "balance"]);
 const paymentMethodBodySchema = z.object({
   id: z.string().optional(),
@@ -1174,10 +1174,6 @@ export function buildApp() {
 
   app.get("/api/admin/order-extract-logs", async (request) => serializeBigInt(services.listExtractLogs(getAdminActor(request))));
 
-  app.post("/api/callbacks/payments/mock", async (request) => {
-    const body = z.object({ channel: z.string().default("mock"), channelTradeNo: z.string(), orderNo: z.string(), amountCents: bigintString }).parse(request.body);
-    return serializeBigInt(services.paymentCallback(body));
-  });
   app.get("/api/callbacks/payments/epay", async (request) => {
     const result = await services.epayProviderCallback(recordPayload(request.query));
     return result.status === "processed" || result.status === "duplicate" ? "success" : serializeBigInt(result);
@@ -1190,11 +1186,6 @@ export function buildApp() {
     }
     const body = paymentResultBodySchema.parse(request.body);
     return serializeBigInt(services.paymentProviderCallback(provider, body));
-  });
-
-  app.post("/api/callbacks/refunds/mock", async (request) => {
-    const body = z.object({ channel: z.string().default("mock"), channelRefundNo: z.string(), refundNo: z.string() }).parse(request.body);
-    return serializeBigInt(services.refundCallback(body));
   });
 
   app.get("/api/exports/reconciliation-summary", async (request) => serializeBigInt(services.exportReconciliationSummary(getAdminActor(request))));
@@ -1273,24 +1264,15 @@ function merchantIdFromRecord(input: object): string {
 }
 
 function getUserActor(request: FastifyRequest): UserActor {
-  if (hasBearerToken(request)) return parseSignedActor(request, "user");
-  if (!allowDemoAuth()) return parseSignedActor(request, "user");
-  return { role: "user", userId: requiredHeader(request, "x-user-id") };
+  return parseSignedActor(request, "user");
 }
 
 function getMerchantActor(request: FastifyRequest): MerchantActor {
-  if (hasBearerToken(request)) return parseSignedActor(request, "merchant");
-  if (!allowDemoAuth()) return parseSignedActor(request, "merchant");
-  return merchantActorFromMerchant(requiredHeader(request, "x-merchant-id"), requiredHeader(request, "x-shop-id"));
+  return parseSignedActor(request, "merchant");
 }
 
 function getAdminActor(request: FastifyRequest): AdminActor {
-  if (hasBearerToken(request)) return parseSignedActor(request, "admin");
-  if (!allowDemoAuth()) return parseSignedActor(request, "admin");
-  return {
-    role: adminRole.parse(requiredHeader(request, "x-admin-role")),
-    adminId: requiredHeader(request, "x-admin-id")
-  } as AdminActor;
+  return parseSignedActor(request, "admin");
 }
 
 function createAuthSession(input: {
@@ -1391,18 +1373,6 @@ function signToken(payload: Record<string, unknown>): string {
 
 function recordPayload(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function hasBearerToken(request: FastifyRequest): boolean {
-  const authorization = request.headers.authorization;
-  return typeof authorization === "string" && authorization.startsWith("Bearer ");
-}
-
-function allowDemoAuth(): boolean {
-  if (isProductionRuntime()) return false;
-  const configured = process.env.ALLOW_DEMO_AUTH ?? process.env.DEMO_AUTH_ENABLED;
-  if (configured !== undefined) return configured === "true";
-  return true;
 }
 
 function isProductionRuntime(): boolean {

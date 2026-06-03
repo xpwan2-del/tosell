@@ -18,6 +18,8 @@
 node_modules/
 dist/
 coverage/
+apps/api/uploads/
+output/
 .env
 .env.local
 .env*.local

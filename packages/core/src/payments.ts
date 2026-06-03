@@ -13,14 +13,6 @@ export type PaymentProvider = {
   verifyPaymentCallback(payload: PaymentCallbackPayload): boolean;
 };
 
-export class MockPaymentProvider implements PaymentProvider {
-  readonly channel = "mock";
-
-  verifyPaymentCallback(payload: PaymentCallbackPayload): boolean {
-    return payload.channel === this.channel;
-  }
-}
-
 export type PaymentCallbackOrder = {
   orderNo: string;
   paidAmountCents: bigint;

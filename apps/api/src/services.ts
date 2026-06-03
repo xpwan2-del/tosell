@@ -1,6 +1,5 @@
 import {
   IdempotencyRegistry,
-  MockPaymentProvider,
   type Actor,
   type RefundResponsibility,
   allocateRefund,
@@ -13,16 +12,11 @@ import {
   calculateServiceFeeCents,
   deductDeposit,
   hasAdminPermission,
-  processPaymentCallback,
   quoteMerchantOwnedProduct,
   quotePlatformProduct,
   refundCallbackKey,
   shouldRestrictForDeposit
 } from "../../../packages/core/src/index.js";
-import {
-  virtualCatalogProducts,
-  virtualShopSeed
-} from "../../../packages/database/src/virtual-catalog.js";
 import {
   PrismaClient,
   createPrismaRepositories,
@@ -47,22 +41,10 @@ export type MerchantActor = Extract<Actor, { role: "merchant" }>;
 export type AdminActor = Extract<Actor, { role: "operator" | "finance" | "admin" }>;
 
 export function createBackendServices() {
-  if (isProductionRuntime()) {
-    if (!process.env.DATABASE_URL) {
-      return createPersistenceDisabledServices("DATABASE_URL is required in production") as unknown as BackendServices;
-    }
-    return createPrismaProductionServices() as unknown as BackendServices;
+  if (!process.env.DATABASE_URL) {
+    throw new ApiError(503, "DATABASE_NOT_CONFIGURED", "DATABASE_URL is required; demo and memory persistence have been removed");
   }
-  if (process.env.PERSISTENCE_PROVIDER === "prisma") {
-    if (!process.env.DATABASE_URL) {
-      return createPersistenceDisabledServices("DATABASE_URL is required for Prisma persistence") as unknown as BackendServices;
-    }
-    return createPrismaProductionServices() as unknown as BackendServices;
-  }
-  if (process.env.ALLOW_MEMORY_STORE === "false") {
-    return createPersistenceDisabledServices("memory store is disabled and Prisma persistence is not configured") as unknown as BackendServices;
-  }
-  return new BackendServices(createMemoryStore(), { persistenceMode: "memory" });
+  return createPrismaProductionServices() as unknown as BackendServices;
 }
 
 let productionPrisma: PrismaClient | undefined;
@@ -166,7 +148,7 @@ function createPrismaProductionServices() {
   const prisma = prismaClient();
   const repositories = createPrismaRepositories(prisma);
   const repository = new PrismaStateRepository(prisma, repositories);
-  const service = new BackendServices(createEmptyMemoryStore(), {
+  const service = new BackendServices(createEmptyRuntimeState(), {
     persistenceMode: "prisma",
     adminAuth: (input) => withPrismaRetry(() => repository.verifyAdmin(input)),
     merchantAuth: (input) => withPrismaRetry(() => repository.verifyMerchant(input))
@@ -477,32 +459,12 @@ function createPrismaProductionServices() {
   return proxy;
 }
 
-function createPersistenceDisabledServices(message: string) {
-  const disabled = () => {
-    throw new ApiError(503, "PERSISTENCE_NOT_CONFIGURED", message);
-  };
-  return new Proxy({
-    health: () => ({
-      ok: false,
-      service: "tosell-api",
-      runtime: runtimeMode(),
-      persistenceMode: "disabled",
-      code: "PERSISTENCE_NOT_CONFIGURED"
-    })
-  }, {
-    get(target, property) {
-      if (property in target) return target[property as keyof typeof target];
-      return disabled;
-    }
-  });
-}
-
 function isMutatingServiceMethod(name: string) {
   return /^(add|approve|batchSelect|confirm|create|deduct|delete|export|fulfill|generate|grant|handle|mark|paymentCallback|paymentProviderCallback|epayProviderCallback|queryPaymentOrder|refundCallback|register|release|reveal|review|select|set|submit|test|update|upsert)/.test(name);
 }
 
 type BackendServicesOptions = {
-  persistenceMode: "memory" | "prisma";
+  persistenceMode: "prisma";
   adminAuth?: (input: { username: string; password: string }) => Promise<AdminLoginResult>;
   merchantAuth?: (input: { account: string; password: string }) => Promise<MerchantLoginResult>;
 };
@@ -529,9 +491,8 @@ export type MerchantLoginResult = {
 
 class BackendServices {
   private readonly registry = new IdempotencyRegistry();
-  private readonly paymentProvider = new MockPaymentProvider();
 
-  constructor(public store: MemoryStore, private readonly options: BackendServicesOptions = { persistenceMode: "memory" }) {}
+  constructor(public store: RuntimeState, private readonly options: BackendServicesOptions = { persistenceMode: "prisma" }) {}
 
   health() {
     return {
@@ -932,18 +893,6 @@ class BackendServices {
     assertUserOrderScope(actor, order);
     if (order.paymentStatus === "paid" && !order.paymentSnapshot) {
       return { status: "already_paid" as const, orderNo, channel: input.channel };
-    }
-    if (input.channel === "mock") {
-      if (!mockPaymentEnabled()) {
-        throw new ApiError(403, "MOCK_PAYMENT_DISABLED", "mock payment is disabled in this runtime");
-      }
-      return {
-        status: "ready" as const,
-        orderNo,
-        channel: "mock" as const,
-        amountCents: payableAmount(order),
-        devOnly: true
-      };
     }
     const configured = this.paymentConfigStatus({ role: "admin", adminId: "system" })
       .find((item) => item.channel === input.channel && item.enabled);
@@ -2764,41 +2713,6 @@ class BackendServices {
     return result ?? { status: "duplicate" as const, idempotencyKey, order: this.serializePublicOrder(order, { includeDeliveryCodes: false }) };
   }
 
-  paymentCallback(input: { channel: string; channelTradeNo: string; orderNo: string; amountCents: bigint }) {
-    if (input.channel === "mock" && !mockPaymentEnabled()) {
-      throw new ApiError(403, "MOCK_PAYMENT_DISABLED", "mock payment callback is disabled in this runtime");
-    }
-    const order = requireEntity(this.store.orders.get(input.orderNo), "RESOURCE_NOT_FOUND", "order not found");
-    try {
-      const result = processPaymentCallback({
-        provider: this.paymentProvider,
-        registry: this.registry,
-        payload: input,
-        order: {
-          orderNo: order.orderNo,
-          paidAmountCents: payableAmount(order),
-          paymentStatus: order.paymentStatus
-        },
-        onProcessed: () => {
-          order.paymentStatus = "paid";
-          order.status = "fulfilling";
-          order.fulfillmentStatus = "processing";
-          order.paidAt = new Date();
-          if (order.salesChannelType !== "platform_self_operated") {
-            this.store.pendingIncomeByMerchant.set(order.merchantId, (this.store.pendingIncomeByMerchant.get(order.merchantId) ?? 0n) + order.snapshot.amountSnapshot.merchantExpectedIncomeCents);
-            this.addChannelPendingIncome(order);
-          }
-          this.ledger("PAYMENT_SUCCEEDED", { orderNo: order.orderNo, merchantId: order.merchantId }, order.snapshot.amountSnapshot.paidAmountCents, { channel: input.channel });
-          this.tryAutoFulfillWithRightsCode(order);
-        }
-      });
-      this.audit("system", "payment.callback", "order", order.orderNo, result);
-      return result;
-    } catch (error) {
-      throw new ApiError(400, "PAYMENT_CALLBACK_REJECTED", getErrorMessage(error));
-    }
-  }
-
   paymentProviderCallback(provider: PaymentProviderType, input: {
     orderNo?: string;
     providerTradeNo: string;
@@ -2994,9 +2908,6 @@ class BackendServices {
   }
 
   refundCallback(input: { channel: string; channelRefundNo: string; refundNo: string }) {
-    if (input.channel === "mock" && !mockPaymentEnabled()) {
-      throw new ApiError(403, "MOCK_PAYMENT_DISABLED", "mock refund callback is disabled in this runtime");
-    }
     const refund = requireEntity(this.store.refunds.get(input.refundNo), "RESOURCE_NOT_FOUND", "refund not found");
     const idempotencyKey = refundCallbackKey(input.channel, input.channelRefundNo);
     const result = this.registry.runOnce(idempotencyKey, () => {
@@ -3455,9 +3366,7 @@ class BackendServices {
         label: paymentProviderDisplay(provider)
       };
     });
-    const legacyRows = this.store.paymentChannelConfigs
-      .filter((config) => config.channel !== "mock" || mockPaymentEnabled())
-      .map((config) => ({
+    const legacyRows = this.store.paymentChannelConfigs.map((config) => ({
         ...config,
         provider: paymentChannelProvider(config.channel),
         label: paymentChannelDisplay(config.channel)
@@ -3494,7 +3403,7 @@ class BackendServices {
       productionReady: missing.length === 0 && !mockPaymentEnabled() && !allowDemoAuth(),
       missing,
       demoAuthEnabled: allowDemoAuth(),
-      channels: this.store.paymentChannelConfigs.filter((config) => config.channel !== "mock" || mockPaymentEnabled())
+      channels: this.store.paymentChannelConfigs
     };
   }
 
@@ -6136,7 +6045,7 @@ class PrismaStateRepository {
     };
   }
 
-  async listPlatformProducts(actor?: MerchantActor, runtimeStore?: MemoryStore) {
+  async listPlatformProducts(actor?: MerchantActor, runtimeStore?: RuntimeState) {
     if (!actor) {
       return this.listDirectFirstTierPlatformProducts();
     }
@@ -6255,7 +6164,7 @@ class PrismaStateRepository {
     return this.getDirectMerchantProductListing(actor, row.id);
   }
 
-  async selectPlatformProduct(actor: MerchantActor, input: MerchantProductListingSelectionInput, runtimeStore?: MemoryStore) {
+  async selectPlatformProduct(actor: MerchantActor, input: MerchantProductListingSelectionInput, runtimeStore?: RuntimeState) {
     await this.getMerchantShop(actor);
     const rows = await this.prisma.$queryRaw<Array<{
       merchant_status: string;
@@ -6380,7 +6289,7 @@ class PrismaStateRepository {
     return this.getDirectMerchantProductListing(actor, listingId);
   }
 
-  private async findDirectUpstreamProductListing(merchantId: string, platformProductId: string, runtimeStore?: MemoryStore): Promise<{ id?: string; salePriceCents: bigint } | undefined> {
+  private async findDirectUpstreamProductListing(merchantId: string, platformProductId: string, runtimeStore?: RuntimeState): Promise<{ id?: string; salePriceCents: bigint } | undefined> {
     const runtimeOffer = this.findRuntimeUpstreamOffer(merchantId, platformProductId, runtimeStore);
     if (runtimeOffer) {
       const upstreamListingRows = await this.prisma.$queryRaw<Array<{ id: string }>>`
@@ -6414,7 +6323,7 @@ class PrismaStateRepository {
     return row ? { id: row.id, salePriceCents: row.sale_price_cents } : undefined;
   }
 
-  private findRuntimeSellingRelation(merchantId: string, runtimeStore?: MemoryStore) {
+  private findRuntimeSellingRelation(merchantId: string, runtimeStore?: RuntimeState) {
     return runtimeStore?.channelRelations.find((relation) =>
       relation.status === "active"
       && (
@@ -6424,7 +6333,7 @@ class PrismaStateRepository {
     );
   }
 
-  private findRuntimeUpstreamOffer(merchantId: string, platformProductId: string, runtimeStore?: MemoryStore) {
+  private findRuntimeUpstreamOffer(merchantId: string, platformProductId: string, runtimeStore?: RuntimeState) {
     const relation = this.findRuntimeSellingRelation(merchantId, runtimeStore);
     if (!relation || !runtimeStore) return undefined;
     const offer = runtimeStore.channelProductOffers.find((item) =>
@@ -6509,7 +6418,7 @@ class PrismaStateRepository {
     }));
   }
 
-  private async listDirectUpstreamPlatformProducts(merchantId: string, runtimeStore?: MemoryStore) {
+  private async listDirectUpstreamPlatformProducts(merchantId: string, runtimeStore?: RuntimeState) {
     const runtimeRelation = this.findRuntimeSellingRelation(merchantId, runtimeStore);
     const runtimeOffers = runtimeRelation && runtimeStore
       ? runtimeStore.channelProductOffers.filter((offer) => offer.channelRelationId === runtimeRelation.id && offer.status === "listed")
@@ -7899,11 +7808,19 @@ class PrismaStateRepository {
       product_snapshot_json: unknown;
     }>>`
       SELECT o.id, o.order_no, o.user_id, o.merchant_id, o.shop_id, o.payment_status, o.fulfillment_status,
-             o.refund_status, o.paid_amount_cents, COALESCE(oas.paid_amount_cents, o.paid_amount_cents) AS order_base_amount_cents,
+             o.refund_status, o.paid_amount_cents,
+             COALESCE(ps.base_amount_cents, o.paid_amount_cents) AS order_base_amount_cents,
              oas.fulfillment_rule_snapshot_json,
              oas.product_snapshot_json
         FROM orders o
         LEFT JOIN order_amount_snapshots oas ON oas.order_id = o.id
+        LEFT JOIN LATERAL (
+          SELECT base_amount_cents
+            FROM payment_snapshots
+           WHERE order_id = o.id
+           ORDER BY created_at DESC
+           LIMIT 1
+        ) ps ON TRUE
        WHERE o.order_no = ${orderNo}
        LIMIT 1
     `;
@@ -9670,8 +9587,8 @@ class PrismaStateRepository {
     };
   }
 
-  async load(): Promise<MemoryStore> {
-    const store = createEmptyMemoryStore();
+  async load(): Promise<RuntimeState> {
+    const store = createEmptyRuntimeState();
     await Promise.all([
       this.loadMerchantsAndDeposits(store),
       this.loadShops(store),
@@ -9704,7 +9621,7 @@ class PrismaStateRepository {
     await this.ensureMerchantProductRuntimeSchema();
   }
 
-  async save(_store: MemoryStore): Promise<void> {
+  async save(_store: RuntimeState): Promise<void> {
     await this.persistInShortTransaction((tx) => this.persistUsers(tx, _store));
     await this.persistInShortTransaction((tx) => this.persistMerchants(tx, _store));
     await this.persistInShortTransaction((tx) => this.persistMerchantAccounts(tx, _store));
@@ -9721,7 +9638,7 @@ class PrismaStateRepository {
     await this.persistInShortTransaction((tx) => this.persistNotificationsAndPaymentConfig(tx, _store));
   }
 
-	  async saveForMethod(method: string, store: MemoryStore): Promise<void> {
+	  async saveForMethod(method: string, store: RuntimeState): Promise<void> {
 	    if (method === "createMerchantByAdmin" || method === "createMerchantByAdmin") {
 	      await this.persistInShortTransaction((tx) => this.persistLatestManualMerchantCreation(tx, store));
 	      return;
@@ -9975,7 +9892,7 @@ class PrismaStateRepository {
     return this.repositories.tx.transaction(fn, { maxWait: 10_000, timeout: 30_000 });
   }
 
-  private async persistUsers(tx: PrismaTx, store: MemoryStore) {
+  private async persistUsers(tx: PrismaTx, store: RuntimeState) {
     const userIds = new Set<string>();
     for (const merchant of store.merchants.values()) userIds.add(merchant.userId);
     for (const application of store.merchantApplications.values()) userIds.add(application.userId);
@@ -9990,7 +9907,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async persistMerchantAccounts(tx: PrismaTx, store: MemoryStore) {
+  private async persistMerchantAccounts(tx: PrismaTx, store: RuntimeState) {
     for (const merchant of store.merchants.values()) {
       if (merchant.initialPasswordSet && merchant.passwordHash) {
         await this.persistMerchantAccountForMerchant(tx, merchant);
@@ -9998,7 +9915,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async persistLatestManualMerchantCreation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestManualMerchantCreation(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["merchant.admin_create_first_tier"]);
     const merchantId = audit ? stringValue(audit.targetId) : undefined;
     const merchant = merchantId ? store.merchants.get(merchantId) : undefined;
@@ -10041,7 +9958,7 @@ class PrismaStateRepository {
 	    `;
 	  }
 
-  private async persistLatestInviteCodeCreation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestInviteCodeCreation(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["invite_code.create.platform", "invite_code.create.merchant"]);
     const inviteId = audit ? stringValue(audit.targetId) : undefined;
     const invite = inviteId ? store.inviteCodes.get(inviteId) : undefined;
@@ -10050,7 +9967,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestInviteRegistration(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestInviteRegistration(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["merchant.register_by_invite"]);
     const merchantId = audit ? stringValue(audit.targetId) : undefined;
     const merchant = merchantId ? store.merchants.get(merchantId) : undefined;
@@ -10080,7 +9997,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestMerchantReview(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestMerchantReview(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["merchant.review"]);
     const merchantId = audit ? stringValue(audit.targetId) : undefined;
     const merchant = merchantId ? store.merchants.get(merchantId) : undefined;
@@ -10102,7 +10019,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestChannelAuthorizationReview(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestChannelAuthorizationReview(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["channel.authorization.review"]);
     const merchantId = audit ? stringValue(audit.targetId) : undefined;
     const authorization = merchantId
@@ -10113,7 +10030,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestChannelRelationCreation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestChannelRelationCreation(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["channel.relation.create"]);
     if (!audit) return;
     const relationId = stringValue(audit.targetId);
@@ -10303,7 +10220,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistLatestDepositConfirmation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestDepositConfirmation(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["deposit.confirm"]);
     const merchantId = audit ? stringValue(audit.targetId) : undefined;
     const merchant = merchantId ? store.merchants.get(merchantId) : undefined;
@@ -10330,7 +10247,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestPlatformProductCreation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestPlatformProductCreation(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["product.create"]);
     const productId = audit ? stringValue(audit.targetId) : undefined;
     const product = productId ? store.platformProducts.get(productId) : undefined;
@@ -10339,7 +10256,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestRightsCodeImport(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestRightsCodeImport(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["rights_code.import"]);
     const productId = audit ? stringValue(audit.targetId) : undefined;
     const product = productId ? store.platformProducts.get(productId) : undefined;
@@ -10367,7 +10284,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestMerchantRightsCodeImport(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestMerchantRightsCodeImport(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["rights_code.merchant_import"]);
     const merchantProductListingId = audit ? stringValue(audit.targetId) : undefined;
     const merchantProductListing = merchantProductListingId ? store.merchantProductListings.get(merchantProductListingId) : undefined;
@@ -10395,7 +10312,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestPlatformProductSelection(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestPlatformProductSelection(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["merchant_product_listing.select_platform"]);
     const merchantProductListingId = audit ? stringValue(audit.targetId) : undefined;
     const merchantProductListing = merchantProductListingId ? store.merchantProductListings.get(merchantProductListingId) : undefined;
@@ -10406,7 +10323,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestPlatformProductUpdate(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestPlatformProductUpdate(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["platform_product.update"]);
     const productId = audit ? stringValue(audit.targetId) : undefined;
     const product = productId ? store.platformProducts.get(productId) : undefined;
@@ -10415,7 +10332,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestOwnProductSubmission(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestOwnProductSubmission(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["own_product.submit"]);
     const ownProductId = audit ? stringValue(audit.targetId) : undefined;
     const ownProduct = ownProductId ? store.ownProducts.get(ownProductId) : undefined;
@@ -10431,7 +10348,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestOwnProductReview(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestOwnProductReview(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["own_product.review"]);
     const ownProductId = audit ? stringValue(audit.targetId) : undefined;
     const ownProduct = ownProductId ? store.ownProducts.get(ownProductId) : undefined;
@@ -10443,7 +10360,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestOwnProductUpdate(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestOwnProductUpdate(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["own_product.update"]);
     const ownProductId = audit ? stringValue(audit.targetId) : undefined;
     const ownProduct = ownProductId ? store.ownProducts.get(ownProductId) : undefined;
@@ -10454,7 +10371,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestPlatformProductBatchSelection(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestPlatformProductBatchSelection(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["merchant_product_listing.batch_select_platform"]);
     const shopId = audit ? stringValue(audit.targetId) : undefined;
     if (!shopId) throw new Error("platform product batch selection missing current shop");
@@ -10464,7 +10381,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestMerchantProductPriceUpdate(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestMerchantProductPriceUpdate(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["merchant_product_listing.price_update"]);
     const merchantProductListingId = audit ? stringValue(audit.targetId) : undefined;
     const merchantProductListing = merchantProductListingId ? store.merchantProductListings.get(merchantProductListingId) : undefined;
@@ -10473,7 +10390,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestMerchantProductDetailUpdate(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestMerchantProductDetailUpdate(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["merchant_product_listing.detail_update", "merchant_product_listing.price_update"]);
     const merchantProductListingId = audit ? stringValue(audit.targetId) : undefined;
     const merchantProductListing = merchantProductListingId ? store.merchantProductListings.get(merchantProductListingId) : undefined;
@@ -10482,7 +10399,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestPlatformShopProductUpsert(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestPlatformShopProductUpsert(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["platform_shop_product.upsert"]);
     const shopProductId = audit ? stringValue(audit.targetId) : undefined;
     const shopProduct = shopProductId ? store.platformShopProducts.get(shopProductId) : undefined;
@@ -10497,7 +10414,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestPlatformShopProductUpdate(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestPlatformShopProductUpdate(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["platform_shop_product.update"]);
     const shopProductId = audit ? stringValue(audit.targetId) : undefined;
     const shopProduct = shopProductId ? store.platformShopProducts.get(shopProductId) : undefined;
@@ -10506,7 +10423,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestChannelProductOfferUpsert(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestChannelProductOfferUpsert(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["channel.offer.upsert"]);
     const offerId = audit ? stringValue(audit.targetId) : undefined;
     const offer = offerId ? store.channelProductOffers.find((item) => item.id === offerId) : undefined;
@@ -10518,7 +10435,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestRegistrationCouponGrant(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestRegistrationCouponGrant(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["coupon.grant.first_register"]);
     if (!audit) return;
     const userId = stringValue(audit.targetId);
@@ -10532,7 +10449,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, [audit]);
   }
 
-  private async persistLatestAdminCouponGrant(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestAdminCouponGrant(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["coupon.grant.admin"]);
     if (!audit) return;
     const templateId = stringValue(audit.targetId);
@@ -10551,7 +10468,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, [audit]);
   }
 
-  private async persistLatestOrderCreation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestOrderCreation(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["order.create"]);
     const orderNo = audit ? stringValue(audit.targetId) : undefined;
     const order = orderNo ? store.orders.get(orderNo) : undefined;
@@ -10599,7 +10516,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestOfflinePaymentConfirmation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestOfflinePaymentConfirmation(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["order.offline_payment.confirm"]);
     const orderNo = audit ? stringValue(audit.targetId) : undefined;
     const order = orderNo ? store.orders.get(orderNo) : undefined;
@@ -10623,7 +10540,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, [autoFulfillmentAudit, audit].filter((item): item is Record<string, unknown> => Boolean(item)));
   }
 
-  private async persistLatestPaymentVoucher(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestPaymentVoucher(tx: PrismaTx, store: RuntimeState) {
     const voucher = this.latestPaymentVoucher(store);
     if (!voucher) throw new Error("payment voucher persistence missing current voucher");
     await this.persistPaymentDisputeMaterial(tx, voucher);
@@ -10638,7 +10555,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audits);
   }
 
-  private async persistLatestPaymentMethodMutation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestPaymentMethodMutation(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, [
       "payment_method.upsert",
       "payment_method.default",
@@ -10653,7 +10570,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestPaymentOrderCreation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestPaymentOrderCreation(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["payment.manual.create", "payment.order.create", "wallet.payment.capture"]);
     const orderNo = audit ? stringValue(audit.targetId) : undefined;
     const order = orderNo ? store.orders.get(orderNo) : undefined;
@@ -10666,7 +10583,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestWalletRechargeMutation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestWalletRechargeMutation(tx: PrismaTx, store: RuntimeState) {
     await this.persistWalletState(tx, store);
     const audit = this.latestAuditLog(store, ["wallet.recharge.create", "wallet.recharge.confirm", "wallet.payment.capture"]);
     await this.persistAuditLogs(tx, audit ? [audit] : []);
@@ -10693,7 +10610,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistWalletState(tx: PrismaTx, store: MemoryStore) {
+  private async persistWalletState(tx: PrismaTx, store: RuntimeState) {
     for (const wallet of store.userWallets.values()) {
       await tx.$executeRaw`
         INSERT INTO users (id, status, created_at, updated_at)
@@ -10794,7 +10711,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async persistLatestPaymentResult(tx: PrismaTx, store: MemoryStore, methodName: string) {
+  private async persistLatestPaymentResult(tx: PrismaTx, store: RuntimeState, methodName: string) {
     const latestLog = [...store.paymentCallbackLogs].reverse()[0];
     const latestException = [...store.paymentExceptions].reverse()[0];
     const audit = this.latestAuditLog(store, ["payment.callback.success", "payment.query.success", "payment.exception"]);
@@ -10828,7 +10745,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async persistLatestPaymentExceptionHandling(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestPaymentExceptionHandling(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["payment.exception.handle"]);
     const exceptionId = audit ? stringValue(audit.targetId) : undefined;
     const exception = exceptionId
@@ -10839,12 +10756,12 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private latestPaymentVoucher(store: MemoryStore) {
+  private latestPaymentVoucher(store: RuntimeState) {
     return [...store.paymentVouchers.values()]
       .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())[0];
   }
 
-  private paymentMethodForOrder(store: MemoryStore, order: DemoOrder) {
+  private paymentMethodForOrder(store: RuntimeState, order: DemoOrder) {
     if (order.paymentSnapshot?.paymentMethodId === "balance") {
       return {
         id: "balance",
@@ -10864,7 +10781,7 @@ class PrismaStateRepository {
     return order.paymentSnapshot?.paymentMethodId ? store.paymentMethods.get(order.paymentSnapshot.paymentMethodId) : undefined;
   }
 
-  private async persistLatestFulfillmentUpdate(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestFulfillmentUpdate(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["fulfillment.update"]);
     const orderNo = audit ? stringValue(audit.targetId) : undefined;
     const order = orderNo ? store.orders.get(orderNo) : undefined;
@@ -10874,7 +10791,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestAfterSaleCreation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestAfterSaleCreation(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["after_sale.create"]);
     const afterSaleNo = audit ? stringValue(audit.targetId) : undefined;
     const afterSale = afterSaleNo ? store.afterSales.get(afterSaleNo) : undefined;
@@ -10886,7 +10803,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestRefundApproval(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestRefundApproval(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["refund.approve"]);
     const afterSaleNo = audit ? stringValue(audit.targetId) : undefined;
     const afterSale = afterSaleNo ? store.afterSales.get(afterSaleNo) : undefined;
@@ -10911,7 +10828,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestManualRefundConfirmation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestManualRefundConfirmation(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["refund.manual_confirm", "refund.callback"]);
     const refundNo = audit ? stringValue(audit.targetId) : undefined;
     const refund = refundNo ? store.refunds.get(refundNo) : undefined;
@@ -10936,7 +10853,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestSettlementGeneration(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestSettlementGeneration(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["settlement.generate"]);
     const settlementNo = audit ? stringValue(audit.targetId) : undefined;
     const sheet = settlementNo ? store.settlementSheets.find((item) => item.settlementNo === settlementNo) : undefined;
@@ -10953,7 +10870,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistLatestManualPayoutConfirmation(tx: PrismaTx, store: MemoryStore) {
+  private async persistLatestManualPayoutConfirmation(tx: PrismaTx, store: RuntimeState) {
     const audit = this.latestAuditLog(store, ["manual_payout.confirm"]);
     const settlementNo = audit ? stringValue(audit.targetId) : undefined;
     const sheet = settlementNo ? store.settlementSheets.find((item) => item.settlementNo === settlementNo) : undefined;
@@ -10974,7 +10891,7 @@ class PrismaStateRepository {
     await this.persistAuditLogs(tx, audit ? [audit] : []);
   }
 
-  private async persistMerchants(tx: PrismaTx, store: MemoryStore) {
+  private async persistMerchants(tx: PrismaTx, store: RuntimeState) {
     for (const merchant of store.merchants.values()) {
       await this.persistMerchantForMerchant(tx, merchant);
       await this.persistMerchantAccountForMerchant(tx, merchant);
@@ -10985,7 +10902,7 @@ class PrismaStateRepository {
 	    }
 	  }
 
-  private async persistShops(tx: PrismaTx, store: MemoryStore) {
+  private async persistShops(tx: PrismaTx, store: RuntimeState) {
     for (const shop of store.shops.values()) {
       await tx.$executeRaw`
           INSERT INTO shops (
@@ -11043,7 +10960,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async persistProducts(tx: PrismaTx, store: MemoryStore) {
+  private async persistProducts(tx: PrismaTx, store: RuntimeState) {
     for (const product of store.platformProducts.values()) {
       await this.persistPlatformProduct(tx, product);
     }
@@ -11061,7 +10978,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async persistMerchantProductWithDependencies(tx: PrismaTx, store: MemoryStore, product: DemoMerchantProductListing) {
+  private async persistMerchantProductWithDependencies(tx: PrismaTx, store: RuntimeState, product: DemoMerchantProductListing) {
     const merchant = store.merchants.get(product.merchantId);
     const shop = store.shops.get(product.shopId);
     if (!merchant) throw new Error("merchant product persistence missing current merchant");
@@ -11198,7 +11115,7 @@ class PrismaStateRepository {
   private async persistPlatformProduct(tx: PrismaTx, product: DemoPlatformProduct) {
     await tx.$executeRaw`
       INSERT INTO platform_products (
-        id, product_no, name, category_name, tags_json, detail, rights_desc,
+        id, product_no, name, category_name, tags_json, detail, rights_desc, manual_fulfillment_instruction,
         image_url, specs_json, detail_sections_json, stock_count, sold_count,
         display_badge, is_recommended, display_sort,
         supply_price_cents, min_sale_price_cents, suggested_sale_price_cents,
@@ -11208,7 +11125,7 @@ class PrismaStateRepository {
       VALUES (
         ${product.id}, ${product.id}, ${product.name}, ${product.category ?? null},
         ${jsonForDb(product.tags ?? [])}::jsonb, ${product.description ?? product.subtitle ?? product.name},
-        ${product.subtitle ?? product.name}, ${product.imageUrl ?? null},
+        ${product.subtitle ?? product.name}, ${product.usageGuide ?? manualFulfillmentInstruction(product.fulfillmentRule) ?? null}, ${product.imageUrl ?? null},
         ${jsonForDb(product.specs ?? [])}::jsonb, ${jsonForDb(product.detailSections ?? [])}::jsonb,
         ${product.stockCount ?? 0}, ${product.soldCount ?? 0}, ${product.displayBadge ?? null},
         ${product.isRecommended ?? false}, ${product.displaySort ?? 0},
@@ -11224,6 +11141,7 @@ class PrismaStateRepository {
         tags_json = EXCLUDED.tags_json,
         detail = EXCLUDED.detail,
         rights_desc = EXCLUDED.rights_desc,
+        manual_fulfillment_instruction = EXCLUDED.manual_fulfillment_instruction,
         image_url = EXCLUDED.image_url,
         specs_json = EXCLUDED.specs_json,
         detail_sections_json = EXCLUDED.detail_sections_json,
@@ -11244,7 +11162,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistAvailableRightsCode(tx: PrismaTx, code: RightsCode, store: MemoryStore) {
+  private async persistAvailableRightsCode(tx: PrismaTx, code: RightsCode, store: RuntimeState) {
     const shape = this.rightsCodeDbShape(code, store);
     await tx.$executeRaw`
       INSERT INTO rights_codes (
@@ -11274,7 +11192,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private rightsCodeDbShape(code: RightsCode, store: MemoryStore) {
+  private rightsCodeDbShape(code: RightsCode, store: RuntimeState) {
     const platformProductId = code.platformProductId ?? (store.platformProducts.has(code.productId) ? code.productId : null);
     const sourceMerchantProduct = code.merchantProductListingId
       ? store.merchantProductListings.get(code.merchantProductListingId)
@@ -11298,7 +11216,7 @@ class PrismaStateRepository {
     };
   }
 
-  private async persistCoupons(tx: PrismaTx, store: MemoryStore) {
+  private async persistCoupons(tx: PrismaTx, store: RuntimeState) {
     for (const template of store.couponTemplates.values()) {
       await this.persistCouponTemplate(tx, template);
     }
@@ -11342,7 +11260,7 @@ class PrismaStateRepository {
     `;
   }
 
-	  private async persistLatestCouponTemplateMutation(tx: PrismaTx, store: MemoryStore) {
+	  private async persistLatestCouponTemplateMutation(tx: PrismaTx, store: RuntimeState) {
 	    const audit = this.latestAuditLog(store, ["coupon_template.create", "coupon_template.status"]);
 	    const templateId = audit ? stringValue(audit.targetId) : undefined;
 	    const template = templateId ? store.couponTemplates.get(templateId) : undefined;
@@ -11379,7 +11297,7 @@ class PrismaStateRepository {
     void relation;
   }
 
-		  private latestAuditLog(store: MemoryStore, actions: string[]) {
+		  private latestAuditLog(store: RuntimeState, actions: string[]) {
     for (let index = store.auditLogs.length - 1; index >= 0; index -= 1) {
       const audit = store.auditLogs[index];
       if (actions.includes(stringValue(audit.action) ?? "")) return audit;
@@ -11429,7 +11347,7 @@ class PrismaStateRepository {
     }
   }
 
-	  private async persistInviteAndChannelState(tx: PrismaTx, store: MemoryStore) {
+	  private async persistInviteAndChannelState(tx: PrismaTx, store: RuntimeState) {
 	    for (const invite of store.inviteCodes.values()) {
       await this.persistInviteCode(tx, invite);
     }
@@ -11452,7 +11370,7 @@ class PrismaStateRepository {
     void authorization;
   }
 
-  private async persistDeposits(tx: PrismaTx, store: MemoryStore) {
+  private async persistDeposits(tx: PrismaTx, store: RuntimeState) {
     for (const [merchantId, account] of store.depositAccounts.entries()) {
       await tx.$executeRaw`
         INSERT INTO deposit_accounts (
@@ -11519,7 +11437,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async persistOrders(tx: PrismaTx, store: MemoryStore) {
+  private async persistOrders(tx: PrismaTx, store: RuntimeState) {
     for (const order of store.orders.values()) {
       if (this.loadedOrderNos.has(order.orderNo)) continue;
       await this.persistOrder(tx, order);
@@ -11763,7 +11681,7 @@ class PrismaStateRepository {
       `;
   }
 
-  private async persistPaymentMethodOwnerDefaults(tx: PrismaTx, store: MemoryStore, changed: PaymentMethodConfig) {
+  private async persistPaymentMethodOwnerDefaults(tx: PrismaTx, store: RuntimeState, changed: PaymentMethodConfig) {
     const scoped = [...store.paymentMethods.values()].filter((method) =>
       method.ownerType === changed.ownerType
       && (method.merchantId ?? null) === (changed.merchantId ?? null)
@@ -11855,7 +11773,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistPaymentSnapshotForOrder(tx: PrismaTx, store: MemoryStore, order: DemoOrder) {
+  private async persistPaymentSnapshotForOrder(tx: PrismaTx, store: RuntimeState, order: DemoOrder) {
     const snapshot = order.paymentSnapshot;
     if (!snapshot?.paymentMethodId || !snapshot.provider) return;
     const method = store.paymentMethods.get(snapshot.paymentMethodId);
@@ -11969,7 +11887,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistPaymentCallbackLog(tx: PrismaTx, store: MemoryStore, log: PaymentCallbackLog) {
+  private async persistPaymentCallbackLog(tx: PrismaTx, store: RuntimeState, log: PaymentCallbackLog) {
     const order = log.orderNo ? store.orders.get(log.orderNo) : undefined;
     const method = order ? this.paymentMethodForOrder(store, order) : undefined;
     const paymentNo = order?.paymentSnapshot?.paymentNo ?? (log.orderNo ? `payment:${log.orderNo}` : null);
@@ -12027,7 +11945,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistPaymentException(tx: PrismaTx, store: MemoryStore, exception: PaymentException) {
+  private async persistPaymentException(tx: PrismaTx, store: RuntimeState, exception: PaymentException) {
     const order = exception.orderNo ? store.orders.get(exception.orderNo) : undefined;
     const method = order ? this.paymentMethodForOrder(store, order) : undefined;
     const paymentNo = order?.paymentSnapshot?.paymentNo ?? (exception.orderNo ? `payment:${exception.orderNo}` : null);
@@ -12105,7 +12023,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistIssuedRightsCodesForOrder(tx: PrismaTx, store: MemoryStore, order: DemoOrder) {
+  private async persistIssuedRightsCodesForOrder(tx: PrismaTx, store: RuntimeState, order: DemoOrder) {
     const codes = store.rightsCodes.filter((code) => code.orderNo === order.orderNo && code.status === "issued");
     for (const code of codes) {
       const shape = this.rightsCodeDbShape(code, store);
@@ -12158,7 +12076,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async persistLockedRightsCodesForOrder(tx: PrismaTx, store: MemoryStore, order: DemoOrder) {
+  private async persistLockedRightsCodesForOrder(tx: PrismaTx, store: RuntimeState, order: DemoOrder) {
     const codes = store.rightsCodes.filter((code) => code.orderNo === order.orderNo && code.status === "locked");
     for (const code of codes) {
       const shape = this.rightsCodeDbShape(code, store);
@@ -12205,7 +12123,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async persistFulfillmentRecordForOrder(tx: PrismaTx, store: MemoryStore, order: DemoOrder) {
+  private async persistFulfillmentRecordForOrder(tx: PrismaTx, store: RuntimeState, order: DemoOrder) {
     const record = store.fulfillmentRecords.get(order.orderNo);
     if (!record) return;
     await tx.$executeRaw`
@@ -12228,7 +12146,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistAfterSalesAndRefunds(tx: PrismaTx, store: MemoryStore) {
+  private async persistAfterSalesAndRefunds(tx: PrismaTx, store: RuntimeState) {
     for (const afterSale of store.afterSales.values()) {
       await this.persistAfterSale(tx, afterSale);
     }
@@ -12302,7 +12220,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistFulfillmentAndExtraction(tx: PrismaTx, store: MemoryStore) {
+  private async persistFulfillmentAndExtraction(tx: PrismaTx, store: RuntimeState) {
     for (const code of store.rightsCodes) {
       const shape = this.rightsCodeDbShape(code, store);
       await tx.$executeRaw`
@@ -12428,12 +12346,12 @@ class PrismaStateRepository {
     }
   }
 
-  private async persistEmailDeliveriesForOrder(tx: PrismaTx, store: MemoryStore, order: DemoOrder) {
+  private async persistEmailDeliveriesForOrder(tx: PrismaTx, store: RuntimeState, order: DemoOrder) {
     const deliveries = store.emailDeliveries.filter((delivery) => delivery.orderNo === order.orderNo);
     for (const delivery of deliveries) await this.persistEmailDelivery(tx, store, delivery);
   }
 
-  private async persistEmailDelivery(tx: PrismaTx, store: MemoryStore, delivery: EmailDelivery) {
+  private async persistEmailDelivery(tx: PrismaTx, store: RuntimeState, delivery: EmailDelivery) {
     const order = store.orders.get(delivery.orderNo);
     if (!order) return;
     const issuedCodeCount = store.rightsCodes.filter((code) => code.orderNo === delivery.orderNo && code.status === "issued").length;
@@ -12499,7 +12417,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistSettlements(tx: PrismaTx, store: MemoryStore) {
+  private async persistSettlements(tx: PrismaTx, store: RuntimeState) {
     for (const sheet of store.settlementSheets) {
       await this.persistSettlementSheet(tx, sheet);
     }
@@ -12588,7 +12506,7 @@ class PrismaStateRepository {
     `;
   }
 
-  private async persistRiskAuditLedger(tx: PrismaTx, store: MemoryStore) {
+  private async persistRiskAuditLedger(tx: PrismaTx, store: RuntimeState) {
     for (const freeze of store.riskFreezes) {
       await tx.$executeRaw`
         INSERT INTO risk_freezes (
@@ -12661,7 +12579,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async persistNotificationsAndPaymentConfig(tx: PrismaTx, store: MemoryStore) {
+  private async persistNotificationsAndPaymentConfig(tx: PrismaTx, store: RuntimeState) {
     void store.notifications;
 
     for (const config of store.paymentChannelConfigs) {
@@ -12796,7 +12714,7 @@ class PrismaStateRepository {
     });
   }
 
-  private async loadMerchantsAndDeposits(store: MemoryStore) {
+  private async loadMerchantsAndDeposits(store: RuntimeState) {
     const merchants = await this.prisma.$queryRaw<Array<{
       id: string;
       user_id: string;
@@ -12863,7 +12781,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async loadShops(store: MemoryStore) {
+  private async loadShops(store: RuntimeState) {
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
       owner_type: "platform" | "merchant";
@@ -12929,7 +12847,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async loadPlatformProducts(store: MemoryStore) {
+  private async loadPlatformProducts(store: RuntimeState) {
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
       name: string;
@@ -12945,6 +12863,7 @@ class PrismaStateRepository {
       display_sort: number;
       detail: string;
       rights_desc: string;
+      manual_fulfillment_instruction: string | null;
       supply_price_cents: bigint;
       min_sale_price_cents: bigint;
       suggested_sale_price_cents: bigint;
@@ -12952,10 +12871,10 @@ class PrismaStateRepository {
       after_sale_rule_json: unknown;
       status: string;
     }>>`
-      SELECT id, name, category_name, tags_json, image_url, specs_json, detail_sections_json,
-             stock_count, sold_count, display_badge, is_recommended, display_sort,
-             detail, rights_desc, supply_price_cents,
-             min_sale_price_cents, suggested_sale_price_cents, fulfillment_rule_json,
+	      SELECT id, name, category_name, tags_json, image_url, specs_json, detail_sections_json,
+	             stock_count, sold_count, display_badge, is_recommended, display_sort,
+	             detail, rights_desc, manual_fulfillment_instruction, supply_price_cents,
+	             min_sale_price_cents, suggested_sale_price_cents, fulfillment_rule_json,
              after_sale_rule_json, status
         FROM platform_products
     `;
@@ -12975,6 +12894,7 @@ class PrismaStateRepository {
         displaySort: row.display_sort,
         description: row.detail,
         subtitle: row.rights_desc,
+        usageGuide: row.manual_fulfillment_instruction ?? undefined,
         supplyPriceCents: row.supply_price_cents,
         minSalePriceCents: row.min_sale_price_cents,
         suggestedSalePriceCents: row.suggested_sale_price_cents,
@@ -12985,7 +12905,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async loadOwnProductReviews(store: MemoryStore) {
+  private async loadOwnProductReviews(store: RuntimeState) {
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
       merchant_id: string;
@@ -13036,7 +12956,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async loadMerchantProducts(store: MemoryStore) {
+  private async loadMerchantProducts(store: RuntimeState) {
     const merchantRows = await this.prisma.$queryRaw<Array<{
       id: string;
       merchant_id: string;
@@ -13115,7 +13035,7 @@ class PrismaStateRepository {
       });
     }
   }
-  private async loadPaymentConfig(store: MemoryStore) {
+  private async loadPaymentConfig(store: RuntimeState) {
     const rows = await this.prisma.$queryRaw<Array<PaymentChannelConfig>>`
       SELECT channel, enabled, fee_bps AS "feeBps", fixed_fee_cents AS "fixedFeeCents",
              status_note AS "statusNote", updated_at AS "updatedAt"
@@ -13124,7 +13044,7 @@ class PrismaStateRepository {
     if (rows.length) store.paymentChannelConfigs = rows;
   }
 
-  private async loadServiceFeeConfig(store: MemoryStore) {
+  private async loadServiceFeeConfig(store: RuntimeState) {
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
       enabled: boolean;
@@ -13153,7 +13073,7 @@ class PrismaStateRepository {
     };
   }
 
-  private async loadWalletState(store: MemoryStore) {
+  private async loadWalletState(store: RuntimeState) {
     const wallets = await this.prisma.$queryRaw<Array<{
       id: string;
       user_id: string;
@@ -13228,7 +13148,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async loadPaymentMethodConfigs(store: MemoryStore) {
+  private async loadPaymentMethodConfigs(store: RuntimeState) {
     await this.ensureCollectionPaymentConfigRuntimeSchema();
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
@@ -13393,7 +13313,7 @@ class PrismaStateRepository {
     `);
   }
 
-  private async loadPaymentRuntimeState(store: MemoryStore) {
+  private async loadPaymentRuntimeState(store: RuntimeState) {
     const snapshots = await this.prisma.$queryRaw<Array<{
       order_no: string;
       payment_no: string;
@@ -13556,7 +13476,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async loadRightsCodes(store: MemoryStore) {
+  private async loadRightsCodes(store: RuntimeState) {
     const rows = await this.prisma.$queryRaw<Array<{
       id: string;
       product_id: string | null;
@@ -13591,7 +13511,7 @@ class PrismaStateRepository {
     }));
   }
 
-  private async loadOrders(store: MemoryStore) {
+  private async loadOrders(store: RuntimeState) {
     const couponUsageByOrderId = new Map<string, string>();
     const couponUsages = await this.prisma.$queryRaw<Array<{ order_id: string; user_coupon_id: string }>>`
       SELECT order_id, user_coupon_id
@@ -13681,7 +13601,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async loadCoupons(store: MemoryStore) {
+  private async loadCoupons(store: RuntimeState) {
     const templates = await this.prisma.$queryRaw<Array<{
       id: string;
       name: string;
@@ -13746,7 +13666,7 @@ class PrismaStateRepository {
     }
   }
 
-  private async loadInviteAndChannelState(store: MemoryStore) {
+  private async loadInviteAndChannelState(store: RuntimeState) {
     const invites = await this.prisma.$queryRaw<Array<{
       id: string;
       code_hash: string;
@@ -13861,7 +13781,7 @@ class PrismaStateRepository {
     store.channelProductOffers = [];
   }
 
-  private async loadFinancialState(store: MemoryStore) {
+  private async loadFinancialState(store: RuntimeState) {
     const settlements = await this.prisma.$queryRaw<Array<{
       settlement_no: string;
       merchant_id: string;
@@ -13985,7 +13905,7 @@ class PrismaStateRepository {
     }));
   }
 
-  private async loadEmailDeliveries(store: MemoryStore) {
+  private async loadEmailDeliveries(store: RuntimeState) {
     const rows = await this.prisma.$queryRaw<Array<{
       delivery_no: string;
       order_no: string;
@@ -14042,17 +13962,11 @@ function isProductionRuntime() {
 }
 
 function allowDemoAuth() {
-  if (isProductionRuntime()) return false;
-  const configured = process.env.ALLOW_DEMO_AUTH ?? process.env.DEMO_AUTH_ENABLED;
-  if (configured !== undefined) return configured === "true";
-  return true;
+  return false;
 }
 
 function mockPaymentEnabled() {
-  if (isProductionRuntime()) return false;
-  const configured = process.env.MOCK_PAYMENT_ENABLED;
-  if (configured !== undefined) return configured === "true";
-  return true;
+  return false;
 }
 
 function fulfillmentMode(snapshot: DemoOrderSnapshot) {
@@ -14823,13 +14737,12 @@ function paymentChannelForProvider(provider: PaymentProviderType): PaymentChanne
   return "alipay_wap";
 }
 
-function paymentChannelProvider(channel: PaymentChannel): PaymentProviderType | "wechat_miniprogram" | "wechat_h5_jsapi" | "mock" {
+function paymentChannelProvider(channel: PaymentChannel): PaymentProviderType | "wechat_miniprogram" | "wechat_h5_jsapi" {
   if (channel === "wechat_h5") return "wechat_merchant";
   if (channel === "wechat_h5_jsapi") return "wechat_h5_jsapi";
   if (channel === "wechat_miniprogram") return "wechat_miniprogram";
   if (channel === "epay") return "epay";
   if (channel === "balance") return "balance";
-  if (channel === "mock") return "mock";
   return "alipay_merchant";
 }
 
@@ -14840,7 +14753,7 @@ function paymentChannelDisplay(channel: PaymentChannel) {
   if (channel === "alipay_wap") return "支付宝商户";
   if (channel === "epay") return "e支付";
   if (channel === "balance") return "余额支付";
-  return "开发模拟";
+  return "未知支付";
 }
 
 function isManualPaymentProvider(provider: PaymentProviderType) {
@@ -15037,152 +14950,7 @@ function assignDefined<T extends object>(target: T, input: object) {
   return target;
 }
 
-function createMemoryStore(): MemoryStore {
-  const store = createEmptyMemoryStore();
-
-  store.merchants.set("merchant-1", { id: "merchant-1", userId: "merchant-user-1", name: "测试代理 A", tier: "first_tier", status: "active", riskStatus: "normal", depositStatus: "paid", contactPhone: "13800000000" });
-  store.merchants.set("merchant-2", { id: "merchant-2", userId: "merchant-user-2", name: "测试代理 B", tier: "second_tier", parentMerchantId: "merchant-1", status: "active", riskStatus: "normal", depositStatus: "paid", contactPhone: "13900000000" });
-  store.merchants.set("merchant-3", { id: "merchant-3", userId: "merchant-user-3", name: "测试代理 C", tier: "third_tier", parentMerchantId: "merchant-2", status: "active", riskStatus: "normal", depositStatus: "paid", contactPhone: "13700000000" });
-  store.merchants.set("merchant-new", { id: "merchant-new", userId: "merchant-user-new", name: "新代理", tier: "first_tier", status: "draft", riskStatus: "normal", depositStatus: "pending_payment" });
-  store.shops.set("shop-1", {
-    id: "shop-1",
-    merchantId: "merchant-1",
-    name: virtualShopSeed.name,
-    status: "open",
-    riskStatus: "normal",
-    announcement: virtualShopSeed.announcement,
-    customerServiceWechat: virtualShopSeed.customerServiceWechat,
-    customerServiceQrUrl: "https://example.test/qr-merchant-a.png",
-    collectionAccountName: virtualShopSeed.collectionAccountName,
-    collectionQrUrl: "https://example.test/pay-merchant-a.png",
-    collectionNote: virtualShopSeed.collectionNote,
-    themeColor: virtualShopSeed.themeColor,
-    bannerUrl: virtualShopSeed.bannerUrl,
-    shareTitle: virtualShopSeed.shareTitle,
-    productGroups: virtualShopSeed.productGroups.map((group) => ({
-      name: group.name,
-      merchantProductListingIds: group.merchantListingSeedIds
-    }))
-  });
-  store.shops.set("shop-2", { id: "shop-2", merchantId: "merchant-2", ownerType: "merchant", name: "测试代理 B 小店", status: "open", riskStatus: "normal", customerServiceWechat: "merchant_b_service", customerServiceQrUrl: "https://example.test/qr-merchant-b.png", collectionAccountName: "测试代理B人工收款", collectionQrUrl: "https://example.test/pay-merchant-b.png", collectionNote: "二级店铺人工收款码" });
-  store.shops.set("shop-3", { id: "shop-3", merchantId: "merchant-3", ownerType: "merchant", name: "测试代理 C 小店", status: "open", riskStatus: "normal", customerServiceWechat: "merchant_c_service", customerServiceQrUrl: "https://example.test/qr-merchant-c.png", collectionAccountName: "测试代理C人工收款", collectionQrUrl: "https://example.test/pay-merchant-c.png", collectionNote: "三级店铺人工收款码" });
-  store.shops.set("shop-new", { id: "shop-new", merchantId: "merchant-new", name: "新代理小店", status: "not_opened", riskStatus: "normal" });
-  store.shops.set("shop-platform", {
-    id: "shop-platform",
-    ownerType: "platform",
-    name: "ToSell 平台自营店",
-    status: "open",
-    riskStatus: "normal",
-    announcement: "平台自营虚拟权益，购买后按商品规则发放",
-    customerServiceWechat: "tosell_service",
-    customerServiceQrUrl: "https://example.test/qr-platform-service.png",
-    collectionAccountName: "ToSell 平台自营人工收款",
-    collectionQrUrl: "https://example.test/pay-platform.png",
-    collectionNote: "平台自营店人工收款码",
-    themeColor: "#0f5f6f",
-    bannerUrl: "https://example.test/banner-platform.png",
-    shareTitle: "ToSell 官方权益精选",
-    productGroups: [{ name: "官方精选", merchantProductListingIds: ["psp-1", "psp-code"] }]
-  });
-  seedPaymentMethod(store, {
-    id: "collection-shop-1",
-    shopId: "shop-1",
-    merchantId: "merchant-1",
-    ownerType: "merchant",
-    provider: "personal_alipay",
-    displayName: "支付宝个人收款码",
-    accountName: virtualShopSeed.collectionAccountName,
-    qrUrl: "https://example.test/pay-merchant-a.png",
-    isDefault: true,
-    sortOrder: 10
-  });
-  seedPaymentMethod(store, {
-    id: "collection-shop-2",
-    shopId: "shop-2",
-    merchantId: "merchant-2",
-    ownerType: "merchant",
-    provider: "wechat_personal",
-    displayName: "微信个人收款码",
-    accountName: "测试代理B人工收款",
-    qrUrl: "https://example.test/pay-merchant-b.png",
-    isDefault: true,
-    sortOrder: 10
-  });
-  seedPaymentMethod(store, {
-    id: "collection-shop-3",
-    shopId: "shop-3",
-    merchantId: "merchant-3",
-    ownerType: "merchant",
-    provider: "personal_alipay",
-    displayName: "支付宝个人收款码",
-    accountName: "测试代理C人工收款",
-    qrUrl: "https://example.test/pay-merchant-c.png",
-    isDefault: true,
-    sortOrder: 10
-  });
-  seedPaymentMethod(store, {
-    id: "collection-platform-personal-alipay",
-    shopId: "shop-platform",
-    ownerType: "platform",
-    provider: "personal_alipay",
-    displayName: "平台个人支付宝",
-    accountName: "ToSell 平台自营人工收款",
-    qrUrl: "https://example.test/pay-platform.png",
-    isDefault: true,
-    sortOrder: 10
-  });
-  seedPaymentMethod(store, {
-    id: "collection-platform-epay",
-    shopId: "shop-platform",
-    ownerType: "platform",
-    provider: "epay",
-    displayName: "平台 e支付",
-    merchantNo: "10783",
-    gatewayUrl: "https://xpay.uumua.com/xpay/epay/",
-    signingSecret: "dev-epay-signing-secret",
-    apiMode: "submit",
-    isDefault: false,
-    sortOrder: 20
-  });
-  seedMemoryCatalog(store);
-  store.notifications.push({ id: "notice-1", merchantId: "merchant-1", type: "system", title: "V2 经营工具已开启", content: "可以使用店铺装修、批量选品、权益码自动履约和经营看板。", createdAt: new Date(), readAt: null });
-  store.depositAccounts.set("merchant-1", { merchantId: "merchant-1", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
-  store.depositAccounts.set("merchant-2", { merchantId: "merchant-2", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
-  store.depositAccounts.set("merchant-3", { merchantId: "merchant-3", requiredAmountCents: 50_000n, availableAmountCents: 50_000n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "paid" });
-  store.depositAccounts.set("merchant-new", { merchantId: "merchant-new", requiredAmountCents: 50_000n, availableAmountCents: 0n, frozenAmountCents: 0n, deductedAmountCents: 0n, status: "pending_payment" });
-  store.channelAuthorizations.push({ id: "channel-auth-1", firstTierMerchantId: "merchant-1", status: "active", reason: null, reviewedAt: new Date() });
-  store.channelRelations.push({ id: "channel-rel-1", firstTierMerchantId: "merchant-1", secondTierMerchantId: "merchant-2", status: "active", reason: null, reviewedAt: new Date(), activeUniqueKey: "second-tier:merchant-2" });
-  store.channelRelations.push({ id: "channel-rel-2", firstTierMerchantId: "merchant-1", secondTierMerchantId: "merchant-2", thirdTierMerchantId: "merchant-3", status: "active", reason: null, reviewedAt: new Date(), activeUniqueKey: "third-tier:merchant-3" });
-  store.channelProductOffers.push({ id: "channel-offer-1", channelRelationId: "channel-rel-1", platformProductId: "prod-1", resellSupplyPriceCents: 11_000n, status: "listed" });
-  store.channelProductOffers.push({ id: "channel-offer-2", channelRelationId: "channel-rel-2", platformProductId: "prod-1", resellSupplyPriceCents: 13_000n, status: "listed" });
-  store.couponTemplates.set("coupon-first-register", {
-    id: "coupon-first-register",
-    name: "新用户无门槛券",
-    discountCents: 500n,
-    productIds: [],
-    validDays: 30,
-    grantOnFirstRegister: true,
-    status: "active",
-    createdAt: new Date()
-  });
-  store.inviteCodes.set("invite-platform-first", {
-    id: "invite-platform-first",
-    code: "PLATFORM-FIRST",
-    issuerType: "platform",
-    targetTier: "first_tier",
-    status: "active",
-    maxUses: null,
-    usedCount: 0,
-    depositRequiredAmountCents: store.depositAccounts.get("merchant-1")?.requiredAmountCents,
-    expiresAt: null,
-    createdBy: "seed",
-    createdAt: new Date()
-  });
-  store.sequence = Date.now();
-  return store;
-}
-
-function createEmptyMemoryStore(): MemoryStore {
+function createEmptyRuntimeState(): RuntimeState {
   return {
     sequence: 0,
     merchantApplications: new Map(),
@@ -15233,7 +15001,6 @@ function createEmptyMemoryStore(): MemoryStore {
     walletHolds: new Map(),
     walletTransactions: [],
     paymentChannelConfigs: [
-      { channel: "mock", enabled: true, feeBps: 0, fixedFeeCents: 0n, statusNote: "dev_only", updatedAt: new Date() },
       { channel: "wechat_miniprogram", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
       { channel: "wechat_h5_jsapi", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
       { channel: "wechat_h5", enabled: false, feeBps: 0, fixedFeeCents: 0n, statusNote: "merchant_account_required", updatedAt: new Date() },
@@ -15245,83 +15012,6 @@ function createEmptyMemoryStore(): MemoryStore {
     payableIncomeByMerchant: new Map(),
     paidIncomeByMerchant: new Map()
   };
-}
-
-const storeMapKeys = [
-  "merchantApplications",
-  "merchants",
-  "shops",
-  "platformProducts",
-  "platformShopProducts",
-  "ownProducts",
-  "merchantProductListings",
-  "depositAccounts",
-  "orders",
-  "afterSales",
-  "refunds",
-  "fulfillmentRecords",
-  "paymentVouchers",
-  "couponTemplates",
-  "userCoupons",
-  "inviteCodes",
-  "paymentMethods",
-  "userWallets",
-  "walletRecharges",
-  "walletHolds"
-] as const;
-
-const storeSetKeys = ["settlementItemKeys", "activeRiskFreezeKeys"] as const;
-
-const storeArrayKeys = [
-  "depositTransactions",
-  "settlementSheets",
-  "manualPayouts",
-  "clawbacks",
-  "riskFreezes",
-  "auditLogs",
-  "ledgerEntries",
-  "rightsCodes",
-  "notifications",
-  "channelAuthorizations",
-  "channelRelations",
-  "channelProductOffers",
-  "paymentCallbackLogs",
-  "paymentExceptions",
-  "extractLogs",
-  "emailDeliveries",
-  "paymentChannelConfigs"
-] as const;
-
-function serializeMemoryStore(store: MemoryStore) {
-  const output: Record<string, unknown> = { sequence: store.sequence };
-  for (const key of storeMapKeys) output[key] = [...store[key].entries()];
-  for (const key of storeSetKeys) output[key] = [...store[key].values()];
-  for (const key of storeArrayKeys) output[key] = store[key];
-  output.pendingIncomeByMerchant = [...store.pendingIncomeByMerchant.entries()];
-  output.payableIncomeByMerchant = [...store.payableIncomeByMerchant.entries()];
-  output.paidIncomeByMerchant = [...store.paidIncomeByMerchant.entries()];
-  return encodeStoreValue(output);
-}
-
-function hydrateMemoryStore(snapshot: unknown): MemoryStore {
-  const decoded = decodeStoreValue(snapshot) as Record<string, unknown>;
-  const store = createEmptyMemoryStore();
-  store.sequence = typeof decoded.sequence === "number" ? decoded.sequence : 0;
-  for (const key of storeMapKeys) {
-    const entries = Array.isArray(decoded[key]) ? decoded[key] as Array<[string, unknown]> : [];
-    store[key] = new Map(entries) as never;
-  }
-  for (const key of storeSetKeys) {
-    const values = Array.isArray(decoded[key]) ? decoded[key] as string[] : [];
-    store[key] = new Set(values) as never;
-  }
-  for (const key of storeArrayKeys) {
-    store[key] = (Array.isArray(decoded[key]) ? decoded[key] : []) as never;
-  }
-  store.pendingIncomeByMerchant = new Map(Array.isArray(decoded.pendingIncomeByMerchant) ? decoded.pendingIncomeByMerchant as Array<[string, bigint]> : []);
-  store.payableIncomeByMerchant = new Map(Array.isArray(decoded.payableIncomeByMerchant) ? decoded.payableIncomeByMerchant as Array<[string, bigint]> : []);
-  store.paidIncomeByMerchant = new Map(Array.isArray(decoded.paidIncomeByMerchant) ? decoded.paidIncomeByMerchant as Array<[string, bigint]> : []);
-  return store;
 }
 
 function encodeStoreValue(value: unknown): unknown {
@@ -15344,114 +15034,6 @@ function decodeStoreValue(value: unknown): unknown {
   return value;
 }
 
-function seedPaymentMethod(store: MemoryStore, input: {
-  id: string;
-  shopId: string;
-  merchantId?: string;
-  ownerType: "platform" | "merchant";
-  provider: PaymentProviderType;
-  displayName: string;
-  merchantNo?: string;
-  appId?: string;
-  serviceProviderId?: string;
-  gatewayUrl?: string;
-  signingSecret?: string;
-  apiMode?: PaymentApiMode;
-  accountName?: string;
-  qrUrl?: string;
-  paymentUrl?: string;
-  isDefault: boolean;
-  sortOrder: number;
-}) {
-  store.paymentMethods.set(input.id, {
-    id: input.id,
-    ownerType: input.ownerType,
-    merchantId: input.merchantId,
-    shopId: input.shopId,
-    provider: input.provider,
-    confirmationMode: isManualPaymentProvider(input.provider) ? "manual" : "automatic",
-    displayName: input.displayName,
-    merchantNo: input.merchantNo,
-    appId: input.appId,
-    serviceProviderId: input.serviceProviderId,
-    gatewayUrl: input.gatewayUrl,
-    signingSecret: input.signingSecret,
-    apiMode: input.apiMode,
-    accountName: input.accountName,
-    qrUrl: input.qrUrl,
-    paymentUrl: input.paymentUrl,
-    enabled: true,
-    status: "enabled",
-    isDefault: input.isDefault,
-    secretConfigured: isManualPaymentProvider(input.provider) ? false : Boolean(input.signingSecret) || input.provider !== "epay",
-    createdAt: new Date(),
-    updatedAt: new Date()
-  });
-}
-
-function seedMemoryCatalog(store: MemoryStore) {
-  for (const item of virtualCatalogProducts) {
-    store.platformProducts.set(item.demoId, {
-      id: item.demoId,
-      name: item.name,
-      category: item.category,
-      tags: item.tags,
-      subtitle: item.subtitle,
-      description: item.description,
-      usageGuide: item.usageGuide,
-      imageUrl: item.imageUrl,
-      specs: item.specs,
-      detailSections: item.detailSections,
-      stockCount: item.stockCount,
-      soldCount: item.soldCount,
-      supplyPriceCents: item.supplyPriceCents,
-      minSalePriceCents: item.minSalePriceCents,
-      suggestedSalePriceCents: item.suggestedSalePriceCents,
-      fulfillmentRule: {
-        mode: item.fulfillmentMode,
-        ...(item.fulfillmentMode === "code_pool" ? { extractCodeRequired: true } : {})
-      },
-      afterSaleRule: { refundBeforeFulfillment: true },
-      status: "active"
-    });
-    if (item.platformShopProductId && item.platformSalePriceCents !== undefined) {
-      store.platformShopProducts.set(item.platformShopProductId, {
-        id: item.platformShopProductId,
-        shopId: "shop-platform",
-        platformProductId: item.demoId,
-        salePriceCents: item.platformSalePriceCents,
-        fulfillmentCostCents: item.fulfillmentCostCents ?? item.supplyPriceCents,
-        status: "listed",
-        groupName: "官方精选"
-      });
-    }
-    store.merchantProductListings.set(item.merchantListingSeedId, {
-      id: item.merchantListingSeedId,
-      merchantId: "merchant-1",
-      shopId: "shop-1",
-      productType: "platform",
-      platformProductId: item.demoId,
-      ownProductReviewId: null,
-      salePriceCents: item.merchantSalePriceCents,
-      status: "listed",
-      groupName: item.groupName
-    });
-    for (const [index, code] of (item.rightsCodes ?? []).entries()) {
-      store.rightsCodes.push({
-        codeId: `code-${item.demoId}-${index + 1}`,
-        productId: item.demoId,
-        platformProductId: item.demoId,
-        code,
-        batchNo: `seed-${item.productNo.toLowerCase()}`,
-        status: "available",
-        createdAt: new Date()
-      });
-    }
-  }
-  store.merchantProductListings.set("ap-2", { id: "ap-2", merchantId: "merchant-2", shopId: "shop-2", productType: "platform", platformProductId: "prod-1", ownProductReviewId: null, salePriceCents: 16_000n, status: "listed" });
-  store.merchantProductListings.set("ap-3", { id: "ap-3", merchantId: "merchant-3", shopId: "shop-3", productType: "platform", platformProductId: "prod-1", ownProductReviewId: null, salePriceCents: 15_000n, status: "listed" });
-}
-
 function requireEntity<T>(value: T | undefined, code: string, message: string): T {
   if (!value) throw new ApiError(404, code, message);
   return value;
@@ -15462,7 +15044,7 @@ function required<T>(value: T | undefined | null, name: string): T {
   return value;
 }
 
-function nextId(store: MemoryStore, prefix: string) {
+function nextId(store: RuntimeState, prefix: string) {
   store.sequence += 1;
   return `${prefix}-${store.sequence}`;
 }
@@ -15666,7 +15248,7 @@ type DemoMerchantProductListing = {
 };
 
 type SalesChannelType = "platform_self_operated" | "single_merchant" | "two_tier" | "three_tier";
-type PaymentChannel = "wechat_miniprogram" | "wechat_h5_jsapi" | "wechat_h5" | "alipay_wap" | "epay" | "balance" | "mock";
+type PaymentChannel = "wechat_miniprogram" | "wechat_h5_jsapi" | "wechat_h5" | "alipay_wap" | "epay" | "balance";
 type PaymentProviderType = "alipay_merchant" | "wechat_merchant" | "epay" | "personal_alipay" | "wechat_personal" | "balance";
 type PaymentApiMode = "mapi_first" | "submit" | "hupijiao_direct";
 type PaymentDisplayType =
@@ -16218,7 +15800,7 @@ type RiskFreezeItem = Record<string, unknown> & {
   releasedAt: Date | null;
 };
 
-type MemoryStore = {
+type RuntimeState = {
   sequence: number;
   merchantApplications: Map<string, MerchantApplication>;
   merchants: Map<string, DemoMerchant>;
